@@ -28,7 +28,7 @@ struct RenderGpuLight
     float pos[4];    // xyz, w range
     float color[4];  // rgb * intensity (candela), w type (1 point, 2 spot)
     float dir[4];    // xyz spot direction, w spot scale
-    float params[4]; // x spot offset, y first shadow view (-1 none), z 1/range^2, w 0
+    float params[4]; // x spot offset, y first shadow view (-1 none), z 1/range^2, w 1: casts shadows in the scene (it may still have no map)
     float sphere[4]; // culling sphere: xyz centre, w radius
 };
 

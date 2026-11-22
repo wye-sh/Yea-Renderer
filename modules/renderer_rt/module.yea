@@ -17,8 +17,9 @@ setting float full_below 0.15 0 1
 # Where what a ray hits is visible on screen, its fully lit colour from there (with all shadows and
 # lights); elsewhere it is lit at the hit.
 setting bool screen_colors true
-# Reflected things in shadow are dark: a shadow ray towards each light reaching what a ray hit.
-setting bool shadow_rays true
+# How what a reflection shows is shadowed. Scene: as the scene shadows it (from each light's shadow map, a ray
+# for lights without one and for the sun). Rays: a ray towards every light, to compare. Off: no shadows.
+setting choice reflected_shadows Scene Scene Rays Off
 # Frames of history blended into rough reflections, so they hold still (mirrors take little, moving things less).
 setting int history_frames 12 1 inf
 # The brightest a single ray's find may be (times white), so a stray ray onto a light can't sparkle.

@@ -15,6 +15,7 @@
 #include <Common_3/Graphics/FSL/defaults.h>
 #include "Shaders/Trace.srt.h"
 
+#include <math.h>
 #include <string.h>
 
 namespace renderer_rt
@@ -31,6 +32,9 @@ struct RtData
     float    temporal[4];
     uint32_t tiles[4];
     uint32_t zero[4];
+    float    shadow[4];
+    uint32_t shadowMode[4];
+    float    taps[32][4];
 };
 
 struct Blas
@@ -45,7 +49,9 @@ const uint32_t kMaxFrames = 4;
 const uint32_t kMaxMeshes = 1024;
 const uint32_t kMaxRetired = 256;
 const uint32_t kMaxInstances = 65536; // the core's Instance table
-const uint32_t kFlagScreen = 1, kFlagShadowRays = 2, kFlagDebug = 4;
+const uint32_t kFlagScreen = 1, kFlagDebug = 4;
+// How hits are shadowed (Trace.comp.fsl SHADOWS_*): as the scene, rays for every light, none.
+enum { kShadowsScene, kShadowsRays, kShadowsOff };
 
 Renderer*            gRenderer;
 Queue*               gQueue;
@@ -75,6 +81,11 @@ uint32_t             gFreshFrames; // frames left that write every tile (both hi
 uint32_t             gResolves;    // resolves run: picks the flag sets
 uint32_t             gWidth, gHeight;
 bool                 gReady;
+// For the shadow maps' lookups at hits: a comparison sampler as the core's, and stand-ins bound while
+// renderer_shadows draws no maps (then no light has one, and none is read).
+Sampler*             gShadowCmp;
+Texture*             gDummyAtlas;
+Buffer*              gDummyViews;
 
 Blas gBlas[kMaxMeshes];
 // Bottom-level structures replaced while frames in flight may still trace them: freed once those are done.
@@ -115,7 +126,8 @@ void freeTexture()
     gAccumFrame = 0;
 }
 
-Texture* makeTexture(uint32_t w, uint32_t h, const char* name, TinyImageFormat format = TinyImageFormat_R16G16B16A16_SFLOAT)
+Texture* makeTexture(uint32_t w, uint32_t h, const char* name, TinyImageFormat format = TinyImageFormat_R16G16B16A16_SFLOAT,
+                     DescriptorType descriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE))
 {
     Texture*    t = nullptr;
     TextureDesc d = {};
@@ -125,7 +137,7 @@ Texture* makeTexture(uint32_t w, uint32_t h, const char* name, TinyImageFormat f
     d.mSampleCount = SAMPLE_COUNT_1;
     d.mFormat = format; // RWTex2D(half4) is rgba16f on Vulkan, RWTex2D(float) r32f
     d.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
-    d.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+    d.mDescriptors = descriptors;
     d.pName = name;
     TextureLoadDesc l = {};
     l.pDesc = &d;
@@ -311,6 +323,17 @@ int load(int reloaded)
         if (!gPipe[k])
             return 1;
     }
+    SamplerDesc sd = {};
+    sd.mMinFilter = FILTER_LINEAR;
+    sd.mMagFilter = FILTER_LINEAR;
+    sd.mMipMapMode = MIPMAP_MODE_NEAREST;
+    sd.mAddressU = sd.mAddressV = sd.mAddressW = ADDRESS_MODE_CLAMP_TO_EDGE;
+    sd.mCompareFunc = CMP_LEQUAL;
+    addSampler(gRenderer, &sd, &gShadowCmp);
+    gDummyAtlas = makeTexture(1, 1, "renderer_rt_no_atlas", TinyImageFormat_D32_SFLOAT, DESCRIPTOR_TYPE_TEXTURE); // no UAV: a depth format can't take one
+    gDummyViews = makeMapped(144, 144, DESCRIPTOR_TYPE_BUFFER, "renderer_rt_no_views");
+    if (!gShadowCmp || !gDummyAtlas || !gDummyViews)
+        return 1;
     DescriptorSetDesc setDesc = SRT_SET_DESC(RtSrt, PerFrame, gFrames * 2, 0);
     addDescriptorSet(gRenderer, &setDesc, &gSet);
     for (uint32_t i = 0; i < gFrames; ++i)
@@ -343,6 +366,15 @@ void unload()
     }
     if (gSet)
         removeDescriptorSet(gRenderer, gSet);
+    if (gShadowCmp)
+        removeSampler(gRenderer, gShadowCmp);
+    if (gDummyAtlas)
+        removeResource(gDummyAtlas);
+    if (gDummyViews)
+        removeResource(gDummyViews);
+    gShadowCmp = nullptr;
+    gDummyAtlas = nullptr;
+    gDummyViews = nullptr;
     for (uint32_t k = 0; k < kShaders; ++k)
     {
         if (gPipe[k])
@@ -411,7 +443,27 @@ bool rt_prepare(uint64_t address)
     d.sunColor[3] = F->ambient;
     d.counts[0] = F->allLightCount;
     d.counts[1] = (uint32_t)(F->frameNumber % 64u);
-    d.counts[2] = (settings.screen_colors ? kFlagScreen : 0) | (settings.shadow_rays ? kFlagShadowRays : 0) | (settings.show_hits ? kFlagDebug : 0);
+    d.counts[2] = (settings.screen_colors ? kFlagScreen : 0) | (settings.show_hits ? kFlagDebug : 0);
+    // Hits are shadowed as the scene is: from the local lights' maps (the same filter, normal bias and
+    // contact-hardening as the forward pass), a ray where a light casts but has no map, a ray for the sun. When the
+    // scene gains a ray-traced shadow mode, picking it here (kShadowsRays) is all reflections need.
+    bool maps = F->localAtlas && F->shadowViews;
+    d.shadowMode[1] = settings.reflected_shadows == ReflectedShadows::Rays  ? kShadowsRays
+                      : settings.reflected_shadows == ReflectedShadows::Off ? kShadowsOff
+                                                                             : kShadowsScene;
+    d.shadowMode[0] = F->taps >= 4 && F->taps <= 32 ? F->taps : 16;
+    d.shadowMode[2] = F->receiverPlane ? 1 : 0;
+    d.shadowMode[3] = maps ? 1 : 0;
+    d.shadow[0] = F->softness;
+    d.shadow[1] = F->normalBias;
+    d.shadow[2] = F->localTexel;
+    d.shadow[3] = F->localLightSize;
+    for (uint32_t i = 0; i < d.shadowMode[0]; ++i)
+    {
+        float r = sqrtf(((float)i + 0.5f) / (float)d.shadowMode[0]), t = (float)i * 2.39996323f;
+        d.taps[i][0] = r * cosf(t);
+        d.taps[i][1] = r * sinf(t);
+    }
     d.counts[3] = F->drawableCount;
     d.params[0] = settings.max_distance < 1 ? 1 : settings.max_distance;
     d.params[1] = 0.05f;
@@ -501,7 +553,7 @@ void rt_run(uint64_t address)
             gDescs[i] = gDescs[0];
         AccelerationStructureDesc d = {};
         d.mType = ACCELERATION_STRUCTURE_TYPE_TOP;
-        d.mFlags = ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD;
+        d.mFlags = ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE; // rebuilt every frame, but 53-odd instances build in no time; every ray traverses it
         d.mTop.mDescCount = cap;
         d.mTop.pInstanceDescs = gDescs;
         addAccelerationStructure(gRay, &d, &gTlas[fi]);
@@ -527,7 +579,16 @@ void rt_run(uint64_t address)
     Texture*       previous = F->previous->pTexture;
     Buffer*        exposure = F->exposure;
     Texture*       motion = F->motion->pTexture;
-    DescriptorData p[22] = {};
+    // renderer_shadows has drawn its atlas by now (shadows_render runs before the prepass).
+    Texture*       atlas = F->localAtlas && F->shadowViews ? F->localAtlas->pTexture : gDummyAtlas;
+    Buffer*        views = F->localAtlas && F->shadowViews ? F->shadowViews : gDummyViews;
+    DescriptorData p[25] = {};
+    p[22].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gShadowViews);
+    p[22].ppBuffers = &views;
+    p[23].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gLocalAtlas);
+    p[23].ppTextures = &atlas;
+    p[24].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gShadowCmp);
+    p[24].ppSamplers = &gShadowCmp;
     p[0].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gScene);
     p[0].ppAccelerationStructures = &gTlas[fi];
     p[1].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gRt);
@@ -573,10 +634,10 @@ void rt_run(uint64_t address)
     // The trace reads neither trace (the history stands in, in the state it is in), the resolve reads both.
     p[12].ppTextures = &gAccum[w ^ 1];
     p[13].ppTextures = &gAccum[w ^ 1];
-    updateDescriptorSet(gRenderer, fi * 2, gSet, 22, p);
+    updateDescriptorSet(gRenderer, fi * 2, gSet, 25, p);
     p[12].ppTextures = &gHalf;
     p[13].ppTextures = &gTex;
-    updateDescriptorSet(gRenderer, fi * 2 + 1, gSet, 22, p);
+    updateDescriptorSet(gRenderer, fi * 2 + 1, gSet, 25, p);
 
     // Every target the two passes write goes to UNORDERED_ACCESS at once; the tile flags stay there.
     BufferBarrier tb = { gTiles, gTilesState, RESOURCE_STATE_UNORDERED_ACCESS };

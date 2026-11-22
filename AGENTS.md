@@ -86,7 +86,13 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   low-discrepancy sequence over frames, IGN across pixels), each sample capped at `brightest` times white. A hit visible on screen now (its depth matches there) takes last frame's resolved colour
   (`screen_colors`), fully lit with every shadow; elsewhere it is shaded at the hit: emission, the sun and up to
   64 local lights (the core's light buffer now holds the lights outside the view after the visible ones,
-  `allLightCount`), at most 8 shadow rays per hit (`shadow_rays`), sky ambient. A miss sees the sky. The forward
+  `allLightCount`), sky ambient. Hits are shadowed as the scene is (`reflected_shadows` Scene): a local light with a
+  map in renderer_shadows' atlas from that map, filtered as the forward pass does (`Shaders/Shadow.h.fsl` copies the
+  core's localShadow: keep them in step), a light that casts in the scene but has no map (outside the view, over the
+  budget; the core's LightData params.w) by a ray, the sun by a ray; at most 8 rays per hit. A scene ray-traced shadow
+  mode would pick `kShadowsRays` in rt_prepare. Rays traces every light (to compare), Off none. Each round of the
+  trace packs its hits to light (most of the cost where reflections show what is off screen) into a group-shared list
+  the whole thread group then lights, one hit a thread. A miss sees the sky. The forward
   pass blends it over the probes, fading out over the roughness limit's last third. Two passes, both
   `Shaders/Trace.comp.fsl`. The trace runs a thread per 2x2 block, so no lane idles: pixels smoother than `full_below`
   (0.15: mirrors) are traced at every pixel, so mirrors are exactly as at full resolution, and with `half_resolution`
@@ -164,7 +170,7 @@ intensity, max_distance, show_contact. `renderer_probes`: enabled, resolution (6
 `renderer_ssr`: enabled, half_resolution, max_roughness, thickness, max_distance, steps, edge_fade, intensity,
 show_hits (tints where reflections were found). `renderer_vrs`: enabled, aggressiveness, motion (0), keep_curved, glossy_below, allow_4x4,
 show_rates (green half rate, blue 2x2, magenta coarser). `renderer_rt`: enabled, max_roughness, half_resolution, full_below, screen_colors,
-shadow_rays, history_frames, brightest, max_distance, show_hits (green: hit seen on screen, blue: lit at the hit, grey: sky).
+reflected_shadows (Scene, Rays, Off), history_frames, brightest, max_distance, show_hits (green: hit seen on screen, blue: lit at the hit, grey: sky).
 
 ## Reset
 
@@ -182,7 +188,7 @@ glossy pixels with reflections on, and shows in its timing), per re-captured pro
 resolution plus 6 small passes per mip, sun cascades whose view or casters changed redrawn, at most `updates_per_frame` local lights redrawn (oldest shadow first), two
 exposure dispatches, with ray-traced reflections (instead of the SSR depth copy and march) one top-level
 rebuild, a trace dispatch (a closest-hit ray per glossy pixel, a quarter of them with half_resolution except
-mirror-like ones, plus up to 9 shadow rays where the hit isn't on screen) and a full-size resolve (upsample and
+mirror-like ones; where the hit isn't on screen a shadow map lookup per lit light with a map, a ray for the sun and for mapless casters) and a full-size resolve (upsample and
 temporal accumulation in one; tiles with no glossy pixel cost two reads), one full-screen TAA resolve (when on; with an upscaler, its dispatch at the display size and a one-thread
 exposure copy instead, every scene pass then at the render size), one full-screen composite. No per-frame allocation. GPU memory at the defaults:
 HDR + depth at 4x MSAA, sun atlas 4096² D32 (64 MB), local atlas 4096² (64 MB), a screen-size R32F depth copy
