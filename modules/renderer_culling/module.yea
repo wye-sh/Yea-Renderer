@@ -1,0 +1,12 @@
+module renderer_culling
+
+# Called by renderer (the core) each frame with the address of its RenderFrame (frame.h).
+export bool cull_prepare(u64 frame)
+export void cull_run(u64 frame)
+
+category Light Culling
+setting bool enabled true
+setting int max_lights 1024 16 4096
+setting int tile_size 16 8 32
+setting int z_bins 1024 64 8192
+setting bool heatmap false

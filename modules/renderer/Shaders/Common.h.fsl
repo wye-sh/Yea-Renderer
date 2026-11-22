@@ -1,0 +1,99 @@
+// Layouts shared by the core's shaders; the C++ mirrors are in renderer.cpp and frame.h.
+#ifndef RENDER_COMMON_H
+#define RENDER_COMMON_H
+
+#define PI 3.14159265
+
+#if defined(VULKAN)
+#define FirstBitLow(x) uint(findLSB(x))
+#else
+#define FirstBitLow(x) firstbitlow(x)
+#endif
+
+STRUCT(FrameData)
+{
+    DATA(float4, viewProj[4], None);  // rows
+    DATA(float4, view[4], None);      // rows, world -> view (+z forward)
+    DATA(float4, camPos, None);       // xyz, w near
+    DATA(float4, screen, None);       // width, height, 1/width, 1/height
+    DATA(float4, proj, None);         // x P00, y P11 (projection scale)
+    DATA(float4, sunDir[4], None);    // towards the light; w 1 when on
+    DATA(float4, sunColor[4], None);  // rgb lux
+    DATA(float4, skyZenith, None);    // rgb luminance
+    DATA(float4, skyHorizon, None);
+    DATA(float4, skyGround, None);    // w ambient multiplier
+    DATA(uint4, counts, None);        // x local lights, y directional lights, z flags, w taps
+    DATA(uint4, tiles, None);         // x tile size, y tiles x, z words per tile, w bins
+    DATA(float4, misc, None);         // x bin scale, y specular AA, z sun disk size (cos), w heatmap scale
+    DATA(float4, cascadeEnd, None);   // view depth where each cascade ends
+    DATA(float4, shadow, None);       // x cascades, y softness (texels), z sun size (PCSS, 0 off), w normal bias (texels)
+    DATA(float4, shadow2, None);      // x 1/sun atlas, y 1/local atlas
+    DATA(float4, viewProjNoJitter[4], None); // rows, this frame without the TAA jitter
+    DATA(float4, prevViewProj[4], None);     // rows, last frame without jitter
+    DATA(float4, aoParams, None);            // x specular occlusion, y multi-bounce on
+    DATA(uint4, probeInfo, None);            // x probes, y mips, z parallax on
+    DATA(float4, probeParams, None);         // x intensity, y blend (m)
+};
+
+// A reflection probe (renderer_probes), smallest box first.
+STRUCT(ProbeData)
+{
+    DATA(float4, pos, None);          // xyz capture point, w slice in gProbes
+    DATA(float4, boxMin, None);
+    DATA(float4, boxMax, None);
+};
+
+// flags in counts.z
+#define FLAG_CULLED   1u
+#define FLAG_HEATMAP  2u
+#define FLAG_CASCADES 4u
+#define FLAG_SHADOWS  8u
+#define FLAG_AO       16u
+#define FLAG_AO_DEBUG 32u
+#define FLAG_CONTACT  64u
+#define FLAG_CONTACT_DEBUG 128u
+#define FLAG_UNLIT    256u // F1's Wireframe: each line in its material's own colour
+
+STRUCT(InstanceData)
+{
+    DATA(float4, row0, None);
+    DATA(float4, row1, None);
+    DATA(float4, row2, None);
+    DATA(uint4, misc, None);          // x material
+};
+
+// Last frame's world rows of each instance (for motion vectors), at the same index as gInstances.
+STRUCT(PrevInstanceData)
+{
+    DATA(float4, row0, None);
+    DATA(float4, row1, None);
+    DATA(float4, row2, None);
+};
+
+STRUCT(MaterialData)
+{
+    DATA(float4, albedoRough, None);  // rgb albedo, a roughness
+    DATA(float4, params, None);       // x metallic, y f0 (dielectric), z reflections on
+    DATA(float4, emissive, None);     // rgb luminance
+};
+
+STRUCT(LightData)
+{
+    DATA(float4, pos, None);          // xyz, w range
+    DATA(float4, color, None);        // rgb candela, w type
+    DATA(float4, dir, None);          // xyz spot direction, w spot scale
+    DATA(float4, params, None);       // x spot offset, y first shadow view or -1, z 1/range^2
+    DATA(float4, sphere, None);       // culling sphere
+};
+
+STRUCT(ShadowView)
+{
+    DATA(float4, row0, None);
+    DATA(float4, row1, None);
+    DATA(float4, row2, None);
+    DATA(float4, row3, None);
+    DATA(float4, rect, None);         // tile: u, v, width, height
+    DATA(float4, info, None);         // x texel world size (at distance 1 if perspective), y depth range, z perspective, w near
+};
+
+#endif

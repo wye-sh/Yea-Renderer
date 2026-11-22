@@ -1,4 +1,4 @@
-# Lighting (component)
+# Renderer (component)
 
 3D renderer for a view: forward+ PBR with a depth prepass, compute light culling, sun cascades and a
 local-light shadow atlas, contact shadows, GTAO, reflection probes, TAA, auto exposure and tonemapping.
@@ -7,36 +7,36 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
 
 ## Modules
 
-- `lighting`: the core. Scene tables and exports, camera, depth prepass, forward shading, sky, exposure,
-  tonemap, composite. Code: `lighting.cpp` (frame), `scene.cpp` (exports), `Shaders/`.
-- `lighting_culling`: Z-bins (CPU, lights sorted by view depth) and per-tile light bitmasks (compute,
+- `renderer`: the core. Scene tables and exports, camera, depth prepass, forward shading, sky, exposure,
+  tonemap, composite. Code: `renderer.cpp` (frame), `scene.cpp` (exports), `Shaders/`.
+- `renderer_culling`: Z-bins (CPU, lights sorted by view depth) and per-tile light bitmasks (compute,
   tile depth range from the prepass). Switch off: every pixel loops all visible lights (capped at 256).
-- `lighting_shadows`: sun cascades (stabilised, PCF or PCSS) and a cached 16 x 16 tile atlas for spot and
+- `renderer_shadows`: sun cascades (stabilised, PCF or PCSS) and a cached 16 x 16 tile atlas for spot and
   point lights (6 tiles per point light), redrawn only when the light or a nearby caster moves.
-- `lighting_taa`: temporal antialiasing. Picks a Halton sub-pixel jitter each frame; the core then renders
+- `renderer_taa`: temporal antialiasing. Picks a Halton sub-pixel jitter each frame; the core then renders
   at one sample (TAA replaces `msaa`) with a motion vector target (RG16F, from last frame's instance rows and
   camera); the resolve reprojects two ping-pong RGBA16F histories (Catmull-Rom), clips them to the 3x3
   neighbourhood's spread in YCoCg, blends. Sharpening is in the core's composite, after TAA, never in history.
   Switch off: the core renders with `msaa` as before.
-- `lighting_ao`: GTAO (Jimenez 2016) from the prepass depth alone (normals rebuilt from depth), then
+- `renderer_ao`: GTAO (Jimenez 2016) from the prepass depth alone (normals rebuilt from depth), then
   `denoise` depth-aware 3x3 blurs, into a full-size R32F texture. The forward pass darkens sky ambient by it:
   diffuse with the multi-bounce fit, specular with Lagarde's specular occlusion. Direct light is untouched.
   Runs between the prepass and the forward pass, beside culling. Noise rotates per frame only with TAA on.
-- `lighting_contact`: sun contact shadows. A screen-space march from each pixel towards the sun over
+- `renderer_contact`: sun contact shadows. A screen-space march from each pixel towards the sun over
   `length` metres against the prepass depth, into a full-size R32F texture the forward pass multiplies the
   sun's shadow by. Catches small and thin shadows the cascades miss. Off when there is no sun.
-- `lighting_probes`: reflection probes games place (its own `Probe` table, up to 16). Each is captured as a
+- `renderer_probes`: reflection probes games place (its own `Probe` table, up to 16). Each is captured as a
   cube (the scene lit diffusely: sky ambient, sun without shadow, the nearest 64 local lights; alpha =
   coverage), halved level by level, prefiltered (GGX) into one slice of an RGBA16F octahedral 2D array, a mip
   per roughness step. Dirty probes are captured first (at most `updates_per_frame`, or 1), then that many more
   in turn. The forward pass blends the probes whose boxes hold the pixel, smallest box first, projects onto
   the box (parallax), and lets the live sky show where the capture saw none.
-- The core calls the others through optional imports with a `LightingFrame*` (as `u64`): `frame.h`, copied
-  identically into `lighting`, `lighting_culling`, `lighting_shadows`, `lighting_taa`, `lighting_ao`, `lighting_contact` and `lighting_probes` (`mathx.h` into the
-  first three). Change all copies together and raise `LIGHTING_FRAME_VERSION`. `taa_prepare` runs first,
+- The core calls the others through optional imports with a `RenderFrame*` (as `u64`): `frame.h`, copied
+  identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact` and `renderer_probes` (`mathx.h` into the
+  first three). Change all copies together and raise `RENDER_FRAME_VERSION`. `taa_prepare` runs first,
   before the camera, so the jitter reaches the projection.
 
-## Hook-up points (exports of `lighting`)
+## Hook-up points (exports of `renderer`)
 
 Units: metres; sun intensity in lux, point and spot in candela. Colours linear RGB.
 - Meshes: `mesh_box/sphere/plane/cylinder/cone/torus` (unit size, centred), or `mesh_begin`,
@@ -52,29 +52,29 @@ Units: metres; sun intensity in lux, point and spot in candela. Colours linear R
   intensity)`, `light_range`, `light_cone(inner°, outer°)`, `light_shadow(l, cast)`, `light_remove`. The
   first sun gets the cascades; up to 4 suns.
 - `camera(eye, target, fov°)`, `clear()` (removes everything but probes).
-- Reflection probes (exports of `lighting_probes`): `probe_add(pos, box_min, box_max)` (capture point and
+- Reflection probes (exports of `renderer_probes`): `probe_add(pos, box_min, box_max)` (capture point and
   the world box where it is used and reflections are projected onto; put the box's bottom just under the
   floor), `probe_place`, `probe_remove`, `probe_clear`, `probe_count`.
 - Handles are `row | generation << 20`; stale handles are ignored.
 
-Minimal link module: `use lighting`, a `preset` for every knob, and in `update(SIMULATE)` add meshes,
+Minimal link module: `use renderer`, a `preset` for every knob, and in `update(SIMULATE)` add meshes,
 materials, instances and lights once (when `instance_count()` is 0), then move what moves and set the camera.
 
 ## Knobs
 
-`lighting`: exposure_ev, auto_exposure, manual_ev100, adapt_speed, tonemapper (0 PBR Neutral, 1 filmic,
+`renderer`: exposure_ev, auto_exposure, manual_ev100, adapt_speed, tonemapper (0 PBR Neutral, 1 filmic,
 2 Reinhard, 3 none), msaa (1/2/4/8), specular_aa, sky/horizon/ground colours, sky_luminance, ambient,
-sun_disk (degrees), near_plane. `lighting_culling`: enabled, max_lights, tile_size (8/16/32), z_bins,
-heatmap. `lighting_shadows`: enabled (the sun's), cascades, shadow_distance, cascade_split, sun_resolution, softness,
+sun_disk (degrees), near_plane. `renderer_culling`: enabled, max_lights, tile_size (8/16/32), z_bins,
+heatmap. `renderer_shadows`: enabled (the sun's), cascades, shadow_distance, cascade_split, sun_resolution, softness,
 filter_taps, pcss, sun_size, normal_bias, slope_bias, light_shadows, shadowed_lights, local_atlas_resolution,
-updates_per_frame, show_cascades, show_atlas (the light shadow atlas, top right). `lighting_taa`: enabled, history_weight, clamp_width, sharpen, jitter,
-jitter_phases. `lighting_ao`: enabled, radius, intensity, falloff, slices, steps, denoise, specular_occlusion,
-multi_bounce, show_ao. `lighting_contact`: enabled, length, thickness, steps, intensity, max_distance,
-show_contact. `lighting_probes`: enabled, resolution (64-512), updates_per_frame, intensity, blend, parallax.
+updates_per_frame, show_cascades, show_atlas (the light shadow atlas, top right). `renderer_taa`: enabled, history_weight, clamp_width, sharpen, jitter,
+jitter_phases. `renderer_ao`: enabled, radius, intensity, falloff, slices, steps, denoise, specular_occlusion,
+multi_bounce, show_ao. `renderer_contact`: enabled, length, thickness, steps, intensity, max_distance,
+show_contact. `renderer_probes`: enabled, resolution (64-512), updates_per_frame, intensity, blend, parallax.
 
 ## Reset
 
-All scene data is in `lighting`'s tables and state: Reset empties the scene; the feature's link module
+All scene data is in `renderer`'s tables and state: Reset empties the scene; the feature's link module
 builds it again. GPU objects and shadow caches are rebuilt on load.
 
 ## Cost
@@ -104,10 +104,10 @@ HDR + depth at 4x MSAA, sun atlas 4096² D32 (64 MB), local atlas 4096² (64 MB)
 - Motion vectors match an instance by its table row and generation; a reused row starts with no motion.
 - Take state blocks (`host()->state`) only in your own `load()`: the host files a block under the module
   running when it is asked for, so one asked for inside an export another module calls is that module's
-  (the camera once never reached the renderer this way). `lighting` binds its blocks in `bindState()`.
+  (the camera once never reached the renderer this way). `renderer` binds its blocks in `bindState()`.
 - A probe sees the objects inside its box too, so a shiny object reflects itself where it is near the probe.
 
-## Example view (`example/lighting_example`)
+## Example view (`example/renderer_example`)
 
 Floor, gold and red sphere rows sweeping roughness, pillars and assorted shapes, spinning tori, a sun,
 `light_count` moving coloured point lights (markers glow in their colour; the first `shadowed_points` cast

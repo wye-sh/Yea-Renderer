@@ -1,0 +1,19 @@
+module renderer_ao
+
+# Called by renderer (the core) each frame with the address of its RenderFrame (frame.h).
+export bool ao_prepare(u64 frame)
+export void ao_run(u64 frame)
+
+category Ambient Occlusion
+setting bool enabled true
+# How far (metres) surfaces shade each other.
+setting float radius 1 0.1 5
+setting float intensity 1 0 3
+# Where shading fades out, as a part of the radius from its edge.
+setting float falloff 0.6 0.1 1
+setting int slices 2 1 4
+setting int steps 4 2 12
+setting int denoise 1 0 3
+setting float specular_occlusion 1 0 1
+setting bool multi_bounce true
+setting bool show_ao false
