@@ -8,7 +8,7 @@ category Variable Rate Shading
 # Smooth areas of the screen are lit once per 2 x 2 (or 2 x 1, 1 x 2) pixels instead of every pixel;
 # edges, highlights and fine detail stay at full rate. Only on GPUs with variable-rate shading, with
 # Anti-aliasing (TAA) on.
-setting bool enabled true
+setting bool enabled false
 # Higher: more of the screen at coarser rates (from last frame's contrast).
 setting float aggressiveness 1 0 4
 # How much faster movement lets shading coarsen.
