@@ -3,9 +3,6 @@ module renderer_shadows
 # Called by renderer (the core) each frame with the address of its RenderFrame (frame.h).
 export bool shadows_prepare(u64 frame)
 export void shadows_render(u64 frame)
-# Whether point and spot lights get shadow maps this frame (light shadows on, a budget above 0), as decided
-# by the last shadows_prepare: the core marks shadow-casting lights for renderer_rt with it.
-export bool light_shadows_on()
 
 category Sun Shadows
 setting bool enabled true

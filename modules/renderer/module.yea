@@ -103,7 +103,6 @@ import renderer_culling bool cull_prepare(u64 frame) = false
 import renderer_culling void cull_run(u64 frame)
 import renderer_shadows bool shadows_prepare(u64 frame) = false
 import renderer_shadows void shadows_render(u64 frame)
-import renderer_shadows bool light_shadows_on() = false
 import renderer_taa bool taa_prepare(u64 frame) = false
 import renderer_taa void taa_resolve(u64 frame)
 import renderer_ao bool ao_prepare(u64 frame) = false

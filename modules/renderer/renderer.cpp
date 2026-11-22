@@ -1487,7 +1487,6 @@ void draw(uint32_t pass, const YeaFrame* yf)
     // GPU lights in sorted order, with the shadow views renderer_shadows picked; then, for reflections
     // (renderer_rt), the lights outside the view, without shadows.
     RenderGpuLight* gl = gLightCpu;
-    const bool      lightShadows = shadows && renderer_shadows::light_shadows_on();
     for (uint32_t i = 0; i < F.lightCount + outsideCount; ++i)
     {
         bool         inside = i < F.lightCount;
@@ -1514,7 +1513,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         g.params[0] = -cosOuter * scale;
         g.params[1] = shadows && inside ? (float)gLocal[i].shadow : -1.0f;
         g.params[2] = 1.0f / (range * range);
-        g.params[3] = lightShadows && l.shadow ? 1.0f : 0.0f; // casts in the scene (renderer_rt: a map, else a ray)
+        g.params[3] = 0;
         if (inside)
             memcpy(g.sphere, gLocal[i].sphere, sizeof g.sphere);
         else

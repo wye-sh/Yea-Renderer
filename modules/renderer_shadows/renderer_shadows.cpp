@@ -66,7 +66,6 @@ float    gCascadeEnd[RENDER_MAX_CASCADES];
 // While F1 shows Wireframe or Overdraw nothing is drawn (Wireframe would draw the maps as edges): the
 // cascades and tiles keep what they had, and every light is redrawn once the mode ends.
 bool gFrozen, gWasFrozen;
-bool gLightShadowsOn; // this frame: point and spot lights get shadow maps (light_shadows_on)
 // The cascades as last drawn: their views, and a sum of hashes of the casters over each (order-free,
 // so the casters' order can change). A cascade whose view and casters match keeps what it has.
 uint32_t              gSunValid; // bit per cascade: drawn and kept since
@@ -455,7 +454,6 @@ void draw(uint32_t pass, const YeaFrame* frame) {}
 bool shadows_prepare(uint64_t address)
 {
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
-    gLightShadowsOn = false;
     if (!gReady || (!settings.enabled && !settings.light_shadows) || !F || F->version != RENDER_FRAME_VERSION)
         return false;
 
@@ -601,7 +599,6 @@ bool shadows_prepare(uint64_t address)
 
     // --- Local lights: pick, assign tiles, decide which to redraw ------------------------------
     uint32_t wanted = settings.light_shadows ? clampu(settings.shadowed_lights, 0, kGroups) : 0;
-    gLightShadowsOn = wanted > 0;
     uint32_t picked[kGroups];
     float    pickedScore[kGroups];
     uint32_t pickedCount = 0;
@@ -805,8 +802,6 @@ bool shadows_prepare(uint64_t address)
     F->receiverPlane = settings.receiver_plane;
     return true;
 }
-
-bool light_shadows_on() { return gLightShadowsOn; }
 
 void shadows_render(uint64_t address)
 {
