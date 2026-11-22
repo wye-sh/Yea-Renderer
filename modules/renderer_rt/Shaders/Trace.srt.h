@@ -2,6 +2,9 @@
 
 // Both passes' bindings (renderer_rt.cpp binds every slot in each; a pass leaves the other's alone).
 BEGIN_SRT(RtSrt)
+    BEGIN_SRT_SET(Persistent) // as the core's: a sampler in a set of its own, written once
+        DECL_SAMPLER(Persistent, SamplerComparisonState, gShadowCmp)
+    END_SRT_SET(Persistent)
     BEGIN_SRT_SET(PerFrame)
         DECL_RAYTRACING(PerFrame, RaytracingAccelerationStructure, gScene) // first: Vulkan binds it at 0
         DECL_CBUFFER(PerFrame, CBUFFER(RtData), gRt)
@@ -27,5 +30,7 @@ BEGIN_SRT(RtSrt)
         DECL_RWTEXTURE(PerFrame, RWTex2D(half4), gOutFull) // trace: the pixels traced at full resolution
         DECL_RWTEXTURE(PerFrame, RWTex2D(half4), gOut)     // resolve: this frame's accumulated reflections
         DECL_RWTEXTURE(PerFrame, RWTex2D(float), gOutZ)
+        DECL_BUFFER(PerFrame, Buffer(ShadowView), gShadowViews) // trace: renderer_shadows' views (a dummy without them)
+        DECL_TEXTURE(PerFrame, Depth2D(float), gLocalAtlas)     // and its local lights' atlas
     END_SRT_SET(PerFrame)
 END_SRT(RtSrt)

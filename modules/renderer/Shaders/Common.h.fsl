@@ -93,7 +93,7 @@ STRUCT(LightData)
     DATA(float4, pos, None);          // xyz, w range
     DATA(float4, color, None);        // rgb candela, w type
     DATA(float4, dir, None);          // xyz spot direction, w spot scale
-    DATA(float4, params, None);       // x spot offset, y first shadow view or -1, z 1/range^2
+    DATA(float4, params, None);       // x spot offset, y first shadow view or -1, z 1/range^2, w 1 casts shadows in the scene
     DATA(float4, sphere, None);       // culling sphere
 };
 

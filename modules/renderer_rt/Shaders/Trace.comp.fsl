@@ -29,19 +29,43 @@ STRUCT(LightData)
     DATA(float4, pos, None);     // xyz, w range
     DATA(float4, color, None);   // rgb candela, w type (1 point, 2 spot)
     DATA(float4, dir, None);     // xyz spot direction, w spot scale
-    DATA(float4, params, None);  // x spot offset, z 1/range^2
+    DATA(float4, params, None);  // x spot offset, y first shadow view (-1: no map), z 1/range^2, w 1: casts shadows in
+                                 // the scene (it may still have no map: outside the view or over the budget)
     DATA(float4, sphere, None);
 };
 
+STRUCT(ShadowView)
+{
+    DATA(float4, row0, None);
+    DATA(float4, row1, None);
+    DATA(float4, row2, None);
+    DATA(float4, row3, None);
+    DATA(float4, rect, None); // tile: u, v, width, height
+    DATA(float4, info, None); // x texel world size at distance 1, yzw where a point light's cube was drawn
+    DATA(float4, inv0, None);
+    DATA(float4, inv1, None);
+    DATA(float4, inv2, None);
+};
+
 #include "Trace.srt.h"
+#include "Shadow.h.fsl"
 
 #define PI 3.14159265
 #define RT_MISS 60000.0
 #define FLAG_SCREEN 1u
-#define FLAG_SHADOW_RAYS 2u
 #define FLAG_DEBUG 4u
+// How a hit's local lights are shadowed (shadowMode.y). The sun always takes a ray.
+#define SHADOWS_SCENE 0u // as the scene: from the light's shadow map where it has one, else a ray
+#define SHADOWS_RAYS 1u  // a ray for every light (the scene's ray-traced mode, or the comparison knob)
+#define SHADOWS_OFF 2u   // none
 #define MAX_HIT_LIGHTS 64u
 #define MAX_SHADOW_RAYS 8u
+// Every instance is opaque triangles: no procedural primitives to test for (only Direct3D 12 has the flag).
+#if defined(RAY_FLAG_SKIP_AABB)
+#define RT_RAY_FLAGS (RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_AABB)
+#else
+#define RT_RAY_FLAGS RAY_FLAG_FORCE_OPAQUE
+#endif
 
 float noise2(float2 p) { return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715)))); }
 
@@ -114,20 +138,20 @@ float3 brdfLight(float3 N, float3 V, float3 L, float3 diffuse, float3 f0, float 
 // Whether anything is between P and a light along L, up to tMax (one any-hit ray).
 float lightVisible(float3 P, float3 L, float tMax)
 {
-    if ((gRt.counts.z & FLAG_SHADOW_RAYS) == 0u)
+    if (gRt.shadowMode.y == SHADOWS_OFF)
         return 1.0;
     RayDesc shadowRay;
     shadowRay.Origin = P;
     shadowRay.Direction = L;
     shadowRay.TMin = 0.0;
     shadowRay.TMax = tMax;
-    RayQueryAnyHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RAY_FLAG_FORCE_OPAQUE, shadowRay, 2u, occluded) // casters only
+    RayQueryAnyHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RT_RAY_FLAGS, shadowRay, 2u, occluded) // casters only
     return RayQueryIsHit(occluded) ? 0.0 : 1.0;
 }
 
-// The hit lit where it is: emission, the sun and local lights (those in view nearest first, then the rest),
-// each shadowed by a ray, and the sky's light.
-float3 shadeHit(float3 P, float3 N, float3 V, MaterialData m)
+// The hit lit where it is: emission, the sun (shadowed by a ray), local lights (those in view nearest first, then
+// the rest; shadowed by their maps or rays, shadowMode.y) and the sky's light. rot turns the maps' filter.
+float3 shadeHit(float3 P, float3 N, float3 V, MaterialData m, float2 rot)
 {
     float  metallic = saturate(m.params.x);
     float3 albedo = m.albedoRough.rgb;
@@ -154,7 +178,8 @@ float3 shadeHit(float3 P, float3 N, float3 V, MaterialData m)
         float  d2 = dot(toLight, toLight);
         if (d2 >= l.pos.w * l.pos.w)
             continue;
-        float3 L = toLight * rsqrt(max(d2, 1e-8));
+        float  invDist = rsqrt(max(d2, 1e-8));
+        float3 L = toLight * invDist;
         float  f = d2 * l.params.z;
         float  window = saturate(1.0 - f * f);
         float  atten = window * window / max(d2, 1e-4);
@@ -163,15 +188,24 @@ float3 shadeHit(float3 P, float3 N, float3 V, MaterialData m)
             float cone = saturate(dot(-L, l.dir.xyz) * l.dir.w + l.params.x);
             atten *= cone * cone;
         }
-        if (atten <= 0.0 || dot(N, L) <= 0.0)
+        float NoL = dot(N, L);
+        if (atten <= 0.0 || NoL <= 0.0)
             continue;
         float3 lit = brdfLight(N, V, L, diffuse, f0, a2, l.color.rgb * atten);
-        // A shadow ray only where the light could be seen (as the forward pass skips its shadow lookups),
-        // and for at most MAX_SHADOW_RAYS lights per hit.
-        if (rays < MAX_SHADOW_RAYS && max(lit.r, max(lit.g, lit.b)) * exposure >= 1.0 / 4096.0)
+        // A shadow only where the light could be seen (as the forward pass skips its shadow lookups). As the
+        // scene: the light's map where it has one; a ray where it casts in the scene but has no map (outside the
+        // view or over the budget: unshadowed it would be wrong); none where it doesn't cast. Rays: one for
+        // every light. At most MAX_SHADOW_RAYS rays per hit.
+        if (gRt.shadowMode.y != SHADOWS_OFF && max(lit.r, max(lit.g, lit.b)) * exposure >= 1.0 / 4096.0)
         {
-            lit *= lightVisible(offset, L, max(sqrt(d2) - 0.05, 0.0));
-            rays += 1u;
+            bool rayAll = gRt.shadowMode.y == SHADOWS_RAYS;
+            if (!rayAll && l.params.y >= 0.0 && gRt.shadowMode.w != 0u)
+                lit *= localShadow(l, P, N, d2 * invDist, NoL, rot);
+            else if ((rayAll || l.params.w > 0.5) && rays < MAX_SHADOW_RAYS)
+            {
+                lit *= lightVisible(offset, L, max(d2 * invDist - 0.05, 0.0));
+                rays += 1u;
+            }
         }
         color += lit;
     }
@@ -187,14 +221,33 @@ float4 clipOf(float4 rows[4], float3 W)
     return float4(dot(rows[0], w), dot(rows[1], w), dot(rows[2], w), dot(rows[3], w));
 }
 
-// What pixel p's reflected ray sees (surface and d: its surface and depth): rgb, a its distance (0: not traced,
-// RT_MISS: the sky).
-float4 tracePixel(int2 p, float4 surface, float d)
+// A hit that still has to be lit where it is (what the screen doesn't show): its position and distance, normal
+// (towards the ray), the ray's direction and how much of it the screen shows, that screen colour, its material.
+STRUCT(Hit)
 {
+    DATA(float4, result, None); // the finished sample (rgb, a distance; 0: not traced, RT_MISS: the sky); a < 0: light it
+    DATA(float4, pos, None);    // xyz the hit, w its distance
+    DATA(float4, normal, None); // xyz
+    DATA(float4, ray, None);    // xyz the ray's direction, w the screen's share
+    DATA(float4, screen, None); // rgb the screen's colour
+    DATA(uint, material, None);
+};
+
+// Traces pixel p's reflected ray (surface and d: its surface and depth). What the screen shows, the sky and
+// untraced pixels come back finished; a hit to light where it is comes back with result.a < 0 (lightHit).
+Hit traceRay(int2 p, float4 surface, float d)
+{
+    Hit o;
+    o.result = float4(0.0, 0.0, 0.0, 0.0);
+    o.pos = float4(0.0, 0.0, 0.0, 0.0);
+    o.normal = float4(0.0, 0.0, 0.0, 0.0);
+    o.ray = float4(0.0, 0.0, 0.0, 0.0);
+    o.screen = float4(0.0, 0.0, 0.0, 0.0);
+    o.material = 0u;
     int2   size = int2(gRt.screen.xy);
     float  rough = surface.x;
     if (d <= 0.0 || rough >= gRt.camPos.w)
-        return float4(0.0, 0.0, 0.0, 0.0);
+        return o;
 
     // The pixel's world position, from depth (reversed-Z, infinite far), undoing the TAA jitter it was drawn with.
     float  z = gRt.forward.w / d;
@@ -224,19 +277,19 @@ float4 tracePixel(int2 p, float4 surface, float d)
     ray.Direction = R;
     ray.TMin = 0.0;
     ray.TMax = gRt.params.x;
-    RayQueryClosestHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RAY_FLAG_FORCE_OPAQUE, ray, 1u, hit)
+    RayQueryClosestHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RT_RAY_FLAGS, ray, 1u, hit)
     bool debug = (gRt.counts.z & FLAG_DEBUG) != 0u;
     if (!RayQueryIsHit(hit))
     {
         float3 sky = skyRadiance(R) * gRt.sunColor.w;
-        return float4(debug ? float3(0.5, 0.5, 0.5) : clampSample(sky), RT_MISS);
+        o.result = float4(debug ? float3(0.5, 0.5, 0.5) : clampSample(sky), RT_MISS);
+        return o;
     }
     float  t = RayQueryRayT(hit);
     uint   index = RayQueryInstanceID(hit);
     uint   prim = RayQueryPrimitiveIndex(hit);
     float2 bary = RayQueryBarycentrics(hit);
     float3 Hp = ray.Origin + R * t;
-
     // How much of the hit to take from the screen: visible there now (its depth matches) and last frame.
     float  screenWeight = 0.0;
     float3 screenColor = float3(0.0, 0.0, 0.0);
@@ -262,28 +315,52 @@ float4 tracePixel(int2 p, float4 surface, float d)
             }
         }
     }
-    float3 color = screenColor;
-    if (screenWeight < 1.0)
+    if (screenWeight >= 1.0)
     {
-        uint4        inst = gRtInstances[index]; // x instance row, y first index, z first vertex
-        InstanceData row = gInstances[inst.x];
-        uint         i0 = gIndices[inst.y + prim * 3u] + inst.z;
-        uint         i1 = gIndices[inst.y + prim * 3u + 1u] + inst.z;
-        uint         i2 = gIndices[inst.y + prim * 3u + 2u] + inst.z;
-        float3       n = vertexNormal(i0) * (1.0 - bary.x - bary.y) + vertexNormal(i1) * bary.x + vertexNormal(i2) * bary.y;
-        // Object to world through the cofactor matrix (right for non-uniform scale), as the forward pass.
-        float3 c0 = cross(row.row1.xyz, row.row2.xyz);
-        float3 c1 = cross(row.row2.xyz, row.row0.xyz);
-        float3 c2 = cross(row.row0.xyz, row.row1.xyz);
-        float3 Nh = normalize(float3(dot(c0, n), dot(c1, n), dot(c2, n)));
-        if (dot(Nh, R) > 0.0)
-            Nh = -Nh; // the side the ray came from
-        float3 lit = shadeHit(Hp, Nh, -R, gMaterials[row.misc.x]);
-        color = lerp(lit, screenColor, screenWeight);
+        o.result = float4(clampSample(debug ? float3(0.0, 1.0, 0.0) : screenColor), max(t, 1e-3));
+        return o;
     }
-    if (debug)
-        color = float3(0.0, screenWeight, 1.0 - screenWeight);
-    return float4(clampSample(color), max(t, 1e-3));
+    uint4        inst = gRtInstances[index]; // x instance row, y first index, z first vertex
+    InstanceData row = gInstances[inst.x];
+    uint         i0 = gIndices[inst.y + prim * 3u] + inst.z;
+    uint         i1 = gIndices[inst.y + prim * 3u + 1u] + inst.z;
+    uint         i2 = gIndices[inst.y + prim * 3u + 2u] + inst.z;
+    float3       n = vertexNormal(i0) * (1.0 - bary.x - bary.y) + vertexNormal(i1) * bary.x + vertexNormal(i2) * bary.y;
+    // Object to world through the cofactor matrix (right for non-uniform scale), as the forward pass.
+    float3 c0 = cross(row.row1.xyz, row.row2.xyz);
+    float3 c1 = cross(row.row2.xyz, row.row0.xyz);
+    float3 c2 = cross(row.row0.xyz, row.row1.xyz);
+    float3 Nh = normalize(float3(dot(c0, n), dot(c1, n), dot(c2, n)));
+    if (dot(Nh, R) > 0.0)
+        Nh = -Nh; // the side the ray came from
+    o.result = float4(0.0, 0.0, 0.0, -1.0);
+    o.pos = float4(Hp, t);
+    o.normal = float4(Nh, 0.0);
+    o.ray = float4(R, screenWeight);
+    o.screen = float4(screenColor, 0.0);
+    o.material = row.misc.x;
+    return o;
+}
+
+// A hit traceRay left to light (for pixel p): lit where it is, blended with what the screen shows of it.
+float4 lightHit(float4 pos, float4 normal, float4 ray, float3 screen, uint material, int2 p)
+{
+    // The maps' filter turned per pixel and frame, as the core's (TAA averages it).
+    float  phi = noise2(float2(p) + float(gRt.counts.y) * 5.588238) * 2.0 * PI;
+    float3 lit = shadeHit(pos.xyz, normal.xyz, -ray.xyz, gMaterials[material], float2(cos(phi), sin(phi)));
+    float3 color = lerp(lit, screen, ray.w);
+    if ((gRt.counts.z & FLAG_DEBUG) != 0u)
+        color = float3(0.0, ray.w, 1.0 - ray.w);
+    return float4(clampSample(color), max(pos.w, 1e-3));
+}
+
+// What pixel p's reflected ray sees: rgb, a its distance (0: not traced, RT_MISS: the sky).
+float4 tracePixel(int2 p, float4 surface, float d)
+{
+    Hit h = traceRay(p, surface, d);
+    if (h.result.a >= 0.0)
+        return h.result;
+    return lightHit(h.pos, h.normal, h.ray, h.screen.rgb, h.material, p);
 }
 
 // Half resolution: each 2 x 2 block traces one pixel, a different one each frame (TAA gathers them).
@@ -299,39 +376,81 @@ int2 blockOffset()
 // half_resolution off) into gOutFull, then with half_resolution on the block's pixel for this frame (unless it is
 // one of those) into gOutHalf. A pixel that reflects marks its 8 x 8 tile in gTiles (cleared by last frame's
 // resolve), so the resolve skips the others.
+// It runs in five rounds (the block's four pixels at full resolution, then its half-resolution one). Each
+// round traces one pixel per thread, and the hits to light where they are (shadow rays and the lights' loop,
+// most of the cost where the reflection shows what is off screen) go into a list the whole group then lights,
+// one hit per thread: lit inline, a thread with such a hit kept its whole warp waiting while the others had
+// none. Two lists alternate, so one barrier a round keeps a list from being refilled while it is read.
+#define GROUP_THREADS 64u
+GroupShared(float4, gsPos[2 * GROUP_THREADS]);
+GroupShared(float4, gsNormal[2 * GROUP_THREADS]);
+GroupShared(float4, gsRay[2 * GROUP_THREADS]);
+GroupShared(float4, gsScreen[2 * GROUP_THREADS]);
+GroupShared(uint2, gsWhere[2 * GROUP_THREADS]); // x the pixel (x | y << 15 | 1 << 30 for gOutHalf), y the material
+GroupShared(uint, gsCount[5]);
+
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(8, 8, 1)
-void CS_MAIN(SV_DispatchThreadID(uint3) id)
+void CS_MAIN(SV_DispatchThreadID(uint3) id, SV_GroupIndex(uint) gi)
 {
     INIT_MAIN;
     int2 size = int2(gRt.screen.xy);
     int2 b = int2(id.xy);
-    if (b.x >= (size.x + 1) / 2 || b.y >= (size.y + 1) / 2)
-        RETURN();
+    bool inside = b.x < (size.x + 1) / 2 && b.y < (size.y + 1) / 2;
+    if (gi < 5u)
+        gsCount[gi] = 0u;
+    GroupMemoryBarrier();
     bool reflects = false;
-    for (uint k = 0u; k < 4u; ++k)
+    for (uint k = 0u; k < 5u; ++k)
     {
-        int2 p = b * 2 + int2(int(k & 1u), int(k >> 1u));
-        if (p.x >= size.x || p.y >= size.y)
-            continue;
-        float4 surface = LoadTex2D(gSurface, NO_SAMPLER, p, 0);
-        if (surface.x >= gRt.camPos.w)
-            continue;
-        reflects = true;
-        if (surface.x < gRt.params.z)
-            Write2D(gOutFull, p, tracePixel(p, surface, LoadTex2D(gDepth, NO_SAMPLER, p, 0).r));
+        // This round's pixel: one of the block's four at full resolution, or its half-resolution one.
+        bool   isHalf = k == 4u;
+        int2   p = isHalf ? min(b * 2 + blockOffset(), size - int2(1, 1)) : b * 2 + int2(int(k & 1u), int(k >> 1u));
+        float4 surface = float4(1.0, 0.0, 0.0, 0.0);
+        if (inside && p.x < size.x && p.y < size.y)
+            surface = LoadTex2D(gSurface, NO_SAMPLER, p, 0);
+        bool glossy = surface.x < gRt.camPos.w;
+        reflects = reflects || (glossy && !isHalf);
+        bool trace = glossy && (isHalf ? gRt.temporal.w > 0.5 && surface.x >= gRt.params.z : surface.x < gRt.params.z);
+        uint list = (k & 1u) * GROUP_THREADS;
+        if (trace)
+        {
+            Hit h = traceRay(p, surface, LoadTex2D(gDepth, NO_SAMPLER, p, 0).r);
+            if (h.result.a >= 0.0)
+            {
+                if (isHalf)
+                    Write2D(gOutHalf, b, h.result);
+                else
+                    Write2D(gOutFull, p, h.result);
+            }
+            else
+            {
+                uint at;
+                AtomicAdd(gsCount[k], 1u, at);
+                int2 q = isHalf ? b : p;
+                gsPos[list + at] = h.pos;
+                gsNormal[list + at] = h.normal;
+                gsRay[list + at] = h.ray;
+                gsScreen[list + at] = h.screen;
+                gsWhere[list + at] = uint2(uint(q.x) | (uint(q.y) << 15u) | (isHalf ? 1u << 30u : 0u), h.material);
+            }
+        }
+        else if (isHalf && inside && gRt.temporal.w > 0.5)
+            Write2D(gOutHalf, b, float4(0.0, 0.0, 0.0, 0.0));
+        GroupMemoryBarrier();
+        if (gi < gsCount[k])
+        {
+            uint2  where = gsWhere[list + gi];
+            int2   q = int2(int(where.x & 0x7FFFu), int((where.x >> 15u) & 0x7FFFu));
+            float4 v = lightHit(gsPos[list + gi], gsNormal[list + gi], gsRay[list + gi], gsScreen[list + gi].rgb, where.y, q);
+            if ((where.x >> 30u) != 0u)
+                Write2D(gOutHalf, q, v);
+            else
+                Write2D(gOutFull, q, v);
+        }
     }
     if (reflects)
         gTiles[gRt.tiles.z + (b.y >> 2) * gRt.tiles.x + (b.x >> 2)] = 1u;
-    if (gRt.temporal.w > 0.5)
-    {
-        int2   s = min(b * 2 + blockOffset(), size - int2(1, 1));
-        float4 ss = LoadTex2D(gSurface, NO_SAMPLER, s, 0);
-        float4 v = float4(0.0, 0.0, 0.0, 0.0);
-        if (ss.x >= gRt.params.z && ss.x < gRt.camPos.w)
-            v = tracePixel(s, ss, LoadTex2D(gDepth, NO_SAMPLER, s, 0).r);
-        Write2D(gOutHalf, b, v);
-    }
     RETURN();
 }
 #endif
