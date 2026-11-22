@@ -22,4 +22,5 @@ setting bool light_shadows true
 setting int shadowed_lights 24 0 32
 setting int local_atlas_resolution 4096 1024 8192
 setting int updates_per_frame 8 1 32
+setting int max_tile_resolution 1024 128 2048
 setting bool show_atlas false

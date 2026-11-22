@@ -213,11 +213,10 @@ float localShadow(LightData l, float3 P, float3 N, float3 toLight, float phi)
     uint view = uint(l.params.y);
     if (l.color.w < 1.5)
     {
-        // Pick the face from where the cube was drawn, which may lag the light by a few frames:
-        // otherwise the point projects outside the face and reads its clamped edge. Faces go
-        // +x -x +y -y +z -z, and each face's last row is (axis, -dot(axis, eye)).
-        float3 eye = -float3(gShadowViews[view].row3.w, gShadowViews[view + 2u].row3.w, gShadowViews[view + 4u].row3.w);
-        float3 d = P - eye;
+        // Pick the face from where the cube was drawn (info.yzw), which may lag the light by a few
+        // frames: otherwise the point projects outside the face and reads its clamped edge. Faces go
+        // +x -x +y -y +z -z.
+        float3 d = P - gShadowViews[view].info.yzw;
         float3 ad = abs(d);
         uint   face = ad.x >= ad.y && ad.x >= ad.z ? (d.x > 0.0 ? 0u : 1u) : (ad.y >= ad.z ? (d.y > 0.0 ? 2u : 3u) : (d.z > 0.0 ? 4u : 5u));
         view += face;

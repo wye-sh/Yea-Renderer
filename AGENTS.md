@@ -11,8 +11,10 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   tonemap, composite. Code: `renderer.cpp` (frame), `scene.cpp` (exports), `Shaders/`.
 - `renderer_culling`: Z-bins (CPU, lights sorted by view depth) and per-tile light bitmasks (compute,
   tile depth range from the prepass). Switch off: every pixel loops all visible lights (capped at 256).
-- `renderer_shadows`: sun cascades (stabilised, PCF or PCSS) and a cached 16 x 16 tile atlas for spot and
-  point lights (6 tiles per point light), redrawn only when the light or a nearby caster moves.
+- `renderer_shadows`: sun cascades (stabilised, PCF or PCSS) and a cached atlas for spot and point lights
+  (6 tiles per point light), redrawn only when the light or a nearby caster moves. Tiles are squares of
+  128 to max_tile_resolution px, sized to the light's reach on screen and halved, largest first, until
+  all fit 90% of the atlas; a light changes size only when its wanted size doubles or halves.
 - `renderer_taa`: temporal antialiasing. Picks a Halton sub-pixel jitter each frame; the core then renders
   at one sample (TAA replaces `msaa`) with a motion vector target (RG16F, from last frame's instance rows and
   camera); the resolve reprojects two ping-pong RGBA16F histories (Catmull-Rom), clips them to the 3x3
@@ -67,7 +69,7 @@ materials, instances and lights once (when `instance_count()` is 0), then move w
 sun_disk (degrees), near_plane, gpu_timings (logs each pass's GPU time every 10 s: avg/max ms). `renderer_culling`: enabled, max_lights, tile_size (8/16/32), z_bins,
 heatmap. `renderer_shadows`: enabled (the sun's), cascades, shadow_distance, cascade_split, sun_resolution, softness,
 filter_taps, pcss, sun_size, normal_bias, slope_bias, light_shadows, shadowed_lights, local_atlas_resolution,
-updates_per_frame, show_cascades, show_atlas (the light shadow atlas, top right). `renderer_taa`: enabled, history_weight, clamp_width, sharpen, jitter,
+updates_per_frame, max_tile_resolution, show_cascades, show_atlas (the light shadow atlas, top right). `renderer_taa`: enabled, history_weight, clamp_width, sharpen, jitter,
 jitter_phases. `renderer_ao`: enabled, half_resolution (GTAO and its blur at half size, then a depth-aware upsample), radius, intensity, falloff, slices, steps, denoise, specular_occlusion,
 multi_bounce, show_ao. `renderer_contact`: enabled, length, thickness, steps, intensity, max_distance,
 show_contact. `renderer_probes`: enabled, resolution (64-512), updates_per_frame, intensity, blend, parallax.
@@ -102,7 +104,7 @@ HDR + depth at 4x MSAA, sun atlas 4096² D32 (64 MB), local atlas 4096² (64 MB)
   add what is missing (the example adds its probes whenever `probe_count()` is 0).
 - A light's shadow is drawn from where it was when its tiles were last redrawn, which lags a moving light
   when more lights move than `updates_per_frame`. Shading must use that drawn position (point lights pick
-  their cube face from it), never the light's current one, or points project off the tile's edge.
+  their cube face from it, kept in the first face's `info.yzw`), never the light's current one, or points project off the tile's edge.
 - 2D world quads the host draws after this view are over the 3D image; there is no depth between them.
 - Instances draw with an instance-rate stream of indices, never `SV_InstanceID` (D3D12/Vulkan rule).
 - Shadows use standard Z (near 0); the camera uses reversed-Z with an infinite far plane.

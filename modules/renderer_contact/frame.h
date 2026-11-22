@@ -36,7 +36,7 @@ struct RenderGpuShadowView
 {
     float row[4][4]; // world -> clip (ndc xy in -1..1, z 0..1)
     float rect[4];   // tile in the atlas: u, v, width, height
-    float info[4];   // x world size of a texel (at distance 1 when perspective), y depth range, z perspective, w near
+    float info[4];   // x world size of a texel (at distance 1 when perspective); sun: y depth range; lights: yzw drawn from
 };
 
 // A reflection probe as the shaders read it (renderer's Shaders/Common.h.fsl ProbeData).

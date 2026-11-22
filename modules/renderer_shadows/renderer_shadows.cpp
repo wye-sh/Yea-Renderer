@@ -19,10 +19,10 @@ namespace
 {
 const uint32_t kMaxFrames = 4;
 const uint32_t kSunViews = RENDER_MAX_CASCADES;
-const uint32_t kGrid = 16;               // local atlas: 16 x 16 tiles
-const uint32_t kTiles = kGrid * kGrid;
-const uint32_t kGroups = kTiles / 6;     // six tiles per shadowed light (a point light's faces)
-const uint32_t kMaxViews = kSunViews + kTiles;
+const uint32_t kCell = 128;              // the local atlas is handed out in squares of 128 px cells
+const uint32_t kMaxSide = 64;            // cells per side at the largest atlas (8192)
+const uint32_t kGroups = 42;             // shadowed lights at most, each with six view slots
+const uint32_t kMaxViews = kSunViews + kGroups * 6;
 const uint32_t kMaxEntries = 1u << 20;   // caster entries per frame
 
 struct Group
@@ -35,6 +35,9 @@ struct Group
     uint64_t              seen;
     float                 key[9];
     RenderGpuShadowView views[6];
+    uint32_t              cells;  // each face's square, in cells per side (0: none held)
+    uint32_t              nfaces; // squares held
+    uint8_t               cx[6], cy[6];
 };
 
 Renderer*      gRenderer;
@@ -50,6 +53,8 @@ RenderTarget * gSunAtlas, *gLocalAtlas;
 uint32_t       gSunSize, gSunRes, gLocalSize;
 bool           gLocalFresh; // cleared once when made, so tiles never drawn read as empty
 Group          gGroups[kGroups];
+uint64_t       gOcc[kMaxSide]; // the local atlas's cells in use, a row each
+uint32_t       gSide;          // cells per side
 // The views are built and read here, then copied once into the mapped buffer (reading mapped
 // memory back is very slow on write-combined heaps).
 RenderGpuShadowView gViewsCpu[kMaxViews];
@@ -66,6 +71,78 @@ uint32_t gPendingCount;
 uint32_t gStreamUsed;
 
 uint32_t clampu(int32_t v, uint32_t lo, uint32_t hi) { return v < (int32_t)lo ? lo : ((uint32_t)v > hi ? hi : (uint32_t)v); }
+
+uint64_t rowMask(uint32_t x, uint32_t k) { return (k >= 64 ? ~0ull : ((1ull << k) - 1)) << x; }
+
+bool cellsFree(uint32_t x, uint32_t y, uint32_t k)
+{
+    for (uint32_t r = y; r < y + k; ++r)
+        if (gOcc[r] & rowMask(x, k))
+            return false;
+    return true;
+}
+
+void cellsMark(uint32_t x, uint32_t y, uint32_t k, bool on)
+{
+    for (uint32_t r = y; r < y + k; ++r)
+        gOcc[r] = on ? gOcc[r] | rowMask(x, k) : gOcc[r] & ~rowMask(x, k);
+}
+
+uint32_t compactBits(uint32_t v)
+{
+    v &= 0x55555555u;
+    v = (v | (v >> 1)) & 0x33333333u;
+    v = (v | (v >> 2)) & 0x0F0F0F0Fu;
+    v = (v | (v >> 4)) & 0x00FF00FFu;
+    return (v | (v >> 8)) & 0x0000FFFFu;
+}
+
+// A free k x k square aligned to k, the first in Morton order: small squares fill one corner of a
+// larger one before the next, which leaves room for large ones.
+bool cellsAlloc(uint32_t k, uint32_t* x, uint32_t* y)
+{
+    uint32_t n = gSide / k;
+    for (uint32_t i = 0; i < n * n; ++i)
+    {
+        uint32_t bx = compactBits(i) * k, by = compactBits(i >> 1) * k;
+        if (cellsFree(bx, by, k))
+        {
+            *x = bx;
+            *y = by;
+            return true;
+        }
+    }
+    return false;
+}
+
+void groupFree(Group& g)
+{
+    for (uint32_t f = 0; f < g.nfaces; ++f)
+        cellsMark(g.cx[f], g.cy[f], g.cells, false);
+    g.cells = g.nfaces = 0;
+}
+
+// Squares for a group's faces, at k cells per side or the largest smaller size that fits.
+bool groupAlloc(Group& g, uint32_t faces, uint32_t k)
+{
+    groupFree(g);
+    for (; k >= 1; k /= 2)
+    {
+        uint32_t f = 0, x, y;
+        for (; f < faces && cellsAlloc(k, &x, &y); ++f)
+        {
+            cellsMark(x, y, k, true);
+            g.cx[f] = (uint8_t)x;
+            g.cy[f] = (uint8_t)y;
+        }
+        g.cells = k;
+        g.nfaces = f;
+        if (f == faces)
+            return true;
+        groupFree(g);
+    }
+    return false;
+}
 
 uint32_t pow2Floor(uint32_t v)
 {
@@ -194,8 +271,9 @@ void lightKey(const RenderLight& l, float key[9])
     key[8] = (float)l.type;
 }
 
-void buildLocalViews(Group& g, const RenderLight& l, uint32_t groupIndex, float tileRes)
+void buildLocalViews(Group& g, const RenderLight& l)
 {
+    float tileRes = (float)(g.cells * kCell), atlas = (float)(gSide * kCell);
     v3    p = V(l.pos[0], l.pos[1], l.pos[2]);
     float nearZ = clampf(l.range * 0.005f, 0.01f, 0.2f);
     g.faces = l.type == 1 ? 6 : 1;
@@ -214,14 +292,13 @@ void buildLocalViews(Group& g, const RenderLight& l, uint32_t groupIndex, float 
             tanHalf = tanf(minf(outer * 1.05f + 0.02f, 1.48f));
             perspective(v, p, normalize(V(l.dir[0], l.dir[1], l.dir[2])), tanHalf, nearZ, l.range);
         }
-        uint32_t tile = groupIndex * 6 + f;
-        v.rect[0] = (float)(tile % kGrid) / kGrid;
-        v.rect[1] = (float)(tile / kGrid) / kGrid;
-        v.rect[2] = v.rect[3] = 1.0f / kGrid;
+        v.rect[0] = (float)(g.cx[f] * kCell) / atlas;
+        v.rect[1] = (float)(g.cy[f] * kCell) / atlas;
+        v.rect[2] = v.rect[3] = tileRes / atlas;
         v.info[0] = 2 * tanHalf / tileRes;
-        v.info[1] = l.range;
-        v.info[2] = 1;
-        v.info[3] = nearZ;
+        v.info[1] = p.x; // where it was drawn from: the shader picks a point light's face by it
+        v.info[2] = p.y;
+        v.info[3] = p.z;
     }
 }
 
@@ -363,6 +440,8 @@ bool shadows_prepare(uint64_t address)
             gLocalFresh = true;
             gLocalSize = localSize;
             memset(gGroups, 0, sizeof gGroups);
+            memset(gOcc, 0, sizeof gOcc);
+            gSide = localSize / kCell;
         }
         if (slope != gPipeSlope)
         {
@@ -486,6 +565,13 @@ bool shadows_prepare(uint64_t address)
                 break;
             }
     }
+    // Lights no longer shadowed give their squares back.
+    for (Group& g : gGroups)
+        if (!g.used && g.cells)
+        {
+            groupFree(g);
+            g.valid = 0;
+        }
     for (uint32_t j = 0; j < pickedCount; ++j)
     {
         if (groupOf[j] >= 0)
@@ -500,6 +586,72 @@ bool shadows_prepare(uint64_t address)
         g.used = 1;
         groupOf[j] = (int32_t)best;
     }
+
+    // --- Tile sizes: texels matched to screen pixels where the light's reach is ------------------
+    // A face spans twice the light's range; seen from the camera that is 2 * r pixels across, so it
+    // wants about 2 * r texels. Sizes change only when the wanted one doubles or halves, the largest
+    // are halved until all fit 90% of the atlas, and only as many
+    // lights are moved to new squares as are redrawn this frame, so none loses its shadow meanwhile.
+    uint32_t budget = clampu(settings.updates_per_frame, 1, kGroups);
+    uint32_t target[kGroups];
+    {
+        uint32_t maxCells = clampu((int32_t)(pow2Floor(clampu(settings.max_tile_resolution, kCell, 2048)) / kCell), 1, gSide);
+        float    focal = F->p11 * (float)F->height * 0.5f;
+        uint32_t area = 0;
+        for (uint32_t j = 0; j < pickedCount; ++j)
+        {
+            const RenderLight& l = F->lights[picked[j]];
+            const Group&       g = gGroups[groupOf[j]];
+            float dist = length(V(l.pos[0], l.pos[1], l.pos[2]) - camPos);
+            float want = maxf(2.0f * l.range * focal / maxf(dist, l.range) / (float)kCell, 1.0f);
+            uint32_t k = pow2Floor((uint32_t)want);
+            if (g.cells && want < g.cells * 2.0f)
+                k = want >= g.cells * 0.5f ? g.cells : k * 2; // shrink one step at a time
+            target[j] = k < maxCells ? k : maxCells;
+            area += (l.type == 1 ? 6 : 1) * target[j] * target[j];
+        }
+        uint32_t capacity = gSide * gSide * 9 / 10;
+        while (area > capacity)
+        {
+            int32_t pick = -1;
+            for (uint32_t j = 0; j < pickedCount; ++j)
+            {
+                if (target[j] <= 1)
+                    continue;
+                if (pick < 0 || target[j] > target[pick])
+                {
+                    pick = (int32_t)j;
+                    continue;
+                }
+                if (target[j] < target[pick])
+                    continue;
+                // Same size: keep lights at the size they have; then the dimmest gives way.
+                bool growJ = target[j] > gGroups[groupOf[j]].cells, growP = target[pick] > gGroups[groupOf[pick]].cells;
+                if ((growJ && !growP) || (growJ == growP && pickedScore[j] < pickedScore[pick]))
+                    pick = (int32_t)j;
+            }
+            if (pick < 0)
+                break;
+            uint32_t faces = F->lights[picked[pick]].type == 1 ? 6 : 1;
+            area -= faces * (target[pick] * target[pick] - target[pick] * target[pick] / 4);
+            target[pick] /= 2;
+        }
+    }
+    uint32_t moved = 0;
+    for (uint32_t pass = 0; pass < 2 && !gFrozen; ++pass)
+        for (uint32_t j = 0; j < pickedCount && moved < budget; ++j)
+        {
+            // Lights without a shadow first, then those changing size.
+            Group&   g = gGroups[groupOf[j]];
+            uint32_t faces = F->lights[picked[j]].type == 1 ? 6 : 1;
+            if ((pass == 0) != (g.valid == 0) || (g.cells == target[j] && g.nfaces == faces))
+                continue;
+            if (pass == 1)
+                groupFree(g); // its squares can be part of the new ones
+            g.valid = 0;
+            if (groupAlloc(g, faces, target[j]))
+                moved++;
+        }
 
     uint64_t latestMove = 0;
     for (uint32_t i = 0; i < F->casterCount; ++i)
@@ -523,7 +675,7 @@ bool shadows_prepare(uint64_t address)
                     stale = true;
             }
         }
-        if (stale && !gFrozen)
+        if (stale && !gFrozen && g.cells)
             dirty[dirtyCount++] = j;
     }
     // The oldest shadows first (lights with none yet before all), so every moving light takes its
@@ -537,14 +689,12 @@ bool shadows_prepare(uint64_t address)
             dirty[b - 1] = t;
         }
     gPendingCount = 0;
-    uint32_t budget = clampu(settings.updates_per_frame, 1, kGroups);
-    float    tileRes = (float)(gLocalSize / kGrid);
     for (uint32_t d = 0; d < dirtyCount && gPendingCount < budget; ++d)
     {
         uint32_t             j = dirty[d];
         Group&               g = gGroups[groupOf[j]];
         const RenderLight& l = F->lights[picked[j]];
-        buildLocalViews(g, l, (uint32_t)groupOf[j], tileRes);
+        buildLocalViews(g, l);
         lightKey(l, g.key);
         g.valid = 1;
         g.rendered = F->frameNumber + 1;
@@ -633,14 +783,14 @@ void shadows_render(uint64_t address)
         gLocalFresh = false;
         bind.mDepthStencil.mStoreAction = STORE_ACTION_STORE;
         cmdBindRenderTargets(cmd, &bind);
-        float tile = (float)(gLocalSize / kGrid);
         for (uint32_t k = 0; k < gPendingCount; ++k)
         {
             const Group& g = gGroups[gPending[k]];
+            float        tile = (float)(g.cells * kCell);
             for (uint32_t f = 0; f < g.faces; ++f)
             {
                 uint32_t idx = gPending[k] * 6 + f;
-                float    x = (float)(idx % kGrid) * tile, y = (float)(idx / kGrid) * tile;
+                float    x = (float)(g.cx[f] * kCell), y = (float)(g.cy[f] * kCell);
                 cmdSetViewport(cmd, x, y, tile, tile, 0, 1);
                 cmdSetScissor(cmd, (uint32_t)x, (uint32_t)y, (uint32_t)tile, (uint32_t)tile);
                 cmdBindPipeline(cmd, gClearPipe);

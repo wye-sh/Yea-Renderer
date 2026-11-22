@@ -97,7 +97,7 @@ float4 PS_MAIN(VSOutput In)
         c = clamp(c + (c - (l + r + u + d) * 0.25) * (sharpen * 2.0), lo, hi);
     }
 #endif
-    // Debug: the light shadow atlas, near casters bright, empty tiles black, a line between tiles.
+    // Debug: the light shadow atlas, near casters bright, empty space black.
     float inset = gComposite.params.y;
     if (inset > 0.0)
     {
@@ -107,9 +107,6 @@ float4 PS_MAIN(VSOutput In)
             float d = LoadTex2D(gShadowAtlas, NO_SAMPLER, int2(q * gComposite.params.z), 0).r;
             float v = pow(saturate(1.0 - d), 0.25);
             c = float3(v, v, v);
-            float2 t = frac(q * 16.0) * (inset / 16.0);
-            if (t.x < 1.0 || t.y < 1.0)
-                c = float3(0.6, 0.45, 0.1);
         }
     }
     // Dither by half a step of 8 bits, so smooth gradients don't band.
