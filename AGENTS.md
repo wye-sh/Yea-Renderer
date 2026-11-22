@@ -109,7 +109,12 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   frees its history and stands aside (its `sharpen` still applies, after the upscale). Not upscaling (native size, the
   default), it returns false and the frame is exactly as without it: no pass, copy or target added. Shadow tiles size
   by `displayHeight`. renderer_vrs reads last frame's image through `_up` shader variants only while upscaled.
-  (So far it never upscales: the FSR and DLSS upscalers come next.)
+  Upscalers: FSR (Windows, Direct3D 12): AMD's signed FSR SDK 2.4 DLLs in `Assets/` (the loader finds the upscaler
+  DLL beside itself), loaded only while FSR is picked, through AMD's MIT API headers (`third_party/ffx`); FSR 4 on
+  Radeon RX 6000 and later, FSR 3.1 elsewhere. Its jitter is AMD's (Halton 2,3 over 8 x ratio² phases), the render size
+  the vendors' ratio per quality mode; the core's exposure is copied into a 1x1 texture for it (one tiny dispatch), its
+  own sharpening is off. Where FSR can't run (Linux so far, or its DLLs or context refused, logged once), TAA. DLSS
+  comes through Yea's host service when it lands.
 - The core calls the others through optional imports with a `RenderFrame*` (as `u64`): `frame.h`, copied
   identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes`, `renderer_ssr`, `renderer_vrs`, `renderer_rt` and `renderer_upscale` (`mathx.h` into the
   first three). Change all copies together and raise `RENDER_FRAME_VERSION`. `upscale_prepare`, then `taa_prepare` run first,
@@ -152,7 +157,8 @@ sun_disk (degrees), near_plane, gpu_timings (logs each pass's GPU time every 10 
 heatmap. `renderer_shadows`: enabled (the sun's), cascades, shadow_distance, cascade_split, sun_resolution, softness,
 filter_taps, pcss, sun_size, normal_bias, slope_bias, receiver_plane, light_shadows, shadowed_lights, local_atlas_resolution,
 updates_per_frame, max_tile_resolution, contact_hardening, light_size (m), show_cascades, show_atlas (the light shadow atlas, top right). `renderer_taa`: enabled, history_weight, clamp_width, sharpen, jitter,
-jitter_phases. `renderer_ao`: enabled, half_resolution (GTAO and its blur at half size, then a depth-aware upsample), radius, intensity, falloff, slices, steps, denoise, specular_occlusion,
+jitter_phases. `renderer_upscale`: upscaler (TAA, FSR), quality_mode (Native, Quality 67%, Balanced 59%,
+Performance 50%, Ultra_Performance 33%; for an upscaler only). `renderer_ao`: enabled, half_resolution (GTAO and its blur at half size, then a depth-aware upsample), radius, intensity, falloff, slices, steps, denoise, specular_occlusion,
 multi_bounce, show_ao. `renderer_contact`: enabled, surface_thickness (a part of the distance), edge_threshold, contrast, ignore_edges,
 intensity, max_distance, show_contact. `renderer_probes`: enabled, resolution (64-512), updates_per_frame, intensity, blend, parallax.
 `renderer_ssr`: enabled, half_resolution, max_roughness, thickness, max_distance, steps, edge_fade, intensity,
@@ -177,7 +183,8 @@ resolution plus 6 small passes per mip, sun cascades whose view or casters chang
 exposure dispatches, with ray-traced reflections (instead of the SSR depth copy and march) one top-level
 rebuild, a trace dispatch (a closest-hit ray per glossy pixel, a quarter of them with half_resolution except
 mirror-like ones, plus up to 9 shadow rays where the hit isn't on screen) and a full-size resolve (upsample and
-temporal accumulation in one; tiles with no glossy pixel cost two reads), one full-screen TAA resolve (when on), one full-screen composite. No per-frame allocation. GPU memory at the defaults:
+temporal accumulation in one; tiles with no glossy pixel cost two reads), one full-screen TAA resolve (when on; with an upscaler, its dispatch at the display size and a one-thread
+exposure copy instead, every scene pass then at the render size), one full-screen composite. No per-frame allocation. GPU memory at the defaults:
 HDR + depth at 4x MSAA, sun atlas 4096² D32 (64 MB), local atlas 4096² (64 MB), a screen-size R32F depth copy
 for screen reflections (a quarter of it at half resolution).
 
@@ -209,6 +216,11 @@ for screen reflections (a quarter of it at half resolution).
   when more lights move than `updates_per_frame`. Shading must use that drawn position (point lights pick
   their cube face from it, kept in the first face's `info.yzw`), never the light's current one, or points project off the tile's edge.
 - 2D world quads the host draws after this view are over the 3D image; there is no depth between them.
+- FSR's dispatch sets its own descriptor heaps and root signatures on the command list; `restoreForgeState` sets
+  The Forge's back and forgets its bound tables (The Forge sets heaps only at `beginCmd`). Any new vendor dispatch must
+  do the same.
+- A new module of the component isn't added to the example's Base Settings by `yea publish`: `yea feature set "Base
+  Settings" <every module> --view Renderer`.
 - Sizes: `width`/`height` are the render size, `displayWidth`/`displayHeight` the frame's. Anything shown at the frame's
   size or chosen by how big things look on screen (shadow resolution) uses the display size; anything reading this
   frame's scene targets uses the render size. At native size they are equal, so a mix-up shows only when upscaled.

@@ -1,0 +1,12 @@
+// The renderer's exposure ([1] of its exposure buffer, what the image is multiplied by before tonemapping) into a 1 x 1
+// texture: upscalers read exposure from a texture.
+#include "Exposure.srt.h"
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(1, 1, 1)
+void CS_MAIN(SV_GroupThreadID(uint3) tid)
+{
+    INIT_MAIN;
+    Write2D(gOut, int2(0, 0), max(gExposure[1], 1e-8));
+    RETURN();
+}

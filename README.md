@@ -3,7 +3,8 @@
 The 3D rendering engine for Yea games: physically based materials, a sun and any number of
 coloured point and spot lights, light culling on the GPU, soft cascaded sun shadows and cached
 shadows for local lights, ambient occlusion, contact shadows, reflection probes, ray-traced reflections on GPUs with ray tracing (screen-space ones elsewhere), variable-rate
-shading, temporal antialiasing, automatic exposure and tonemapping. Open its example view, Renderer,
+shading, temporal antialiasing, AMD FSR upscaling (Windows), automatic exposure and tonemapping. Open its example view, Renderer,
 to see everything it does and tune it in F1.
 
-MIT licensed. Our own code throughout; nothing of anyone else's ships with it.
+MIT licensed. Our own code, apart from the third-party items in LICENSES.txt, each shipped only while the option that
+uses it is picked (such as AMD's FSR DLLs, under AMD's own licence).

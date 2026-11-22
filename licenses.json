@@ -48,5 +48,51 @@
       "modules/renderer_contact/Shaders/BendSss.h.fsl"
     ],
     "notice": "Copyright 2023 Sony Interactive Entertainment. Shaders/BendSss.h.fsl is a modified version of bend_sss_gpu.h (its header lists the changes); bend_sss_cpu.h is unmodified."
+  },
+  {
+    "name": "AMD FSR SDK runtime (FSR upscaling: loader and upscaler DLLs)",
+    "version": "2.4.0 (FSR Upscaling 4.1.2, FidelityFX Super Resolution 3.1.6)",
+    "license": "LicenseRef-AMD-FSR-SDK",
+    "source": "https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v2.4.0/Kits/FidelityFX/signedbin",
+    "licenseUrl": "https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/blob/v2.4.0/docs/license.md",
+    "usedBy": [
+      "modules/renderer_upscale/Assets/amd_fidelityfx_loader_dx12.dll",
+      "modules/renderer_upscale/Assets/amd_fidelityfx_upscaler_dx12.dll"
+    ],
+    "platforms": [
+      "windows"
+    ],
+    "notice": "The following license applies to all files except as noted below.\n\nCopyright (C) Advanced Micro Devices, Inc.\n\nREDISTRIBUTION: Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the “Software”), to install, reproduce, copy and distribute copies of the Software, in binary form only, and to permit persons to whom the Software is provided to do the same, provided that the following conditions are met:\n\nNo reverse engineering, decompilation, or disassembly of this Software is permitted.\n\nRedistributions must reproduce the above copyright notice, this permission notice, and the following disclaimers and notices in the Software documentation and/or other materials provided with the Software.\n\nDISCLAIMER: THE USE OF THE SOFTWARE IS AT YOUR SOLE RISK.  THE SOFTWARE IS PROVIDED “AS IS” AND WITHOUT WARRANTY OF ANY KIND AND COPYRIGHT HOLDER AND ITS LICENSORS EXPRESSLY DISCLAIM ALL WARRANTIES, EXPRESS AND IMPLIED, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT. COPYRIGHT HOLDER AND ITS LICENSORS DO NOT WARRANT THAT THE SOFTWARE WILL MEET YOUR REQUIREMENTS, OR THAT THE OPERATION OF THE SOFTWARE WILL BE UNINTERRUPTED OR ERROR-FREE.  THE ENTIRE RISK ASSOCIATED WITH THE USE OF THE SOFTWARE IS ASSUMED BY YOU.  FURTHERMORE, COPYRIGHT HOLDER AND ITS LICENSORS DO NOT WARRANT OR MAKE ANY REPRESENTATIONS REGARDING THE USE OR THE RESULTS OF THE USE OF THE SOFTWARE IN TERMS OF ITS CORRECTNESS, ACCURACY, RELIABILITY, CURRENTNESS, OR OTHERWISE.\n\nDISCLAIMER: UNDER NO CIRCUMSTANCES INCLUDING NEGLIGENCE, SHALL COPYRIGHT HOLDER AND ITS LICENSORS OR ITS DIRECTORS, OFFICERS, EMPLOYEES OR AGENTS (“AUTHORIZED REPRESENTATIVES”) BE LIABLE FOR ANY INCIDENTAL, INDIRECT, SPECIAL OR CONSEQUENTIAL DAMAGES (INCLUDING DAMAGES FOR LOSS OF BUSINESS PROFITS, BUSINESS INTERRUPTION, LOSS OF BUSINESS INFORMATION, AND THE LIKE) ARISING OUT OF THE USE, MISUSE OR INABILITY TO USE THE SOFTWARE, BREACH OR DEFAULT, INCLUDING THOSE ARISING FROM INFRINGEMENT OR ALLEGED INFRINGEMENT OF ANY PATENT, TRADEMARK, COPYRIGHT OR OTHER INTELLECTUAL PROPERTY RIGHT EVEN IF COPYRIGHT HOLDER AND ITS AUTHORIZED REPRESENTATIVES HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.  IN NO EVENT SHALL COPYRIGHT HOLDER OR ITS AUTHORIZED REPRESENTATIVES TOTAL LIABILITY FOR ALL DAMAGES, LOSSES, AND CAUSES OF ACTION (WHETHER IN CONTRACT, TORT (INCLUDING NEGLIGENCE) OR OTHERWISE) EXCEED THE AMOUNT OF US$10.",
+    "when": [
+      {
+        "setting": "renderer_upscale.upscaler",
+        "is": [
+          "FSR"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "AMD FSR API headers",
+    "version": "FSR SDK 2.4.0",
+    "license": "MIT",
+    "source": "https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v2.4.0/Kits/FidelityFX",
+    "licenseUrl": "https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/blob/v2.4.0/docs/license.md",
+    "usedBy": [
+      "modules/renderer_upscale/third_party/ffx/",
+      "modules/renderer_upscale/renderer_upscale.cpp"
+    ],
+    "platforms": [
+      "windows"
+    ],
+    "notice": "Copyright (C) 2026 Advanced Micro Devices, Inc.",
+    "when": [
+      {
+        "setting": "renderer_upscale.upscaler",
+        "is": [
+          "FSR"
+        ]
+      }
+    ]
   }
 ]
