@@ -154,6 +154,7 @@ float sunCascade(uint cascade, float3 P, float3 N, float phi)
         return 1.0;
     float radius = gFrame.shadow.y * texel;
     uint  taps = gFrame.counts.w;
+#ifdef FULL
     if (gFrame.shadow.z > 0.0)
     {
         // Contact-hardening (PCSS): average blocker depth, then a penumbra from the sun's size.
@@ -176,6 +177,7 @@ float sunCascade(uint cascade, float3 P, float3 N, float phi)
         float gap = (c.z - blockers / count) * v.info.y;
         radius = clamp(gap * tanSize / v.info.x, 1.0, 32.0) * texel + radius * 0.25;
     }
+#endif
     return sunPcf(c, radius, bounds, taps, phi);
 }
 

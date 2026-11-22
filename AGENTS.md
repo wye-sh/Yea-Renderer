@@ -43,10 +43,12 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
 Units: metres; sun intensity in lux, point and spot in candela. Colours linear RGB.
 - Meshes: `mesh_box/sphere/plane/cylinder/cone/torus` (unit size, centred), or `mesh_begin`,
   `mesh_vertex(pos, normal)` (returns a local index), `mesh_triangle`, `mesh_end` → mesh id. Meshes are
-  uploaded when they change (a stall: build them up front).
+  uploaded when they change (a stall: build them up front). A triangle faces where cross(b - a, c - a)
+  points (counter-clockwise around its outward normal); back faces are culled.
 - Materials: `material_add(albedo, roughness, metallic)`, `material_set`, `material_emissive(m, color, nits)`,
   `material_reflections(m, on)`: off, the material shows no reflected image (probes or sky), only the sky's
-  soft light, however shiny or metallic it is.
+  soft light, however shiny or metallic it is. `material_double_sided(m, on)` (off by default): drawn from
+  both sides, for open or thin surfaces (a lone plane, leaves, cloth).
 - Instances: `instance_add(mesh, material)`, `instance_place(i, pos, quat, scale)`, `instance_material`,
   `instance_shadow(i, cast)`, `instance_remove`. Only call `instance_place` when it moved: a move redraws
   local shadows near it.
@@ -81,7 +83,8 @@ builds it again. GPU objects and shadow caches are rebuilt on load.
 
 ## Cost
 
-Per frame: one depth prepass and one forward pass (draws grouped by mesh, instanced), one culling
+Per frame: one depth prepass and one forward pass (draws grouped by mesh and sidedness, instanced; back
+faces culled except for double-sided materials; a leaner forward shader unless PCSS or a debug view is on), one culling
 dispatch per 16 px tile, a GTAO dispatch and `denoise` blur dispatches (at half size with half_resolution, plus a full-size upsample), one contact shadow dispatch (all full size; its march takes no more steps than the ray spans pixels), per re-captured probe 6 scene draws at half its
 resolution plus 6 small passes per mip, sun cascades redrawn, at most `updates_per_frame` local lights redrawn (oldest shadow first), two
 exposure dispatches, one full-screen TAA resolve (when on), one full-screen composite. No per-frame allocation. GPU memory at the defaults:
@@ -89,6 +92,11 @@ HDR + depth at 4x MSAA, sun atlas 4096² D32 (64 MB), local atlas 4096² (64 MB)
 
 ## Pitfalls
 
+- Back faces are culled in the prepass, forward pass and probe captures; the camera space is left-handed,
+  so front faces are clockwise on screen (`FRONT_FACE_CW`). Shadow maps cull nothing: a single-sided
+  surface must cast from both sides (a ceiling plane lit from above), and the biases were tuned so.
+- Changing the Material table's layout empties it on reload; `load()` then clears the scene so its
+  owner builds it again rather than drawing instances whose materials are gone.
 - Debug views must not feed auto exposure: Show AO and Show Contact write raw values shown at exposure 1, and
   exposure holds while they or the heatmap are on. A view scaled by 1/exposure is metered by the histogram,
   which lowers exposure every frame until the HDR image saturates (Show AO once read flat grey this way).

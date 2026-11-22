@@ -24,6 +24,7 @@ table Material none 4096
   float reflectance
   float3 emissive
   u32 reflections
+  u32 doubleSided
   u32 gen
   u32 alive
 end
@@ -61,6 +62,8 @@ export u32 mesh_cone(u32 segments)
 export u32 mesh_torus(float thickness, u32 segments)
 export bool mesh_begin()
 export u32 mesh_vertex(float3 pos, float3 normal)
+# A triangle faces where cross(b - a, c - a) points: counter-clockwise around its outward normal.
+# Only that side is drawn unless its material is double-sided.
 export void mesh_triangle(u32 a, u32 b, u32 c)
 export u32 mesh_end()
 
@@ -70,6 +73,10 @@ export void material_emissive(handle m, float3 color, float luminance)
 # Whether the material shows reflections of its surroundings (on by default), apart from how shiny
 # or metallic it is. Off: no reflected image (probes or sky), only the sky's soft light on it.
 export void material_reflections(handle m, bool on)
+# Whether the material's surfaces are seen from both sides (off by default). Off: only from the side
+# its triangles face (see mesh_triangle), which is cheaper; for closed shapes. On: open or thin
+# surfaces such as leaves, cloth or a single plane seen from below.
+export void material_double_sided(handle m, bool on)
 
 export handle instance_add(u32 mesh, handle material)
 export void instance_place(handle i, float3 pos, float4 rotation, float3 scale)

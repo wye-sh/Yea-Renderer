@@ -95,6 +95,7 @@ float4 PS_MAIN(VSOutput In)
 {
     INIT_MAIN;
     MaterialData m = gMaterials[In.Material];
+#ifdef FULL
     if ((gFrame.counts.z & FLAG_UNLIT) != 0u)
     {
         float3 unlit = m.albedoRough.rgb + m.emissive.rgb;
@@ -107,6 +108,7 @@ float4 PS_MAIN(VSOutput In)
         RETURN(float4(unlit, 1.0));
 #endif
     }
+#endif
     float3 N = normalize(In.Normal);
     float3 V = normalize(gFrame.camPos.xyz - In.WorldPos);
     float  rough = clamp(m.albedoRough.a, 0.03, 1.0);
@@ -228,6 +230,7 @@ float4 PS_MAIN(VSOutput In)
     color += FssEss * radiance * specularAo + (Fms * Ems + kD) * irradiance * diffuseAo;
     color += m.emissive.rgb;
 
+#ifdef FULL
     if ((gFrame.counts.z & FLAG_CASCADES) != 0u)
     {
         uint c = sunCascadeIndex(viewZ);
@@ -243,6 +246,7 @@ float4 PS_MAIN(VSOutput In)
         float exposure = max(gExposure[1], 1e-8);
         color = color * 0.15 + heatColor(float(lightCount)) * (0.6 / exposure);
     }
+#endif
 #ifdef MOTION
     PSOutput Out;
     Out.Color = float4(color, 1.0);

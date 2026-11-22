@@ -10,7 +10,7 @@ struct Buffer;
 struct RenderTarget;
 struct Texture;
 
-#define RENDER_FRAME_VERSION 5u
+#define RENDER_FRAME_VERSION 6u
 #define RENDER_MAX_CASCADES  4u
 #define RENDER_VIEW_SHIFT    20u // shadow instance stream entry: instance | view << 20
 
@@ -47,7 +47,7 @@ struct RenderGpuProbe
     float boxMax[4];
 };
 
-// A shadow-casting instance, as the core sorted them: by mesh.
+// A shadow-casting instance, as the core sorted them: by mesh (drawables: by mesh, then two-sided).
 struct RenderCaster
 {
     uint32_t instance;   // row in the frame's instance buffer
@@ -56,6 +56,8 @@ struct RenderCaster
     int32_t  vertexOffset;
     float    sphere[4];  // world bounding sphere
     uint64_t moved;      // frame number it last moved, appeared or changed mesh
+    uint32_t twoSided;   // its material is double-sided: draw it without back-face culling
+    uint32_t reserved;
 };
 
 // A visible local light, sorted by view depth (nearest first).

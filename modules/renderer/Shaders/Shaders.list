@@ -18,6 +18,17 @@
 #include "Forward.frag.fsl"
 #end
 
+#frag renderer_forward_full.frag
+#define FULL
+#include "Forward.frag.fsl"
+#end
+
+#frag renderer_forward_motion_full.frag
+#define MOTION
+#define FULL
+#include "Forward.frag.fsl"
+#end
+
 #frag renderer_sky.frag
 #include "Sky.frag.fsl"
 #end

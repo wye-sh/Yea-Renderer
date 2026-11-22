@@ -44,6 +44,7 @@ struct Run
     uint32_t firstIndex, indexCount;
     int32_t  vertexOffset;
     uint32_t streamStart, count;
+    uint32_t twoSided;
 };
 
 const uint32_t kMaxFrames = 4, kMaxProbes = 16, kMaxPerFrame = 4, kMaxLevels = 8;
@@ -56,7 +57,7 @@ Renderer*      gRenderer;
 Queue*         gQueue;
 uint32_t       gFrames;
 Shader *       gCaptureShader, *gDownShader, *gFilterShader;
-Pipeline *     gCapturePipe, *gDownPipe, *gFilterPipe;
+Pipeline *     gCapturePipe[2], *gDownPipe, *gFilterPipe;
 DescriptorSet *gCaptureSet, *gPassSet;
 Buffer *       gCaptureCb[kMaxFrames], *gViewBuf[kMaxFrames], *gStreamBuf[kMaxFrames], *gProbeBuf[kMaxFrames];
 Buffer*        gPassCb[kPassSets];
@@ -251,7 +252,8 @@ Pipeline* fullscreenPipeline(Shader* s, const char* name)
     return p;
 }
 
-Pipeline* capturePipeline()
+// [0] culls back faces, [1] draws both sides (double-sided materials).
+Pipeline* capturePipeline(CullMode cull)
 {
     VertexLayout l = {};
     l.mBindingCount = 2;
@@ -274,7 +276,8 @@ Pipeline* capturePipeline()
     l.mAttribs[2].mLocation = 2;
 
     RasterizerStateDesc raster = {};
-    raster.mCullMode = CULL_MODE_NONE;
+    raster.mCullMode = cull;
+    raster.mFrontFace = FRONT_FACE_CW; // as the core's scene pipelines
     DepthStateDesc depth = {};
     depth.mDepthTest = true;
     depth.mDepthWrite = true;
@@ -392,7 +395,8 @@ int load(int reloaded)
     gFilterShader = loadShader("renderer_probe_fullscreen.vert", "renderer_probe_prefilter.frag");
     if (!gCaptureShader || !gDownShader || !gFilterShader)
         return 1;
-    gCapturePipe = capturePipeline();
+    gCapturePipe[0] = capturePipeline(CULL_MODE_BACK);
+    gCapturePipe[1] = capturePipeline(CULL_MODE_NONE);
     gDownPipe = fullscreenPipeline(gDownShader, "renderer_probe_downsample");
     gFilterPipe = fullscreenPipeline(gFilterShader, "renderer_probe_prefilter");
 
@@ -414,7 +418,7 @@ int load(int reloaded)
     gStreamCpu = new uint32_t[kMaxEntries];
     gRuns = new Run[kMaxRuns];
     memset(gCapturedAt, 0, sizeof gCapturedAt);
-    gReady = gCapturePipe && gDownPipe && gFilterPipe && gCaptureSet && gPassSet;
+    gReady = gCapturePipe[0] && gCapturePipe[1] && gDownPipe && gFilterPipe && gCaptureSet && gPassSet;
     return gReady ? 0 : 1;
 }
 
@@ -438,7 +442,7 @@ void unload()
     for (DescriptorSet* s : sets)
         if (s)
             removeDescriptorSet(gRenderer, s);
-    Pipeline* pipes[3] = { gCapturePipe, gDownPipe, gFilterPipe };
+    Pipeline* pipes[4] = { gCapturePipe[0], gCapturePipe[1], gDownPipe, gFilterPipe };
     for (Pipeline* p : pipes)
         if (p)
             removePipeline(gRenderer, p);
@@ -535,12 +539,12 @@ bool probes_prepare(uint64_t address)
                 float up = b[2][0] * x + b[2][1] * y + b[2][2] * z;
                 if (fw - fabsf(rt) < -rad || fw - fabsf(up) < -rad)
                     continue; // outside the 90 degree face (planes scaled by sqrt 2)
-                if (!run || run->firstIndex != c.firstIndex || run->vertexOffset != c.vertexOffset)
+                if (!run || run->firstIndex != c.firstIndex || run->vertexOffset != c.vertexOffset || run->twoSided != c.twoSided)
                 {
                     if (runs >= kMaxRuns)
                         break;
                     run = &gRuns[runs++];
-                    *run = { c.firstIndex, c.indexCount, c.vertexOffset, used, 0 };
+                    *run = { c.firstIndex, c.indexCount, c.vertexOffset, used, 0, c.twoSided };
                 }
                 gStreamCpu[used++] = c.instance | (view << RENDER_VIEW_SHIFT);
                 run->count++;
@@ -633,12 +637,17 @@ void probes_render(uint64_t address)
         {
             uint32_t view = t * 6 + f;
             bindSlice(cmd, gChain[0], f, 0, LOAD_ACTION_CLEAR, gCaptureDepth);
-            cmdBindPipeline(cmd, gCapturePipe);
-            cmdBindDescriptorSet(cmd, fi, gCaptureSet);
-            cmdBindIndexBuffer(cmd, F->indices, INDEX_TYPE_UINT32, 0);
+            uint32_t bound = 2;
             for (uint32_t r = gRunStart[view]; r < gRunStart[view + 1]; ++r)
             {
                 const Run& run = gRuns[r];
+                if (run.twoSided != bound)
+                {
+                    bound = run.twoSided;
+                    cmdBindPipeline(cmd, gCapturePipe[bound]);
+                    cmdBindDescriptorSet(cmd, fi, gCaptureSet);
+                    cmdBindIndexBuffer(cmd, F->indices, INDEX_TYPE_UINT32, 0);
+                }
                 Buffer*    bufs[2] = { F->vertices, gStreamBuf[fi] };
                 uint32_t   strides[2] = { F->vertexStride, 4 };
                 uint64_t   offsets[2] = { 0, (uint64_t)run.streamStart * 4 };

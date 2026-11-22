@@ -169,7 +169,7 @@ uint32_t mesh_box()
             if (c == 0)
                 base = i;
         }
-        quad(base, base + 1, base + 2, base + 3);
+        quad(base, base + 3, base + 2, base + 1); // counter-clockwise around n, as every shape
     }
     return finish();
 }
@@ -362,6 +362,13 @@ void material_reflections(yea_handle h, bool on)
     uint32_t row = rowOf(Materials, h);
     if (row != 0xFFFFFFFFu)
         Materials[row].reflections = on;
+}
+
+void material_double_sided(yea_handle h, bool on)
+{
+    uint32_t row = rowOf(Materials, h);
+    if (row != 0xFFFFFFFFu)
+        Materials[row].doubleSided = on;
 }
 
 uint32_t materialRow(yea_handle h)
