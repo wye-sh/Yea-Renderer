@@ -250,8 +250,12 @@ float3 shadeLocalLight(uint i, Surface s, float phi)
     }
     if (atten <= 0.0 || dot(s.N, L) <= 0.0)
         return float3(0.0, 0.0, 0.0);
-    float shadow = (gFrame.counts.z & FLAG_SHADOWS) != 0u ? localShadow(l, s.P, s.N, toLight, phi) : 1.0;
-    return brdfLight(s, L, l.color.rgb * (atten * shadow));
+    float3 lit = brdfLight(s, L, l.color.rgb * atten);
+    // Where the light adds under one 8-bit step on screen even in the darkest areas (the edge of its
+    // range; sRGB steepens darks 12.92x), its shadow can't be seen: the lookup is skipped.
+    if ((gFrame.counts.z & FLAG_SHADOWS) == 0u || max(lit.r, max(lit.g, lit.b)) * gExposure[1] < 1.0 / 4096.0)
+        return lit;
+    return lit * localShadow(l, s.P, s.N, toLight, phi);
 }
 
 #endif
