@@ -13,6 +13,7 @@ import renderer void instance_place(handle i, float3 pos, float4 rotation, float
 import renderer void instance_shadow(handle i, bool cast)
 import renderer void instance_remove(handle i)
 import renderer u32 instance_count() = 0
+import renderer u32 light_count() = 0
 import renderer handle light_add(u32 type) = 4294967295
 import renderer void light_place(handle l, float3 pos, float3 dir)
 import renderer void light_color(handle l, float3 color, float intensity)

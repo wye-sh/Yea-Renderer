@@ -5,6 +5,7 @@
 #include "yea_renderer_example.h"
 
 #include <math.h>
+#include <stdio.h>
 
 namespace renderer_example
 {
@@ -33,6 +34,9 @@ struct State
     yea_float3 spinScale[kMaxSpin];
     yea_float3 spinAxis[kMaxSpin];
     uint32_t   sphereMesh;
+    yea_handle spotMarkers[kMaxSpots];
+    yea_handle spotMarkerMaterials[kMaxSpots];
+    uint32_t   instances, lightsAlive; // the renderer's live counts once this frame's scene was in place
 };
 State* gState;
 
@@ -57,7 +61,7 @@ State* state()
     if (!gState)
     {
         int fresh = 0;
-        gState = (State*)yea::host()->state("renderer_example", 3, sizeof(State), &fresh);
+        gState = (State*)yea::host()->state("renderer_example", 4, sizeof(State), &fresh);
         if (fresh)
             startCamera(gState);
     }
@@ -105,12 +109,18 @@ void addProbes()
     renderer_probes::probe_add({ 0, 2.0f, 1.5f }, { -16.0f, -0.5f, -16.0f }, { 16.0f, 10.0f, 16.0f });
 }
 
+// The whole scene, from nothing. Not while the renderer is unloaded (a crash, a revert, a reload): its imports are
+// stubs then, and a scene built against them would hold invalid handles that never move what the renderer has.
 void build(State* s)
 {
+    s->built = 0;
     renderer::clear();
     renderer_probes::probe_clear();
     s->lightCount = s->spotCount = s->spinCount = 0;
-    uint32_t sphere = renderer::mesh_sphere(48), box = renderer::mesh_box(), plane = renderer::mesh_plane();
+    uint32_t sphere = renderer::mesh_sphere(48);
+    if (sphere == 0xFFFFFFFFu)
+        return; // the renderer isn't loaded: try again next frame
+    uint32_t box = renderer::mesh_box(), plane = renderer::mesh_plane();
     uint32_t cylinder = renderer::mesh_cylinder(40), cone = renderer::mesh_cone(40), torus = renderer::mesh_torus(0.15f, 64);
     s->sphereMesh = sphere;
 
@@ -186,13 +196,21 @@ void syncLights(State* s)
     spots = spots > kMaxSpots ? kMaxSpots : spots;
     while (s->spotCount < spots)
     {
+        uint32_t   i = s->spotCount++;
         yea_handle h = renderer::light_add(2);
         renderer::light_cone(h, 14, 24);
         renderer::light_shadow(h, true);
-        s->spots[s->spotCount++] = h;
+        s->spots[i] = h;
+        s->spotMarkerMaterials[i] = renderer::material_add({ 0, 0, 0 }, 1, 0);
+        s->spotMarkers[i] = renderer::instance_add(s->sphereMesh, s->spotMarkerMaterials[i]);
+        renderer::instance_shadow(s->spotMarkers[i], false);
     }
     while (s->spotCount > spots)
-        renderer::light_remove(s->spots[--s->spotCount]);
+    {
+        uint32_t i = --s->spotCount;
+        renderer::light_remove(s->spots[i]);
+        renderer::instance_remove(s->spotMarkers[i]);
+    }
 }
 
 void animate(State* s)
@@ -225,9 +243,11 @@ void animate(State* s)
         yea_float3 p = { cosf(a) * 7.0f, 6.5f, sinf(a) * 7.0f };
         float      b = a + t * 0.5f * settings.light_speed / 0.4f;
         yea_float3 target = { cosf(b) * 3.0f, 0, sinf(b) * 3.0f };
+        yea_float3 c = (i & 1) ? yea_float3{ 0.7f, 0.85f, 1.0f } : yea_float3{ 1.0f, 0.85f, 0.6f };
         renderer::light_place(s->spots[i], p, { target.x - p.x, target.y - p.y, target.z - p.z });
-        renderer::light_color(s->spots[i], (i & 1) ? yea_float3{ 0.7f, 0.85f, 1.0f } : yea_float3{ 1.0f, 0.85f, 0.6f },
-                              settings.spot_intensity);
+        renderer::light_color(s->spots[i], c, settings.spot_intensity);
+        renderer::material_emissive(s->spotMarkerMaterials[i], c, settings.spot_intensity * 0.6f + 1.0f);
+        renderer::instance_place(s->spotMarkers[i], p, kNoRotation, { 0.16f, 0.16f, 0.16f });
         renderer::light_range(s->spots[i], 16);
     }
     for (uint32_t i = 0; i < s->spinCount; ++i)
@@ -312,15 +332,29 @@ void update(uint32_t phase, float dt)
     if (phase != YEA_PHASE_SIMULATE)
         return;
     State* s = state();
-    if (!s->built || renderer::instance_count() == 0)
+    // The renderer's scene must be the one this module built: after a renderer crash, revert or reload that lost or
+    // replaced it (or one that came back while this module had built against stubs), every handle held here is stale
+    // and nothing would move, so build it all again.
+    if (!s->built || renderer::instance_count() != s->instances || renderer::light_count() != s->lightsAlive)
+    {
+        char line[160];
+        snprintf(line, sizeof line, "renderer_example: building the scene (built %u; renderer has %u instances, %u lights; expected %u, %u)",
+                 s->built, renderer::instance_count(), renderer::light_count(), s->instances, s->lightsAlive);
         build(s);
-    else if (renderer_probes::probe_count() == 0)
+        if (s->built)
+            yea::log(line);
+    }
+    if (!s->built)
+        return; // the renderer isn't loaded
+    if (renderer_probes::probe_count() == 0)
         addProbes(); // renderer_probes came up after the scene was built: its import was a stub then
     if (!settings.benchmark_view)
         s->t += dt; // Benchmark View holds the lights and shapes still, so timings repeat
     syncLights(s);
     animate(s);
     moveCamera(s, dt);
+    s->instances = renderer::instance_count();
+    s->lightsAlive = renderer::light_count();
 }
 
 void draw(uint32_t pass, const YeaFrame* frame) {}
