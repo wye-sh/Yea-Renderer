@@ -111,7 +111,7 @@ Pipeline *     gSkyPipe, *gCompositePipe, *gHistogramPipe, *gAdaptPipe;
 RenderTarget * gHdr, *gDepth, *gDummyDepth, *gMotion, *gDummyArray, *gDummyColor;
 Texture*       gDummyRates;   // stands in for renderer_vrs's rate copy (R32_UINT)
 Texture*       gTonyLut;      // Tony McMapface's 48^3 table (Assets/tony_mc_mapface.dds) while it is picked and loaded
-Texture*       gTonyDummy;    // a 2^3 stand-in for the composite's table slot otherwise
+bool           gTargetsFailed; // the screen targets were refused (logged once)
 bool           gTonyTried;    // read the table since Tony McMapface was picked (once per pick, even when it failed)
 const YeaShadingRate* gShadingRate; // nullptr: no variable-rate shading on this GPU
 Buffer *       gFrameCb[kMaxFrames], *gInstanceBuf[kMaxFrames], *gMaterialBuf[kMaxFrames], *gLightBuf[kMaxFrames], *gStreamBuf[kMaxFrames];
@@ -721,62 +721,85 @@ void timeFrame(Cmd* cmd, uint32_t fi, bool on, const char* scene)
 
 } // namespace
 
-// Tony McMapface's table: its DDS as published (DX10 header, R9G9B9E5, 48^3, one mip), uploaded as it is. Read
-// only while Tony McMapface is picked (a game shipped with another tonemapper leaves the file out); nullptr when
-// the file is missing or not that table.
-Texture* makeTony(uint32_t dim, const uint8_t* texels)
+// One of the table's R9G9B9E5 channels (9-bit mantissa m, shared exponent e: m * 2^(e - 24)) as a half float. Every
+// such value is a half exactly: at most 9 significant bits, between 2^-24 and 65408.
+uint16_t halfOf(uint32_t m, uint32_t e)
 {
-    TextureDesc t = {};
-    t.mWidth = t.mHeight = t.mDepth = dim;
-    t.mArraySize = t.mMipLevels = 1;
-    t.mSampleCount = SAMPLE_COUNT_1;
-    t.mFormat = TinyImageFormat_E5B9G9R9_UFLOAT;
-    t.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
-    t.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
-    t.pName = "renderer_tony_mc_mapface";
-    Texture*        tex = nullptr;
-    TextureLoadDesc tl = {};
-    tl.pDesc = &t;
-    tl.ppTexture = &tex;
-    addResource(&tl, nullptr);
-    waitForAllResourceLoads();
-    if (tex && texels)
-    {
-        TextureUpdateDesc u = {};
-        u.pTexture = tex;
-        u.mMipLevels = u.mLayerCount = 1;
-        u.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
-        beginUpdateResource(&u);
-        TextureSubresourceUpdate s = u.getSubresourceUpdateDesc(0, 0);
-        for (uint32_t z = 0; z < dim; ++z)
-            for (uint32_t r = 0; r < s.mRowCount; ++r)
-                memcpy(s.pMappedData + z * s.mDstSliceStride + r * s.mDstRowStride, texels + (z * dim + r) * dim * 4, dim * 4);
-        endUpdateResource(&u);
-        waitForAllResourceLoads();
-    }
-    return tex;
+    if (!m)
+        return 0;
+    uint32_t k = 8;
+    while (!(m >> k))
+        --k;                                // m's top bit
+    int32_t E = (int32_t)(k + e) - 9;        // the half's biased exponent
+    if (E <= 0)
+        return (uint16_t)(m << e);         // subnormal: m * 2^(e - 24) = (m << e) * 2^-24
+    return (uint16_t)((E << 10) | ((m << (10 - k)) & 0x3FFu));
 }
 
+// Tony McMapface's table: its DDS as published (DX10 header, R9G9B9E5, 48^3, one mip), read only while Tony McMapface
+// is picked (a game shipped with another tonemapper leaves the file out), into a 2D RGBA16F strip of its 48 slices side
+// by side (2304 x 48), filtered across slices in the shader; nullptr when the file is missing or not that table.
 Texture* loadTonyLut()
 {
     const uint32_t kDim = 48, kHeader = 148, kBytes = kDim * kDim * kDim * 4;
     Texture*       tex = nullptr;
     char           path[1024];
     FILE*          f = yea::asset("tony_mc_mapface.dds", path, sizeof path) ? fopen(path, "rb") : nullptr;
+    uint8_t*       data = f ? (uint8_t*)malloc(kHeader + kBytes) : nullptr;
+    size_t         n = data ? fread(data, 1, kHeader + kBytes + 1, f) : 0; // + 1: the file is exactly that long
+    uint32_t       h[37] = {};
+    if (n == kHeader + kBytes)
+        memcpy(h, data, sizeof h);
     if (f)
-    {
-        uint8_t* data = (uint8_t*)malloc(kHeader + kBytes);
-        size_t   n = data ? fread(data, 1, kHeader + kBytes + 1, f) : 0; // + 1: the file is exactly that long
-        uint32_t h[37] = {};
-        if (n == kHeader + kBytes)
-            memcpy(h, data, sizeof h);
-        // "DDS ", size 124; height, width, depth; "DX10"; R9G9B9E5_SHAREDEXP (67), a 3D texture (4)
-        if (h[0] == 0x20534444u && h[1] == 124 && h[3] == kDim && h[4] == kDim && h[6] == kDim && h[21] == 0x30315844u && h[32] == 67 &&
-            h[33] == 4)
-            tex = makeTony(kDim, data + kHeader);
-        free(data);
         fclose(f);
+    // "DDS ", size 124; height, width, depth; "DX10"; R9G9B9E5_SHAREDEXP (67), a 3D texture (4)
+    if (h[0] == 0x20534444u && h[1] == 124 && h[3] == kDim && h[4] == kDim && h[6] == kDim && h[21] == 0x30315844u && h[32] == 67 &&
+        h[33] == 4)
+    {
+        TextureDesc t = {};
+        t.mWidth = kDim * kDim;
+        t.mHeight = kDim;
+        t.mDepth = t.mArraySize = t.mMipLevels = 1;
+        t.mSampleCount = SAMPLE_COUNT_1;
+        t.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
+        t.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+        t.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+        t.pName = "renderer_tony_mc_mapface";
+        TextureLoadDesc tl = {};
+        tl.pDesc = &t;
+        tl.ppTexture = &tex;
+        addResource(&tl, nullptr);
+        waitForAllResourceLoads();
+        if (tex)
+        {
+            TextureUpdateDesc u = {};
+            u.pTexture = tex;
+            u.mMipLevels = u.mLayerCount = 1;
+            u.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+            beginUpdateResource(&u);
+            TextureSubresourceUpdate s = u.getSubresourceUpdateDesc(0, 0);
+            const uint8_t*           src = data + kHeader;
+            for (uint32_t y = 0; y < kDim && y < s.mRowCount; ++y)
+            {
+                uint16_t* row = (uint16_t*)(s.pMappedData + y * s.mDstRowStride);
+                for (uint32_t z = 0; z < kDim; ++z)
+                    for (uint32_t x = 0; x < kDim; ++x)
+                    {
+                        uint32_t v, e;
+                        memcpy(&v, src + ((z * kDim + y) * kDim + x) * 4, 4);
+                        e = v >> 27;
+                        uint16_t* o = row + (z * kDim + x) * 4;
+                        o[0] = halfOf(v & 511u, e);
+                        o[1] = halfOf((v >> 9) & 511u, e);
+                        o[2] = halfOf((v >> 18) & 511u, e);
+                        o[3] = 0x3C00; // 1
+                    }
+            }
+            endUpdateResource(&u);
+            waitForAllResourceLoads();
+        }
     }
+    free(data);
     if (!tex)
         yea::host()->log(1, "renderer: Tony McMapface's table (Assets/tony_mc_mapface.dds) didn't load: Khronos PBR Neutral stands in");
     return tex;
@@ -917,12 +940,26 @@ int load(int reloaded)
         addResource(&tl, nullptr);
         waitForAllResourceLoads();
     }
-    gTonyDummy = makeTony(2, nullptr); // 2: a 3D view on every API
     // stands in for the probe array: two slices, so an array view
     d.mArraySize = 2;
     d.pName = "renderer_dummy_probes";
     addRenderTarget(gRenderer, &d, &gDummyArray);
 
+    // Every buffer and texture made above, before anything uses them: a GPU or driver that refuses one stops the
+    // module cleanly instead of crashing on it later.
+    bool made = gDfg && gExposure && gHistogram && gDummyU32 && gDummyViews && gDummyProbes && gDummyDepth && gDummyColor &&
+                gDummyRates && gDummyArray && gScenePersistent && gSceneFrame && gCompositeSet && gExposureSet && gShadowSampler;
+    for (uint32_t i = 0; i < gFrames; ++i)
+        made = made && gFrameCb[i] && gCompositeCb[i] && gExposureCb[i] && gInstanceBuf[i] && gMaterialBuf[i] && gLightBuf[i] &&
+               gStreamBuf[i] && gPrevBuf[i] && gFrameCb[i]->pCpuMappedAddress && gCompositeCb[i]->pCpuMappedAddress &&
+               gExposureCb[i]->pCpuMappedAddress && gInstanceBuf[i]->pCpuMappedAddress && gMaterialBuf[i]->pCpuMappedAddress &&
+               gLightBuf[i]->pCpuMappedAddress && gStreamBuf[i]->pCpuMappedAddress && gPrevBuf[i]->pCpuMappedAddress;
+    if (!made)
+    {
+        yea::host()->log(2, "renderer: the GPU refused one of its buffers or textures; the Renderer is off");
+        unload();
+        return 1;
+    }
     DescriptorData p[2] = {};
     p[0].mIndex = SRT_RES_IDX(SceneSrt, Persistent, gShadowCmp);
     p[0].ppSamplers = &gShadowSampler;
@@ -950,6 +987,7 @@ int load(int reloaded)
     memset(gPrevRows, 0, sizeof(PrevRows) * Instances.capacity());
     gPrevCpu = new float[Instances.capacity()][3][4];
     gPrevViewProjFrame = 0;
+
     gReady = true;
     return 0;
 }
@@ -974,9 +1012,7 @@ void unload()
     gDummyRates = nullptr;
     if (gTonyLut)
         removeResource(gTonyLut);
-    if (gTonyDummy)
-        removeResource(gTonyDummy);
-    gTonyLut = gTonyDummy = nullptr;
+    gTonyLut = nullptr;
     gTonyTried = false;
     for (uint32_t i = 0; i < gFrames; ++i)
     {
@@ -1000,20 +1036,21 @@ void unload()
     DescriptorSet** sets[4] = { &gScenePersistent, &gSceneFrame, &gCompositeSet, &gExposureSet };
     for (DescriptorSet** set : sets)
         if (*set)
-            removeDescriptorSet(gRenderer, *set);
+            removeDescriptorSet(gRenderer, *set), *set = nullptr;
     if (gShadowSampler)
-        removeSampler(gRenderer, gShadowSampler);
-    Shader* shaders[] = { gForwardDepthShader, gForwardShader, gSkyShader, gAdaptShader, gMotionDepthShader, gMotionShader, gSkyMotionShader,
-                          gForwardFullShader, gMotionFullShader, gGlossShader, gSurfaceShader };
-    for (Shader* s : shaders)
-        if (s)
-            removeShader(gRenderer, s);
+        removeSampler(gRenderer, gShadowSampler), gShadowSampler = nullptr;
+    // Each one let go and forgotten, so a second unload (after a load that gave up) frees nothing twice.
+    Shader** shaders[] = { &gForwardDepthShader, &gForwardShader, &gSkyShader, &gAdaptShader, &gMotionDepthShader, &gMotionShader,
+                           &gSkyMotionShader, &gForwardFullShader, &gMotionFullShader, &gGlossShader, &gSurfaceShader };
+    for (Shader** s : shaders)
+        if (*s)
+            removeShader(gRenderer, *s), *s = nullptr;
     for (int i = 0; i < 4; ++i)
     {
         if (gCompositeShader[i])
-            removeShader(gRenderer, gCompositeShader[i]);
+            removeShader(gRenderer, gCompositeShader[i]), gCompositeShader[i] = nullptr;
         if (gHistogramShader[i])
-            removeShader(gRenderer, gHistogramShader[i]);
+            removeShader(gRenderer, gHistogramShader[i]), gHistogramShader[i] = nullptr;
     }
 }
 
@@ -1082,6 +1119,16 @@ void draw(uint32_t pass, const YeaFrame* yf)
         waitQueueIdle(gQueue);
         destroyTargets();
         createTargets(w, h, samples, taa);
+        if (!gHdr || !gDepth || (taa && (!gMotion || !gGloss || (gRaytracing && !gSurface))))
+        {
+            // Refused (out of memory, say): nothing drawn this frame, tried again next frame, said once.
+            if (!gTargetsFailed)
+                yea::host()->log(2, "renderer: the GPU refused its screen targets; nothing is drawn until it takes them");
+            gTargetsFailed = true;
+            destroyTargets();
+            return;
+        }
+        gTargetsFailed = false;
     }
     if (samples != gPipeSamples || taa != gPipeMotion)
     {
@@ -1654,7 +1701,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         c[4].mIndex = SRT_RES_IDX(CompositeSrt, PerFrame, gRates);
         c[4].ppTextures = &rates;
         c[5].mIndex = SRT_RES_IDX(CompositeSrt, PerFrame, gTony);
-        Texture* tonyTex = gTonyLut ? gTonyLut : gTonyDummy;
+        Texture* tonyTex = gTonyLut ? gTonyLut : gDummyColor->pTexture;
         c[5].ppTextures = &tonyTex;
         updateDescriptorSet(gRenderer, fi, gCompositeSet, 6, c);
 
