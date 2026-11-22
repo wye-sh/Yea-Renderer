@@ -1,5 +1,5 @@
 {
- "name": "lighting",
+ "name": "renderer",
  "title": "Lighting",
  "version": "0.8.0",
  "source": "https://github.com/wye-sh/Yea-Renderer",
