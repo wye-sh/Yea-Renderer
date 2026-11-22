@@ -376,7 +376,22 @@ float4 PS_MAIN(VSOutput In)
     float  horizon = saturate(1.0 + dot(R, normalize(In.Normal) * (dot(In.Normal, V) < 0.0 ? -1.0 : 1.0)));
     float3 irradiance = skyIrradiance(N) * ambient;
     float  r = sqrt(sqrt(a2));
-    float3 radiance = environment(In.WorldPos, R, r, m.params.z > 0.5);
+    // Ray-traced (renderer_rt): what the reflected ray hit, or the sky; fading out towards the roughness limit, where
+    // the probes' prefiltered reflections take over. Where it takes over fully (smooth surfaces, a ray traced), the
+    // probes and sky would only be lerped away, so they aren't looked up (SSR never runs with it).
+    float  rtFound = 0.0;
+    float3 rtSeen = float3(0.0, 0.0, 0.0);
+    if ((gFrame.counts.z & FLAG_RT) != 0u && m.params.z > 0.5)
+    {
+        float4 traced = LoadTex2D(gRtReflection, NO_SAMPLER, int2(In.Position.xy), 0);
+        float  limit = gFrame.rt.x;
+        if (traced.a > 0.0)
+        {
+            rtFound = saturate((limit - r) / max(limit * 0.33, 1e-4));
+            rtSeen = traced.rgb;
+        }
+    }
+    float3 radiance = rtFound < 1.0 ? environment(In.WorldPos, R, r, m.params.z > 0.5) : rtSeen;
     float  ssrFound = 0.0;
     if ((gFrame.counts.z & FLAG_SSR) != 0u && m.params.z > 0.5)
     {
@@ -402,21 +417,8 @@ float4 PS_MAIN(VSOutput In)
         radiance = lerp(radiance, sr.rgb, sr.a);
         ssrFound = sr.a;
     }
-    float  rtFound = 0.0;
-    float3 rtSeen = float3(0.0, 0.0, 0.0);
-    if ((gFrame.counts.z & FLAG_RT) != 0u && m.params.z > 0.5)
-    {
-        // Ray-traced (renderer_rt): what the reflected ray hit, or the sky; fading out towards the roughness
-        // limit, where the probes' prefiltered reflections take over.
-        float4 traced = LoadTex2D(gRtReflection, NO_SAMPLER, int2(In.Position.xy), 0);
-        float  limit = gFrame.rt.x;
-        if (traced.a > 0.0)
-        {
-            rtFound = saturate((limit - r) / max(limit * 0.33, 1e-4));
-            radiance = lerp(radiance, traced.rgb, rtFound);
-            rtSeen = traced.rgb;
-        }
-    }
+    if (rtFound > 0.0 && rtFound < 1.0)
+        radiance = lerp(radiance, rtSeen, rtFound);
     radiance *= horizon * horizon;
     float3 FssEss = s.f0 * dfg.x + float3(dfg.y, dfg.y, dfg.y);
     float  Ems = 1.0 - Ess;
