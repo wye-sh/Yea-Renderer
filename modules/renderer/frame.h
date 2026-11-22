@@ -10,7 +10,7 @@ struct Buffer;
 struct RenderTarget;
 struct Texture;
 
-#define RENDER_FRAME_VERSION 13u
+#define RENDER_FRAME_VERSION 14u
 #define RENDER_MAX_CASCADES  4u
 #define RENDER_VIEW_SHIFT    20u // shadow instance stream entry: instance | view << 20
 
@@ -160,8 +160,10 @@ struct RenderFrame
 
     // Ambient occlusion (renderer_ao). ao_prepare runs after cull_prepare (jitter and taaOn are set);
     // ao_run right after it, after the depth prepass, with depth in SHADER_RESOURCE.
-    Texture* ao;            // RG16F, x visibility (1: open), full size, SHADER_RESOURCE after ao_run
+    Texture* ao;            // RG16F, x visibility (1: open), y view depth; at 1 / aoScale of width and height,
+                            // SHADER_RESOURCE after ao_run
     uint32_t aoOn;
+    uint32_t aoScale;       // 1: ao is full size; 2: half size, and the forward pass upsamples it along edges
     float    aoSpecular;    // specular occlusion, 0..1
     uint32_t aoMultiBounce; // brighter occlusion on bright surfaces (light bouncing between them)
     uint32_t aoDebug;       // show the occlusion alone

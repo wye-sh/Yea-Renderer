@@ -51,3 +51,6 @@ setting float move_speed 6 0.5 inf
 # The camera held at its start view (field of view 55) and the lights and shapes held still, so GPU timings
 # compare between versions.
 setting bool benchmark_view false
+# Where Benchmark View holds the camera: the start view (field of view 55), or a close-up of the gold or the
+# mirror sphere (field of view 40), where reflections cover most of the screen.
+setting choice benchmark_camera Start Start Gold_Closeup Mirror_Closeup

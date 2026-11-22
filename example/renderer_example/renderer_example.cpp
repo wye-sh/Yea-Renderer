@@ -266,10 +266,17 @@ void moveCamera(State* s, float dt)
 
     if (settings.benchmark_view)
     {
-        // The start view at a fixed field of view; the user's own camera is kept for after.
-        const float yaw = kStartYaw, pitch = kStartPitch, dist = kStartDist;
-        yea_float3  eye = { cosf(yaw) * cosf(pitch) * dist, 0.8f + sinf(pitch) * dist, sinf(yaw) * cosf(pitch) * dist };
-        renderer::camera(eye, { 0, 0.8f, 0 }, 55);
+        // The start view, or a close-up, at a fixed field of view; the user's own camera is kept for after.
+        if (settings.benchmark_camera == BenchmarkCamera::Gold_Closeup)
+            renderer::camera({ -4.2f, 1.4f, -1.2f }, { -5.0f, 0.75f, -4.0f }, 40);
+        else if (settings.benchmark_camera == BenchmarkCamera::Mirror_Closeup)
+            renderer::camera({ -7.0f, 1.0f, -2.6f }, { -7.0f, 0.75f, -4.0f }, 40);
+        else
+        {
+            const float yaw = kStartYaw, pitch = kStartPitch, dist = kStartDist;
+            yea_float3  eye = { cosf(yaw) * cosf(pitch) * dist, 0.8f + sinf(pitch) * dist, sinf(yaw) * cosf(pitch) * dist };
+            renderer::camera(eye, { 0, 0.8f, 0 }, 55);
+        }
         return;
     }
     if (gPicture)

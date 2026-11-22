@@ -1595,6 +1595,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     {
         gf->aoParams[0] = F.aoSpecular;
         gf->aoParams[1] = F.aoMultiBounce ? 1.0f : 0.0f;
+        gf->aoParams[2] = F.aoScale == 2 ? 2.0f : 1.0f; // half size: the forward pass upsamples it
     }
     gf->counts[3] = F.taps ? F.taps : 16;
     if (gTapsMade != gf->counts[3])

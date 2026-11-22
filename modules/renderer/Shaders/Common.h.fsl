@@ -31,7 +31,7 @@ STRUCT(FrameData)
                                       // w local lights' radius (m) for contact-hardening, 0 off
     DATA(float4, viewProjNoJitter[4], None); // rows, this frame without the TAA jitter
     DATA(float4, prevViewProj[4], None);     // rows, last frame without jitter
-    DATA(float4, aoParams, None);            // x specular occlusion, y multi-bounce on
+    DATA(float4, aoParams, None);            // x specular occlusion, y multi-bounce on, z gAo's scale (2: half size)
     DATA(uint4, probeInfo, None);            // x probes, y mips, z parallax on
     DATA(float4, probeParams, None);         // x intensity, y blend (m)
     DATA(float4, ssr, None);                 // x max roughness, y thickness (m), z max distance (m), w edge fade

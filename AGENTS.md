@@ -32,8 +32,9 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   pixel once and sharpens into a packed R32_UINT the composite reads (tonemappers in `Shaders/Tonemap.h.fsl`).
   Switch off: the core renders with `msaa` as before.
 - `renderer_ao`: GTAO (Jimenez 2016) from the prepass depth alone (normals rebuilt from depth), then
-  `denoise` depth-aware 3x3 blurs, into a full-size RG16F texture (x visibility; every pass carries the view depth
-  in y, so the blurs and the upsample read no depth). The forward pass darkens sky ambient by it:
+  `denoise` depth-aware 3x3 blurs, into an RG16F texture at full or half render size (`F->aoScale`; x visibility, and
+  every pass carries the view depth in y, so the blurs read no depth). At half size the forward pass upsamples it
+  itself (the four nearest texels, weighted by depth against its own view depth): no full-size pass. It darkens sky ambient by it:
   diffuse with the multi-bounce fit, specular with Lagarde's specular occlusion. Direct light is untouched.
   Runs between the prepass and the forward pass, beside culling. Noise rotates per frame only with TAA on.
 - `renderer_contact`: sun contact shadows, Bend Studio's screen space shadows (Apache-2.0; `third_party/bend_sss/bend_sss_cpu.h`
@@ -164,7 +165,7 @@ heatmap. `renderer_shadows`: enabled (the sun's), cascades, shadow_distance, cas
 filter_taps, pcss, sun_size, normal_bias, slope_bias, receiver_plane, light_shadows, shadowed_lights, local_atlas_resolution,
 updates_per_frame, max_tile_resolution, contact_hardening, light_size (m), show_cascades, show_atlas (the light shadow atlas, top right). `renderer_taa`: enabled, history_weight, clamp_width, sharpen, jitter,
 jitter_phases. `renderer_upscale`: upscaler (TAA, FSR), quality_mode (Native, Quality 67%, Balanced 59%,
-Performance 50%, Ultra_Performance 33%; for an upscaler only). `renderer_ao`: enabled, half_resolution (GTAO and its blur at half size, then a depth-aware upsample), radius, intensity, falloff, slices, steps, denoise, specular_occlusion,
+Performance 50%, Ultra_Performance 33%; for an upscaler only). `renderer_ao`: enabled, half_resolution (GTAO and its blur at half size, upsampled along edges in the forward pass), radius, intensity, falloff, slices, steps, denoise, specular_occlusion,
 multi_bounce, show_ao. `renderer_contact`: enabled, surface_thickness (a part of the distance), edge_threshold, contrast, ignore_edges,
 intensity, max_distance, show_contact. `renderer_probes`: enabled, resolution (64-512), updates_per_frame, intensity, blend, parallax.
 `renderer_ssr`: enabled, half_resolution, max_roughness, thickness, max_distance, steps, edge_fade, intensity,
@@ -181,7 +182,7 @@ builds it again. GPU objects and shadow caches are rebuilt on load.
 
 Per frame: one depth prepass and one forward pass (draws grouped by mesh and sidedness, instanced; back
 faces culled except for double-sided materials; a leaner forward shader unless PCSS or a debug view is on), one culling
-dispatch per 16 px tile, a GTAO dispatch and `denoise` blur dispatches (at half size with half_resolution, plus a full-size upsample), one contact shadow dispatch (all full size; 64-pixel stretches of rays from the sun's point on screen, two bilinear depth reads per pixel), one
+dispatch per 16 px tile, a GTAO dispatch and `denoise` blur dispatches (at half size with half_resolution; the forward pass upsamples), one contact shadow dispatch (all full size; 64-pixel stretches of rays from the sun's point on screen, two bilinear depth reads per pixel), one
 rate dispatch per 16 px tile and a small dilation dispatch with variable-rate shading (the forward pass then shades smooth tiles at 2x2), one
 depth copy for screen reflections (their march, up to `steps` plus 4 depth reads per crossing, runs in the forward pass for
 glossy pixels with reflections on, and shows in its timing), per re-captured probe 6 scene draws at half its
@@ -250,6 +251,6 @@ asks the host for the mouse each frame (`yea::captureMouse(true)`: hidden, kept 
 `yea_mouse_dx`/`yea_mouse_dy` (`look_sensitivity`); the move keys fly (WASD, Q/E down/up, `move_speed`).
 The host lets go when the button is up (it is no longer asked), F1 opens, focus is lost, or on a view switch
 or Reset. Reset: lights and camera
-back to the start. `benchmark_view` holds the camera at its start view (field of view 55) without moving the
-user's own, and holds the lights and shapes still, so GPU Timings compare between versions; the project's
+back to the start. `benchmark_view` holds the camera at its start view (field of view 55), or at the gold or
+mirror sphere's close-up (`benchmark_camera`, field of view 40), without moving the user's own, and holds the lights and shapes still, so GPU Timings compare between versions; the project's
 `modules/test_renderer_bench` (a test on the user's machine) drives it. Exports `picture` (a fixed angle).

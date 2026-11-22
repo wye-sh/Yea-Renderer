@@ -329,7 +329,38 @@ float4 PS_MAIN(VSOutput In)
     float  specularAo = 1.0;
     if ((gFrame.counts.z & FLAG_AO) != 0u)
     {
-        ao = LoadTex2D(gAo, NO_SAMPLER, int2(In.Position.xy), 0).r;
+        int2 p = int2(In.Position.xy);
+        if (gFrame.aoParams.z > 1.5)
+        {
+            // Half size: the four nearest texels, bilinear weights times how close each one's depth (carried with it)
+            // is to this pixel's, so occlusion never bleeds across an edge; when none is close, the closest in depth.
+            int2   last = (int2(gFrame.screen.xy) + int2(1, 1)) / 2 - int2(1, 1);
+            int2   base = p / 2;
+            float2 f = float2(p - base * 2) * 0.5;
+            float  sum = 0.0;
+            float  total = 0.0;
+            float  best = 1e30;
+            float  nearest = 1.0;
+            for (int j = 0; j < 2; ++j)
+            {
+                for (int i = 0; i < 2; ++i)
+                {
+                    float2 q = LoadTex2D(gAo, NO_SAMPLER, min(base + int2(i, j), last), 0).xy;
+                    float  dz = abs(q.y - viewZ);
+                    float  w = (i == 0 ? 1.0 - f.x : f.x) * (j == 0 ? 1.0 - f.y : f.y) * saturate(1.0 - dz / (viewZ * 0.03));
+                    sum += q.x * w;
+                    total += w;
+                    if (dz < best)
+                    {
+                        best = dz;
+                        nearest = q.x;
+                    }
+                }
+            }
+            ao = total > 1e-4 ? sum / total : nearest;
+        }
+        else
+            ao = LoadTex2D(gAo, NO_SAMPLER, p, 0).x;
         diffuseAo = float3(ao, ao, ao);
         if (gFrame.aoParams.y > 0.0)
         {
