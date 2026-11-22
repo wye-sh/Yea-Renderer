@@ -693,8 +693,9 @@ Active         gActive, gLastActive;
 const uint32_t kDlssMode[5] = { YEA_DLSS_DLAA, YEA_DLSS_QUALITY, YEA_DLSS_BALANCED, YEA_DLSS_PERFORMANCE, YEA_DLSS_ULTRA_PERFORMANCE };
 // DLSS's models: CNN is NVIDIA's preset E, Transformer NVIDIA's own choice per mode (K for DLAA to Balanced, M for
 // Performance, L for Ultra Performance). A Yea from before the CNN preset refuses it: NVIDIA's own then, said once.
-bool           gDlssCnnRefused; // this Yea refused E: the default model until the module reloads
-bool           gDlssCnnSaid;    // that CNN ran, said once
+bool           gDlssCnnRefused[6]; // per DLSS mode: E was refused there (the default retry ran): the default model there
+bool           gDlssCnnSaid[6];    // per DLSS mode: that CNN ran there, said once
+const char*    kDlssModeName[6] = { "", "Ultra Performance", "Performance", "Balanced", "Quality", "DLAA" };
 
 // The GPU runs FP8, where NVIDIA's transformer models are cheap (RTX 40 and later): Auto's Transformer. From yea::device(),
 // taken in load(); off on a Yea without it, so Auto is CNN there.
@@ -728,25 +729,34 @@ bool dlssRun(const RenderFrame* F, RenderTarget* out, bool reset, uint32_t q)
     in.preExposure = 1.0f;
     in.mode = kDlssMode[q];
     const bool transformer = settings.dlss_model == DlssModel::Transformer || (settings.dlss_model == DlssModel::Auto && gFp8);
-    const bool cnn = !transformer && !gDlssCnnRefused;
+    const uint32_t m = in.mode < 6 ? in.mode : 0;
+    const bool     cnn = !transformer && !gDlssCnnRefused[m];
     in.preset = cnn ? YEA_DLSS_PRESET_E : YEA_DLSS_PRESET_DEFAULT;
     in.flags = YEA_DLSS_HDR | YEA_DLSS_DEPTH_INVERTED;
     in.reset = reset ? 1u : 0u;
     in.viewport = 0;
     gDlssUsed = true;
     bool ok = gDlss->evaluate(F->cmd, &in) != 0;
+    char line[160];
     if (cnn && !ok)
     {
-        // A Yea before the CNN preset refuses it: NVIDIA's default model, this frame on.
-        say("renderer_upscale: this Yea's DLSS refused the CNN model; NVIDIA's default model instead");
-        gDlssCnnRefused = true;
+        // Refused with E: the same frame again with NVIDIA's default model. Only when that runs was it the preset (a
+        // Yea before E's, or a mode that won't take it): the default model in this mode from then on, said once.
         in.preset = YEA_DLSS_PRESET_DEFAULT;
         ok = gDlss->evaluate(F->cmd, &in) != 0;
+        if (ok)
+        {
+            gDlssCnnRefused[m] = true;
+            snprintf(line, sizeof line, "renderer_upscale: DLSS refused the CNN model at %s; NVIDIA's default model there instead",
+                     kDlssModeName[m]);
+            say(line);
+        }
     }
-    else if (cnn && !gDlssCnnSaid)
+    else if (cnn && !gDlssCnnSaid[m])
     {
-        say("renderer_upscale: DLSS runs NVIDIA's CNN model", 0);
-        gDlssCnnSaid = true;
+        snprintf(line, sizeof line, "renderer_upscale: DLSS runs NVIDIA's CNN model at %s", kDlssModeName[m]);
+        say(line, 0);
+        gDlssCnnSaid[m] = true;
     }
     forgetForgeState(F->cmd);
     return ok;
