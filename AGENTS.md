@@ -11,7 +11,8 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   tonemap, composite. Code: `renderer.cpp` (frame), `scene.cpp` (exports), `Shaders/`.
 - `renderer_culling`: Z-bins (CPU, lights sorted by view depth) and per-tile light bitmasks (compute,
   tile depth range from the prepass). Switch off: every pixel loops all visible lights (capped at 256).
-- `renderer_shadows`: sun cascades (stabilised, PCF or PCSS) and a cached atlas for spot and point lights
+- `renderer_shadows`: sun cascades (stabilised, PCF or PCSS; each redrawn only when its view or a caster over it
+  changed) and a cached atlas for spot and point lights
   (6 tiles per point light), redrawn only when the light or a nearby caster moves. Tiles are squares of
   128 to max_tile_resolution px, sized to the light's reach on screen and halved, largest first, until
   all fit 90% of the atlas; a light changes size only when its wanted size doubles or halves.
@@ -161,7 +162,7 @@ dispatch per 16 px tile, a GTAO dispatch and `denoise` blur dispatches (at half 
 rate dispatch per 16 px tile and a small dilation dispatch with variable-rate shading (the forward pass then shades smooth tiles at 2x2), one
 depth copy for screen reflections (their march, up to `steps` plus 4 depth reads per crossing, runs in the forward pass for
 glossy pixels with reflections on, and shows in its timing), per re-captured probe 6 scene draws at half its
-resolution plus 6 small passes per mip, sun cascades redrawn, at most `updates_per_frame` local lights redrawn (oldest shadow first), two
+resolution plus 6 small passes per mip, sun cascades whose view or casters changed redrawn, at most `updates_per_frame` local lights redrawn (oldest shadow first), two
 exposure dispatches, with ray-traced reflections (instead of the SSR depth copy and march) one top-level
 rebuild, a trace dispatch (a closest-hit ray per glossy pixel, a quarter of them with half_resolution except
 mirror-like ones, plus up to 9 shadow rays where the hit isn't on screen) and a full-size resolve (upsample and
@@ -173,6 +174,8 @@ for screen reflections (a quarter of it at half resolution).
 
 - Third-party material: every addition or removal updates both `licenses.json` and `LICENSES.txt` (its name,
   what uses it, source, verbatim licence text with its copyright line) in the same commit.
+- Code run per light per pixel (`brdfLight`, the shadow filters) stays free of sin, cos, pow and per-tap sqrt: the
+  filters' taps are `FrameData.taps` (a Vogel disk the core builds for `counts.w`), turned by the pixel's `Surface.rot`.
 - Back faces are culled in the prepass, forward pass and probe captures; the camera space is left-handed,
   so front faces are clockwise on screen (`FRONT_FACE_CW`). Shadow maps cull nothing: a single-sided
   surface must cast from both sides (a ceiling plane lit from above), and the biases were tuned so.

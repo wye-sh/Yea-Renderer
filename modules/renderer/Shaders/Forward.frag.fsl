@@ -257,6 +257,7 @@ float4 PS_MAIN(VSOutput In)
     s.f0 = lerp(float3(m.params.y, m.params.y, m.params.y), albedo, metallic);
     s.a2 = a2;
     s.NoV = NoV;
+    s.smithV = sqrt(NoV * NoV * (1.0 - a2) + a2);
     float2 dfg = dfgLookup(NoV, sqrt(sqrt(a2)));
     float  Ess = dfg.x + dfg.y;
     s.energy = float3(1.0, 1.0, 1.0) + s.f0 * (1.0 / max(Ess, 1e-3) - 1.0);
@@ -264,6 +265,7 @@ float4 PS_MAIN(VSOutput In)
     // Filter noise, turned each frame when TAA is on (it averages it); and the cascade dither.
     float  frameNoise = max(gFrame.shadow2.z, 0.0) * 5.588238;
     float  phi = interleavedGradientNoise(In.Position.xy + frameNoise) * 2.0 * PI;
+    s.rot = float2(cos(phi), sin(phi));
     float  dither = gFrame.shadow2.z >= 0.0 ? interleavedGradientNoise(In.Position.yx + 31.0 + frameNoise) : -1.0;
     float  viewZ = dot(gFrame.view[2], float4(In.WorldPos, 1.0));
     float3 color = float3(0.0, 0.0, 0.0);
@@ -275,7 +277,7 @@ float4 PS_MAIN(VSOutput In)
         float3 L = gFrame.sunDir[d].xyz;
         if (dot(N, L) <= 0.0)
             continue;
-        float shadow = (d == 0u && (gFrame.counts.z & FLAG_SHADOWS) != 0u) ? sunShadow(In.WorldPos, N, viewZ, phi, dither) : 1.0;
+        float shadow = (d == 0u && (gFrame.counts.z & FLAG_SHADOWS) != 0u) ? sunShadow(In.WorldPos, N, viewZ, s.rot, dither) : 1.0;
         if (d == 0u)
             shadow *= contact;
         color += brdfLight(s, L, gFrame.sunColor[d].rgb * shadow);

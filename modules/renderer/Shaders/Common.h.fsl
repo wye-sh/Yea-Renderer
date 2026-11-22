@@ -37,6 +37,7 @@ STRUCT(FrameData)
     DATA(float4, ssr, None);                 // x max roughness, y thickness (m), z max distance (m), w edge fade
     DATA(float4, ssr2, None);                // x intensity, y depth copy scale, z steps, w noise offset this frame
     DATA(float4, rt, None);                  // x max roughness of ray-traced reflections (renderer_rt)
+    DATA(float4, taps[32], None);            // xy: the shadow filters' Vogel disk of counts.w taps, unturned
 };
 
 // A reflection probe (renderer_probes), smallest box first.

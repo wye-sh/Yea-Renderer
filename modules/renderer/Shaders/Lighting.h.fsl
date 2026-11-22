@@ -19,25 +19,6 @@ float2 dfgLookup(float NoV, float rough)
     return lerp(a, b, fy);
 }
 
-float D_GGX(float NoH, float a2)
-{
-    float d = (NoH * a2 - NoH) * NoH + 1.0;
-    return a2 / (PI * d * d);
-}
-
-float V_SmithCorrelated(float NoV, float NoL, float a2)
-{
-    float gv = NoL * sqrt(NoV * NoV * (1.0 - a2) + a2);
-    float gl = NoV * sqrt(NoL * NoL * (1.0 - a2) + a2);
-    return 0.5 / max(gv + gl, 1e-5);
-}
-
-float3 F_Schlick(float3 f0, float VoH)
-{
-    float f = pow(1.0 - VoH, 5.0);
-    return f0 + (float3(1.0, 1.0, 1.0) - f0) * f;
-}
-
 STRUCT(Surface)
 {
     DATA(float3, P, None);
@@ -48,19 +29,31 @@ STRUCT(Surface)
     DATA(float3, energy, None);  // multiple-scattering compensation for direct light
     DATA(float, a2, None);
     DATA(float, NoV, None);
+    DATA(float, smithV, None);   // sqrt(NoV^2 (1 - a2) + a2): the view's half of the Smith term, the same for every light
+    DATA(float2, rot, None);     // (cos, sin) of the pixel's noise angle: turns the shadow filters' disk
 };
 
-// Radiance reflected towards V from a light of illuminance E (lux) arriving along L.
+// Radiance reflected towards V from a light of illuminance E (lux) arriving along L: GGX D, the
+// height-correlated Smith V and Schlick's F, arranged for a loop over lights: H's length from L.V alone (|V + L|^2 =
+// 2 + 2 L.V, so N.H and V.H without forming H), the view's Smith half from the surface, D and V under one
+// divide, and Schlick's fifth power by multiplying (pow is a log and an exp).
 float3 brdfLight(Surface s, float3 L, float3 E)
 {
     float NoL = saturate(dot(s.N, L));
     if (NoL <= 0.0)
         return float3(0.0, 0.0, 0.0);
-    float3 H = normalize(s.V + L);
-    float  NoH = saturate(dot(s.N, H));
-    float  VoH = saturate(dot(s.V, H));
-    float3 spec = D_GGX(NoH, s.a2) * V_SmithCorrelated(s.NoV, NoL, s.a2) * F_Schlick(s.f0, VoH) * s.energy;
-    return (s.diffuse * (1.0 / PI) + spec) * E * NoL;
+    float  LoV = dot(L, s.V);
+    float  invH = rsqrt(max(2.0 + 2.0 * LoV, 1e-8));
+    float  NoH = saturate((NoL + s.NoV) * invH);
+    float  VoH = saturate(invH + invH * LoV);
+    float  d = (NoH * s.a2 - NoH) * NoH + 1.0;
+    float  gv = NoL * s.smithV;
+    float  gl = s.NoV * sqrt(NoL * NoL * (1.0 - s.a2) + s.a2);
+    float  DV = s.a2 * 0.5 / (PI * d * d * max(gv + gl, 1e-5));
+    float  x = 1.0 - VoH;
+    float  x2 = x * x;
+    float3 F = s.f0 + (float3(1.0, 1.0, 1.0) - s.f0) * (x2 * x2 * x);
+    return (s.diffuse * (1.0 / PI) + DV * F * s.energy) * E * NoL;
 }
 
 // Procedural sky: zenith, horizon and ground colours (luminance).
@@ -93,6 +86,9 @@ float2 vogelDisk(uint i, uint n, float phi)
     return r * float2(cos(t), sin(t));
 }
 
+// A direction turned by the golden angle: the next tap's on a Vogel disk.
+float2 vogelTurn(float2 d) { return float2(d.x * -0.73736888 - d.y * 0.67549029, d.x * 0.67549029 + d.y * -0.73736888); }
+
 float3 viewToAtlas(ShadowView v, float3 P)
 {
     float4 q = float4(P, 1.0);
@@ -122,14 +118,16 @@ float2 receiverSlope(ShadowView v, float3 P, float3 N, float NoL)
     return g;
 }
 
-float sunPcf(float3 c, float2 g, float radius, float4 bounds, uint taps, float phi)
+float sunPcf(float3 c, float2 g, float radius, float4 bounds, uint taps, float2 rot)
 {
     // The disk's last four taps lie on its rim, spread by the golden angle: when they agree (fully lit
-    // or fully shadowed) the whole disk does, and only penumbrae pay for the rest.
+    // or fully shadowed) the whole disk does, and only penumbrae pay for the rest. The taps come from the
+    // frame's table, turned by the pixel's angle (rot).
     float rim = 0.0;
     for (uint i = taps - 4u; i < taps; ++i)
     {
-        float2 uv = clamp(c.xy + vogelDisk(i, taps, phi) * radius, bounds.xy, bounds.zw);
+        float2 t = gFrame.taps[i].xy;
+        float2 uv = clamp(c.xy + float2(t.x * rot.x - t.y * rot.y, t.x * rot.y + t.y * rot.x) * radius, bounds.xy, bounds.zw);
         rim += CompareTex2D(gSunAtlas, gShadowCmp, float3(uv, c.z + dot(g, uv - c.xy)));
     }
     if (rim == 0.0 || rim == 4.0)
@@ -137,18 +135,20 @@ float sunPcf(float3 c, float2 g, float radius, float4 bounds, uint taps, float p
     float sum = rim;
     for (uint j = 0u; j < taps - 4u; ++j)
     {
-        float2 uv = clamp(c.xy + vogelDisk(j, taps, phi) * radius, bounds.xy, bounds.zw);
+        float2 t = gFrame.taps[j].xy;
+        float2 uv = clamp(c.xy + float2(t.x * rot.x - t.y * rot.y, t.x * rot.y + t.y * rot.x) * radius, bounds.xy, bounds.zw);
         sum += CompareTex2D(gSunAtlas, gShadowCmp, float3(uv, c.z + dot(g, uv - c.xy)));
     }
     return sum / float(taps);
 }
 
-float localPcf(float3 c, float2 g, float radius, float4 bounds, uint taps, float phi)
+float localPcf(float3 c, float2 g, float radius, float4 bounds, uint taps, float2 rot)
 {
     float rim = 0.0;
     for (uint i = taps - 4u; i < taps; ++i)
     {
-        float2 uv = clamp(c.xy + vogelDisk(i, taps, phi) * radius, bounds.xy, bounds.zw);
+        float2 t = gFrame.taps[i].xy;
+        float2 uv = clamp(c.xy + float2(t.x * rot.x - t.y * rot.y, t.x * rot.y + t.y * rot.x) * radius, bounds.xy, bounds.zw);
         rim += CompareTex2D(gLocalAtlas, gShadowCmp, float3(uv, c.z + dot(g, uv - c.xy)));
     }
     if (rim == 0.0 || rim == 4.0)
@@ -156,13 +156,14 @@ float localPcf(float3 c, float2 g, float radius, float4 bounds, uint taps, float
     float sum = rim;
     for (uint j = 0u; j < taps - 4u; ++j)
     {
-        float2 uv = clamp(c.xy + vogelDisk(j, taps, phi) * radius, bounds.xy, bounds.zw);
+        float2 t = gFrame.taps[j].xy;
+        float2 uv = clamp(c.xy + float2(t.x * rot.x - t.y * rot.y, t.x * rot.y + t.y * rot.x) * radius, bounds.xy, bounds.zw);
         sum += CompareTex2D(gLocalAtlas, gShadowCmp, float3(uv, c.z + dot(g, uv - c.xy)));
     }
     return sum / float(taps);
 }
 
-float sunCascade(uint cascade, float3 P, float3 N, float phi)
+float sunCascade(uint cascade, float3 P, float3 N, float2 rot)
 {
     ShadowView v = gShadowViews[cascade];
     float  texel = gFrame.shadow2.x;
@@ -182,9 +183,10 @@ float sunCascade(uint cascade, float3 P, float3 N, float phi)
         float search = clamp(tanSize * c.z * v.info.y / v.info.x, 1.0, 24.0) * texel;
         float blockers = 0.0;
         float count = 0.0;
-        for (uint i = 0u; i < 12u; ++i)
+        float2 dir = rot;
+        for (uint i = 0u; i < 12u; ++i, dir = vogelTurn(dir))
         {
-            float2 uv = clamp(c.xy + vogelDisk(i, 12u, phi) * search, bounds.xy, bounds.zw);
+            float2 uv = clamp(c.xy + dir * (sqrt((float(i) + 0.5) / 12.0) * search), bounds.xy, bounds.zw);
             float  d = SampleLvlTex2D(gSunAtlas, gSamplerPointClamp, uv, 0.0).x;
             if (d < c.z + dot(g, uv - c.xy))
             {
@@ -198,7 +200,7 @@ float sunCascade(uint cascade, float3 P, float3 N, float phi)
         radius = clamp(gap * tanSize / v.info.x, 1.0, 32.0) * texel + radius * 0.25;
     }
 #endif
-    return sunPcf(c, g, radius, bounds, taps, phi);
+    return sunPcf(c, g, radius, bounds, taps, rot);
 }
 
 uint sunCascadeIndex(float viewZ)
@@ -211,7 +213,7 @@ uint sunCascadeIndex(float viewZ)
 }
 
 // dither: 0..1 noise that changes each frame (TAA on), or negative.
-float sunShadow(float3 P, float3 N, float viewZ, float phi, float dither)
+float sunShadow(float3 P, float3 N, float viewZ, float2 rot, float dither)
 {
     uint count = uint(gFrame.shadow.x);
     uint c = sunCascadeIndex(viewZ);
@@ -226,19 +228,19 @@ float sunShadow(float3 P, float3 N, float viewZ, float phi, float dither)
     if (dither >= 0.0)
     {
         if (dither < w)
-            return c + 1u < count ? sunCascade(c + 1u, P, N, phi) : 1.0;
-        return sunCascade(c, P, N, phi);
+            return c + 1u < count ? sunCascade(c + 1u, P, N, rot) : 1.0;
+        return sunCascade(c, P, N, rot);
     }
-    float s = sunCascade(c, P, N, phi);
+    float s = sunCascade(c, P, N, rot);
     if (w > 0.0)
     {
-        float next = c + 1u < count ? sunCascade(c + 1u, P, N, phi) : 1.0;
+        float next = c + 1u < count ? sunCascade(c + 1u, P, N, rot) : 1.0;
         s = lerp(s, next, w);
     }
     return s;
 }
 
-float localShadow(LightData l, float3 P, float3 N, float3 toLight, float phi)
+float localShadow(LightData l, float3 P, float3 N, float3 toLight, float phi, float2 rot)
 {
     if (l.params.y < 0.0)
         return 1.0;
@@ -305,7 +307,7 @@ float localShadow(LightData l, float3 P, float3 N, float3 toLight, float phi)
         float pen = size * max(dR - dB, 0.0) / (max(dB, 1e-4) * dR * v.info.x);
         radius = clamp(pen, 1.0, min(24.0, tile * 0.08)) * texel + radius * 0.25;
     }
-    return localPcf(c, g, radius, bounds, gFrame.counts.w, phi);
+    return localPcf(c, g, radius, bounds, gFrame.counts.w, rot);
 }
 
 // --- Lights ----------------------------------------------------------------------------------
@@ -333,7 +335,7 @@ float3 shadeLocalLight(uint i, Surface s, float phi)
     // range; sRGB steepens darks 12.92x), its shadow can't be seen: the lookup is skipped.
     if ((gFrame.counts.z & FLAG_SHADOWS) == 0u || max(lit.r, max(lit.g, lit.b)) * gExposure[1] < 1.0 / 4096.0)
         return lit;
-    return lit * localShadow(l, s.P, s.N, toLight, phi);
+    return lit * localShadow(l, s.P, s.N, toLight, phi, s.rot);
 }
 
 #endif

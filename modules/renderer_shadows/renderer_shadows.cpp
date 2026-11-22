@@ -1,6 +1,6 @@
 // Shadows for the renderer core. The sun: up to four stabilised cascades (PSSM splits, a bounding
-// sphere per slice so the size never changes as the camera turns, texel-snapped), redrawn every
-// frame into one atlas. Spot and point lights: one cached atlas of tiles; a light's tiles are
+// sphere per slice so the size never changes as the camera turns, texel-snapped) in one atlas, each
+// redrawn only when its view or a caster over it changed. Spot and point lights: one cached atlas of tiles; a light's tiles are
 // redrawn only when it or a caster near it moved, a few lights per frame.
 #include "yea_renderer_shadows.h"
 #include "frame.h"
@@ -66,9 +66,23 @@ float    gCascadeEnd[RENDER_MAX_CASCADES];
 // While F1 shows Wireframe or Overdraw nothing is drawn (Wireframe would draw the maps as edges): the
 // cascades and tiles keep what they had, and every light is redrawn once the mode ends.
 bool gFrozen, gWasFrozen;
+// The cascades as last drawn: their views, and a sum of hashes of the casters over each (order-free,
+// so the casters' order can change). A cascade whose view and casters match keeps what it has.
+uint32_t              gSunValid; // bit per cascade: drawn and kept since
+uint32_t              gSunDirty; // bit per cascade: to draw this frame
+RenderGpuShadowView gSunDrawn[kSunViews];
+uint64_t              gSunSig[kSunViews];
 uint32_t gPending[kGroups];
 uint32_t gPendingCount;
 uint32_t gStreamUsed;
+
+uint64_t mix64(uint64_t x)
+{
+    x += 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
 
 uint32_t clampu(int32_t v, uint32_t lo, uint32_t hi) { return v < (int32_t)lo ? lo : ((uint32_t)v > hi ? hi : (uint32_t)v); }
 
@@ -458,6 +472,7 @@ bool shadows_prepare(uint64_t address)
             gSunAtlas = makeAtlas(sunSize, "renderer_sun_atlas");
             gSunSize = sunSize;
             gCascades = 0; // nothing in it yet
+            gSunValid = 0;
         }
         if (localSize != gLocalSize)
         {
@@ -474,6 +489,7 @@ bool shadows_prepare(uint64_t address)
             makePipelines(slope);
             for (Group& g : gGroups)
                 g.valid = 0;
+            gSunValid = 0;
         }
     }
     gSunRes = res;
@@ -483,8 +499,12 @@ bool shadows_prepare(uint64_t address)
     RenderGpuShadowView* views = gViewsCpu;
     gFrozen = yea::viewMode() != 0;
     if (gWasFrozen && !gFrozen)
+    {
         for (Group& g : gGroups)
             g.rendered = 0; // stale: redrawn oldest first, a few each frame
+        gSunValid = 0;
+    }
+    gSunDirty = 0;
     gWasFrozen = gFrozen;
 
     // --- Sun cascades -------------------------------------------------------------------------
@@ -544,7 +564,38 @@ bool shadows_prepare(uint64_t address)
             gCascadeEnd[i] = splitFar;
             splitNear = splitFar;
         }
+        for (uint32_t i = 0; i < cascades; ++i)
+        {
+            // The casters over the cascade (an orthographic view: a caster beside it can't shade it).
+            const RenderGpuShadowView& v = views[i];
+            uint64_t sig = 0;
+            for (uint32_t c = 0; c < F->casterCount; ++c)
+            {
+                const RenderCaster& k = F->casters[c];
+                float x = v.row[0][0] * k.sphere[0] + v.row[0][1] * k.sphere[1] + v.row[0][2] * k.sphere[2] + v.row[0][3];
+                float y = v.row[1][0] * k.sphere[0] + v.row[1][1] * k.sphere[1] + v.row[1][2] * k.sphere[2] + v.row[1][3];
+                float r = k.sphere[3] * length(V(v.row[0][0], v.row[0][1], v.row[0][2])) + 1e-3f;
+                if (fabsf(x) > 1 + r || fabsf(y) > 1 + r)
+                    continue;
+                uint32_t b[4];
+                memcpy(b, k.sphere, sizeof b);
+                uint64_t h = mix64(k.moved);
+                h = mix64(h ^ ((uint64_t)b[0] << 32 | b[1]));
+                h = mix64(h ^ ((uint64_t)b[2] << 32 | b[3]));
+                h = mix64(h ^ ((uint64_t)k.firstIndex << 32 | k.indexCount));
+                sig += mix64(h ^ (uint32_t)k.vertexOffset);
+            }
+            if (!(gSunValid & (1u << i)) || sig != gSunSig[i] || memcmp(&v, &gSunDrawn[i], sizeof v) != 0)
+            {
+                gSunDirty |= 1u << i;
+                gSunDrawn[i] = v;
+                gSunSig[i] = sig;
+            }
+        }
+        gSunValid = (1u << cascades) - 1;
     }
+    else if (!gFrozen)
+        gSunValid = 0;
 
     // --- Local lights: pick, assign tiles, decide which to redraw ------------------------------
     uint32_t wanted = settings.light_shadows ? clampu(settings.shadowed_lights, 0, kGroups) : 0;
@@ -772,13 +823,15 @@ void shadows_render(uint64_t address)
         updateDescriptorSet(gRenderer, fi, gSet, 2, p);
     const RenderGpuShadowView* views = gViewsCpu;
 
-    if (gCascades && !gFrozen)
+    if (gCascades && !gFrozen && gSunDirty)
     {
         cmdBeginDebugMarker(cmd, 1.0f, 0.9f, 0.4f, "Renderer sun shadows");
         RenderTargetBarrier b = { gSunAtlas, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_DEPTH_WRITE };
         cmdResourceBarrier(cmd, 0, nullptr, 0, nullptr, 1, &b);
+        // All of them: one clear. Some: the others kept, and each one drawn cleared first.
+        bool all = !geometry || gSunDirty == (1u << gCascades) - 1;
         BindRenderTargetsDesc bind = {};
-        bind.mDepthStencil = { gSunAtlas, LOAD_ACTION_CLEAR };
+        bind.mDepthStencil = { gSunAtlas, all ? LOAD_ACTION_CLEAR : LOAD_ACTION_LOAD };
         bind.mDepthStencil.mStoreAction = STORE_ACTION_STORE;
         cmdBindRenderTargets(cmd, &bind);
         if (geometry)
@@ -788,10 +841,21 @@ void shadows_render(uint64_t address)
             cmdBindIndexBuffer(cmd, F->indices, INDEX_TYPE_UINT32, 0);
             for (uint32_t i = 0; i < gCascades; ++i)
             {
+                if (!(gSunDirty & (1u << i)))
+                    continue;
                 const RenderGpuShadowView& v = views[i];
                 float x = v.rect[0] * gSunSize, y = v.rect[1] * gSunSize, s = v.rect[2] * gSunSize;
                 cmdSetViewport(cmd, x, y, s, s, 0, 1);
                 cmdSetScissor(cmd, (uint32_t)x, (uint32_t)y, (uint32_t)s, (uint32_t)s);
+                if (!all)
+                {
+                    cmdBindPipeline(cmd, gClearPipe);
+                    cmdBindDescriptorSet(cmd, fi, gSet);
+                    cmdDraw(cmd, 3, 0);
+                    cmdBindPipeline(cmd, gPipe);
+                    cmdBindDescriptorSet(cmd, fi, gSet);
+                    cmdBindIndexBuffer(cmd, F->indices, INDEX_TYPE_UINT32, 0);
+                }
                 drawCasters(cmd, F, i, v, stream, gStreamBuf[fi]);
             }
         }

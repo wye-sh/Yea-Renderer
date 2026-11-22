@@ -58,6 +58,7 @@ struct GpuFrame
     float    ssr[4];  // x max roughness, y thickness, z max distance, w edge fade
     float    ssr2[4]; // x intensity, y depth copy scale, z steps
     float    rt[4];   // x max roughness of ray-traced reflections
+    float    taps[32][4]; // xy: the shadow filters' Vogel disk, unturned
 };
 struct GpuMaterial
 {
@@ -146,6 +147,7 @@ struct InstanceInfo
 // write-combined on many drivers, so reading them back (or scattered small writes) is very slow.
 InstanceInfo*        gInfo;     // per GPU instance
 RenderGpuInstance* gInstCpu;  // instance rows
+uint32_t             gTapsMade; // the taps count gFrameCpu.taps holds
 uint32_t*            gStream;   // visible instances by mesh
 RenderGpuLight*    gLightCpu;
 GpuMaterial*         gMaterialCpu;
@@ -1570,6 +1572,18 @@ void draw(uint32_t pass, const YeaFrame* yf)
         gf->aoParams[1] = F.aoMultiBounce ? 1.0f : 0.0f;
     }
     gf->counts[3] = F.taps ? F.taps : 16;
+    if (gTapsMade != gf->counts[3])
+    {
+        // Each pixel turns the disk by its own noise angle: one rotation per pixel instead of a sine, cosine
+        // and square root per tap.
+        gTapsMade = gf->counts[3];
+        for (uint32_t i = 0; i < gTapsMade && i < 32; ++i)
+        {
+            float r = sqrtf(((float)i + 0.5f) / (float)gTapsMade), t = (float)i * 2.39996323f;
+            gf->taps[i][0] = r * cosf(t);
+            gf->taps[i][1] = r * sinf(t);
+        }
+    }
     if (culled)
     {
         gf->tiles[0] = F.tileSize;
