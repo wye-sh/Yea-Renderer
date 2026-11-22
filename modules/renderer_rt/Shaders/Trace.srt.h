@@ -27,8 +27,5 @@ BEGIN_SRT(RtSrt)
         DECL_RWTEXTURE(PerFrame, RWTex2D(half4), gOutFull) // trace: the pixels traced at full resolution
         DECL_RWTEXTURE(PerFrame, RWTex2D(half4), gOut)     // resolve: this frame's accumulated reflections
         DECL_RWTEXTURE(PerFrame, RWTex2D(float), gOutZ)
-        DECL_BUFFER(PerFrame, Buffer(ShadowView), gShadowViews) // trace: renderer_shadows' views (a dummy without them)
-        DECL_TEXTURE(PerFrame, Depth2D(float), gLocalAtlas)     // and its local lights' atlas
-        DECL_SAMPLER(PerFrame, SamplerComparisonState, gShadowCmp)
     END_SRT_SET(PerFrame)
 END_SRT(RtSrt)

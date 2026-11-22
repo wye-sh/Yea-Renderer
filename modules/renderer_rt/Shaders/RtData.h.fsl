@@ -23,9 +23,4 @@ STRUCT(RtData)
                                      // frame's "has pixels to trace", w next frame's (the resolve clears them)
     DATA(uint4, zero, None);         // where the "all zero" flags start: x of the history texture written this
                                      // frame, as of its last write; y as of this one; z 1 to write every tile
-    DATA(float4, shadow, None);      // local lights' shadow maps, as the core filters them: x PCF radius (texels),
-                                     // y normal bias (texels), z 1 / atlas size, w light size for contact-hardening (0: off)
-    DATA(uint4, shadowMode, None);   // x filter taps, y how hits are shadowed (SHADOWS_*), z receiver-plane bias,
-                                     // w 1 when the atlas is drawn this frame
-    DATA(float4, taps[32], None);    // xy: the filters' Vogel disk, unturned (as the core's)
 };
