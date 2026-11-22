@@ -116,7 +116,7 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   frees its history and stands aside (its `sharpen` still applies, after the upscale). Not upscaling (native size, the
   default), it returns false and the frame is exactly as without it: no pass, copy or target added. Shadow tiles size
   by `displayHeight`. renderer_vrs reads last frame's image through `_up` shader variants only while upscaled.
-  Upscalers: FSR (Windows, Direct3D 12): AMD's signed FSR SDK 2.4 DLLs in `Assets/` (the loader finds the upscaler
+  Upscalers: FSR (Windows, Direct3D 12): AMD's signed FSR SDK 2.4 DLLs in `Assets/windows/` (found by bare name; the loader finds the upscaler
   DLL beside itself), loaded only while FSR is picked, through AMD's MIT API headers (`third_party/ffx`); FSR 4 on
   Radeon RX 6000 and later, FSR 3.1 elsewhere. Its jitter is AMD's (Halton 2,3 over 8 x ratio² phases), the render size
   the vendors' ratio per quality mode; the core's exposure is copied into a 1x1 texture for it (one tiny dispatch), its

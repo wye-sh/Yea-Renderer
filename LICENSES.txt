@@ -294,7 +294,7 @@ What uses it: the FSR option of the Upscaler setting (renderer_upscale), on Wind
 shipped while a game picks it.
 Source: https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK (release v2.4.0)
 
-AMD's signed runtime DLLs, shipped unchanged: modules/renderer_upscale/Assets/amd_fidelityfx_loader_dx12.dll and
+AMD's signed runtime DLLs, shipped unchanged: modules/renderer_upscale/Assets/windows/amd_fidelityfx_loader_dx12.dll and
 amd_fidelityfx_upscaler_dx12.dll. Licence (AMD's own, from docs/license.md):
 
 The following license applies to all files except as noted below.

@@ -15,6 +15,7 @@
 #include "Shaders/Exposure.srt.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 
 #if defined(_WIN32)
@@ -57,6 +58,20 @@ bool           gReady;
 #if !defined(_WIN32)
 bool gSaidFallback; // the fallback to TAA was logged
 #endif
+
+// Lines said from upscale_prepare (the core's call, which would file them under renderer) wait here for this module's
+// own update(), and are said there under renderer_upscale. A few, fixed size: no allocation.
+char     gSay[4][192];
+int      gSayLevel[4]; // 0 news, 1 a warning
+uint32_t gSayCount;
+void say(const char* line, int level = 1)
+{
+    if (gSayCount < 4)
+    {
+        gSayLevel[gSayCount] = level;
+        snprintf(gSay[gSayCount++], sizeof gSay[0], "%s", line);
+    }
+}
 
 // The vendors' per-axis ratios (display / render) for Native, Quality, Balanced, Performance, Ultra Performance.
 const float kRatio[5] = { 1.0f, 1.5f, 1.7f, 2.0f, 3.0f };
@@ -160,15 +175,37 @@ bool fsrLoad()
     char path[1024];
     if (!yea::asset("amd_fidelityfx_loader_dx12.dll", path, sizeof path))
     {
-        yea::host()->log(1, "renderer_upscale: FSR's files are missing; TAA instead");
+        say("renderer_upscale: FSR's files are missing; TAA instead");
         gFfxFailed = true;
         return false;
     }
     wchar_t wide[1024];
-    if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, 1024) ||
-        !(gFfxDll = LoadLibraryExW(wide, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH)))
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide, 1024))
     {
-        yea::host()->log(1, "renderer_upscale: FSR's loader didn't load; TAA instead");
+        char line[192];
+        snprintf(line, sizeof line, "renderer_upscale: FSR's path isn't UTF-8 (Windows error %lu); TAA instead", GetLastError());
+        say(line);
+        gFfxFailed = true;
+        return false;
+    }
+    if (!(gFfxDll = LoadLibraryExW(wide, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH)))
+    {
+        // AMD's DLLs need Microsoft's Visual C++ 2015-2022 runtime: name the parts this PC lacks.
+        const DWORD    error = GetLastError();
+        const wchar_t* runtime[3] = { L"vcruntime140.dll", L"vcruntime140_1.dll", L"msvcp140.dll" };
+        char           missing[96] = "";
+        for (const wchar_t* dll : runtime)
+        {
+            HMODULE m = LoadLibraryExW(dll, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+            if (m)
+                FreeLibrary(m);
+            else
+                snprintf(missing + strlen(missing), sizeof missing - strlen(missing), " %ls", dll);
+        }
+        char line[192];
+        snprintf(line, sizeof line, "renderer_upscale: FSR's loader didn't load (Windows error %lu; Visual C++ runtime missing:%s); TAA instead",
+                 error, missing[0] ? missing : " none");
+        say(line);
         gFfxFailed = true;
         return false;
     }
@@ -177,7 +214,7 @@ bool fsrLoad()
     gFfxDispatch = (PfnFfxDispatch)(void*)GetProcAddress(gFfxDll, "ffxDispatch");
     if (!gFfxCreate || !gFfxDestroy || !gFfxDispatch)
     {
-        yea::host()->log(1, "renderer_upscale: FSR's loader lacks its functions; TAA instead");
+        say("renderer_upscale: FSR's loader lacks its functions; TAA instead");
         fsrUnload();
         gFfxFailed = true;
         return false;
@@ -207,7 +244,7 @@ bool fsrContext(uint32_t dw, uint32_t dh)
     desc.maxUpscaleSize = { dw, dh };
     if (gFfxCreate(&gFfx, &desc.header, nullptr) != FFX_API_RETURN_OK || !gFfx)
     {
-        yea::host()->log(1, "renderer_upscale: FSR refused this GPU; TAA instead");
+        say("renderer_upscale: FSR refused this GPU; TAA instead");
         gFfx = nullptr;
         gFfxFailed = true;
         return false;
@@ -345,7 +382,12 @@ void unload()
     gReady = false;
 }
 
-void update(uint32_t phase, float dt) {}
+void update(uint32_t phase, float dt)
+{
+    for (uint32_t i = 0; i < gSayCount; ++i)
+        yea::host()->log(gSayLevel[i], gSay[i]);
+    gSayCount = 0;
+}
 void draw(uint32_t pass, const YeaFrame* frame) {}
 
 bool upscale_prepare(uint64_t address)
@@ -365,11 +407,30 @@ bool upscale_prepare(uint64_t address)
 #else
     if (fsr && !gSaidFallback)
     {
-        yea::host()->log(1, "renderer_upscale: FSR isn't available on this platform yet; TAA instead");
+        say("renderer_upscale: FSR isn't available on this platform yet; TAA instead");
         gSaidFallback = true;
     }
     fsr = false;
 #endif
+    // Which upscaler runs, and its sizes: said when they change (what F1's knob picked, and what could run).
+    {
+        const uint32_t q = (uint32_t)settings.quality_mode < 5 ? (uint32_t)settings.quality_mode : 1;
+        const uint32_t dw = F->displayWidth, dh = F->displayHeight;
+        const uint32_t w = fsr ? (uint32_t)((float)dw / kRatio[q]) : dw, h = fsr ? (uint32_t)((float)dh / kRatio[q]) : dh;
+        static uint32_t said[6] = { ~0u, 0, 0, 0, 0, 0 };
+        const uint32_t  now[6] = { (uint32_t)fsr, (uint32_t)settings.upscaler, w, h, dw, dh };
+        if (memcmp(said, now, sizeof now))
+        {
+            memcpy(said, now, sizeof now);
+            char line[192];
+            if (fsr)
+                snprintf(line, sizeof line, "renderer_upscale: FSR picked; FSR renders %ux%u, upscaled to %ux%u", w, h, dw, dh);
+            else
+                snprintf(line, sizeof line, "renderer_upscale: %s picked; TAA runs at %ux%u",
+                         settings.upscaler == Upscaler::FSR ? "FSR" : "TAA", dw, dh);
+            say(line, 0);
+        }
+    }
     if (!fsr)
     {
         if (gOut[0] || gOut[1])

@@ -56,8 +56,8 @@
     "source": "https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v2.4.0/Kits/FidelityFX/signedbin",
     "licenseUrl": "https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/blob/v2.4.0/docs/license.md",
     "usedBy": [
-      "modules/renderer_upscale/Assets/amd_fidelityfx_loader_dx12.dll",
-      "modules/renderer_upscale/Assets/amd_fidelityfx_upscaler_dx12.dll"
+      "modules/renderer_upscale/Assets/windows/amd_fidelityfx_loader_dx12.dll",
+      "modules/renderer_upscale/Assets/windows/amd_fidelityfx_upscaler_dx12.dll"
     ],
     "platforms": [
       "windows"
