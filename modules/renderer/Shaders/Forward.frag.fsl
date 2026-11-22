@@ -141,6 +141,7 @@ float4 screenReflection(float3 P, float3 R, float rough, float noise)
     float dt = tEnd / steps;
     float tStart = min(1.5 / span, 0.5) * tEnd; // off the surface itself
     float tPrev = tStart;
+    bool  wasFront = true;
     float tHit = -1.0;
     for (float i = 0.0; i < steps; i += 1.0)
     {
@@ -149,24 +150,41 @@ float4 screenReflection(float3 P, float3 R, float rough, float noise)
             break;
         float rayZ = 1.0 / lerp(k0, k1, t);
         float b = behind(lerp(s0, s1, t), rayZ);
-        if (b > 0.002 * rayZ && b < gFrame.ssr.y)
+        bool  isBehind = b > 0.002 * rayZ;
+        if (isBehind && wasFront)
         {
-            tHit = t;
-            break;
+            // The ray went behind what is seen between the last step and this one: find where, then judge
+            // the thickness there. Judged at the step itself, a coarse step past a curved surface reads as
+            // passing behind it, and neighbouring pixels flip between hit and miss (rings, speckle).
+            float lo = tPrev;
+            float hi = t;
+            for (uint r = 0u; r < 6u; ++r)
+            {
+                float mid = 0.5 * (lo + hi);
+                float z = 1.0 / lerp(k0, k1, mid);
+                if (behind(lerp(s0, s1, mid), z) > 0.002 * z)
+                    hi = mid;
+                else
+                    lo = mid;
+            }
+            // A real crossing: what is seen is continuous across it. Where the depth jumps (a near
+            // object's outline), the ray only went behind that object towards a side the camera can't see:
+            // it marches on, and if nothing else is found the probes show.
+            float zLo = 1.0 / lerp(k0, k1, lo);
+            float zHit = 1.0 / lerp(k0, k1, hi);
+            float bHit = behind(lerp(s0, s1, hi), zHit);
+            float jump = (zLo - behind(lerp(s0, s1, lo), zLo)) - (zHit - bHit);
+            if (bHit < gFrame.ssr.y && jump < gFrame.ssr.y)
+            {
+                tHit = hi;
+                break;
+            }
         }
+        wasFront = !isBehind;
         tPrev = t; // in front, or behind something thicker than `thickness`: it passes behind it
     }
     if (tHit < 0.0)
         return float4(0.0, 0.0, 0.0, 0.0);
-    float lo = tPrev;
-    for (uint r = 0u; r < 4u; ++r)
-    {
-        float mid = 0.5 * (lo + tHit);
-        if (behind(lerp(s0, s1, mid), 1.0 / lerp(k0, k1, mid)) > 0.002 / lerp(k0, k1, mid))
-            tHit = mid;
-        else
-            lo = mid;
-    }
     float  rayZ = 1.0 / lerp(k0, k1, tHit);
     float  u = abs(c1.w - c0.w) > 1e-4 ? saturate((rayZ - c0.w) / (c1.w - c0.w)) : tHit; // along P..P + R len
     float3 H = P + R * (len * u);
@@ -323,7 +341,7 @@ float4 PS_MAIN(VSOutput In)
     float  ssrFound = 0.0;
     if ((gFrame.counts.z & FLAG_SSR) != 0u && m.params.z > 0.5)
     {
-        float4 sr = screenReflection(In.WorldPos, R, m.albedoRough.a, frac(phi * (0.5 / PI) + 0.37));
+        float4 sr = screenReflection(In.WorldPos, R, m.albedoRough.a, frac(phi * (0.5 / PI) + 0.37 + gFrame.ssr2.w));
         radiance = lerp(radiance, sr.rgb, sr.a);
         ssrFound = sr.a;
     }

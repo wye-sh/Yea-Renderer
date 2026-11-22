@@ -11,8 +11,11 @@ category Variable Rate Shading
 setting bool enabled true
 # Higher: more of the screen at coarser rates (from last frame's contrast).
 setting float aggressiveness 1 0 4
-# How much faster movement lets shading coarsen.
-setting float motion 1 0 4
+# How much faster movement lets shading coarsen (0: movement never coarsens it).
+setting float motion 0 0 4
+# Curved surfaces (spheres, rings, pillars) always at full rate: their reflections and highlights change
+# from pixel to pixel.
+setting bool keep_curved true
 # Very smooth areas once per 4 x 4 pixels, where the GPU has it.
 setting bool allow_4x4 false
 # Tints the screen by rate: green 2 x 1 or 1 x 2, blue 2 x 2, magenta coarser; full rate untinted.

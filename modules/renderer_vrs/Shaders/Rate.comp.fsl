@@ -1,14 +1,18 @@
-// One shading rate per tile (a thread group of 8 x 8, each thread tile/8 squared pixels). From last
-// frame's anti-aliased image, as seen (exposed, compressed, square-rooted): the RMS difference between
-// horizontal and between vertical neighbours, which halving the rate along that axis would lose
-// (Yang et al. 2019, content-adaptive shading). Below the threshold, scaled up by last frame's motion,
-// that axis goes coarse. A depth edge or crease in this frame's depth (the second difference of 1/z,
-// zero across any plane) keeps the tile at full rate, as do tiles with highlights or detail.
+// One shading rate per tile (a thread group of 8 x 8, each thread tile/8 squared pixels), into gPre;
+// Dilate.comp.fsl then makes the final image. From last frame's anti-aliased image, as seen (exposed,
+// compressed, square-rooted): the RMS difference between horizontal and between vertical neighbours, which
+// halving the rate along that axis would lose (Yang et al. 2019, content-adaptive shading), both where the
+// pixel is and where it was a frame ago (last frame's motion), the larger counting: a moving object's
+// detail is caught where it is going. Below the threshold (raised by motion only if `motion` asks) that
+// axis goes coarse. From this frame's depth, the prepass's: a depth edge or crease (the second difference
+// of 1/z, zero across any plane) keeps the tile at full rate, and so does a curved surface (1/z off a plane
+// across the tile), whose reflections and highlights change from pixel to pixel.
 STRUCT(VrsData)
 {
     DATA(uint4, size, None);    // xy screen, zw rate image
     DATA(uint4, info, None);    // x tile (px), y the GPU's rates (bits 1 << rate), z 4 x 4 allowed, w write the image
-    DATA(float4, params, None); // x contrast threshold, y motion scale (per px/frame), z edge threshold
+    DATA(float4, params, None); // x contrast threshold, y motion scale (per px/frame), z edge threshold,
+                                // w curvature threshold (0: curved surfaces may go coarse)
 };
 
 #include "Rate.srt.h"
@@ -18,11 +22,16 @@ STRUCT(VrsData)
 #define RATE_2X1 4u
 #define RATE_2X2 5u
 #define RATE_4X4 10u
+#define FROM_CONTRAST 16u // gPre: full rate for its contrast; Dilate spreads it to the neighbours
+#define CURVED 32u        // gPre: full rate as curved; Dilate fills a tile mostly surrounded by these (a flat facet)
 
-GroupShared(float, gsH[64]);
-GroupShared(float, gsV[64]);
-GroupShared(float, gsEdge[64]);
-GroupShared(float, gsMotion[64]);
+// The tile and a one-pixel border, loaded once: luminance as seen now and a frame ago, and depth.
+#define BORDER_MAX 34u
+GroupShared(float, gsL[BORDER_MAX * BORDER_MAX]);
+GroupShared(float, gsR[BORDER_MAX * BORDER_MAX]);
+GroupShared(float, gsZ[BORDER_MAX * BORDER_MAX]);
+GroupShared(float4, gsSum[64]); // h, v, h reprojected, v reprojected
+GroupShared(float2, gsMax[64]); // edge, motion
 
 float seen(int2 p)
 {
@@ -31,56 +40,89 @@ float seen(int2 p)
     return sqrt(l / (1.0 + l));
 }
 
-float depthAt(int2 p) { return LoadTex2D(gDepth, NO_SAMPLER, p, 0).r; } // reversed-Z, infinite far: near / z
+float curve(uint a, uint b, uint c) { return abs(gsZ[a] + gsZ[c] - 2.0 * gsZ[b]) / max(gsZ[b], 1e-7); }
 
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(8, 8, 1)
 void CS_MAIN(SV_GroupID(uint3) gid, SV_GroupThreadID(uint3) tid, SV_GroupIndex(uint) gi)
 {
     INIT_MAIN;
-    uint tile = gVrs.info.x;
+    uint tile = min(gVrs.info.x, BORDER_MAX - 2u);
     uint per = max(tile / 8u, 1u);
+    uint side = tile + 2u;
     int2 last = int2(gVrs.size.xy) - int2(1, 1);
-    int2 base = int2(gid.xy) * int(tile) + int2(tid.xy) * int(per);
-    float h = 0.0;
-    float v = 0.0;
-    float edge = 0.0;
+    int2 origin = int2(gid.xy) * int(tile) - int2(1, 1);
+    float2 size = float2(gVrs.size.xy);
     float motion = 0.0;
+    for (uint i = gi; i < side * side; i += 64u)
+    {
+        int2   q = clamp(origin + int2(int(i % side), int(i / side)), int2(0, 0), last);
+        float2 m = LoadTex2D(gMotion, NO_SAMPLER, q, 0).rg * size; // px moved over the last frame
+        gsL[i] = seen(q);
+        gsR[i] = seen(clamp(q - int2(floor(m + 0.5)), int2(0, 0), last));
+        gsZ[i] = LoadTex2D(gDepth, NO_SAMPLER, q, 0).r; // reversed-Z, infinite far: near / z
+        motion = max(motion, length(m));
+    }
+    GroupMemoryBarrier();
+
+    float4 sum = float4(0.0, 0.0, 0.0, 0.0);
+    float  edge = 0.0;
+    uint2  at = tid.xy * per; // within the tile
     for (uint y = 0u; y < per; ++y)
         for (uint x = 0u; x < per; ++x)
         {
-            int2  p = min(base + int2(int(x), int(y)), last);
-            float l = seen(p);
-            float dh = seen(min(p + int2(1, 0), last)) - l;
-            float dv = seen(min(p + int2(0, 1), last)) - l;
-            h += dh * dh;
-            v += dv * dv;
-            float d = depthAt(p);
-            float ex = depthAt(max(p - int2(1, 0), int2(0, 0))) + depthAt(min(p + int2(1, 0), last)) - 2.0 * d;
-            float ey = depthAt(max(p - int2(0, 1), int2(0, 0))) + depthAt(min(p + int2(0, 1), last)) - 2.0 * d;
+            uint  k = (at.y + y + 1u) * side + (at.x + x + 1u);
+            float dh = gsL[k + 1u] - gsL[k];
+            float dv = gsL[k + side] - gsL[k];
+            float rh = gsR[k + 1u] - gsR[k];
+            float rv = gsR[k + side] - gsR[k];
+            sum += float4(dh * dh, dv * dv, rh * rh, rv * rv);
+            float d = gsZ[k];
+            float ex = gsZ[k - 1u] + gsZ[k + 1u] - 2.0 * d;
+            float ey = gsZ[k - side] + gsZ[k + side] - 2.0 * d;
             edge = max(edge, max(abs(ex), abs(ey)) / max(d, 1e-7));
-            motion = max(motion, length(LoadTex2D(gMotion, NO_SAMPLER, p, 0).rg * float2(gVrs.size.xy)));
         }
-    gsH[gi] = h;
-    gsV[gi] = v;
-    gsEdge[gi] = edge;
-    gsMotion[gi] = motion;
+    gsSum[gi] = sum;
+    gsMax[gi] = float2(edge, motion);
     GroupMemoryBarrier();
+    for (uint s = 32u; s > 0u; s >>= 1u)
+    {
+        if (gi < s)
+        {
+            gsSum[gi] += gsSum[gi + s];
+            gsMax[gi] = max(gsMax[gi], gsMax[gi + s]);
+        }
+        GroupMemoryBarrier();
+    }
     if (gi != 0u)
         RETURN();
-    for (uint i = 1u; i < 64u; ++i)
+    sum = gsSum[0];
+    edge = gsMax[0].x;
+    motion = gsMax[0].y;
+    // Curvature: 1/z on a 3 x 3 grid across the tile, against the plane through it.
+    float curved = 0.0;
+    if (gVrs.params.w > 0.0)
     {
-        h += gsH[i];
-        v += gsV[i];
-        edge = max(edge, gsEdge[i]);
-        motion = max(motion, gsMotion[i]);
+        uint a = 1u;
+        uint b = 1u + (tile - 1u) / 2u;
+        uint c = 1u + 2u * ((tile - 1u) / 2u);
+        for (uint j = 0u; j < 3u; ++j)
+        {
+            uint o = j == 0u ? a : (j == 1u ? b : c);
+            curved = max(curved, curve(o * side + a, o * side + b, o * side + c)); // along a row
+            curved = max(curved, curve(a * side + o, b * side + o, c * side + o)); // down a column
+        }
+        curved = max(curved, curve(a * side + a, b * side + b, c * side + c));
+        curved = max(curved, curve(a * side + c, b * side + b, c * side + a));
     }
     float n = float(64u * per * per);
-    float eh = sqrt(h / n);
-    float ev = sqrt(v / n);
+    float eh = sqrt(max(sum.x, sum.z) / n);
+    float ev = sqrt(max(sum.y, sum.w) / n);
     float t = gVrs.params.x * (1.0 + motion * gVrs.params.y);
     uint  rate = RATE_1X1;
-    if (edge < gVrs.params.z)
+    if (edge < gVrs.params.z && gVrs.params.w > 0.0 && curved >= gVrs.params.w)
+        rate = RATE_1X1 | CURVED;
+    else if (edge < gVrs.params.z)
     {
         if (eh < t && ev < t)
             rate = gVrs.info.z != 0u && (gVrs.info.y & (1u << RATE_4X4)) != 0u && eh < t * 0.25 && ev < t * 0.25 ? RATE_4X4 : RATE_2X2;
@@ -88,9 +130,9 @@ void CS_MAIN(SV_GroupID(uint3) gid, SV_GroupThreadID(uint3) tid, SV_GroupIndex(u
             rate = RATE_2X1;
         else if (ev < t)
             rate = RATE_1X2;
+        else
+            rate = RATE_1X1 | FROM_CONTRAST;
     }
-    if (gVrs.info.w != 0u)
-        Write2D(gRate, int2(gid.xy), rate);
-    Write2D(gRateCopy, int2(gid.xy), rate);
+    Write2D(gPre, int2(gid.xy), rate);
     RETURN();
 }

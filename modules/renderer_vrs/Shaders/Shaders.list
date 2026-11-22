@@ -9,3 +9,7 @@
 #comp renderer_vrs_rate.comp
 #include "Rate.comp.fsl"
 #end
+
+#comp renderer_vrs_dilate.comp
+#include "Dilate.comp.fsl"
+#end

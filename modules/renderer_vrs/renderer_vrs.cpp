@@ -29,8 +29,11 @@ Renderer*             gRenderer;
 Queue*                gQueue;
 uint32_t              gFrames;
 const YeaShadingRate* gRate;   // nullptr: no variable-rate shading on this GPU
-Shader*               gShader;
+Shader*               gShader;       // Rate.comp.fsl: a rate per tile into gPre
 Pipeline*             gPipe;
+Shader*               gDilateShader; // Dilate.comp.fsl: gPre into the rate image and gCopy
+Pipeline*             gDilatePipe;
+Texture*              gPre;          // R32_UINT, UNORDERED_ACCESS always
 DescriptorSet*        gSet;
 Buffer*               gCb[kMaxFrames];
 Texture*              gImage;  // Yea's rate image: SHADING_RATE_SOURCE after vrs_run (made in UNORDERED_ACCESS)
@@ -47,7 +50,9 @@ void freeImages()
         removeResource(gImage);
     if (gCopy)
         removeResource(gCopy);
-    gImage = gCopy = nullptr;
+    if (gPre)
+        removeResource(gPre);
+    gImage = gCopy = gPre = nullptr;
     gWidth = gHeight = 0;
 }
 
@@ -68,6 +73,11 @@ void createImages(uint32_t w, uint32_t h)
     TextureLoadDesc l = {};
     l.pDesc = &d;
     l.ppTexture = &gCopy;
+    addResource(&l, nullptr);
+    d.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
+    d.mDescriptors = DESCRIPTOR_TYPE_RW_TEXTURE;
+    d.pName = "renderer_vrs_pre";
+    l.ppTexture = &gPre;
     addResource(&l, nullptr);
     waitForAllResourceLoads();
     gWidth = w;
@@ -105,6 +115,14 @@ int load(int reloaded)
     desc.mComputeDesc.pShaderProgram = gShader;
     desc.pName = "renderer_vrs_rate";
     addPipeline(gRenderer, &desc, &gPipe);
+    ShaderLoadDesc dd = {};
+    dd.mComp.pFileName = "renderer_vrs_dilate.comp";
+    addShader(gRenderer, &dd, &gDilateShader);
+    if (!gDilateShader)
+        return 1;
+    desc.mComputeDesc.pShaderProgram = gDilateShader;
+    desc.pName = "renderer_vrs_dilate";
+    addPipeline(gRenderer, &desc, &gDilatePipe);
     DescriptorSetDesc setDesc = SRT_SET_DESC(VrsSrt, PerFrame, gFrames, 0);
     addDescriptorSet(gRenderer, &setDesc, &gSet);
     for (uint32_t i = 0; i < gFrames; ++i)
@@ -120,7 +138,7 @@ int load(int reloaded)
         addResource(&d, nullptr);
     }
     waitForAllResourceLoads();
-    gReady = gPipe && gSet;
+    gReady = gPipe && gDilatePipe && gSet;
     return gReady ? 0 : 1;
 }
 
@@ -137,6 +155,10 @@ void unload()
         removeDescriptorSet(gRenderer, gSet);
     if (gPipe)
         removePipeline(gRenderer, gPipe);
+    if (gDilatePipe)
+        removePipeline(gRenderer, gDilatePipe);
+    if (gDilateShader)
+        removeShader(gRenderer, gDilateShader);
     if (gShader)
         removeShader(gRenderer, gShader);
 }
@@ -158,7 +180,7 @@ bool vrs_prepare(uint64_t address)
         freeImages();
         createImages(F->width, F->height);
     }
-    if (!gImage || !gCopy)
+    if (!gImage || !gCopy || !gPre)
         return false;
     VrsData d = {};
     d.size[0] = F->width;
@@ -172,6 +194,7 @@ bool vrs_prepare(uint64_t address)
     d.params[0] = 0.012f * clampf(settings.aggressiveness, 0.0f, 10.0f);
     d.params[1] = 0.25f * clampf(settings.motion, 0.0f, 10.0f);
     d.params[2] = 0.01f;
+    d.params[3] = settings.keep_curved ? 2e-6f : 0.0f; // 1/z off a plane across a tile, relative
     memcpy(gCb[F->frameIndex]->pCpuMappedAddress, &d, sizeof d);
     F->rateImage = gImage;
     F->rateCopy = gCopy;
@@ -186,7 +209,7 @@ void vrs_run(uint64_t address)
     if (!gReady || !F || F->rateImage != gImage || !gImage || !F->depth || !F->previous || !F->motion || !F->exposure)
         return;
     Cmd*           cmd = F->cmd;
-    DescriptorData p[7] = {};
+    DescriptorData p[8] = {};
     p[0].mIndex = SRT_RES_IDX(VrsSrt, PerFrame, gVrs);
     p[0].ppBuffers = &gCb[F->frameIndex];
     p[1].mIndex = SRT_RES_IDX(VrsSrt, PerFrame, gPrevious);
@@ -201,7 +224,9 @@ void vrs_run(uint64_t address)
     p[5].ppTextures = &gImage;
     p[6].mIndex = SRT_RES_IDX(VrsSrt, PerFrame, gRateCopy);
     p[6].ppTextures = &gCopy;
-    updateDescriptorSet(gRenderer, F->frameIndex, gSet, 7, p);
+    p[7].mIndex = SRT_RES_IDX(VrsSrt, PerFrame, gPre);
+    p[7].ppTextures = &gPre;
+    updateDescriptorSet(gRenderer, F->frameIndex, gSet, 8, p);
 
     cmdBeginDebugMarker(cmd, 1.0f, 0.5f, 0.2f, "Renderer VRS rates");
     if (gImageState != RESOURCE_STATE_UNORDERED_ACCESS)
@@ -209,7 +234,12 @@ void vrs_run(uint64_t address)
     barrier(cmd, gCopy, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
     cmdBindPipeline(cmd, gPipe);
     cmdBindDescriptorSet(cmd, F->frameIndex, gSet);
-    cmdDispatch(cmd, (F->width + gTile - 1) / gTile, (F->height + gTile - 1) / gTile, 1);
+    uint32_t tw = (F->width + gTile - 1) / gTile, th = (F->height + gTile - 1) / gTile;
+    cmdDispatch(cmd, tw, th, 1);
+    barrier(cmd, gPre, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_UNORDERED_ACCESS);
+    cmdBindPipeline(cmd, gDilatePipe);
+    cmdBindDescriptorSet(cmd, F->frameIndex, gSet);
+    cmdDispatch(cmd, (tw + 7) / 8, (th + 7) / 8, 1);
     barrier(cmd, gImage, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADING_RATE_SOURCE);
     barrier(cmd, gCopy, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE);
     gImageState = RESOURCE_STATE_SHADING_RATE_SOURCE;

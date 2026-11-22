@@ -1311,6 +1311,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         gf->ssr2[0] = F.ssrIntensity;
         gf->ssr2[1] = F.ssrScale;
         gf->ssr2[2] = (float)F.ssrSteps;
+        gf->ssr2[3] = (float)((F.frameNumber % 64u) * 0.6180339887); // rotates the march's noise; TAA averages it
     }
     if (probes)
     {

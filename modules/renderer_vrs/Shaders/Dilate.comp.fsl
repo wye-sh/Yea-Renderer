@@ -1,0 +1,41 @@
+// The final rates, one thread per tile: a tile next to one kept at full rate for its contrast goes full
+// rate too, as the rates come from last frame's image and what changed (a moving highlight or shadow
+// edge) may have crossed into it. Full rate for depth edges and curves is this frame's own: not spread,
+// except into a tile with curved ones on most sides, which lies on one flat facet of a curved mesh.
+STRUCT(VrsData)
+{
+    DATA(uint4, size, None);
+    DATA(uint4, info, None);
+    DATA(float4, params, None);
+};
+
+#include "Rate.srt.h"
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) id)
+{
+    INIT_MAIN;
+    int2 tiles = int2(gVrs.size.zw);
+    int2 p = int2(id.xy);
+    if (p.x >= tiles.x || p.y >= tiles.y)
+        RETURN();
+    uint rate = LoadRWTex2D(gPre, p).x & 15u;
+    uint curved = 0u;
+    for (int y = -1; y <= 1; ++y)
+        for (int x = -1; x <= 1; ++x)
+        {
+            int2 q = clamp(p + int2(x, y), int2(0, 0), tiles - int2(1, 1));
+            uint n = LoadRWTex2D(gPre, q).x;
+            if ((n & 16u) != 0u)
+                rate = 0u;
+            if ((n & 32u) != 0u)
+                curved += 1u;
+        }
+    if (curved >= 4u)
+        rate = 0u;
+    if (gVrs.info.w != 0u)
+        Write2D(gRate, p, rate);
+    Write2D(gRateCopy, p, rate);
+    RETURN();
+}

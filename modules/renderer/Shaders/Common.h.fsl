@@ -34,7 +34,7 @@ STRUCT(FrameData)
     DATA(uint4, probeInfo, None);            // x probes, y mips, z parallax on
     DATA(float4, probeParams, None);         // x intensity, y blend (m)
     DATA(float4, ssr, None);                 // x max roughness, y thickness (m), z max distance (m), w edge fade
-    DATA(float4, ssr2, None);                // x intensity, y depth copy scale, z steps
+    DATA(float4, ssr2, None);                // x intensity, y depth copy scale, z steps, w noise offset this frame
 };
 
 // A reflection probe (renderer_probes), smallest box first.
