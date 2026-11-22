@@ -133,6 +133,9 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   dispatch); the upscalers' own sharpening is off. After one records, The Forge's bound state is forgotten so its next binds
   are made in full. Lines said from `upscale_prepare` wait for this module's `update()`, so they are filed under
   renderer_upscale: which upscaler is picked and runs, its sizes, and why FSR can't run.
+  Before AMD's DLLs load (FSR, and DLSS's fallback to it), Microsoft's C++ runtime is checked: AMD builds with toolset
+  14.44 and its DLLs can crash in std::mutex before 14.40, so an older msvcp140.dll (the one in the process, else
+  System32's), or one whose version can't be read, means TAA, said once with the version. Nothing of Microsoft's ships.
 - The core calls the others through optional imports with a `RenderFrame*` (as `u64`): `frame.h`, copied
   identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes`, `renderer_ssr`, `renderer_vrs`, `renderer_rt` and `renderer_upscale` (`mathx.h` into the
   first three). Change all copies together and raise `RENDER_FRAME_VERSION`. `upscale_prepare`, then `taa_prepare` run first,

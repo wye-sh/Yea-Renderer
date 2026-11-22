@@ -264,11 +264,62 @@ HMODULE fsrLoadAsset(const char* name)
 
 // AMD's upscaler, then its loader. The loader opens the upscaler by bare name, which Windows answers with the one
 // already loaded.
+// Microsoft's C++ runtime is new enough for AMD's DLLs: they're built with toolset 14.44 and can crash in std::mutex on
+// a runtime before 14.40. The copy already in the process if one is (the one AMD's DLLs would get), else System32's,
+// read from its version resource (kernel32 only). Checked once; an old runtime, or a failed check, is said once.
+int  gRuntimeOk = -1; // -1 not checked yet, 0 too old or unknown, 1 fine
+bool fsrRuntimeOk()
+{
+    if (gRuntimeOk >= 0)
+        return gRuntimeOk != 0;
+    HMODULE m = GetModuleHandleW(L"msvcp140.dll");
+    HMODULE ours = nullptr;
+    if (!m)
+        m = ours = LoadLibraryExW(L"msvcp140.dll", nullptr,
+                                  LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+    uint32_t major = 0, minor = 0, build = 0;
+    if (m)
+    {
+        HRSRC res = FindResourceW(m, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(16)); // VS_VERSION_INFO, RT_VERSION
+        HGLOBAL data = res ? LoadResource(m, res) : nullptr;
+        const uint8_t* p = data ? (const uint8_t*)LockResource(data) : nullptr;
+        const DWORD n = res ? SizeofResource(m, res) : 0;
+        for (DWORD i = 0; p && i + 16 <= n; i += 4) // VS_FIXEDFILEINFO: its signature, then its version words
+        {
+            uint32_t w[4];
+            memcpy(w, p + i, sizeof w);
+            if (w[0] == 0xFEEF04BDu)
+            {
+                major = w[2] >> 16;
+                minor = w[2] & 0xFFFF;
+                build = w[3] >> 16;
+                break;
+            }
+        }
+    }
+    if (ours)
+        FreeLibrary(ours);
+    gRuntimeOk = major > 14 || (major == 14 && minor >= 40);
+    char line[192];
+    if (!gRuntimeOk && !major)
+        snprintf(line, sizeof line, "renderer_upscale: FSR needs Microsoft's Visual C++ runtime 14.40 or later, and this PC's "
+                                    "version couldn't be read%s; TAA instead", m ? "" : " (msvcp140.dll not found)");
+    else
+        snprintf(line, sizeof line, gRuntimeOk ? "renderer_upscale: Visual C++ runtime %u.%u.%u: FSR can load"
+                                               : "renderer_upscale: FSR needs Microsoft's Visual C++ runtime 14.40 or later, this PC "
+                                                 "has %u.%u.%u; TAA instead",
+                 major, minor, build);
+    say(line, gRuntimeOk ? 0 : 1);
+    return gRuntimeOk != 0;
+}
+
 bool fsrLoad()
 {
     if (gFfxDll)
         return true;
     if (gFfxFailed || gRenderer->mRendererApi != RENDERER_API_D3D12)
+        return false;
+    if (!fsrRuntimeOk())
         return false;
     if (!gFfxUpscalerDll)
         gFfxUpscalerDll = fsrLoadAsset("amd_fidelityfx_upscaler_dx12.dll");
