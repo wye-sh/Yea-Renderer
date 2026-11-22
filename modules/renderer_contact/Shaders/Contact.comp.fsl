@@ -103,19 +103,27 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
     }
     float3 stepV = gContact.light.xyz * (gContact.proj.w / float(steps));
     float3 pos = P + N * (2.0 * pixel) + stepV * noise;
+    // Stepped in the screen's homogeneous coordinates (pixel x and y times view depth, and view depth),
+    // where the ray is still a straight line: one reciprocal per step gives the pixel and the depth.
+    float2 k = float2(0.5, -0.5) * gContact.proj.xy * gContact.screen.xy;
+    float2 c = 0.5 * gContact.screen.xy + gContact.screen.zw;
+    float3 h = float3(pos.xy * k + pos.z * c, pos.z);
+    float3 dh = float3(stepV.xy * k + stepV.z * c, stepV.z);
+    float  near = gContact.proj.z;
     float  occlusion = 0.0;
     for (uint i = 0u; i < steps; ++i)
     {
-        pos += stepV;
-        if (pos.z <= gContact.proj.z)
+        h += dh;
+        if (h.z <= near)
             break;
-        float2 px = toPixel(pos);
+        float2 px = h.xy * (1.0 / h.z);
         if (px.x < 0.0 || px.y < 0.0 || px.x >= gContact.screen.x || px.y >= gContact.screen.y)
             break;
-        float sceneZ = viewDepth(DEPTH_AT(int2(px)));
-        float delta = pos.z - sceneZ;
-        float bias = 0.002 * pos.z + 0.004;
-        if (delta > bias && delta < gContact.light.w)
+        // Behind what is seen there by more than the bias and less than the thickness. The depth read,
+        // seen, stands for view depth near / seen; multiplied out, z - near / seen > bias is (z - bias) seen > near.
+        float seen = max(DEPTH_AT(int2(px)), 1e-7);
+        float bias = 0.002 * h.z + 0.004;
+        if ((h.z - bias) * seen > near && (h.z - gContact.light.w) * seen < near)
         {
             // Softer towards the screen's edges, where what casts may be off screen.
             float2 e = min(px, gContact.screen.xy - px) / (gContact.screen.xy * 0.05);
