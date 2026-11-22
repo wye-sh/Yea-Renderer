@@ -13,9 +13,9 @@ setting bool half_resolution false
 # Rougher materials keep the probes alone; reflections fade out over the last third.
 setting float max_roughness 0.4 0 1
 # How thick (metres) things on screen are taken to be behind what is seen of them.
-setting float thickness 0.35 0.02 3
+setting float thickness 0.35 0.02 inf
 # How far (metres) a reflection is looked for.
-setting float max_distance 25 1 200
+setting float max_distance 25 1 inf
 setting int steps 32 8 96
 # The fraction of the screen at its edges over which reflections fade into the probes.
 setting float edge_fade 0.1 0 0.5

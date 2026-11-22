@@ -31,5 +31,5 @@ setting int resolution 256 64 512
 setting int updates_per_frame 1 0 4
 setting float intensity 1 0 2
 # Metres over which a probe fades in from the sides of its box.
-setting float blend 1 0 10
+setting float blend 1 0 inf
 setting bool parallax true

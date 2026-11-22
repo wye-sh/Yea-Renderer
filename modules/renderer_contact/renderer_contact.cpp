@@ -166,10 +166,10 @@ bool contact_prepare(uint64_t address)
     d.proj[0] = F->p00;
     d.proj[1] = F->p11;
     d.proj[2] = F->nearZ;
-    d.proj[3] = clampf(settings.length, 0.01f, 10);
+    d.proj[3] = clampf(settings.length, 0.01f, 1e6f);
     for (int r = 0; r < 3; ++r)
         d.light[r] = v[r][0] * F->sunDir[0] + v[r][1] * F->sunDir[1] + v[r][2] * F->sunDir[2];
-    d.light[3] = clampf(settings.thickness, 0.005f, 10);
+    d.light[3] = clampf(settings.thickness, 0.005f, 1e6f);
     d.screen[0] = (float)F->width;
     d.screen[1] = (float)F->height;
     d.screen[2] = F->jitter[0];

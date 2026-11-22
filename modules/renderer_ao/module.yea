@@ -9,7 +9,7 @@ setting bool enabled true
 # Computed at half size and upsampled along edges: about a quarter of the cost, slightly softer in fine creases.
 setting bool half_resolution true
 # How far (metres) surfaces shade each other.
-setting float radius 1 0.1 5
+setting float radius 1 0.1 inf
 setting float intensity 1 0 3
 # Where shading fades out, as a part of the radius from its edge.
 setting float falloff 0.6 0.1 1

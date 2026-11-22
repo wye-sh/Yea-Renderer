@@ -46,7 +46,8 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   Below `aggressiveness`' threshold, raised by motion, that axis goes coarse (2x1, 1x2, 2x2; 4x4 with
   allow_4x4). A crease or edge in this frame's depth keeps the tile at 1x1. Writes Yea's R8_UINT rate image
   and an R32_UINT copy (Show Rates); the core binds the forward pass with the service's `bindRenderTargets`.
-  Needs TAA and one sample; off in F1's view modes. Vulkan caveat: FSL declares `RWTex2D(uint)` as `r32ui`,
+  Needs TAA and one sample; off in F1's view modes. On Direct3D 12 it needs Yea 111 or later: older Yeas
+  made the rate image typeless, and binding it lost the GPU device. Vulkan caveat: FSL declares `RWTex2D(uint)` as `r32ui`,
   so the R8_UINT image is written through a mismatched format qualifier (fine on D3D12; unverified on Vulkan
   VRS hardware).
 - The core calls the others through optional imports with a `RenderFrame*` (as `u64`): `frame.h`, copied

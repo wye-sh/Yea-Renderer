@@ -7,11 +7,11 @@ export void contact_run(u64 frame)
 category Contact Shadows
 setting bool enabled true
 # How far (metres) towards the sun each pixel looks for something in the way.
-setting float length 0.6 0.05 3
+setting float length 0.6 0.05 inf
 # How thick (metres) things in front are taken to be: lower lets light under thin objects.
-setting float thickness 0.25 0.01 2
+setting float thickness 0.25 0.01 inf
 setting int steps 16 4 64
 setting float intensity 1 0 1
 # Beyond this distance (metres) there are none; they fade out over the last fifth.
-setting float max_distance 60 5 500
+setting float max_distance 60 5 inf
 setting bool show_contact false

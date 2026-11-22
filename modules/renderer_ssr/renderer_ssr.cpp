@@ -162,8 +162,8 @@ bool ssr_prepare(uint64_t address)
     F->ssrSteps = (uint32_t)(settings.steps < 8 ? 8 : (settings.steps > 96 ? 96 : settings.steps));
     F->ssrDebug = settings.show_hits;
     F->ssrMaxRoughness = clampf(settings.max_roughness, 0.0f, 1.0f);
-    F->ssrThickness = clampf(settings.thickness, 0.01f, 10.0f);
-    F->ssrMaxDistance = clampf(settings.max_distance, 0.5f, 1000.0f);
+    F->ssrThickness = clampf(settings.thickness, 0.01f, 1e6f);
+    F->ssrMaxDistance = clampf(settings.max_distance, 0.5f, 1e6f);
     F->ssrEdgeFade = clampf(settings.edge_fade, 0.001f, 0.5f);
     F->ssrIntensity = clampf(settings.intensity, 0.0f, 1.0f);
     F->ssrScale = half ? 0.5f : 1.0f;
