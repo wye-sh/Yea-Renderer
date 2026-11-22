@@ -1,0 +1,22 @@
+// The renderer_rt passes' constants (renderer_rt.cpp RtData).
+STRUCT(RtData)
+{
+    DATA(float4, right, None);       // camera basis (world), w P00
+    DATA(float4, up, None);          // w P11
+    DATA(float4, forward, None);     // w near
+    DATA(float4, camPos, None);      // w max roughness
+    DATA(float4, screen, None);      // xy size, zw TAA jitter (px)
+    DATA(float4, viewProj[4], None); // rows, this frame without jitter
+    DATA(float4, prevViewProj[4], None);
+    DATA(float4, sunDir, None);      // towards the sun, w 1 when on
+    DATA(float4, sunColor, None);    // rgb lux, w sky ambient multiplier
+    DATA(float4, skyZenith, None);
+    DATA(float4, skyHorizon, None);
+    DATA(float4, skyGround, None);
+    DATA(uint4, counts, None);       // x lights, y frame (noise), z flags, w instances
+    DATA(float4, params, None);      // x max distance (m), y edge fade (fraction of the screen), z roughness below
+                                     // which pixels are traced at full resolution with half_resolution on
+    DATA(float4, temporal, None);    // x frames of history for rough reflections, y 1 when last frame's history is
+                                     // usable, z the brightest a sample may be (exposed luminance),
+                                     // w 1 when the half-resolution trace ran
+};

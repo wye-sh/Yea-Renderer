@@ -74,8 +74,8 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   (mask 1 every drawable, 2 shadow casters). The core's vertex and index buffers get the device-address and
   build-input flags and a uint view when the service exists. While it runs, the prepass writes `surface`
   (RGBA16F: x reflection roughness, yzw the normal; renderer_vrs reads x as its gloss). After the prepass, one
-  full-size compute dispatch traces each pixel below `max_roughness` along a GGX-jittered reflection (TAA
-  averages the lobe). A hit visible on screen now (its depth matches there) takes last frame's resolved colour
+  full-size compute dispatch traces each pixel below `max_roughness` along one GGX visible-normal sample (R2
+  low-discrepancy sequence over frames, IGN across pixels), each sample capped at `brightest` times white. A hit visible on screen now (its depth matches there) takes last frame's resolved colour
   (`screen_colors`), fully lit with every shadow; elsewhere it is shaded at the hit: emission, the sun and up to
   64 local lights (the core's light buffer now holds the lights outside the view after the visible ones,
   `allLightCount`), at most 8 shadow rays per hit (`shadow_rays`), sky ambient. A miss sees the sky. The forward
@@ -83,7 +83,13 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   one pixel of each 2x2 block is traced (a different one each frame, for TAA to gather) into a half-size texture,
   and a full-size upsample fills every pixel from the four nearest samples weighted by distance, depth and normal
   match; pixels smoother than `full_below` (0.15: mirrors) and pixels no sample matches are traced in the upsample
-  itself, so mirrors are exactly as at full resolution. Every GPU object is freed
+  itself, so mirrors are exactly as at full resolution (the upsample also weights by inverse brightness). Then
+  `Shaders/Temporal.comp.fsl` accumulates the reflections over frames (two RGBA16F histories plus R32F view
+  depth, alternating; `rtReflection` is this frame's): history reprojected by the reflection's virtual image
+  (smooth) or the surface (rough), dropped where the surface's depth doesn't match, clipped to the
+  neighbourhood's spread in YCoCg (at half resolution, of the 3x3 traced samples around), blended in
+  compressed colour, up to `history_frames` (full from roughness 0.125, 4 on moving things, 1 on mirrors).
+  Without it, 1 spp reflections flickered (fireflies). Every GPU object is freed
   in `unload()` (device-loss recovery unloads modules); nothing GPU-side is in tables.
 - The core calls the others through optional imports with a `RenderFrame*` (as `u64`): `frame.h`, copied
   identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes`, `renderer_ssr`, `renderer_vrs` and `renderer_rt` (`mathx.h` into the
@@ -130,7 +136,7 @@ show_contact. `renderer_probes`: enabled, resolution (64-512), updates_per_frame
 `renderer_ssr`: enabled, half_resolution, max_roughness, thickness, max_distance, steps, edge_fade, intensity,
 show_hits (tints where reflections were found). `renderer_vrs`: enabled, aggressiveness, motion (0), keep_curved, glossy_below, allow_4x4,
 show_rates (green half rate, blue 2x2, magenta coarser). `renderer_rt`: enabled, max_roughness, half_resolution, full_below, screen_colors,
-shadow_rays, max_distance, show_hits (green: hit seen on screen, blue: lit at the hit, grey: sky).
+shadow_rays, history_frames, brightest, max_distance, show_hits (green: hit seen on screen, blue: lit at the hit, grey: sky).
 
 ## Reset
 

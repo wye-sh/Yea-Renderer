@@ -19,6 +19,10 @@ setting float full_below 0.15 0 1
 setting bool screen_colors true
 # Reflected things in shadow are dark: a shadow ray towards each light reaching what a ray hit.
 setting bool shadow_rays true
+# Frames of history blended into rough reflections, so they hold still (mirrors take little, moving things less).
+setting int history_frames 12 1 inf
+# The brightest a single ray's find may be (times white), so a stray ray onto a light can't sparkle.
+setting float brightest 8 1 inf
 # How far (metres) rays look for something to reflect.
 setting float max_distance 100 1 inf
 # Tints traced reflections: green where the hit was seen on screen, blue where it was lit at the hit,

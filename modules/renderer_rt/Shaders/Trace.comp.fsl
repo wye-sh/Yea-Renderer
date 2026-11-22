@@ -1,29 +1,13 @@
-// Ray-traced reflections: per pixel below the roughness limit, the reflected ray (one GGX microfacet normal
-// per pixel and frame, Walter et al. 2007; TAA averages them into the lobe) traced with an inline ray query
+// Ray-traced reflections: per pixel below the roughness limit, the reflected ray (one microfacet normal per
+// pixel and frame from the GGX distribution of visible normals, Dupuy & Benyoub 2023, driven by a
+// low-discrepancy sequence; Temporal.comp.fsl averages them into the lobe) traced with an inline ray query
 // against the scene's acceleration structure. What it hits gets its colour from last frame's anti-aliased
 // image where the hit is visible on screen (fully lit, with every shadow), verified against the depth there,
 // so a hidden or off-screen hit is never mistaken for what stands in front of it; elsewhere it is lit at the
 // hit: the sun (with a shadow ray), local lights, the sky's light, emission. A miss sees the sky.
 #include "fsl_ext.h"
 
-STRUCT(RtData)
-{
-    DATA(float4, right, None);       // camera basis (world), w P00
-    DATA(float4, up, None);          // w P11
-    DATA(float4, forward, None);     // w near
-    DATA(float4, camPos, None);      // w max roughness
-    DATA(float4, screen, None);      // xy size, zw TAA jitter (px)
-    DATA(float4, viewProj[4], None); // rows, this frame without jitter
-    DATA(float4, prevViewProj[4], None);
-    DATA(float4, sunDir, None);      // towards the sun, w 1 when on
-    DATA(float4, sunColor, None);    // rgb lux, w sky ambient multiplier
-    DATA(float4, skyZenith, None);
-    DATA(float4, skyHorizon, None);
-    DATA(float4, skyGround, None);
-    DATA(uint4, counts, None);       // x lights, y frame (noise), z flags, w instances
-    DATA(float4, params, None);      // x max distance (m), y edge fade (fraction of the screen), z roughness below
-                                     // which pixels are traced at full resolution with half_resolution on
-};
+#include "RtData.h.fsl"
 
 STRUCT(InstanceData)
 {
@@ -60,6 +44,34 @@ STRUCT(LightData)
 #define MAX_SHADOW_RAYS 8u
 
 float noise2(float2 p) { return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715)))); }
+
+// Pixel p's sample for this frame: interleaved gradient noise across the screen (so neighbours differ), stepped
+// through the R2 sequence over frames (so a pixel's samples cover the lobe evenly, not at random).
+float2 sample2(int2 p)
+{
+    float2 offset = float2(noise2(float2(p)), noise2(float2(p.yx) + 17.0));
+    return frac(offset + float(gRt.counts.y) * float2(0.7548776662, 0.5698402910));
+}
+
+// A GGX visible normal (tangent space, z the normal) for view direction v and roughness alpha: spherical caps.
+float3 sampleVndf(float3 v, float alpha, float2 u)
+{
+    float3 vh = normalize(float3(alpha * v.x, alpha * v.y, v.z));
+    float  phi = 2.0 * PI * u.x;
+    float  z = (1.0 - u.y) * (1.0 + vh.z) - vh.z;
+    float  s = sqrt(saturate(1.0 - z * z));
+    float3 h = float3(s * cos(phi), s * sin(phi), z) + vh;
+    return normalize(float3(alpha * h.x, alpha * h.y, max(h.z, 1e-6)));
+}
+
+float luminance(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
+
+// Caps a sample's brightness: a ray now and then finding a light or a bright spot would otherwise flash.
+float3 clampSample(float3 c)
+{
+    float l = luminance(c) * gExposure[1];
+    return l > gRt.temporal.z ? c * (gRt.temporal.z / l) : c;
+}
 
 float3 skyRadiance(float3 d)
 {
@@ -194,22 +206,17 @@ float4 tracePixel(int2 p, bool halfPass)
     float3 N = normalize(surface.yzw);
     float3 V = normalize(gRt.camPos.xyz - P);
 
-    // The reflected ray, about one microfacet normal from the lobe; a mirror stays a mirror.
-    float  a2 = rough * rough;
-    a2 *= a2;
+    // The reflected ray, about one visible microfacet normal; a mirror stays a mirror.
+    float  alpha = rough * rough;
     float3 R = reflect(-V, N);
-    if (a2 > 1e-6)
+    if (alpha > 1e-3)
     {
-        float2 q = float2(p) + float(gRt.counts.y) * float2(5.588238, 5.588238);
-        float  u1 = noise2(q);
-        float  u2 = noise2(q.yx + 17.0);
-        float  cosT = sqrt((1.0 - u1) / (1.0 + (a2 - 1.0) * u1));
-        float  sinT = sqrt(max(1.0 - cosT * cosT, 0.0));
         float3 axis = abs(N.y) < 0.9 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
         float3 tx = normalize(cross(axis, N));
         float3 ty = cross(N, tx);
-        float3 H = normalize(tx * (sinT * cos(u2 * 2.0 * PI)) + ty * (sinT * sin(u2 * 2.0 * PI)) + N * cosT);
-        float3 Rj = reflect(-V, H);
+        float3 v = float3(dot(V, tx), dot(V, ty), max(dot(V, N), 1e-4));
+        float3 h = sampleVndf(v, alpha, sample2(p));
+        float3 Rj = reflect(-V, tx * h.x + ty * h.y + N * h.z);
         if (dot(Rj, N) > 0.0)
             R = Rj;
     }
@@ -224,7 +231,7 @@ float4 tracePixel(int2 p, bool halfPass)
     if (!RayQueryIsHit(hit))
     {
         float3 sky = skyRadiance(R) * gRt.sunColor.w;
-        return float4(debug ? float3(0.5, 0.5, 0.5) : sky, RT_MISS);
+        return float4(debug ? float3(0.5, 0.5, 0.5) : clampSample(sky), RT_MISS);
     }
     float  t = RayQueryRayT(hit);
     uint   index = RayQueryInstanceID(hit);
@@ -278,7 +285,7 @@ float4 tracePixel(int2 p, bool halfPass)
     }
     if (debug)
         color = float3(0.0, screenWeight, 1.0 - screenWeight);
-    return float4(color, max(t, 1e-3));
+    return float4(clampSample(color), max(t, 1e-3));
 }
 
 // Half resolution: each 2 x 2 block traces one pixel, a different one each frame (TAA gathers them).
@@ -289,9 +296,9 @@ int2 blockOffset()
 }
 
 #if defined(TRACE_UPSAMPLE)
-// A full-resolution pixel from the four nearest half-resolution samples, each weighted by how close it lies
-// and by how well its depth and normal match this pixel's, so reflections don't bleed across edges or
-// creases. Mirror-like pixels (below the threshold), and pixels no sample matches, are traced here.
+// A full-resolution pixel from the four nearest half-resolution samples, each weighted by how close it lies,
+// by how well its depth and normal match this pixel's, so reflections don't bleed across edges or creases,
+// and by its inverse brightness (Karis 2014), so one bright sample can't spread over its neighbours. Mirror-like pixels (below the threshold), and pixels no sample matches, are traced here.
 float4 upsample(int2 p)
 {
     int2   size = int2(gRt.screen.xy);
@@ -307,8 +314,10 @@ float4 upsample(int2 p)
     float2 f = float2(p - o) * 0.5 - float2(base);
     float  zp = gRt.forward.w / d;
     float3 Np = normalize(surface.yzw);
+    float  exposure = gExposure[1];
     float4 sum = float4(0.0, 0.0, 0.0, 0.0);
     float  wsum = 0.0;
+    float  match = 0.0; // the weights before the brightness one: whether any sample fits
     for (uint i = 0u; i < 4u; ++i)
     {
         int2   dq = int2(int(i & 1u), int(i >> 1u));
@@ -322,10 +331,12 @@ float4 upsample(int2 p)
         float  bx = dq.x == 1 ? f.x : 1.0 - f.x;
         float  by = dq.y == 1 ? f.y : 1.0 - f.y;
         float  w = (bx * by + 0.05) * saturate(1.0 - abs(zs - zp) / (0.02 * zp + 0.02)) * pow(saturate(dot(Ns, Np)), 32.0);
+        match += w;
+        w /= 1.0 + luminance(v.rgb) * exposure;
         sum += v * w;
         wsum += w;
     }
-    if (wsum < 0.02)
+    if (match < 0.02)
         return tracePixel(p, false);
     return sum / wsum;
 }

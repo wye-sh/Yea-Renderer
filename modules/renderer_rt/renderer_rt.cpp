@@ -2,7 +2,8 @@
 // Owns the scene's acceleration structures: one bottom-level structure per mesh (built on the frame's command
 // list when the mesh appears or changes) and one top-level structure per frame in flight, its instances
 // rewritten (setInstances) and rebuilt each frame. After the depth prepass, Shaders/Trace.comp.fsl traces each
-// glossy pixel's reflected ray into a full-size RGBA16F texture the core's forward pass reads.
+// glossy pixel's reflected ray into a full-size RGBA16F texture, and Shaders/Temporal.comp.fsl accumulates it
+// over frames (two histories, alternating) into the texture the core's forward pass reads.
 #include "yea_renderer_rt.h"
 #include <yea/raytracing.h>
 #include "frame.h"
@@ -12,6 +13,7 @@
 #include <Common_3/Resources/ResourceLoader/Interfaces/IResourceLoader.h>
 #include <Common_3/Graphics/FSL/defaults.h>
 #include "Shaders/Trace.srt.h"
+#include "Shaders/Temporal.srt.h"
 
 #include <string.h>
 
@@ -26,6 +28,7 @@ struct RtData
     float    sunDir[4], sunColor[4], skyZenith[4], skyHorizon[4], skyGround[4];
     uint32_t counts[4];
     float    params[4];
+    float    temporal[4];
 };
 
 struct Blas
@@ -46,13 +49,19 @@ Queue*               gQueue;
 uint32_t             gFrames;
 const YeaRaytracing* gService;
 Raytracing*          gRay;
-enum { kTraceFull, kTraceHalf, kUpsample, kShaders };
+enum { kTraceFull, kTraceHalf, kUpsample, kTemporal, kShaders };
 Shader*              gShader[kShaders];
 Pipeline*            gPipe[kShaders];
-DescriptorSet*       gSet; // two per frame in flight: the trace (full or half) and the upsample
+DescriptorSet*       gSet;  // two per frame in flight: the trace (full or half) and the upsample
+DescriptorSet*       gTSet; // one per frame in flight: the temporal accumulation
 Buffer*              gCb[kMaxFrames];
-Texture*             gTex;  // SHADER_RESOURCE between frames
-Texture*             gHalf; // the half-resolution trace (a quarter of the pixels), SHADER_RESOURCE between frames
+// All SHADER_RESOURCE between frames.
+Texture*             gTex;      // this frame's trace
+Texture*             gHalf;     // the half-resolution trace (a quarter of the pixels)
+Texture*             gAccum[2]; // accumulated reflections: this frame's is written, last frame's read
+Texture*             gAccumZ[2]; // R32F: the view depth each accumulated pixel was for
+uint32_t             gAccumIndex;   // the one written last
+uint64_t             gAccumFrame;   // the frame it was written (0: no history)
 uint32_t             gWidth, gHeight;
 bool                 gReady;
 
@@ -79,15 +88,18 @@ uint64_t gPrevFrame;
 
 void freeTexture()
 {
-    if (gTex)
-        removeResource(gTex);
-    if (gHalf)
-        removeResource(gHalf);
-    gTex = gHalf = nullptr;
+    Texture** all[6] = { &gTex, &gHalf, &gAccum[0], &gAccum[1], &gAccumZ[0], &gAccumZ[1] };
+    for (Texture** t : all)
+    {
+        if (*t)
+            removeResource(*t);
+        *t = nullptr;
+    }
     gWidth = gHeight = 0;
+    gAccumFrame = 0;
 }
 
-Texture* makeTexture(uint32_t w, uint32_t h, const char* name)
+Texture* makeTexture(uint32_t w, uint32_t h, const char* name, TinyImageFormat format = TinyImageFormat_R16G16B16A16_SFLOAT)
 {
     Texture*    t = nullptr;
     TextureDesc d = {};
@@ -95,7 +107,7 @@ Texture* makeTexture(uint32_t w, uint32_t h, const char* name)
     d.mHeight = h;
     d.mDepth = d.mArraySize = d.mMipLevels = 1;
     d.mSampleCount = SAMPLE_COUNT_1;
-    d.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT; // RWTex2D(half4) is rgba16f on Vulkan
+    d.mFormat = format; // RWTex2D(half4) is rgba16f on Vulkan, RWTex2D(float) r32f
     d.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
     d.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
     d.pName = name;
@@ -111,8 +123,16 @@ void createTexture(uint32_t w, uint32_t h)
 {
     gTex = makeTexture(w, h, "renderer_rt_reflection");
     gHalf = makeTexture((w + 1) / 2, (h + 1) / 2, "renderer_rt_half");
-    if (!gTex || !gHalf)
+    for (uint32_t i = 0; i < 2; ++i)
+    {
+        gAccum[i] = makeTexture(w, h, "renderer_rt_accum");
+        gAccumZ[i] = makeTexture(w, h, "renderer_rt_accum_z", TinyImageFormat_R32_SFLOAT);
+    }
+    if (!gTex || !gHalf || !gAccum[0] || !gAccum[1] || !gAccumZ[0] || !gAccumZ[1])
+    {
         freeTexture();
+        return;
+    }
     gWidth = w;
     gHeight = h;
 }
@@ -249,7 +269,7 @@ int load(int reloaded)
         gRay = nullptr;
         return 0;
     }
-    const char* names[kShaders] = { "renderer_rt_trace.comp", "renderer_rt_trace_half.comp", "renderer_rt_upsample.comp" };
+    const char* names[kShaders] = { "renderer_rt_trace.comp", "renderer_rt_trace_half.comp", "renderer_rt_upsample.comp", "renderer_rt_temporal.comp" };
     for (uint32_t k = 0; k < kShaders; ++k)
     {
         ShaderLoadDesc sd = {};
@@ -259,15 +279,28 @@ int load(int reloaded)
             return 1;
         PipelineDesc desc = {};
         desc.mType = PIPELINE_TYPE_COMPUTE;
-        PIPELINE_LAYOUT_DESC(desc, NULL, SRT_LAYOUT_DESC(RtSrt, PerFrame), NULL, NULL);
         desc.mComputeDesc.pShaderProgram = gShader[k];
         desc.pName = "renderer_rt_trace";
-        addPipeline(gRenderer, &desc, &gPipe[k]);
+        // The layout array lives in the block that adds the pipeline (Vulkan; on Direct3D 12 it is nothing).
+        if (k == kTemporal)
+        {
+            PIPELINE_LAYOUT_DESC(desc, NULL, SRT_LAYOUT_DESC(TemporalSrt, PerFrame), NULL, NULL);
+            addPipeline(gRenderer, &desc, &gPipe[k]);
+        }
+        else
+        {
+            PIPELINE_LAYOUT_DESC(desc, NULL, SRT_LAYOUT_DESC(RtSrt, PerFrame), NULL, NULL);
+            addPipeline(gRenderer, &desc, &gPipe[k]);
+        }
         if (!gPipe[k])
             return 1;
     }
     DescriptorSetDesc setDesc = SRT_SET_DESC(RtSrt, PerFrame, gFrames * 2, 0);
     addDescriptorSet(gRenderer, &setDesc, &gSet);
+    DescriptorSetDesc tSetDesc = SRT_SET_DESC(TemporalSrt, PerFrame, gFrames, 0);
+    addDescriptorSet(gRenderer, &tSetDesc, &gTSet);
+    if (!gTSet)
+        return 1;
     for (uint32_t i = 0; i < gFrames; ++i)
         gCb[i] = makeMapped(sizeof(RtData) < 256 ? 256 : (sizeof(RtData) + 255) / 256 * 256, 0, DESCRIPTOR_TYPE_UNIFORM_BUFFER, "renderer_rt_cb");
     gReady = gSet != nullptr;
@@ -298,6 +331,8 @@ void unload()
     }
     if (gSet)
         removeDescriptorSet(gRenderer, gSet);
+    if (gTSet)
+        removeDescriptorSet(gRenderer, gTSet);
     for (uint32_t k = 0; k < kShaders; ++k)
     {
         if (gPipe[k])
@@ -318,7 +353,7 @@ bool rt_prepare(uint64_t address)
     if (!gReady || !settings.enabled || !F || F->version != RENDER_FRAME_VERSION || !F->width || !F->height || !F->taaOn)
         return false;
     if (yea::viewMode() || !F->surface || !F->previous || !F->drawableCount || !F->vertices || !F->indices || !F->instances ||
-        !F->materials || !F->lightBuffer || !F->exposure || F->frameIndex >= kMaxFrames)
+        !F->materials || !F->lightBuffer || !F->exposure || !F->motion || F->frameIndex >= kMaxFrames)
         return false;
     if (F->width != gWidth || F->height != gHeight)
     {
@@ -371,9 +406,14 @@ bool rt_prepare(uint64_t address)
     d.params[0] = settings.max_distance < 1 ? 1 : settings.max_distance;
     d.params[1] = 0.05f;
     d.params[2] = settings.half_resolution ? (settings.full_below < 0 ? 0 : settings.full_below) : 0.0f;
+    // History only when it was written last frame, by the same camera path (not after a jump of frames).
+    d.temporal[0] = settings.history_frames < 1 ? 1.0f : (float)settings.history_frames;
+    d.temporal[1] = havePrev && gAccumFrame + 1 == F->frameNumber ? 1.0f : 0.0f;
+    d.temporal[2] = settings.brightest < 1 ? 1.0f : settings.brightest;
+    d.temporal[3] = settings.half_resolution ? 1.0f : 0.0f;
     memcpy(gCb[F->frameIndex]->pCpuMappedAddress, &d, sizeof d);
 
-    F->rtReflection = gTex;
+    F->rtReflection = gAccum[gAccumIndex ^ 1];
     F->rtMaxRoughness = maxRough;
     F->rtDebug = settings.show_hits;
     return true;
@@ -382,7 +422,8 @@ bool rt_prepare(uint64_t address)
 void rt_run(uint64_t address)
 {
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
-    if (!gReady || !F || F->rtReflection != gTex || !gTex || !F->depth || !F->surface)
+    uint32_t w = gAccumIndex ^ 1; // written this frame; gAccumIndex holds last frame's
+    if (!gReady || !F || !gTex || F->rtReflection != gAccum[w] || !F->depth || !F->surface || !F->motion)
         return;
     Cmd*     cmd = F->cmd;
     uint32_t fi = F->frameIndex;
@@ -533,6 +574,44 @@ void rt_run(uint64_t address)
         cmdDispatch(cmd, (F->width + 7) / 8, (F->height + 7) / 8, 1);
         barrier(cmd, gTex, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE);
     }
+
+    // The temporal accumulation: gTex and last frame's history into this frame's.
+    Texture*       motion = F->motion->pTexture;
+    DescriptorData t[11] = {};
+    t[0].mIndex = SRT_RES_IDX(TemporalSrt, PerFrame, gRt);
+    t[0].ppBuffers = &gCb[fi];
+    t[1].mIndex = SRT_RES_IDX(TemporalSrt, PerFrame, gDepth);
+    t[1].ppTextures = &F->depth->pTexture;
+    t[2].mIndex = SRT_RES_IDX(TemporalSrt, PerFrame, gSurface);
+    t[2].ppTextures = &F->surface->pTexture;
+    t[3].mIndex = SRT_RES_IDX(TemporalSrt, PerFrame, gMotion);
+    t[3].ppTextures = &motion;
+    t[4].mIndex = SRT_RES_IDX(TemporalSrt, PerFrame, gCurrent);
+    t[4].ppTextures = &gTex;
+    t[5].mIndex = SRT_RES_IDX(TemporalSrt, PerFrame, gHistory);
+    t[5].ppTextures = &gAccum[w ^ 1];
+    t[6].mIndex = SRT_RES_IDX(TemporalSrt, PerFrame, gHistoryZ);
+    t[6].ppTextures = &gAccumZ[w ^ 1];
+    t[7].mIndex = SRT_RES_IDX(TemporalSrt, PerFrame, gExposure);
+    t[7].ppBuffers = &exposure;
+    t[8].mIndex = SRT_RES_IDX(TemporalSrt, PerFrame, gOut);
+    t[8].ppTextures = &gAccum[w];
+    t[9].mIndex = SRT_RES_IDX(TemporalSrt, PerFrame, gOutZ);
+    t[9].ppTextures = &gAccumZ[w];
+    t[10].mIndex = SRT_RES_IDX(TemporalSrt, PerFrame, gHalfIn);
+    t[10].ppTextures = &halfTex;
+    updateDescriptorSet(gRenderer, fi, gTSet, 11, t);
+    TextureBarrier in[2] = { { gAccum[w], RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS },
+                             { gAccumZ[w], RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS } };
+    cmdResourceBarrier(cmd, 0, nullptr, 2, in, 0, nullptr);
+    cmdBindPipeline(cmd, gPipe[kTemporal]);
+    cmdBindDescriptorSet(cmd, fi, gTSet);
+    cmdDispatch(cmd, (F->width + 7) / 8, (F->height + 7) / 8, 1);
+    TextureBarrier out[2] = { { gAccum[w], RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE },
+                              { gAccumZ[w], RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE } };
+    cmdResourceBarrier(cmd, 0, nullptr, 2, out, 0, nullptr);
+    gAccumIndex = w;
+    gAccumFrame = F->frameNumber;
     cmdEndDebugMarker(cmd);
 }
 } // namespace renderer_rt

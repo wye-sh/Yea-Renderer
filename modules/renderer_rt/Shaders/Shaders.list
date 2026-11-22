@@ -19,3 +19,7 @@
 #define TRACE_UPSAMPLE
 #include "Trace.comp.fsl"
 #end
+
+#comp renderer_rt_temporal.comp
+#include "Temporal.comp.fsl"
+#end
