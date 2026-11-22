@@ -7,19 +7,11 @@
 #end
 
 #comp FT_RAYTRACING renderer_rt_trace.comp
+#define TRACE_PASS
 #include "Trace.comp.fsl"
 #end
 
-#comp FT_RAYTRACING renderer_rt_trace_half.comp
-#define TRACE_HALF
+#comp FT_RAYTRACING renderer_rt_resolve.comp
+#define TRACE_RESOLVE
 #include "Trace.comp.fsl"
-#end
-
-#comp FT_RAYTRACING renderer_rt_upsample.comp
-#define TRACE_UPSAMPLE
-#include "Trace.comp.fsl"
-#end
-
-#comp renderer_rt_temporal.comp
-#include "Temporal.comp.fsl"
 #end

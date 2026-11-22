@@ -187,15 +187,13 @@ float4 clipOf(float4 rows[4], float3 W)
     return float4(dot(rows[0], w), dot(rows[1], w), dot(rows[2], w), dot(rows[3], w));
 }
 
-// What pixel p's reflected ray sees: rgb, a its distance (0: not traced, RT_MISS: the sky). halfPass skips
-// pixels smoother than the full-resolution threshold: the upsample traces those itself.
-float4 tracePixel(int2 p, bool halfPass)
+// What pixel p's reflected ray sees (surface and d: its surface and depth): rgb, a its distance (0: not traced,
+// RT_MISS: the sky).
+float4 tracePixel(int2 p, float4 surface, float d)
 {
     int2   size = int2(gRt.screen.xy);
-    float4 surface = LoadTex2D(gSurface, NO_SAMPLER, p, 0);
-    float  d = LoadTex2D(gDepth, NO_SAMPLER, p, 0).r;
     float  rough = surface.x;
-    if (d <= 0.0 || rough >= gRt.camPos.w || (halfPass && rough < gRt.params.z))
+    if (d <= 0.0 || rough >= gRt.camPos.w)
         return float4(0.0, 0.0, 0.0, 0.0);
 
     // The pixel's world position, from depth (reversed-Z, infinite far), undoing the TAA jitter it was drawn with.
@@ -295,19 +293,57 @@ int2 blockOffset()
     return int2(k == 1u || k == 2u ? 1 : 0, k == 1u || k == 3u ? 1 : 0);
 }
 
-#if defined(TRACE_UPSAMPLE)
+#if defined(TRACE_PASS)
+// The trace, one thread per 2 x 2 block of pixels, so a quarter of the threads trace at half resolution with
+// none idle: its pixels smoother than the full-resolution threshold (params.z; every glossy pixel with
+// half_resolution off) into gOutFull, then with half_resolution on the block's pixel for this frame (unless it is
+// one of those) into gOutHalf. A pixel that reflects marks its 8 x 8 tile in gTiles (cleared by last frame's
+// resolve), so the resolve skips the others.
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) id)
+{
+    INIT_MAIN;
+    int2 size = int2(gRt.screen.xy);
+    int2 b = int2(id.xy);
+    if (b.x >= (size.x + 1) / 2 || b.y >= (size.y + 1) / 2)
+        RETURN();
+    bool reflects = false;
+    for (uint k = 0u; k < 4u; ++k)
+    {
+        int2 p = b * 2 + int2(int(k & 1u), int(k >> 1u));
+        if (p.x >= size.x || p.y >= size.y)
+            continue;
+        float4 surface = LoadTex2D(gSurface, NO_SAMPLER, p, 0);
+        if (surface.x >= gRt.camPos.w)
+            continue;
+        reflects = true;
+        if (surface.x < gRt.params.z)
+            Write2D(gOutFull, p, tracePixel(p, surface, LoadTex2D(gDepth, NO_SAMPLER, p, 0).r));
+    }
+    if (reflects)
+        gTiles[gRt.tiles.z + (b.y >> 2) * gRt.tiles.x + (b.x >> 2)] = 1u;
+    if (gRt.temporal.w > 0.5)
+    {
+        int2   s = min(b * 2 + blockOffset(), size - int2(1, 1));
+        float4 ss = LoadTex2D(gSurface, NO_SAMPLER, s, 0);
+        float4 v = float4(0.0, 0.0, 0.0, 0.0);
+        if (ss.x >= gRt.params.z && ss.x < gRt.camPos.w)
+            v = tracePixel(s, ss, LoadTex2D(gDepth, NO_SAMPLER, s, 0).r);
+        Write2D(gOutHalf, b, v);
+    }
+    RETURN();
+}
+#endif
+
+#if defined(TRACE_RESOLVE)
 // A full-resolution pixel from the four nearest half-resolution samples, each weighted by how close it lies,
 // by how well its depth and normal match this pixel's, so reflections don't bleed across edges or creases,
-// and by its inverse brightness (Karis 2014), so one bright sample can't spread over its neighbours. Mirror-like pixels (below the threshold), and pixels no sample matches, are traced here.
-float4 upsample(int2 p)
+// and by its inverse brightness (Karis 2014), so one bright sample can't spread over its neighbours. Pixels no
+// sample matches are traced here.
+float4 upsample(int2 p, float4 surface, float d)
 {
     int2   size = int2(gRt.screen.xy);
-    float4 surface = LoadTex2D(gSurface, NO_SAMPLER, p, 0);
-    float  d = LoadTex2D(gDepth, NO_SAMPLER, p, 0).r;
-    if (d <= 0.0 || surface.x >= gRt.camPos.w)
-        return float4(0.0, 0.0, 0.0, 0.0);
-    if (surface.x < gRt.params.z)
-        return tracePixel(p, false);
     int2   o = blockOffset();
     int2   halfSize = (size + int2(1, 1)) / 2;
     int2   base = (p - o) >> 1;
@@ -337,31 +373,185 @@ float4 upsample(int2 p)
         wsum += w;
     }
     if (match < 0.02)
-        return tracePixel(p, false);
+        return tracePixel(p, surface, d);
     return sum / wsum;
 }
-#endif
 
+// This frame's reflection at pixel q (surface and d: its surface and depth): traced at full resolution by the
+// trace pass, upsampled from the half-resolution samples, or nothing.
+float4 currentAt(int2 q, float4 surface, float d)
+{
+    if (d <= 0.0 || surface.x >= gRt.camPos.w)
+        return float4(0.0, 0.0, 0.0, 0.0);
+    if (surface.x < gRt.params.z)
+        return LoadTex2D(gFullIn, NO_SAMPLER, q, 0);
+    return upsample(q, surface, d);
+}
+
+// The reflections' temporal accumulation, in the same pass: each pixel's history is found where the reflected
+// image was last frame (reprojecting the reflection's virtual image, P plus the hit distance along the view
+// ray, for smooth surfaces; the surface itself for rough ones), dropped where that surface wasn't there last
+// frame (its depth), clipped to this frame's neighbourhood spread (mean +- 1.25 deviations, YCoCg) and blended
+// in a compressed space (c / (1 + max(c)), so a bright sample counts no more than a white one), with more
+// history the rougher, noisier and stiller the surface. At half resolution the spread comes from the traced
+// samples themselves (3 x 3 of them, 6 x 6 pixels): upsampled neighbours share samples, and their spread is too
+// narrow to hold the history. TAA then anti-aliases the frame as before.
+#define CLIP_WIDTH 1.25
+
+float3 compressColor(float3 c) { return c / (1.0 + max(c.r, max(c.g, c.b))); }
+float3 expandColor(float3 c) { return c / max(1.0 - max(c.r, max(c.g, c.b)), 1e-4); }
+float3 toYCoCg(float3 c) { return float3(dot(c, float3(0.25, 0.5, 0.25)), dot(c, float3(0.5, 0.0, -0.5)), dot(c, float3(-0.25, 0.5, -0.25))); }
+float3 fromYCoCg(float3 c) { return float3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z); }
+
+float3 clipToBox(float3 h, float3 lo, float3 hi)
+{
+    float3 centre = 0.5 * (lo + hi);
+    float3 extent = 0.5 * (hi - lo) + float3(1e-5, 1e-5, 1e-5);
+    float3 v = h - centre;
+    float3 a = abs(v / extent);
+    float  m = max(a.x, max(a.y, a.z));
+    return m > 1.0 ? centre + v / m : h;
+}
+
+float2 uvOf(float4 c) { return c.xy / c.w * float2(0.5, -0.5) + 0.5; }
+bool   inScreen(float2 uv) { return uv.x > 0.0 && uv.y > 0.0 && uv.x < 1.0 && uv.y < 1.0; }
+
+void resolve(int2 p)
+{
+    int2   size = int2(gRt.screen.xy);
+    float4 surface = LoadTex2D(gSurface, NO_SAMPLER, p, 0);
+    float  d = surface.x < gRt.camPos.w ? LoadTex2D(gDepth, NO_SAMPLER, p, 0).r : 0.0;
+    float4 cur = currentAt(p, surface, d);
+    if (cur.a <= 0.0 || d <= 0.0)
+    {
+        // Nothing reflected here: no depth is kept either, as the history's alpha says so.
+        Write2D(gOut, p, float4(0.0, 0.0, 0.0, 0.0));
+        return;
+    }
+    float exposure = max(gExposure[1], 1e-8);
+    float rough = surface.x;
+
+    // The neighbourhood's spread (traced pixels only), and its brightest neighbour.
+    float3 c = toYCoCg(compressColor(cur.rgb * exposure));
+    float3 m1 = c;
+    float3 m2 = c * c;
+    float  n = 1.0;
+    float  brightest = 0.0;
+    bool   fromHalf = gRt.temporal.w > 0.5 && rough >= gRt.params.z;
+    int2   halfSize = (size + int2(1, 1)) / 2;
+    int2   centre = fromHalf ? clamp(p >> 1, int2(0, 0), halfSize - int2(1, 1)) : p;
+    int2   last = fromHalf ? halfSize - int2(1, 1) : size - int2(1, 1);
+    for (int y = -1; y <= 1; ++y)
+    {
+        for (int x = -1; x <= 1; ++x)
+        {
+            if (x == 0 && y == 0 && !fromHalf)
+                continue;
+            int2   q = clamp(centre + int2(x, y), int2(0, 0), last);
+            float4 v = float4(0.0, 0.0, 0.0, 0.0);
+            if (fromHalf)
+                v = LoadTex2D(gHalfIn, NO_SAMPLER, q, 0);
+            else
+            {
+                float4 sq = LoadTex2D(gSurface, NO_SAMPLER, q, 0);
+                if (sq.x < gRt.camPos.w)
+                    v = currentAt(q, sq, LoadTex2D(gDepth, NO_SAMPLER, q, 0).r);
+            }
+            if (v.a <= 0.0)
+                continue;
+            float3 s = toYCoCg(compressColor(v.rgb * exposure));
+            m1 += s;
+            m2 += s * s;
+            n += 1.0;
+            brightest = max(brightest, s.x);
+        }
+    }
+    // A jittered sample brighter than all its neighbours is a stray: held to the brightest of them.
+    if (rough > 0.1 && n > 4.0 && c.x > brightest)
+        c *= brightest / max(c.x, 1e-6);
+    float3 mean = m1 / n;
+    float3 width = sqrt(max(m2 / n - mean * mean, float3(0.0, 0.0, 0.0))) * CLIP_WIDTH;
+
+    // This pixel's world position (undoing the jitter it was drawn with), and where it and its reflection were.
+    float  z = gRt.forward.w / d;
+    float2 u = float2(p) + 0.5 - gRt.screen.zw;
+    float2 ndc = float2(u.x / gRt.screen.x * 2.0 - 1.0, 1.0 - u.y / gRt.screen.y * 2.0);
+    float3 P = gRt.camPos.xyz + gRt.right.xyz * (ndc.x * z / gRt.right.w) + gRt.up.xyz * (ndc.y * z / gRt.up.w) + gRt.forward.xyz * z;
+    float3 toP = normalize(P - gRt.camPos.xyz);
+    float4 pcS = clipOf(gRt.prevViewProj, P);
+    float4 pcV = clipOf(gRt.prevViewProj, P + toP * min(cur.a, 1000.0));
+    float  mirrorish = saturate(1.0 - rough / max(gRt.camPos.w * 0.5, 1e-3));
+    float2 uvS = uvOf(pcS);
+    float2 uvPrev = pcV.w > gRt.forward.w ? lerp(uvS, uvOf(pcV), mirrorish) : uvS;
+
+    // More history the rougher (noisier) the surface; little on mirrors, which are exact, and on what moves.
+    float  frames = 1.0 + (gRt.temporal.x - 1.0) * saturate(rough * 8.0);
+    float2 uvNow = (float2(p) + 0.5) / gRt.screen.xy;
+    float2 moved = (LoadTex2D(gMotion, NO_SAMPLER, p, 0).xy - (uvNow - uvS)) * gRt.screen.xy;
+    if (dot(moved, moved) > 0.25)
+        frames = min(frames, 4.0);
+
+    float3 result = c;
+    bool   valid = gRt.temporal.y > 0.5 && pcS.w > gRt.forward.w && inScreen(uvS) && inScreen(uvPrev);
+    if (valid)
+    {
+        // Was this surface there last frame? Its depth then against the depth kept there (none where the
+        // history holds nothing).
+        int2  qs = clamp(int2(uvS * gRt.screen.xy), int2(0, 0), size - int2(1, 1));
+        float zPrev = LoadTex2D(gHistory, NO_SAMPLER, qs, 0).a > 0.0 ? LoadTex2D(gHistoryZ, NO_SAMPLER, qs, 0).r : 0.0;
+        valid = abs(zPrev - pcS.w) < 0.04 * pcS.w + 0.02;
+    }
+    if (valid && frames > 1.0)
+    {
+        // Bilinear, over the history texels that hold reflections only.
+        float2 pos = uvPrev * gRt.screen.xy - 0.5;
+        int2   base = int2(floor(pos));
+        float2 f = pos - float2(base);
+        float4 sum = float4(0.0, 0.0, 0.0, 0.0);
+        for (uint i = 0u; i < 4u; ++i)
+        {
+            int2   dq = int2(int(i & 1u), int(i >> 1u));
+            int2   q = clamp(base + dq, int2(0, 0), size - int2(1, 1));
+            float4 h = LoadTex2D(gHistory, NO_SAMPLER, q, 0);
+            float  w = (dq.x == 1 ? f.x : 1.0 - f.x) * (dq.y == 1 ? f.y : 1.0 - f.y);
+            if (h.a > 0.0)
+                sum += float4(compressColor(h.rgb * exposure), 1.0) * w;
+        }
+        if (sum.w > 0.05)
+        {
+            float3 history = clipToBox(toYCoCg(sum.rgb / sum.w), mean - width, mean + width);
+            result = lerp(history, c, 1.0 / frames);
+        }
+    }
+    Write2D(gOut, p, float4(max(expandColor(fromYCoCg(result)), float3(0.0, 0.0, 0.0)) / exposure, cur.a));
+    Write2D(gOutZ, p, z);
+}
+
+// The resolve, one full-size pass: this frame's reflection per pixel (the full-resolution trace, or the upsampled
+// half-resolution one) accumulated with last frame's into gOut. A tile with nothing to reflect writes zeros only
+// when the texture doesn't hold zeros there already (gTiles), so most of a frame without glossy surfaces
+// costs two reads per tile. Flags are read and written in different places, so no thread waits for another.
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(8, 8, 1)
-void CS_MAIN(SV_DispatchThreadID(uint3) id)
+void CS_MAIN(SV_DispatchThreadID(uint3) id, SV_GroupID(uint3) gid, SV_GroupIndex(uint) gi)
 {
     INIT_MAIN;
     int2 size = int2(gRt.screen.xy);
-#if defined(TRACE_HALF)
-    int2 hp = int2(id.xy);
-    if (hp.x >= (size.x + 1) / 2 || hp.y >= (size.y + 1) / 2)
-        RETURN();
-    Write2D(gOut, hp, tracePixel(min(hp * 2 + blockOffset(), size - int2(1, 1)), true));
-#else
     int2 p = int2(id.xy);
-    if (p.x >= size.x || p.y >= size.y)
+    uint tile = gid.y * gRt.tiles.x + gid.x;
+    bool traced = gTiles[gRt.tiles.z + tile] != 0u;
+    bool zero = gTiles[gRt.zero.x + tile] != 0u && gRt.zero.z == 0u;
+    if (gi == 0u)
+    {
+        gTiles[gRt.zero.y + tile] = traced ? 0u : 1u;
+        gTiles[gRt.tiles.w + tile] = 0u; // next frame's trace marks it afresh
+    }
+    if (p.x >= size.x || p.y >= size.y || (!traced && zero))
         RETURN();
-#if defined(TRACE_UPSAMPLE)
-    Write2D(gOut, p, upsample(p));
-#else
-    Write2D(gOut, p, tracePixel(p, false));
-#endif
-#endif
+    if (traced)
+        resolve(p);
+    else
+        Write2D(gOut, p, float4(0.0, 0.0, 0.0, 0.0));
     RETURN();
 }
+#endif

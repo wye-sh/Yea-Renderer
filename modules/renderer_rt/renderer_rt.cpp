@@ -1,9 +1,10 @@
 // Ray-traced reflections for the renderer core, where the GPU has inline ray queries (yea::raytracing()).
 // Owns the scene's acceleration structures: one bottom-level structure per mesh (built on the frame's command
 // list when the mesh appears or changes) and one top-level structure per frame in flight, its instances
-// rewritten (setInstances) and rebuilt each frame. After the depth prepass, Shaders/Trace.comp.fsl traces each
-// glossy pixel's reflected ray into a full-size RGBA16F texture, and Shaders/Temporal.comp.fsl accumulates it
-// over frames (two histories, alternating) into the texture the core's forward pass reads.
+// rewritten (setInstances) and rebuilt each frame. After the depth prepass, Shaders/Trace.comp.fsl runs twice:
+// the trace (mirror-like pixels at full resolution, the rest one pixel in four with half_resolution), then the
+// resolve, one full-size pass that upsamples the quarter-resolution traces and accumulates the reflections over
+// frames (two histories, alternating) into the texture the core's forward pass reads.
 #include "yea_renderer_rt.h"
 #include <yea/raytracing.h>
 #include "frame.h"
@@ -13,7 +14,6 @@
 #include <Common_3/Resources/ResourceLoader/Interfaces/IResourceLoader.h>
 #include <Common_3/Graphics/FSL/defaults.h>
 #include "Shaders/Trace.srt.h"
-#include "Shaders/Temporal.srt.h"
 
 #include <string.h>
 
@@ -29,6 +29,8 @@ struct RtData
     uint32_t counts[4];
     float    params[4];
     float    temporal[4];
+    uint32_t tiles[4];
+    uint32_t zero[4];
 };
 
 struct Blas
@@ -49,19 +51,27 @@ Queue*               gQueue;
 uint32_t             gFrames;
 const YeaRaytracing* gService;
 Raytracing*          gRay;
-enum { kTraceFull, kTraceHalf, kUpsample, kTemporal, kShaders };
+enum { kTrace, kResolve, kShaders };
 Shader*              gShader[kShaders];
 Pipeline*            gPipe[kShaders];
-DescriptorSet*       gSet;  // two per frame in flight: the trace (full or half) and the upsample
-DescriptorSet*       gTSet; // one per frame in flight: the temporal accumulation
+DescriptorSet*       gSet; // two per frame in flight: the trace and the resolve
 Buffer*              gCb[kMaxFrames];
 // All SHADER_RESOURCE between frames.
-Texture*             gTex;      // this frame's trace
+Texture*             gTex;      // this frame's trace of the pixels traced at full resolution (only those written)
 Texture*             gHalf;     // the half-resolution trace (a quarter of the pixels)
 Texture*             gAccum[2]; // accumulated reflections: this frame's is written, last frame's read
 Texture*             gAccumZ[2]; // R32F: the view depth each accumulated pixel was for
 uint32_t             gAccumIndex;   // the one written last
 uint64_t             gAccumFrame;   // the frame it was written (0: no history)
+// Per 8 x 8 tile (UNORDERED_ACCESS once used), six sets of flags, so no pass reads a flag it writes: whether
+// any pixel reflects (this frame's, which the trace sets, and next frame's, which the resolve clears), and
+// whether the history texture's tile holds only zeros, so the resolve skips writing zeros again (four: each
+// texture's as of its last write and as of this one, alternating).
+Buffer*              gTiles;
+ResourceState        gTilesState;
+uint32_t             gTilesX, gTileCount;
+uint32_t             gFreshFrames; // frames left that write every tile (both histories new)
+uint32_t             gResolves;    // resolves run: picks the flag sets
 uint32_t             gWidth, gHeight;
 bool                 gReady;
 
@@ -95,6 +105,9 @@ void freeTexture()
             removeResource(*t);
         *t = nullptr;
     }
+    if (gTiles)
+        removeResource(gTiles);
+    gTiles = nullptr;
     gWidth = gHeight = 0;
     gAccumFrame = 0;
 }
@@ -128,11 +141,26 @@ void createTexture(uint32_t w, uint32_t h)
         gAccum[i] = makeTexture(w, h, "renderer_rt_accum");
         gAccumZ[i] = makeTexture(w, h, "renderer_rt_accum_z", TinyImageFormat_R32_SFLOAT);
     }
-    if (!gTex || !gHalf || !gAccum[0] || !gAccum[1] || !gAccumZ[0] || !gAccumZ[1])
+    gTilesX = (w + 7) / 8;
+    gTileCount = gTilesX * ((h + 7) / 8);
+    BufferLoadDesc b = {};
+    b.mDesc.mDescriptors = DESCRIPTOR_TYPE_RW_BUFFER;
+    b.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+    b.mDesc.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+    b.mDesc.mSize = (uint64_t)gTileCount * 6 * 4;
+    b.mDesc.mStructStride = 4;
+    b.mDesc.mElementCount = gTileCount * 6;
+    b.mDesc.pName = "renderer_rt_tiles";
+    b.ppBuffer = &gTiles;
+    addResource(&b, nullptr);
+    waitForAllResourceLoads();
+    gTilesState = RESOURCE_STATE_SHADER_RESOURCE;
+    if (!gTex || !gHalf || !gAccum[0] || !gAccum[1] || !gAccumZ[0] || !gAccumZ[1] || !gTiles)
     {
         freeTexture();
         return;
     }
+    gFreshFrames = 2;
     gWidth = w;
     gHeight = h;
 }
@@ -156,15 +184,6 @@ Buffer* makeMapped(uint64_t size, uint32_t stride, DescriptorType type, const ch
     addResource(&d, nullptr);
     waitForAllResourceLoads();
     return b;
-}
-
-void barrier(Cmd* cmd, Texture* t, ResourceState from, ResourceState to)
-{
-    TextureBarrier b = {};
-    b.pTexture = t;
-    b.mCurrentState = from;
-    b.mNewState = to;
-    cmdResourceBarrier(cmd, 0, nullptr, 1, &b, 0, nullptr);
 }
 
 void retire(AccelerationStructure* as, uint64_t frame)
@@ -269,7 +288,7 @@ int load(int reloaded)
         gRay = nullptr;
         return 0;
     }
-    const char* names[kShaders] = { "renderer_rt_trace.comp", "renderer_rt_trace_half.comp", "renderer_rt_upsample.comp", "renderer_rt_temporal.comp" };
+    const char* names[kShaders] = { "renderer_rt_trace.comp", "renderer_rt_resolve.comp" };
     for (uint32_t k = 0; k < kShaders; ++k)
     {
         ShaderLoadDesc sd = {};
@@ -281,26 +300,13 @@ int load(int reloaded)
         desc.mType = PIPELINE_TYPE_COMPUTE;
         desc.mComputeDesc.pShaderProgram = gShader[k];
         desc.pName = "renderer_rt_trace";
-        // The layout array lives in the block that adds the pipeline (Vulkan; on Direct3D 12 it is nothing).
-        if (k == kTemporal)
-        {
-            PIPELINE_LAYOUT_DESC(desc, NULL, SRT_LAYOUT_DESC(TemporalSrt, PerFrame), NULL, NULL);
-            addPipeline(gRenderer, &desc, &gPipe[k]);
-        }
-        else
-        {
-            PIPELINE_LAYOUT_DESC(desc, NULL, SRT_LAYOUT_DESC(RtSrt, PerFrame), NULL, NULL);
-            addPipeline(gRenderer, &desc, &gPipe[k]);
-        }
+        PIPELINE_LAYOUT_DESC(desc, NULL, SRT_LAYOUT_DESC(RtSrt, PerFrame), NULL, NULL);
+        addPipeline(gRenderer, &desc, &gPipe[k]);
         if (!gPipe[k])
             return 1;
     }
     DescriptorSetDesc setDesc = SRT_SET_DESC(RtSrt, PerFrame, gFrames * 2, 0);
     addDescriptorSet(gRenderer, &setDesc, &gSet);
-    DescriptorSetDesc tSetDesc = SRT_SET_DESC(TemporalSrt, PerFrame, gFrames, 0);
-    addDescriptorSet(gRenderer, &tSetDesc, &gTSet);
-    if (!gTSet)
-        return 1;
     for (uint32_t i = 0; i < gFrames; ++i)
         gCb[i] = makeMapped(sizeof(RtData) < 256 ? 256 : (sizeof(RtData) + 255) / 256 * 256, 0, DESCRIPTOR_TYPE_UNIFORM_BUFFER, "renderer_rt_cb");
     gReady = gSet != nullptr;
@@ -331,8 +337,6 @@ void unload()
     }
     if (gSet)
         removeDescriptorSet(gRenderer, gSet);
-    if (gTSet)
-        removeDescriptorSet(gRenderer, gTSet);
     for (uint32_t k = 0; k < kShaders; ++k)
     {
         if (gPipe[k])
@@ -405,12 +409,21 @@ bool rt_prepare(uint64_t address)
     d.counts[3] = F->drawableCount;
     d.params[0] = settings.max_distance < 1 ? 1 : settings.max_distance;
     d.params[1] = 0.05f;
-    d.params[2] = settings.half_resolution ? (settings.full_below < 0 ? 0 : settings.full_below) : 0.0f;
+    d.params[2] = settings.half_resolution ? (settings.full_below < 0 ? 0 : settings.full_below) : 2.0f; // 2: every pixel
     // History only when it was written last frame, by the same camera path (not after a jump of frames).
     d.temporal[0] = settings.history_frames < 1 ? 1.0f : (float)settings.history_frames;
     d.temporal[1] = havePrev && gAccumFrame + 1 == F->frameNumber ? 1.0f : 0.0f;
     d.temporal[2] = settings.brightest < 1 ? 1.0f : settings.brightest;
     d.temporal[3] = settings.half_resolution ? 1.0f : 0.0f;
+    d.tiles[0] = gTilesX;
+    d.tiles[1] = gTileCount;
+    // The sets: [0, 2) "has pixels to trace" by resolve parity, [2, 6) "all zero" by resolve count mod 4 (the history
+    // texture written now was last written two resolves ago). A resolve that doesn't run leaves its flags as they were.
+    d.tiles[2] = gTileCount * (gResolves & 1);
+    d.tiles[3] = gTileCount * ((gResolves + 1) & 1);
+    d.zero[0] = gTileCount * (2 + ((gResolves + 2) & 3));
+    d.zero[1] = gTileCount * (2 + (gResolves & 3));
+    d.zero[2] = gFreshFrames ? 1 : 0;
     memcpy(gCb[F->frameIndex]->pCpuMappedAddress, &d, sizeof d);
 
     F->rtReflection = gAccum[gAccumIndex ^ 1];
@@ -516,9 +529,8 @@ void rt_run(uint64_t address)
     Buffer*        indices = F->indices;
     Texture*       previous = F->previous->pTexture;
     Buffer*        exposure = F->exposure;
-    bool           half = settings.half_resolution && gHalf;
-    Texture*       halfTex = gHalf;
-    DescriptorData p[14] = {};
+    Texture*       motion = F->motion->pTexture;
+    DescriptorData p[22] = {};
     p[0].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gScene);
     p[0].ppAccelerationStructures = &gTlas[fi];
     p[1].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gRt);
@@ -541,75 +553,59 @@ void rt_run(uint64_t address)
     p[9].ppBuffers = &vertices;
     p[10].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gIndices);
     p[10].ppBuffers = &indices;
-    p[12].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gExposure);
-    p[12].ppBuffers = &exposure;
-    p[11].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gOut);
-    p[13].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gHalfIn);
-    p[13].ppTextures = &halfTex; // read only by the upsample
-    if (half)
-    {
-        // A quarter of the pixels traced into gHalf, then every pixel filled from it (mirror-like ones traced).
-        p[11].ppTextures = &gHalf;
-        updateDescriptorSet(gRenderer, fi * 2, gSet, 14, p);
-        p[11].ppTextures = &gTex;
-        updateDescriptorSet(gRenderer, fi * 2 + 1, gSet, 14, p);
-        barrier(cmd, gHalf, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
-        cmdBindPipeline(cmd, gPipe[kTraceHalf]);
-        cmdBindDescriptorSet(cmd, fi * 2, gSet);
-        cmdDispatch(cmd, ((F->width + 1) / 2 + 7) / 8, ((F->height + 1) / 2 + 7) / 8, 1);
-        barrier(cmd, gHalf, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE);
-        barrier(cmd, gTex, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
-        cmdBindPipeline(cmd, gPipe[kUpsample]);
-        cmdBindDescriptorSet(cmd, fi * 2 + 1, gSet);
-        cmdDispatch(cmd, (F->width + 7) / 8, (F->height + 7) / 8, 1);
-        barrier(cmd, gTex, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE);
-    }
-    else
-    {
-        p[11].ppTextures = &gTex;
-        updateDescriptorSet(gRenderer, fi * 2, gSet, 14, p);
-        barrier(cmd, gTex, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
-        cmdBindPipeline(cmd, gPipe[kTraceFull]);
-        cmdBindDescriptorSet(cmd, fi * 2, gSet);
-        cmdDispatch(cmd, (F->width + 7) / 8, (F->height + 7) / 8, 1);
-        barrier(cmd, gTex, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE);
-    }
+    p[11].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gExposure);
+    p[11].ppBuffers = &exposure;
+    p[12].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gHalfIn);
+    p[13].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gFullIn);
+    p[14].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gMotion);
+    p[14].ppTextures = &motion;
+    p[15].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gHistory);
+    p[15].ppTextures = &gAccum[w ^ 1];
+    p[16].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gHistoryZ);
+    p[16].ppTextures = &gAccumZ[w ^ 1];
+    p[17].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gTiles);
+    p[17].ppBuffers = &gTiles;
+    p[18].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gOutHalf);
+    p[18].ppTextures = &gHalf;
+    p[19].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gOutFull);
+    p[19].ppTextures = &gTex;
+    p[20].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gOut);
+    p[20].ppTextures = &gAccum[w];
+    p[21].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gOutZ);
+    p[21].ppTextures = &gAccumZ[w];
+    // The trace reads neither trace (the history stands in, in the state it is in), the resolve reads both.
+    p[12].ppTextures = &gAccum[w ^ 1];
+    p[13].ppTextures = &gAccum[w ^ 1];
+    updateDescriptorSet(gRenderer, fi * 2, gSet, 22, p);
+    p[12].ppTextures = &gHalf;
+    p[13].ppTextures = &gTex;
+    updateDescriptorSet(gRenderer, fi * 2 + 1, gSet, 22, p);
 
-    // The temporal accumulation: gTex and last frame's history into this frame's.
-    Texture*       motion = F->motion->pTexture;
-    DescriptorData t[11] = {};
-    t[0].mIndex = SRT_RES_IDX(TemporalSrt, PerFrame, gRt);
-    t[0].ppBuffers = &gCb[fi];
-    t[1].mIndex = SRT_RES_IDX(TemporalSrt, PerFrame, gDepth);
-    t[1].ppTextures = &F->depth->pTexture;
-    t[2].mIndex = SRT_RES_IDX(TemporalSrt, PerFrame, gSurface);
-    t[2].ppTextures = &F->surface->pTexture;
-    t[3].mIndex = SRT_RES_IDX(TemporalSrt, PerFrame, gMotion);
-    t[3].ppTextures = &motion;
-    t[4].mIndex = SRT_RES_IDX(TemporalSrt, PerFrame, gCurrent);
-    t[4].ppTextures = &gTex;
-    t[5].mIndex = SRT_RES_IDX(TemporalSrt, PerFrame, gHistory);
-    t[5].ppTextures = &gAccum[w ^ 1];
-    t[6].mIndex = SRT_RES_IDX(TemporalSrt, PerFrame, gHistoryZ);
-    t[6].ppTextures = &gAccumZ[w ^ 1];
-    t[7].mIndex = SRT_RES_IDX(TemporalSrt, PerFrame, gExposure);
-    t[7].ppBuffers = &exposure;
-    t[8].mIndex = SRT_RES_IDX(TemporalSrt, PerFrame, gOut);
-    t[8].ppTextures = &gAccum[w];
-    t[9].mIndex = SRT_RES_IDX(TemporalSrt, PerFrame, gOutZ);
-    t[9].ppTextures = &gAccumZ[w];
-    t[10].mIndex = SRT_RES_IDX(TemporalSrt, PerFrame, gHalfIn);
-    t[10].ppTextures = &halfTex;
-    updateDescriptorSet(gRenderer, fi, gTSet, 11, t);
-    TextureBarrier in[2] = { { gAccum[w], RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS },
+    // Every target the two passes write goes to UNORDERED_ACCESS at once; the tile flags stay there.
+    BufferBarrier tb = { gTiles, gTilesState, RESOURCE_STATE_UNORDERED_ACCESS };
+    TextureBarrier in[4] = { { gHalf, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS },
+                             { gTex, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS },
+                             { gAccum[w], RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS },
                              { gAccumZ[w], RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS } };
-    cmdResourceBarrier(cmd, 0, nullptr, 2, in, 0, nullptr);
-    cmdBindPipeline(cmd, gPipe[kTemporal]);
-    cmdBindDescriptorSet(cmd, fi, gTSet);
+    cmdResourceBarrier(cmd, 1, &tb, 4, in, 0, nullptr);
+    gTilesState = RESOURCE_STATE_UNORDERED_ACCESS;
+    cmdBindPipeline(cmd, gPipe[kTrace]); // a thread per 2 x 2 block
+    cmdBindDescriptorSet(cmd, fi * 2, gSet);
+    cmdDispatch(cmd, ((F->width + 1) / 2 + 7) / 8, ((F->height + 1) / 2 + 7) / 8, 1);
+    TextureBarrier mid[2] = { { gHalf, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE },
+                              { gTex, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE } };
+    tb = { gTiles, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_UNORDERED_ACCESS };
+    cmdResourceBarrier(cmd, 1, &tb, 2, mid, 0, nullptr);
+    cmdBindPipeline(cmd, gPipe[kResolve]);
+    cmdBindDescriptorSet(cmd, fi * 2 + 1, gSet);
     cmdDispatch(cmd, (F->width + 7) / 8, (F->height + 7) / 8, 1);
     TextureBarrier out[2] = { { gAccum[w], RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE },
                               { gAccumZ[w], RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE } };
-    cmdResourceBarrier(cmd, 0, nullptr, 2, out, 0, nullptr);
+    tb = { gTiles, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_UNORDERED_ACCESS };
+    cmdResourceBarrier(cmd, 1, &tb, 2, out, 0, nullptr);
+    if (gFreshFrames)
+        gFreshFrames--;
+    gResolves++;
     gAccumIndex = w;
     gAccumFrame = F->frameNumber;
     cmdEndDebugMarker(cmd);

@@ -15,8 +15,12 @@ STRUCT(RtData)
     DATA(float4, skyGround, None);
     DATA(uint4, counts, None);       // x lights, y frame (noise), z flags, w instances
     DATA(float4, params, None);      // x max distance (m), y edge fade (fraction of the screen), z roughness below
-                                     // which pixels are traced at full resolution with half_resolution on
+                                     // which pixels are traced at full resolution (above 1 with half_resolution off)
     DATA(float4, temporal, None);    // x frames of history for rough reflections, y 1 when last frame's history is
                                      // usable, z the brightest a sample may be (exposed luminance),
                                      // w 1 when the half-resolution trace ran
+    DATA(uint4, tiles, None);        // 8 x 8 tiles: x per row, y count; where in gTiles the flags start: z this
+                                     // frame's "has pixels to trace", w next frame's (the resolve clears them)
+    DATA(uint4, zero, None);         // where the "all zero" flags start: x of the history texture written this
+                                     // frame, as of its last write; y as of this one; z 1 to write every tile
 };

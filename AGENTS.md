@@ -83,17 +83,20 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   (`screen_colors`), fully lit with every shadow; elsewhere it is shaded at the hit: emission, the sun and up to
   64 local lights (the core's light buffer now holds the lights outside the view after the visible ones,
   `allLightCount`), at most 8 shadow rays per hit (`shadow_rays`), sky ambient. A miss sees the sky. The forward
-  pass blends it over the probes, fading out over the roughness limit's last third. With `half_resolution` (on),
-  one pixel of each 2x2 block is traced (a different one each frame, for TAA to gather) into a half-size texture,
-  and a full-size upsample fills every pixel from the four nearest samples weighted by distance, depth and normal
-  match; pixels smoother than `full_below` (0.15: mirrors) and pixels no sample matches are traced in the upsample
-  itself, so mirrors are exactly as at full resolution (the upsample also weights by inverse brightness). Then
-  `Shaders/Temporal.comp.fsl` accumulates the reflections over frames (two RGBA16F histories plus R32F view
-  depth, alternating; `rtReflection` is this frame's): history reprojected by the reflection's virtual image
+  pass blends it over the probes, fading out over the roughness limit's last third. Two passes, both
+  `Shaders/Trace.comp.fsl`. The trace runs a thread per 2x2 block, so no lane idles: pixels smoother than `full_below`
+  (0.15: mirrors) are traced at every pixel, so mirrors are exactly as at full resolution, and with `half_resolution`
+  (on) one other pixel of each block (a different one each frame, for TAA to gather) into a half-size texture.
+  Then one full-size resolve fills every other pixel from the four nearest samples, weighted by distance, depth and
+  normal match and inverse brightness (pixels no sample matches are traced there), and in the same pass
+  accumulates the reflections over frames (two RGBA16F histories plus R32F view depth, alternating, depth kept only
+  where alpha > 0; `rtReflection` is this frame's): history reprojected by the reflection's virtual image
   (smooth) or the surface (rough), dropped where the surface's depth doesn't match, clipped to the
   neighbourhood's spread in YCoCg (at half resolution, of the 3x3 traced samples around), blended in
   compressed colour, up to `history_frames` (full from roughness 0.125, 4 on moving things, 1 on mirrors).
-  Without it, 1 spp reflections flickered (fireflies). Every GPU object is freed
+  Without it, 1 spp reflections flickered (fireflies). The trace marks each 8x8 tile holding a pixel below
+  `max_roughness` (`gTiles`, flag sets double-buffered so no thread reads a flag another rewrites); the resolve skips
+  the rest and writes their zeros only when the history there isn't zero already. Every GPU object is freed
   in `unload()` (device-loss recovery unloads modules); nothing GPU-side is in tables.
 - The core calls the others through optional imports with a `RenderFrame*` (as `u64`): `frame.h`, copied
   identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes`, `renderer_ssr`, `renderer_vrs` and `renderer_rt` (`mathx.h` into the
@@ -160,9 +163,9 @@ depth copy for screen reflections (their march, up to `steps` plus 4 depth reads
 glossy pixels with reflections on, and shows in its timing), per re-captured probe 6 scene draws at half its
 resolution plus 6 small passes per mip, sun cascades redrawn, at most `updates_per_frame` local lights redrawn (oldest shadow first), two
 exposure dispatches, with ray-traced reflections (instead of the SSR depth copy and march) one top-level
-rebuild and one trace dispatch (a closest-hit ray per glossy pixel; with half_resolution a quarter of them plus a
-full-size upsample that traces only mirror-like pixels, plus up to 9 shadow rays where
-the hit isn't on screen), one full-screen TAA resolve (when on), one full-screen composite. No per-frame allocation. GPU memory at the defaults:
+rebuild, a trace dispatch (a closest-hit ray per glossy pixel, a quarter of them with half_resolution except
+mirror-like ones, plus up to 9 shadow rays where the hit isn't on screen) and a full-size resolve (upsample and
+temporal accumulation in one; tiles with no glossy pixel cost two reads), one full-screen TAA resolve (when on), one full-screen composite. No per-frame allocation. GPU memory at the defaults:
 HDR + depth at 4x MSAA, sun atlas 4096² D32 (64 MB), local atlas 4096² (64 MB), a screen-size R32F depth copy
 for screen reflections (a quarter of it at half resolution).
 
