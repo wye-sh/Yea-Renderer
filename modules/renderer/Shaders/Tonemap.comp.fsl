@@ -1,0 +1,42 @@
+// After TAA, with sharpening on: each pixel tonemapped once (an 8 x 8 group and its one-pixel border into shared
+// memory), then the composite's contrast-limited sharpen from there, packed into gLdrOut for the composite, which
+// would otherwise tonemap every pixel five times (itself and its four neighbours).
+#include "CompositeData.h.fsl"
+#include "Tonemap.srt.h"
+#include "Tonemap.h.fsl"
+
+#define TILE 10
+GroupShared(float3, gsTile[TILE * TILE]);
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN(SV_GroupID(uint3) gid, SV_GroupThreadID(uint3) tid, SV_GroupIndex(uint) gi)
+{
+    INIT_MAIN;
+    int2  size = int2(gComposite.mode.w & 0xFFFFu, gComposite.mode.w >> 16);
+    int2  last = size - int2(1, 1);
+    int2  origin = int2(gid.xy) * 8 - int2(1, 1);
+    float exposure = gComposite.params.w > 0.0 ? gComposite.params.w : gExposure[1];
+    uint  mode = gComposite.mode.x;
+    for (uint i = gi; i < uint(TILE * TILE); i += 64u)
+    {
+        int2 q = clamp(origin + int2(int(i % uint(TILE)), int(i / uint(TILE))), int2(0, 0), last);
+        gsTile[i] = saturate(tonemap(LoadTex2D(gHdr, NO_SAMPLER, q, 0).rgb * exposure, mode));
+    }
+    GroupMemoryBarrier();
+
+    int2 p = int2(gid.xy) * 8 + int2(tid.xy);
+    if (p.x >= size.x || p.y >= size.y)
+        RETURN();
+    int    t = (int(tid.y) + 1) * TILE + int(tid.x) + 1;
+    float3 c = gsTile[t];
+    float3 l = gsTile[t - 1];
+    float3 r = gsTile[t + 1];
+    float3 u = gsTile[t - TILE];
+    float3 d = gsTile[t + TILE];
+    float3 lo = min(c, min(min(l, r), min(u, d)));
+    float3 hi = max(c, max(max(l, r), max(u, d)));
+    c = clamp(c + (c - (l + r + u + d) * 0.25) * (gComposite.params.x * 2.0), lo, hi);
+    Write2D(gLdrOut, p, packLdr(c));
+    RETURN();
+}

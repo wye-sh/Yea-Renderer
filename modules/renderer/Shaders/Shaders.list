@@ -100,3 +100,7 @@
 #frag renderer_surface.frag
 #include "Surface.frag.fsl"
 #end
+
+#comp renderer_tonemap.comp
+#include "Tonemap.comp.fsl"
+#end

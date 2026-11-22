@@ -8,7 +8,7 @@ from its upstream LICENSE file.
 
 ACES Fitted
 -----------
-What uses it: the ACES_Fitted tonemapper option (modules/renderer/Shaders/Composite.frag.fsl, acesFitted).
+What uses it: the ACES_Fitted tonemapper option (modules/renderer/Shaders/Tonemap.h.fsl, acesFitted).
 Source: https://github.com/TheRealMJP/BakingLab/blob/master/BakingLab/ACES.hlsl
 Licence: MIT (https://github.com/TheRealMJP/BakingLab/blob/master/LICENSE)
 Credit: the ACES fit was originally written by Stephen Hill (@self_shadow), who deserves all credit

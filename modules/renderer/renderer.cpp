@@ -22,6 +22,7 @@
 #include "Shaders/Scene.srt.h"
 #include "Shaders/Composite.srt.h"
 #include "Shaders/Exposure.srt.h"
+#include "Shaders/Tonemap.srt.h"
 #undef SAMPLE_COUNT
 
 using namespace mx;
@@ -99,6 +100,7 @@ RenderTarget*  gGloss;
 Shader*        gSurfaceShader; // the prepass with roughness and normal outputs, for renderer_rt
 Pipeline*      gDepthSurfacePipe[2];
 RenderTarget*  gSurface;
+Texture*       gLdr;          // the tonemap pass's packed output (R32_UINT), with TAA only
 const YeaRaytracing* gRaytracing; // nullptr: no ray queries on this GPU
 // The full forward shaders add PCSS, the debug views and Wireframe's unlit lines; the lean ones, used
 // otherwise, leave them out and so need fewer registers.
@@ -107,7 +109,9 @@ Sampler*       gShadowSampler;
 DescriptorSet *gScenePersistent, *gSceneFrame, *gCompositeSet, *gExposureSet;
 // Scene pipelines in pairs: [0] culls back faces, [1] draws both sides (double-sided materials).
 Pipeline *     gDepthPipe[2], *gForwardPipe[2], *gForwardFullPipe[2], *gForwardDepthPipe[2];
-Pipeline *     gSkyPipe, *gCompositePipe, *gHistogramPipe, *gAdaptPipe;
+Pipeline *     gSkyPipe, *gCompositePipe, *gHistogramPipe, *gAdaptPipe, *gTonemapPipe;
+Shader*        gTonemapShader;
+DescriptorSet* gTonemapSet;
 RenderTarget * gHdr, *gDepth, *gDummyDepth, *gMotion, *gDummyArray, *gDummyColor;
 Texture*       gDummyRates;   // stands in for renderer_vrs's rate copy (R32_UINT)
 Texture*       gTonyLut;      // Tony McMapface's 48^3 table (Assets/tony_mc_mapface.dds) while it is picked and loaded
@@ -453,6 +457,9 @@ void destroyTargets()
     freeTarget(gMotion);
     freeTarget(gGloss);
     freeTarget(gSurface);
+    if (gLdr)
+        removeResource(gLdr);
+    gLdr = nullptr;
     gWidth = gHeight = gSamples = 0;
 }
 
@@ -495,6 +502,20 @@ void createTargets(uint32_t w, uint32_t h, uint32_t samples, bool motion)
             d.pName = "renderer_surface";
             addRenderTarget(gRenderer, &d, &gSurface);
         }
+        TextureDesc t = {};
+        t.mWidth = w;
+        t.mHeight = h;
+        t.mDepth = t.mArraySize = t.mMipLevels = 1;
+        t.mSampleCount = SAMPLE_COUNT_1;
+        t.mFormat = TinyImageFormat_R32_UINT;
+        t.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+        t.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+        t.pName = "renderer_ldr";
+        TextureLoadDesc tl = {};
+        tl.pDesc = &t;
+        tl.ppTexture = &gLdr;
+        addResource(&tl, nullptr);
+        waitForAllResourceLoads();
     }
     gWidth = w;
     gHeight = h;
@@ -654,8 +675,8 @@ void barrierBuf(Cmd* cmd, Buffer* buf, ResourceState from, ResourceState to)
 // (that frame's fence has passed by then, so nothing waits), averaged and logged every 10 s.
 namespace
 {
-enum Timing : uint32_t { kTimeShadows, kTimeProbes, kTimePrepass, kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeVrs, kTimeRt, kTimeForward, kTimeExposure, kTimeTaa, kTimeComposite, kTimeTotal, kTimings };
-const char* const kTimingNames[kTimings] = { "shadows", "probes", "prepass", "culling", "ao", "contact", "ssr", "vrs", "rt", "forward+sky", "exposure", "taa", "composite", "total" };
+enum Timing : uint32_t { kTimeShadows, kTimeProbes, kTimePrepass, kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeVrs, kTimeRt, kTimeForward, kTimeExposure, kTimeTaa, kTimeTonemap, kTimeComposite, kTimeTotal, kTimings };
+const char* const kTimingNames[kTimings] = { "shadows", "probes", "prepass", "culling", "ao", "contact", "ssr", "vrs", "rt", "forward+sky", "exposure", "taa", "tonemap", "composite", "total" };
 QueryPool*        gTimePool[kMaxFrames];
 uint32_t          gTimeUsed[kMaxFrames]; // bits: what that frame recorded
 double            gTimeTicks;            // per second
@@ -852,7 +873,8 @@ int load(int reloaded)
         ok = ok && gCompositeShader[i] && gHistogramShader[i];
     }
     gAdaptShader = loadShader(nullptr, nullptr, "renderer_adapt.comp");
-    if (!ok || !gAdaptShader)
+    gTonemapShader = loadShader(nullptr, nullptr, "renderer_tonemap.comp");
+    if (!ok || !gAdaptShader || !gTonemapShader)
     {
         host->log(2, "renderer: shaders missing");
         return 1;
@@ -874,6 +896,8 @@ int load(int reloaded)
     addDescriptorSet(gRenderer, &compositeDesc, &gCompositeSet);
     DescriptorSetDesc exposureDesc = SRT_SET_DESC(ExposureSrt, PerFrame, gFrames, 0);
     addDescriptorSet(gRenderer, &exposureDesc, &gExposureSet);
+    DescriptorSetDesc tonemapDesc = SRT_SET_DESC(TonemapSrt, PerFrame, gFrames, 0);
+    addDescriptorSet(gRenderer, &tonemapDesc, &gTonemapSet);
 
     const ResourceMemoryUsage cpu = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
     const ResourceState       sr = RESOURCE_STATE_SHADER_RESOURCE;
@@ -948,7 +972,7 @@ int load(int reloaded)
     // Every buffer and texture made above, before anything uses them: a GPU or driver that refuses one stops the
     // module cleanly instead of crashing on it later.
     bool made = gDfg && gExposure && gHistogram && gDummyU32 && gDummyViews && gDummyProbes && gDummyDepth && gDummyColor &&
-                gDummyRates && gDummyArray && gScenePersistent && gSceneFrame && gCompositeSet && gExposureSet && gShadowSampler;
+                gDummyRates && gDummyArray && gScenePersistent && gSceneFrame && gCompositeSet && gExposureSet && gTonemapSet && gShadowSampler;
     for (uint32_t i = 0; i < gFrames; ++i)
         made = made && gFrameCb[i] && gCompositeCb[i] && gExposureCb[i] && gInstanceBuf[i] && gMaterialBuf[i] && gLightBuf[i] &&
                gStreamBuf[i] && gPrevBuf[i] && gFrameCb[i]->pCpuMappedAddress && gCompositeCb[i]->pCpuMappedAddress &&
@@ -973,6 +997,12 @@ int load(int reloaded)
     cdesc.mComputeDesc.pShaderProgram = gAdaptShader;
     cdesc.pName = "renderer_adapt";
     addPipeline(gRenderer, &cdesc, &gAdaptPipe);
+    PipelineDesc tdesc = {};
+    tdesc.mType = PIPELINE_TYPE_COMPUTE;
+    PIPELINE_LAYOUT_DESC(tdesc, NULL, SRT_LAYOUT_DESC(TonemapSrt, PerFrame), NULL, NULL);
+    tdesc.mComputeDesc.pShaderProgram = gTonemapShader;
+    tdesc.pName = "renderer_tonemap";
+    addPipeline(gRenderer, &tdesc, &gTonemapPipe);
 
     gInfo = new InstanceInfo[Instances.capacity()];
     gInstCpu = new RenderGpuInstance[Instances.capacity()];
@@ -1003,6 +1033,7 @@ void unload()
     destroyScenePipelines();
     freePipeline(gCompositePipe);
     freePipeline(gAdaptPipe);
+    freePipeline(gTonemapPipe);
     destroyTargets();
     freeTarget(gDummyDepth);
     freeTarget(gDummyArray);
@@ -1033,7 +1064,7 @@ void unload()
     freeBuffer(gHistogram);
     freeBuffer(gVertexBuf);
     freeBuffer(gIndexBuf);
-    DescriptorSet** sets[4] = { &gScenePersistent, &gSceneFrame, &gCompositeSet, &gExposureSet };
+    DescriptorSet** sets[5] = { &gScenePersistent, &gSceneFrame, &gCompositeSet, &gExposureSet, &gTonemapSet };
     for (DescriptorSet** set : sets)
         if (*set)
             removeDescriptorSet(gRenderer, *set), *set = nullptr;
@@ -1041,7 +1072,7 @@ void unload()
         removeSampler(gRenderer, gShadowSampler), gShadowSampler = nullptr;
     // Each one let go and forgotten, so a second unload (after a load that gave up) frees nothing twice.
     Shader** shaders[] = { &gForwardDepthShader, &gForwardShader, &gSkyShader, &gAdaptShader, &gMotionDepthShader, &gMotionShader,
-                           &gSkyMotionShader, &gForwardFullShader, &gMotionFullShader, &gGlossShader, &gSurfaceShader };
+                           &gSkyMotionShader, &gForwardFullShader, &gMotionFullShader, &gGlossShader, &gSurfaceShader, &gTonemapShader };
     for (Shader** s : shaders)
         if (*s)
             removeShader(gRenderer, *s), *s = nullptr;
@@ -1603,12 +1634,12 @@ void draw(uint32_t pass, const YeaFrame* yf)
     const bool rawDebug = (ao && F.aoDebug) || (contact && F.contactDebug);
     if (rawDebug && !viewMode)
     {
-        composite.mode[0] = 3;
+        composite.mode[0] = 4; // the tonemapper choice's None: no tonemapping
         composite.params[3] = 1.0f;
     }
     if (viewMode)
     {
-        composite.mode[0] = 3; // no tonemapping
+        composite.mode[0] = 4; // the tonemapper choice's None: no tonemapping
         if (viewMode & YEA_VIEW_OVERDRAW)
             composite.mode[1] = 0; // Overdraw's counts go out as they are, as F1 writes its own
         composite.params[3] = 1.0f; // exposure 1, no dither
@@ -1616,6 +1647,10 @@ void draw(uint32_t pass, const YeaFrame* yf)
     // The light shadow atlas in the top right corner (renderer_shadows' show_atlas).
     composite.rates[0] = vrs && F.vrsDebug ? 1u : 0u;
     composite.rates[1] = F.rateTile ? F.rateTile : 16u;
+    // With TAA's sharpening, the tonemap pass tonemaps each pixel once and sharpens, instead of the composite
+    // tonemapping every pixel five times (MSAA and no sharpening tonemap once per sample there anyway).
+    const bool ldr = taa && composite.params[0] > 0.0f && gLdr && gTonemapPipe;
+    composite.rates[2] = ldr ? 1u : 0u;
     composite.params[1] = shadows && (F.showCascades & 2) ? floorf(mx::minf(h * 0.5f, w * 0.4f)) : 0.0f;
     composite.params[2] = shadows && F.localTexel > 0 ? 1.0f / F.localTexel : 0.0f;
     memcpy(gCompositeCb[fi]->pCpuMappedAddress, &composite, sizeof composite);
@@ -1688,7 +1723,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         p[17].ppTextures = &rtTex;
         updateDescriptorSet(gRenderer, fi, gSceneFrame, 18, p);
 
-        DescriptorData c[6] = {};
+        DescriptorData c[7] = {};
         c[0].mIndex = SRT_RES_IDX(CompositeSrt, PerFrame, gComposite);
         c[0].ppBuffers = &gCompositeCb[fi];
         c[1].mIndex = SRT_RES_IDX(CompositeSrt, PerFrame, gHdr);
@@ -1703,7 +1738,25 @@ void draw(uint32_t pass, const YeaFrame* yf)
         c[5].mIndex = SRT_RES_IDX(CompositeSrt, PerFrame, gTony);
         Texture* tonyTex = gTonyLut ? gTonyLut : gDummyColor->pTexture;
         c[5].ppTextures = &tonyTex;
-        updateDescriptorSet(gRenderer, fi, gCompositeSet, 6, c);
+        Texture* ldrTex = ldr ? gLdr : gDummyRates;
+        c[6].mIndex = SRT_RES_IDX(CompositeSrt, PerFrame, gLdr);
+        c[6].ppTextures = &ldrTex;
+        updateDescriptorSet(gRenderer, fi, gCompositeSet, 7, c);
+        if (ldr)
+        {
+            DescriptorData t[5] = {};
+            t[0].mIndex = SRT_RES_IDX(TonemapSrt, PerFrame, gComposite);
+            t[0].ppBuffers = &gCompositeCb[fi];
+            t[1].mIndex = SRT_RES_IDX(TonemapSrt, PerFrame, gHdr);
+            t[1].ppTextures = &F.resolved->pTexture;
+            t[2].mIndex = SRT_RES_IDX(TonemapSrt, PerFrame, gExposure);
+            t[2].ppBuffers = &gExposure;
+            t[3].mIndex = SRT_RES_IDX(TonemapSrt, PerFrame, gTony);
+            t[3].ppTextures = &tonyTex;
+            t[4].mIndex = SRT_RES_IDX(TonemapSrt, PerFrame, gLdrOut);
+            t[4].ppTextures = &gLdr;
+            updateDescriptorSet(gRenderer, fi, gTonemapSet, 5, t);
+        }
 
         DescriptorData e[4] = {};
         e[0].mIndex = SRT_RES_IDX(ExposureSrt, PerFrame, gExposureData);
@@ -1885,6 +1938,19 @@ void draw(uint32_t pass, const YeaFrame* yf)
         gDepthState = RESOURCE_STATE_SHADER_RESOURCE;
         renderer_taa::taa_resolve((uint64_t)(uintptr_t)&F);
         timeEnd(cmd, fi, kTimeTaa);
+    }
+    if (ldr)
+    {
+        if (timed)
+            timeBegin(cmd, fi, kTimeTonemap);
+        TextureBarrier b = { gLdr, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS };
+        cmdResourceBarrier(cmd, 0, nullptr, 1, &b, 0, nullptr);
+        cmdBindPipeline(cmd, gTonemapPipe);
+        cmdBindDescriptorSet(cmd, fi, gTonemapSet);
+        cmdDispatch(cmd, (w + 7) / 8, (h + 7) / 8, 1);
+        b = { gLdr, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE };
+        cmdResourceBarrier(cmd, 0, nullptr, 1, &b, 0, nullptr);
+        timeEnd(cmd, fi, kTimeTonemap);
     }
     timeEnd(cmd, fi, kTimeTotal);
     for (uint32_t t = 0; t < kTimings; ++t)

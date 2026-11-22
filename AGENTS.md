@@ -26,7 +26,8 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   at one sample (TAA replaces `msaa`) with a motion vector target (RG16F, from last frame's instance rows and
   camera); the resolve (compute, `Shaders/Taa.comp.fsl`: each 8x8 group reads its pixels and a one-pixel border
   into shared memory once) reprojects two ping-pong RGBA16F histories (5-tap Catmull-Rom), clips them to the 3x3
-  neighbourhood's spread in YCoCg, blends. Sharpening is in the core's composite, after TAA, never in history.
+  neighbourhood's spread in YCoCg, blends. Sharpening is the core's, after TAA, never in history: its tonemap pass (`Shaders/Tonemap.comp.fsl`) tonemaps each
+  pixel once and sharpens into a packed R32_UINT the composite reads (tonemappers in `Shaders/Tonemap.h.fsl`).
   Switch off: the core renders with `msaa` as before.
 - `renderer_ao`: GTAO (Jimenez 2016) from the prepass depth alone (normals rebuilt from depth), then
   `denoise` depth-aware 3x3 blurs, into a full-size RG16F texture (x visibility; every pass carries the view depth
@@ -128,7 +129,7 @@ materials, instances and lights once (when `instance_count()` is 0), then move w
 ## Knobs
 
 `renderer`: exposure_ev, auto_exposure, manual_ev100, adapt_speed, tonemapper (a choice: Khronos_PBR_Neutral,
-AgX (our own constants, in Composite.frag.fsl), Hable_Filmic, Reinhard, None, ACES_Fitted (Hill's fit, MIT; its code
+AgX (our own constants, in Tonemap.h.fsl), Hable_Filmic, Reinhard, None, ACES_Fitted (Hill's fit, MIT; its code
 compiles only while the shader's TONEMAPPER_ACES_FITTED is 1, which a build baking another tonemapper sets to 0),
 Tony_McMapface (its table, Assets/tony_mc_mapface.dds, is read only while it is picked; Khronos PBR Neutral stands in
 when missing); the shader's mode is its index, so new options go at the end; both licences are tied to their options), msaa (1/2/4/8), specular_aa, sky/horizon/ground colours, sky_luminance, ambient,

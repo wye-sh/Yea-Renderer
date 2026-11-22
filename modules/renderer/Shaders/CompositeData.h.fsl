@@ -1,0 +1,10 @@
+// The composite's constants, shared by the composite and the tonemap pass.
+STRUCT(CompositeData)
+{
+    DATA(uint4, mode, None);    // x tonemapper, y encode sRGB, z samples, w width | height << 16
+    DATA(float4, params, None); // x sharpen 0..1, y light shadow atlas inset in pixels (0 off), z its size in texels,
+                                // w a fixed exposure without dither (F1's view modes), 0 off
+    DATA(uint4, rates, None);   // x Show Rates (renderer_vrs), y its tile in pixels, z 1: gLdr holds the tonemapped,
+                                // sharpened image (the tonemap pass ran)
+};
+
