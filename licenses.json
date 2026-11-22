@@ -94,5 +94,27 @@
         ]
       }
     ]
+  },
+  {
+    "name": "AMD FidelityFX SDK: FSR 3.1 upscaler and Vulkan backend (source)",
+    "version": "1.1.4 (FidelityFX Super Resolution 3.1)",
+    "license": "MIT",
+    "source": "https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v1.1.4/sdk",
+    "licenseUrl": "https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/blob/v1.1.4/LICENSE.txt",
+    "usedBy": [
+      "modules/renderer_upscale/third_party/ffx_vk/"
+    ],
+    "platforms": [
+      "linux"
+    ],
+    "notice": "Copyright (C) 2024 Advanced Micro Devices, Inc. Modified for the Renderer: include paths; include/FidelityFX/host/ffx_types.h (context size for a 4-byte wchar_t), include/FidelityFX/gpu/fsr3upscaler/ffx_fsr3upscaler_callbacks_glsl.h (luma history format) and src/backends/vk/ffx_vk.cpp (name conversion, scratch alignment, memory type choice), each marked in place; generated/ holds AMD's shaders compiled to SPIR-V.",
+    "when": [
+      {
+        "setting": "renderer_upscale.upscaler",
+        "is": [
+          "FSR"
+        ]
+      }
+    ]
   }
 ]

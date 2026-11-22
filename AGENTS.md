@@ -115,12 +115,21 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   frees its history and stands aside (its `sharpen` still applies, after the upscale). Not upscaling (native size, the
   default), it returns false and the frame is exactly as without it: no pass, copy or target added. Shadow tiles size
   by `displayHeight`. renderer_vrs reads last frame's image through `_up` shader variants only while upscaled.
-  Upscalers: FSR (Windows, Direct3D 12): AMD's signed FSR SDK 2.4 DLLs in `Assets/windows/` (found by bare name; the loader finds the upscaler
-  DLL beside itself), loaded only while FSR is picked, through AMD's MIT API headers (`third_party/ffx`); FSR 4 on
-  Radeon RX 6000 and later, FSR 3.1 elsewhere. Its jitter is AMD's (Halton 2,3 over 8 x ratio² phases), the render size
-  the vendors' ratio per quality mode; the core's exposure is copied into a 1x1 texture for it (one tiny dispatch), its
-  own sharpening is off. Where FSR can't run (Linux so far, or its DLLs or context refused, logged once), TAA. DLSS
-  comes through Yea's host service when it lands.
+  Upscalers (`upscaler`: TAA, FSR): FSR where it can run; where it can't or stops (logged once, with the reason), TAA.
+  FSR on Windows (Direct3D 12): AMD's signed FSR SDK 2.4 DLLs in `Assets/windows/` (a Yea from 133 puts them at the
+  top of Assets/), loaded only while picked, upscaler first, each by its full path with backslashes and
+  `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS` (Assets/ isn't on Windows' DLL search path, and
+  the loader opens the upscaler by bare name; never SetDllDirectory, which is process-wide), through AMD's MIT API
+  headers (`third_party/ffx`); FSR 4 on Radeon RX 6000 and later, FSR 3.1 elsewhere. FSR on Linux (Vulkan): AMD's
+  FSR 3.1 upscaler and Vulkan backend compiled in from AMD's MIT source (`third_party/ffx_vk`, SDK 1.1.4, built by
+  `fsr_vk.cpp`; its few edits are marked `Modified for Yea's Renderer` in place). Its shaders are headers in
+  `third_party/ffx_vk/generated`, made by `fsr_vk_shaders.py` (glslangValidator; run it after changing AMD's GLSL).
+  Its 16-bit and wave64 shaders run only where `yea::device()` says the device has them on. Its working memory is
+  allocated in this module's own `update()`, never in `upscale_prepare`. Jitter: Halton 2,3 over 8 x ratio² phases;
+  the render size is the vendors' ratio per quality mode; the core's exposure is copied into a 1x1 texture (one tiny
+  dispatch); FSR's own sharpening is off. After it records, The Forge's bound state is forgotten so its next binds
+  are made in full. Lines said from `upscale_prepare` wait for this module's `update()`, so they are filed under
+  renderer_upscale: which upscaler is picked and runs, its sizes, and why FSR can't run.
 - The core calls the others through optional imports with a `RenderFrame*` (as `u64`): `frame.h`, copied
   identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes`, `renderer_ssr`, `renderer_vrs`, `renderer_rt` and `renderer_upscale` (`mathx.h` into the
   first three). Change all copies together and raise `RENDER_FRAME_VERSION`. `upscale_prepare`, then `taa_prepare` run first,
