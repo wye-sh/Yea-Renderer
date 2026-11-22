@@ -1,0 +1,124 @@
+// Exposure and tonemapping per MSAA sample, then the average: edges against bright lights stay
+// smooth. Tonemappers: Khronos PBR Neutral (from its specification), Hable's filmic curve,
+// Reinhard on luminance, or none. After TAA, an optional contrast-limited sharpen of the tonemapped
+// image (never fed back into TAA's history).
+STRUCT(CompositeData)
+{
+    DATA(uint4, mode, None);    // x tonemapper, y encode sRGB, z samples, w width | height << 16
+    DATA(float4, params, None); // x sharpen 0..1, y light shadow atlas inset in pixels (0 off), z its size in texels,
+                                // w a fixed exposure without dither (F1's view modes), 0 off
+};
+
+#include "Composite.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float2, UV, TEXCOORD0);
+};
+
+float3 pbrNeutral(float3 color)
+{
+    float startCompression = 0.8 - 0.04;
+    float desaturation = 0.15;
+    float x = min(color.r, min(color.g, color.b));
+    float offset = x < 0.08 ? x - 6.25 * x * x : 0.04;
+    color -= float3(offset, offset, offset);
+    float peak = max(color.r, max(color.g, color.b));
+    if (peak < startCompression)
+        return color;
+    float d = 1.0 - startCompression;
+    float newPeak = 1.0 - d * d / (peak + d - startCompression);
+    color *= newPeak / peak;
+    float g = 1.0 - 1.0 / (desaturation * (peak - newPeak) + 1.0);
+    return lerp(color, float3(newPeak, newPeak, newPeak), g);
+}
+
+float3 hableCurve(float3 x)
+{
+    float A = 0.15;
+    float B = 0.50;
+    float C = 0.10;
+    float D = 0.20;
+    float E = 0.02;
+    float F = 0.30;
+    return ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F;
+}
+
+float3 tonemap(float3 c, uint mode)
+{
+    c = max(c, float3(0.0, 0.0, 0.0));
+    if (mode == 0u)
+        return pbrNeutral(c);
+    if (mode == 1u)
+        return hableCurve(c * 2.0) / hableCurve(float3(11.2, 11.2, 11.2));
+    if (mode == 2u)
+    {
+        float l = dot(c, float3(0.2126, 0.7152, 0.0722));
+        float w2 = 16.0;
+        float t = (1.0 + l / w2) / (1.0 + l);
+        return c * t;
+    }
+    return c;
+}
+
+float3 encodeSrgb(float3 c)
+{
+    c = saturate(c);
+    float3 lo = c * 12.92;
+    float3 hi = 1.055 * pow(c, float3(1.0 / 2.4, 1.0 / 2.4, 1.0 / 2.4)) - 0.055;
+    return float3(c.r <= 0.0031308 ? lo.r : hi.r, c.g <= 0.0031308 ? lo.g : hi.g, c.b <= 0.0031308 ? lo.b : hi.b);
+}
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN(VSOutput In)
+{
+    INIT_MAIN;
+    int2  p = int2(In.Position.xy);
+    float exposure = gComposite.params.w > 0.0 ? gComposite.params.w : gExposure[1];
+    uint  mode = gComposite.mode.x;
+    float3 c = float3(0.0, 0.0, 0.0);
+#if SAMPLE_COUNT > 1
+    for (int s = 0; s < SAMPLE_COUNT; ++s)
+        c += saturate(tonemap(LoadTex2DMS(gHdr, NO_SAMPLER, p, s).rgb * exposure, mode));
+    c *= 1.0 / float(SAMPLE_COUNT);
+#else
+    c = saturate(tonemap(LoadTex2D(gHdr, NO_SAMPLER, p, 0).rgb * exposure, mode));
+    float sharpen = gComposite.params.x;
+    if (sharpen > 0.0)
+    {
+        int2   last = int2(gComposite.mode.w & 0xFFFFu, gComposite.mode.w >> 16) - int2(1, 1);
+        float3 l = saturate(tonemap(LoadTex2D(gHdr, NO_SAMPLER, int2(max(p.x - 1, 0), p.y), 0).rgb * exposure, mode));
+        float3 r = saturate(tonemap(LoadTex2D(gHdr, NO_SAMPLER, int2(min(p.x + 1, last.x), p.y), 0).rgb * exposure, mode));
+        float3 u = saturate(tonemap(LoadTex2D(gHdr, NO_SAMPLER, int2(p.x, max(p.y - 1, 0)), 0).rgb * exposure, mode));
+        float3 d = saturate(tonemap(LoadTex2D(gHdr, NO_SAMPLER, int2(p.x, min(p.y + 1, last.y)), 0).rgb * exposure, mode));
+        float3 lo = min(c, min(min(l, r), min(u, d)));
+        float3 hi = max(c, max(max(l, r), max(u, d)));
+        c = clamp(c + (c - (l + r + u + d) * 0.25) * (sharpen * 2.0), lo, hi);
+    }
+#endif
+    // Debug: the light shadow atlas, near casters bright, empty tiles black, a line between tiles.
+    float inset = gComposite.params.y;
+    if (inset > 0.0)
+    {
+        float2 q = (In.Position.xy - float2(float(gComposite.mode.w & 0xFFFFu) - inset - 8.0, 8.0)) / inset;
+        if (q.x >= 0.0 && q.y >= 0.0 && q.x < 1.0 && q.y < 1.0)
+        {
+            float d = LoadTex2D(gShadowAtlas, NO_SAMPLER, int2(q * gComposite.params.z), 0).r;
+            float v = pow(saturate(1.0 - d), 0.25);
+            c = float3(v, v, v);
+            float2 t = frac(q * 16.0) * (inset / 16.0);
+            if (t.x < 1.0 || t.y < 1.0)
+                c = float3(0.6, 0.45, 0.1);
+        }
+    }
+    // Dither by half a step of 8 bits, so smooth gradients don't band.
+    float n = frac(52.9829189 * frac(dot(In.Position.xy, float2(0.06711056, 0.00583715))));
+    if (gComposite.params.w > 0.0)
+        n = 0.5;
+    if (gComposite.mode.y != 0u)
+        c = encodeSrgb(c) + (n - 0.5) / 255.0;
+    else
+        c = c + (n - 0.5) / 255.0 * (c * 2.0 + 0.02);
+    RETURN(float4(c, 1.0));
+}

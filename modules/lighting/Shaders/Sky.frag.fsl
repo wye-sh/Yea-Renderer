@@ -1,0 +1,51 @@
+// The sky behind everything (drawn where the depth is still clear), with the sun's disk.
+#include "Common.h.fsl"
+#include "Scene.srt.h"
+#include "Lighting.h.fsl"
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float2, UV, TEXCOORD0);
+};
+
+#ifdef MOTION
+STRUCT(PSOutput)
+{
+    DATA(float4, Color, SV_Target0);
+    DATA(float2, Motion, SV_Target1);
+};
+#endif
+
+ROOT_SIGNATURE(DefaultRootSignature)
+#ifdef MOTION
+PSOutput PS_MAIN(VSOutput In)
+#else
+float4 PS_MAIN(VSOutput In)
+#endif
+{
+    INIT_MAIN;
+    float2 ndc = float2(In.UV.x * 2.0 - 1.0, 1.0 - In.UV.y * 2.0);
+    float3 d = normalize(gFrame.view[0].xyz * (ndc.x / gFrame.proj.x) + gFrame.view[1].xyz * (ndc.y / gFrame.proj.y) + gFrame.view[2].xyz);
+    float3 color = skyRadiance(d);
+    if (gFrame.counts.y > 0u && gFrame.misc.z < 1.0)
+    {
+        // The disk's radiance is the sun's illuminance over its solid angle.
+        float cosDisk = gFrame.misc.z;
+        float c = dot(d, gFrame.sunDir[0].xyz);
+        float edge = smoothstep(cosDisk - (1.0 - cosDisk) * 0.3, cosDisk, c);
+        color += gFrame.sunColor[0].rgb * (edge / (2.0 * PI * (1.0 - cosDisk)));
+    }
+#ifdef MOTION
+    // At infinity only the camera's turning moves the sky.
+    float4 dir = float4(d, 0.0);
+    float4 now = float4(dot(gFrame.viewProjNoJitter[0], dir), dot(gFrame.viewProjNoJitter[1], dir), 0.0, dot(gFrame.viewProjNoJitter[3], dir));
+    float4 before = float4(dot(gFrame.prevViewProj[0], dir), dot(gFrame.prevViewProj[1], dir), 0.0, dot(gFrame.prevViewProj[3], dir));
+    PSOutput Out;
+    Out.Color = float4(color, 1.0);
+    Out.Motion = (now.xy / max(now.w, 1e-6) - before.xy / max(before.w, 1e-6)) * float2(0.5, -0.5);
+    RETURN(Out);
+#else
+    RETURN(float4(color, 1.0));
+#endif
+}

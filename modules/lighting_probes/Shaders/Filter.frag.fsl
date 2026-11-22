@@ -1,0 +1,96 @@
+// DOWNSAMPLE: one cube face at half size from the level above (bilinear at the shared corner of four
+// texels: their average). Else the prefilter: one mip of a probe's octahedral image, the GGX lobe of that
+// mip's roughness (N = V = R) importance-sampled from the capture level of the same size.
+STRUCT(PassData)
+{
+    DATA(uint4, info, None);    // x face (downsample), z mip
+    DATA(float4, params, None); // x roughness, y GGX alpha, z samples
+};
+
+#include "Filter.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float2, UV, TEXCOORD0);
+};
+
+#ifdef DOWNSAMPLE
+// Cube faces +X -X +Y -Y +Z -Z; uv from the top left.
+float3 faceDir(uint face, float2 uv)
+{
+    float2 t = uv * 2.0 - 1.0;
+    float3 f = float3(0.0, 0.0, 1.0);
+    float3 r = float3(1.0, 0.0, 0.0);
+    float3 u = float3(0.0, 1.0, 0.0);
+    if (face == 0u) { f = float3(1.0, 0.0, 0.0); r = float3(0.0, 0.0, -1.0); }
+    else if (face == 1u) { f = float3(-1.0, 0.0, 0.0); r = float3(0.0, 0.0, 1.0); }
+    else if (face == 2u) { f = float3(0.0, 1.0, 0.0); u = float3(0.0, 0.0, -1.0); }
+    else if (face == 3u) { f = float3(0.0, -1.0, 0.0); u = float3(0.0, 0.0, 1.0); }
+    else if (face == 5u) { f = float3(0.0, 0.0, -1.0); r = float3(-1.0, 0.0, 0.0); }
+    return normalize(f + r * t.x - u * t.y);
+}
+#else
+float3 octDecode(float2 uv)
+{
+    float2 p = uv * 2.0 - 1.0;
+    float3 d = float3(p.x, 1.0 - abs(p.x) - abs(p.y), p.y);
+    if (d.y < 0.0)
+    {
+        float2 q = (float2(1.0, 1.0) - abs(d.zx)) * float2(d.x >= 0.0 ? 1.0 : -1.0, d.z >= 0.0 ? 1.0 : -1.0);
+        d.x = q.x;
+        d.z = q.y;
+    }
+    return normalize(d);
+}
+
+float radicalInverse(uint i)
+{
+    float r = 0.0;
+    float f = 0.5;
+    for (uint b = 0u; b < 10u; ++b)
+    {
+        if ((i & (1u << b)) != 0u)
+            r += f;
+        f *= 0.5;
+    }
+    return r;
+}
+#endif
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN(VSOutput In)
+{
+    INIT_MAIN;
+#ifdef DOWNSAMPLE
+    RETURN(SampleLvlTexCube(gSource, gSamplerBilinearClamp, faceDir(gPass.info.x, In.UV), 0.0));
+#else
+    float3 N = octDecode(In.UV);
+    if (gPass.info.z == 0u)
+        RETURN(SampleLvlTexCube(gSource, gSamplerBilinearClamp, N, 0.0));
+    float  a = gPass.params.y;
+    uint   n = uint(gPass.params.z);
+    float3 helper = abs(N.y) < 0.99 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+    float3 T = normalize(cross(helper, N));
+    float3 B = cross(N, T);
+    float4 sum = float4(0.0, 0.0, 0.0, 0.0);
+    float  total = 0.0;
+    for (uint i = 0u; i < n; ++i)
+    {
+        float  u = (float(i) + 0.5) / float(n);
+        float  v = radicalInverse(i);
+        float  phi = 2.0 * 3.14159265 * u;
+        float  cosT = sqrt((1.0 - v) / (1.0 + (a * a - 1.0) * v));
+        float  sinT = sqrt(max(1.0 - cosT * cosT, 0.0));
+        float3 H = T * (sinT * cos(phi)) + B * (sinT * sin(phi)) + N * cosT;
+        float3 L = H * (2.0 * dot(N, H)) - N;
+        float  NoL = dot(N, L);
+        if (NoL > 0.0)
+        {
+            sum += SampleLvlTexCube(gSource, gSamplerBilinearClamp, L, 0.0) * NoL;
+            total += NoL;
+        }
+    }
+    RETURN(sum / max(total, 1e-4));
+#endif
+}

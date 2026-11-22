@@ -1,0 +1,48 @@
+// Diffuse-only shading for reflections: sky ambient, the sun (no shadow), the nearest local lights and
+// emission. Metals stand in with their colour. Alpha 1 marks covered texels; the sky stays live in the
+// forward pass, behind whatever a < 1 leaves.
+#include "CaptureCommon.h.fsl"
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float3, WorldPos, TEXCOORD0);
+    DATA(float3, Normal, TEXCOORD1);
+    DATA(FLAT(uint), Material, TEXCOORD2);
+    DATA(FLAT(uint), View, TEXCOORD3);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN(VSOutput In)
+{
+    INIT_MAIN;
+    MaterialData m = gMaterials[In.Material];
+    float3 P = In.WorldPos;
+    float3 N = normalize(In.Normal);
+    if (dot(N, gViews[In.View].eye.xyz - P) < 0.0)
+        N = -N;
+    float3 diffuse = m.albedoRough.rgb * (1.0 - 0.5 * saturate(m.params.x));
+    float3 up = lerp(gCapture.skyHorizon.rgb, gCapture.skyZenith.rgb, 0.6);
+    float3 down = lerp(gCapture.skyHorizon.rgb, gCapture.skyGround.rgb, 0.85);
+    float3 c = lerp(down, up, N.y * 0.5 + 0.5) * gCapture.skyGround.w * diffuse;
+    float3 light = gCapture.sunColor.rgb * saturate(dot(N, gCapture.sunDir.xyz)) * gCapture.sunDir.w;
+    for (uint i = 0u; i < gCapture.counts.x; ++i)
+    {
+        LightData l = gLights[i];
+        float3 toLight = l.pos.xyz - P;
+        float  d2 = dot(toLight, toLight);
+        float  window = saturate(1.0 - d2 * d2 * l.params.z * l.params.z);
+        if (window <= 0.0)
+            continue;
+        float3 L = toLight * rsqrt(max(d2, 1e-8));
+        float  e = window * window / max(d2, 1e-4);
+        if (l.color.w > 1.5)
+        {
+            float cone = saturate(dot(-L, l.dir.xyz) * l.dir.w + l.params.x);
+            e *= cone * cone;
+        }
+        light += l.color.rgb * (e * saturate(dot(N, L)));
+    }
+    c += diffuse * (1.0 / 3.14159265) * light + m.emissive.rgb;
+    RETURN(float4(c, 1.0));
+}

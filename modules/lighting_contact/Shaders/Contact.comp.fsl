@@ -1,0 +1,83 @@
+// Screen-space contact shadows for the sun: from each pixel's view position, `steps` steps towards
+// the sun over `length` metres, each projected to the screen and compared with the depth there. A
+// sample behind the surface seen there (by more than a depth-scaled bias, less than `thickness`) is
+// in shadow. Catches the small and thin shadows the cascades are too coarse for.
+STRUCT(ContactData)
+{
+    DATA(float4, proj, None);   // x P00, y P11, z near, w length (m)
+    DATA(float4, light, None);  // xyz towards the sun in view space, w thickness (m)
+    DATA(float4, screen, None); // xy size, zw jitter (px)
+    DATA(float4, params, None); // x intensity, y max distance, z 1 / fade range
+    DATA(uint4, counts, None);  // x steps, y frame (noise)
+};
+
+#include "Contact.srt.h"
+
+#if SAMPLE_COUNT > 1
+#define DEPTH_AT(q) LoadTex2DMS(gDepth, NO_SAMPLER, q, 0).r
+#else
+#define DEPTH_AT(q) LoadTex2D(gDepth, NO_SAMPLER, q, 0).r
+#endif
+
+float viewDepth(float d) { return gContact.proj.z / max(d, 1e-7); } // reversed-Z, infinite far
+
+float3 viewPos(float2 px, float d)
+{
+    float  z = viewDepth(d);
+    float2 u = px - gContact.screen.zw; // undo the TAA jitter the depth was drawn with
+    float2 ndc = float2(u.x / gContact.screen.x * 2.0 - 1.0, 1.0 - u.y / gContact.screen.y * 2.0);
+    return float3(ndc.x * z / gContact.proj.x, ndc.y * z / gContact.proj.y, z);
+}
+
+float2 toPixel(float3 v)
+{
+    float2 ndc = v.xy * gContact.proj.xy / v.z;
+    return float2((ndc.x * 0.5 + 0.5) * gContact.screen.x, (0.5 - ndc.y * 0.5) * gContact.screen.y) + gContact.screen.zw;
+}
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) id)
+{
+    INIT_MAIN;
+    int2 size = int2(gContact.screen.xy);
+    int2 p = int2(id.xy);
+    if (p.x >= size.x || p.y >= size.y)
+        RETURN();
+    float d = DEPTH_AT(p);
+    float3 P = viewPos(float2(p) + 0.5, d);
+    float distanceFade = saturate((gContact.params.y - P.z) * gContact.params.z);
+    if (d <= 0.0 || distanceFade <= 0.0)
+    {
+        Write2D(gOut, p, 1.0);
+        RETURN();
+    }
+    float2 np = float2(p) + float(gContact.counts.y % 64u) * float2(5.588238, 5.588238);
+    float  noise = frac(52.9829189 * frac(dot(np, float2(0.06711056, 0.00583715))));
+
+    uint   steps = gContact.counts.x;
+    float3 stepV = gContact.light.xyz * (gContact.proj.w / float(steps));
+    float3 pos = P + stepV * noise;
+    float  occlusion = 0.0;
+    for (uint i = 0u; i < steps; ++i)
+    {
+        pos += stepV;
+        if (pos.z <= gContact.proj.z)
+            break;
+        float2 px = toPixel(pos);
+        if (px.x < 0.0 || px.y < 0.0 || px.x >= gContact.screen.x || px.y >= gContact.screen.y)
+            break;
+        float sceneZ = viewDepth(DEPTH_AT(int2(px)));
+        float delta = pos.z - sceneZ;
+        float bias = 0.002 * pos.z + 0.004;
+        if (delta > bias && delta < gContact.light.w)
+        {
+            // Softer towards the screen's edges, where what casts may be off screen.
+            float2 e = min(px, gContact.screen.xy - px) / (gContact.screen.xy * 0.05);
+            occlusion = saturate(min(e.x, e.y));
+            break;
+        }
+    }
+    Write2D(gOut, p, 1.0 - occlusion * gContact.params.x * distanceFade);
+    RETURN();
+}

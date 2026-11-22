@@ -1,0 +1,15 @@
+// Clears one atlas tile to the far depth (1): a triangle over the viewport. First vertex 0.
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN(SV_VertexID(uint) id)
+{
+    INIT_MAIN;
+    VSOutput Out;
+    float2 uv = float2(float((id << 1) & 2), float(id & 2));
+    Out.Position = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 1.0, 1.0);
+    RETURN(Out);
+}

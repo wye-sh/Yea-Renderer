@@ -1,0 +1,30 @@
+// One pass of a 3x3 depth-aware blur of the occlusion: neighbours at a different depth count less.
+#include "AoCommon.h.fsl"
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) id)
+{
+    INIT_MAIN;
+    int2 size = int2(gAo.screen.xy);
+    int2 p = int2(id.xy);
+    if (p.x >= size.x || p.y >= size.y)
+        RETURN();
+    int2  last = size - int2(1, 1);
+    float z = viewDepth(DEPTH_AT(p));
+    float sum = 0.0;
+    float total = 0.0;
+    for (int dy = -1; dy <= 1; ++dy)
+    {
+        for (int dx = -1; dx <= 1; ++dx)
+        {
+            int2  q = clamp(p + int2(dx, dy), int2(0, 0), last);
+            float w = (dx == 0 ? 2.0 : 1.0) * (dy == 0 ? 2.0 : 1.0);
+            w *= saturate(1.0 - abs(viewDepth(DEPTH_AT(q)) - z) / (z * 0.03));
+            sum += LoadTex2D(gIn, NO_SAMPLER, q, 0).r * w;
+            total += w;
+        }
+    }
+    Write2D(gOut, p, sum / max(total, 1e-5));
+    RETURN();
+}

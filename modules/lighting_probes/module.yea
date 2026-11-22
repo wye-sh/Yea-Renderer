@@ -1,0 +1,35 @@
+module lighting_probes
+
+# Reflection probes games place: a capture point and a box (world space) where the probe is used; the
+# box's walls are also what reflections are projected onto (parallax). Rows are never moved.
+table Probe none 16
+  float3 pos
+  float3 boxMin
+  float3 boxMax
+  u64 changed
+  u32 gen
+  u32 alive
+end
+
+# Returns a handle (4294967295 when all 16 are taken).
+export handle probe_add(float3 pos, float3 box_min, float3 box_max)
+export void probe_place(handle p, float3 pos, float3 box_min, float3 box_max)
+export void probe_remove(handle p)
+# Removes every probe.
+export void probe_clear()
+export u32 probe_count()
+
+# Called by lighting (the core) each frame with the address of its LightingFrame (frame.h).
+export bool probes_prepare(u64 frame)
+export void probes_render(u64 frame)
+
+category Reflections
+setting bool enabled true
+# Size of each probe's image: sharper mirror reflections, more memory and capture time.
+setting int resolution 256 64 512
+# Probes captured again each frame, in turn, so moving things show in reflections (0: only when placed).
+setting int updates_per_frame 1 0 4
+setting float intensity 1 0 2
+# Metres over which a probe fades in from the sides of its box.
+setting float blend 1 0 10
+setting bool parallax true

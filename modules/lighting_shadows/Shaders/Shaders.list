@@ -1,0 +1,12 @@
+#include "Common_3/Graphics/FSL/defaults.h"
+
+#rootsig default.rootsig
+#end
+
+#vert lighting_shadow.vert
+#include "Shadow.vert.fsl"
+#end
+
+#vert lighting_shadow_clear.vert
+#include "ShadowClear.vert.fsl"
+#end

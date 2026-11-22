@@ -1,0 +1,15 @@
+module lighting_taa
+
+# Called by lighting (the core) each frame with the address of its LightingFrame (frame.h).
+export bool taa_prepare(u64 frame)
+export void taa_resolve(u64 frame)
+
+category Anti-aliasing
+setting bool enabled true
+# How much of last frame's image each pixel keeps: higher is smoother and steadier, lower reacts faster.
+setting float history_weight 0.9 0.5 0.98
+# How far last frame's colour may stray from the pixel's neighbours: lower ghosts less, higher flickers less.
+setting float clamp_width 1.25 0.5 3
+setting float sharpen 0.25 0 1
+setting float jitter 1 0 1
+setting int jitter_phases 8 2 16

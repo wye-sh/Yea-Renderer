@@ -1,0 +1,83 @@
+#include "Common_3/Graphics/FSL/defaults.h"
+
+#rootsig default.rootsig
+#end
+
+#rootsig compute.rootsig
+#end
+
+#vert lighting_fullscreen.vert
+#include "Fullscreen.vert.fsl"
+#end
+
+#vert lighting_forward.vert
+#include "Forward.vert.fsl"
+#end
+
+#frag lighting_forward.frag
+#include "Forward.frag.fsl"
+#end
+
+#frag lighting_sky.frag
+#include "Sky.frag.fsl"
+#end
+
+#vert lighting_forward_motion.vert
+#define MOTION
+#include "Forward.vert.fsl"
+#end
+
+#frag lighting_forward_motion.frag
+#define MOTION
+#include "Forward.frag.fsl"
+#end
+
+#frag lighting_sky_motion.frag
+#define MOTION
+#include "Sky.frag.fsl"
+#end
+
+#frag lighting_composite_1.frag
+#define SAMPLE_COUNT 1
+#include "Composite.frag.fsl"
+#end
+
+#frag lighting_composite_2.frag
+#define SAMPLE_COUNT 2
+#include "Composite.frag.fsl"
+#end
+
+#frag lighting_composite_4.frag
+#define SAMPLE_COUNT 4
+#include "Composite.frag.fsl"
+#end
+
+#frag lighting_composite_8.frag
+#define SAMPLE_COUNT 8
+#include "Composite.frag.fsl"
+#end
+
+#comp lighting_histogram_1.comp
+#define SAMPLE_COUNT 1
+#include "Histogram.comp.fsl"
+#end
+
+#comp lighting_histogram_2.comp
+#define SAMPLE_COUNT 2
+#include "Histogram.comp.fsl"
+#end
+
+#comp lighting_histogram_4.comp
+#define SAMPLE_COUNT 4
+#include "Histogram.comp.fsl"
+#end
+
+#comp lighting_histogram_8.comp
+#define SAMPLE_COUNT 8
+#include "Histogram.comp.fsl"
+#end
+
+#comp lighting_adapt.comp
+#define SAMPLE_COUNT 1
+#include "Adapt.comp.fsl"
+#end

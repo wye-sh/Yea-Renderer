@@ -1,0 +1,45 @@
+// Layouts of the scene capture (the core's InstanceData, MaterialData and LightData).
+STRUCT(InstanceData)
+{
+    DATA(float4, row0, None);
+    DATA(float4, row1, None);
+    DATA(float4, row2, None);
+    DATA(uint4, misc, None);          // x material
+};
+
+STRUCT(MaterialData)
+{
+    DATA(float4, albedoRough, None);
+    DATA(float4, params, None);       // x metallic
+    DATA(float4, emissive, None);
+};
+
+STRUCT(LightData)
+{
+    DATA(float4, pos, None);          // xyz, w range
+    DATA(float4, color, None);        // rgb candela, w type
+    DATA(float4, dir, None);          // xyz spot direction, w spot scale
+    DATA(float4, params, None);       // x spot offset, z 1/range^2
+    DATA(float4, sphere, None);
+};
+
+STRUCT(CaptureView)
+{
+    DATA(float4, row0, None);         // world -> clip rows
+    DATA(float4, row1, None);
+    DATA(float4, row2, None);
+    DATA(float4, row3, None);
+    DATA(float4, eye, None);
+};
+
+STRUCT(CaptureData)
+{
+    DATA(float4, sunDir, None);       // towards the sun; w 1 when on
+    DATA(float4, sunColor, None);
+    DATA(float4, skyZenith, None);
+    DATA(float4, skyHorizon, None);
+    DATA(float4, skyGround, None);    // w ambient
+    DATA(uint4, counts, None);        // x lights
+};
+
+#include "Capture.srt.h"

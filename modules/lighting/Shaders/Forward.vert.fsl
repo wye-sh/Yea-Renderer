@@ -1,0 +1,55 @@
+// Shared by the depth prepass and the forward pass, so both write the same depth.
+// The instance index comes from an instance-rate vertex stream (never SV_InstanceID).
+// MOTION (TAA on): also this and last frame's unjittered clip positions, for motion vectors; the
+// prepass then uses this variant too, so both passes still compute the same depth.
+#include "Common.h.fsl"
+#include "Scene.srt.h"
+
+STRUCT(VSInput)
+{
+    DATA(float3, Position, POSITION);
+    DATA(float3, Normal, NORMAL);
+    DATA(uint, Instance, TEXCOORD1);
+};
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float3, WorldPos, TEXCOORD0);
+    DATA(float3, Normal, TEXCOORD1);
+    DATA(FLAT(uint), Material, TEXCOORD2);
+#ifdef MOTION
+    DATA(float4, CurrClip, TEXCOORD3);
+    DATA(float4, PrevClip, TEXCOORD4);
+#endif
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN(VSInput In)
+{
+    INIT_MAIN;
+    VSOutput Out;
+    InstanceData inst = gInstances[In.Instance];
+    float4 p = float4(In.Position, 1.0);
+    float3 world = float3(dot(inst.row0, p), dot(inst.row1, p), dot(inst.row2, p));
+    float4 w = float4(world, 1.0);
+    Out.Position = float4(dot(gFrame.viewProj[0], w), dot(gFrame.viewProj[1], w), dot(gFrame.viewProj[2], w), dot(gFrame.viewProj[3], w));
+    Out.WorldPos = world;
+    // Normals through the cofactor matrix: right for non-uniform scale, no inverse needed.
+    float3 a = inst.row0.xyz;
+    float3 b = inst.row1.xyz;
+    float3 c = inst.row2.xyz;
+    float3 c0 = cross(b, c);
+    float3 c1 = cross(c, a);
+    float3 c2 = cross(a, b);
+    float3 n = In.Normal;
+    Out.Normal = float3(dot(c0, n), dot(c1, n), dot(c2, n));
+    Out.Material = inst.misc.x;
+#ifdef MOTION
+    PrevInstanceData prev = gPrevInstances[In.Instance];
+    float4 pw = float4(dot(prev.row0, p), dot(prev.row1, p), dot(prev.row2, p), 1.0);
+    Out.CurrClip = float4(dot(gFrame.viewProjNoJitter[0], w), dot(gFrame.viewProjNoJitter[1], w), dot(gFrame.viewProjNoJitter[2], w), dot(gFrame.viewProjNoJitter[3], w));
+    Out.PrevClip = float4(dot(gFrame.prevViewProj[0], pw), dot(gFrame.prevViewProj[1], pw), dot(gFrame.prevViewProj[2], pw), dot(gFrame.prevViewProj[3], pw));
+#endif
+    RETURN(Out);
+}

@@ -1,0 +1,242 @@
+// Forward shading after the depth prepass: the tile's light bitmask ANDed with the Z-bin's light
+// range (Drobot 2017), the sun with cascaded shadows, sky ambient with multiple scattering.
+#include "Common.h.fsl"
+#include "Scene.srt.h"
+#include "Lighting.h.fsl"
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float3, WorldPos, TEXCOORD0);
+    DATA(float3, Normal, TEXCOORD1);
+    DATA(FLAT(uint), Material, TEXCOORD2);
+#ifdef MOTION
+    DATA(float4, CurrClip, TEXCOORD3);
+    DATA(float4, PrevClip, TEXCOORD4);
+#endif
+};
+
+#ifdef MOTION
+STRUCT(PSOutput)
+{
+    DATA(float4, Color, SV_Target0);
+    DATA(float2, Motion, SV_Target1); // uv now - uv last frame
+};
+#endif
+
+float3 heatColor(float n)
+{
+    float t = saturate(n / 32.0);
+    float3 c = lerp(float3(0.0, 0.05, 0.4), float3(0.0, 0.8, 0.3), saturate(t * 4.0));
+    c = lerp(c, float3(1.0, 0.85, 0.0), saturate(t * 4.0 - 1.0));
+    c = lerp(c, float3(1.0, 0.1, 0.0), saturate(t * 2.0 - 1.0));
+    return n > 0.0 ? c : float3(0.02, 0.02, 0.04);
+}
+
+// A probe's octahedral image (y up) along d, at a roughness mip; rgb premultiplied by coverage a.
+float4 sampleProbe(float3 d, float slice, float lod)
+{
+    d = normalize(d + float3(0.0, 1e-6, 0.0));
+    float2 p = d.xz / (abs(d.x) + abs(d.y) + abs(d.z));
+    if (d.y < 0.0)
+        p = (float2(1.0, 1.0) - abs(p.yx)) * float2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
+    float3 uvw = float3(p * 0.5 + 0.5, slice);
+#if defined(VULKAN)
+    return SampleLvlTex2DArray(gProbes, gSamplerTrilinearClamp, uvw, lod);
+#else
+    return gProbes.SampleLevel(gSamplerTrilinearClamp, uvw, lod);
+#endif
+}
+
+// What a surface at P reflects along R: the probes whose boxes hold P, smallest first (each covers what
+// the ones before it left), projected onto their boxes (parallax), the live sky behind what they didn't
+// capture. With the material's reflections off, only the sky's blurred light: no reflected image.
+float3 environment(float3 P, float3 R, float rough, bool reflections)
+{
+    float ambient = gFrame.skyGround.w;
+    if (!reflections)
+        return skyIrradiance(R) * ambient;
+    float3 sky = lerp(skyRadiance(R), skyIrradiance(R), rough) * ambient;
+    float3 color = float3(0.0, 0.0, 0.0);
+    float  remaining = 1.0;
+    float  lod = rough * float(max(gFrame.probeInfo.y, 1u) - 1u);
+    for (uint i = 0u; i < gFrame.probeInfo.x; ++i)
+    {
+        if (remaining < 0.001)
+            break;
+        ProbeData pr = gProbeData[i];
+        float3 lo = pr.boxMin.xyz;
+        float3 hi = pr.boxMax.xyz;
+        float3 edge = min(P - lo, hi - P);
+        float  inside = min(edge.x, min(edge.y, edge.z));
+        if (inside <= 0.0)
+            continue;
+        float  w = saturate(inside / gFrame.probeParams.y) * remaining;
+        float3 dir = R;
+        if (gFrame.probeInfo.z != 0u)
+        {
+            float3 rr = float3(abs(R.x) > 1e-5 ? R.x : 1e-5, abs(R.y) > 1e-5 ? R.y : 1e-5, abs(R.z) > 1e-5 ? R.z : 1e-5);
+            float3 exit = max((hi - P) / rr, (lo - P) / rr);
+            dir = P + R * min(exit.x, min(exit.y, exit.z)) - pr.pos.xyz;
+        }
+        float4 c = sampleProbe(dir, pr.pos.w, lod);
+        color += (c.rgb * gFrame.probeParams.x + sky * (1.0 - c.a)) * w;
+        remaining -= w;
+    }
+    return color + sky * remaining;
+}
+
+ROOT_SIGNATURE(DefaultRootSignature)
+#ifdef MOTION
+PSOutput PS_MAIN(VSOutput In)
+#else
+float4 PS_MAIN(VSOutput In)
+#endif
+{
+    INIT_MAIN;
+    MaterialData m = gMaterials[In.Material];
+    float3 N = normalize(In.Normal);
+    float3 V = normalize(gFrame.camPos.xyz - In.WorldPos);
+    float  rough = clamp(m.albedoRough.a, 0.03, 1.0);
+    float  a2 = rough * rough;
+    a2 *= a2;
+    // Specular antialiasing: widen the lobe where the normal changes quickly across the pixel.
+    float3 dndx = ddx(In.Normal);
+    float3 dndy = ddy(In.Normal);
+    float  variance = 0.25 * gFrame.misc.y * (dot(dndx, dndx) + dot(dndy, dndy));
+    a2 = saturate(a2 + min(2.0 * variance, 0.18));
+    // Two-sided: shade the face towards the viewer.
+    float NoV = dot(N, V);
+    if (NoV < 0.0)
+    {
+        N = -N;
+        NoV = -NoV;
+    }
+    NoV = max(NoV, 1e-3);
+
+    float  metallic = saturate(m.params.x);
+    float3 albedo = m.albedoRough.rgb;
+    Surface s;
+    s.P = In.WorldPos;
+    s.N = N;
+    s.V = V;
+    s.diffuse = albedo * (1.0 - metallic);
+    s.f0 = lerp(float3(m.params.y, m.params.y, m.params.y), albedo, metallic);
+    s.a2 = a2;
+    s.NoV = NoV;
+    float2 dfg = dfgLookup(NoV, sqrt(sqrt(a2)));
+    float  Ess = dfg.x + dfg.y;
+    s.energy = float3(1.0, 1.0, 1.0) + s.f0 * (1.0 / max(Ess, 1e-3) - 1.0);
+
+    float  phi = interleavedGradientNoise(In.Position.xy) * 2.0 * PI;
+    float  viewZ = dot(gFrame.view[2], float4(In.WorldPos, 1.0));
+    float3 color = float3(0.0, 0.0, 0.0);
+
+    // Directional lights; the first has the cascades and contact shadows (lighting_contact).
+    float contact = (gFrame.counts.z & FLAG_CONTACT) != 0u ? LoadTex2D(gContactShadow, NO_SAMPLER, int2(In.Position.xy), 0).r : 1.0;
+    for (uint d = 0u; d < gFrame.counts.y; ++d)
+    {
+        float3 L = gFrame.sunDir[d].xyz;
+        if (dot(N, L) <= 0.0)
+            continue;
+        float shadow = (d == 0u && (gFrame.counts.z & FLAG_SHADOWS) != 0u) ? sunShadow(In.WorldPos, N, viewZ, phi) : 1.0;
+        if (d == 0u)
+            shadow *= contact;
+        color += brdfLight(s, L, gFrame.sunColor[d].rgb * shadow);
+    }
+
+    // Local lights.
+    uint lightCount = 0u;
+    if ((gFrame.counts.z & FLAG_CULLED) != 0u)
+    {
+        uint binIndex = min(uint(max(viewZ, 0.0) * gFrame.misc.x), gFrame.tiles.w - 1u);
+        uint bin = gZBins[binIndex];
+        uint first = bin & 0xFFFFu;
+        uint last = bin >> 16;
+        if (first <= last)
+        {
+            uint2 tile = uint2(In.Position.xy) / gFrame.tiles.x;
+            uint  base = (tile.y * gFrame.tiles.y + tile.x) * gFrame.tiles.z;
+            uint  w0 = first >> 5;
+            uint  w1 = last >> 5;
+            for (uint w = w0; w <= w1; ++w)
+            {
+                uint mask = gTileMasks[base + w];
+                uint lo = w == w0 ? (first & 31u) : 0u;
+                uint hi = w == w1 ? (last & 31u) : 31u;
+                mask &= (0xFFFFFFFFu << lo) & (0xFFFFFFFFu >> (31u - hi));
+                while (mask != 0u)
+                {
+                    uint b = FirstBitLow(mask);
+                    mask &= mask - 1u;
+                    color += shadeLocalLight(w * 32u + b, s, phi);
+                    lightCount += 1u;
+                }
+            }
+        }
+    }
+    else
+    {
+        for (uint i = 0u; i < gFrame.counts.x; ++i)
+            color += shadeLocalLight(i, s, phi);
+        lightCount = gFrame.counts.x;
+    }
+
+    // Sky ambient with multiple scattering (Fdez-Aguera 2019); horizon occlusion for reflections;
+    // ambient occlusion (lighting_ao) with Jimenez 2016's multi-bounce fit, and Lagarde 2014's specular
+    // occlusion from it.
+    float  ambient = gFrame.skyGround.w;
+    float  ao = 1.0;
+    float3 diffuseAo = float3(1.0, 1.0, 1.0);
+    float  specularAo = 1.0;
+    if ((gFrame.counts.z & FLAG_AO) != 0u)
+    {
+        ao = LoadTex2D(gAo, NO_SAMPLER, int2(In.Position.xy), 0).r;
+        diffuseAo = float3(ao, ao, ao);
+        if (gFrame.aoParams.y > 0.0)
+        {
+            float3 a = 2.0404 * albedo - 0.3324;
+            float3 b = -4.7951 * albedo + 0.6417;
+            float3 c = 2.7552 * albedo + 0.6903;
+            diffuseAo = max(diffuseAo, ((diffuseAo * a + b) * diffuseAo + c) * diffuseAo);
+        }
+        float so = saturate(pow(max(NoV + ao, 1e-4), exp2(-16.0 * sqrt(sqrt(a2)) - 1.0)) - 1.0 + ao);
+        specularAo = lerp(1.0, so, gFrame.aoParams.x);
+    }
+    float3 R = reflect(-V, N);
+    float  horizon = saturate(1.0 + dot(R, normalize(In.Normal) * (dot(In.Normal, V) < 0.0 ? -1.0 : 1.0)));
+    float3 irradiance = skyIrradiance(N) * ambient;
+    float  r = sqrt(sqrt(a2));
+    float3 radiance = environment(In.WorldPos, R, r, m.params.z > 0.5) * (horizon * horizon);
+    float3 FssEss = s.f0 * dfg.x + float3(dfg.y, dfg.y, dfg.y);
+    float  Ems = 1.0 - Ess;
+    float3 Favg = s.f0 + (float3(1.0, 1.0, 1.0) - s.f0) * (1.0 / 21.0);
+    float3 Fms = FssEss * Favg / (float3(1.0, 1.0, 1.0) - Ems * Favg);
+    float3 kD = s.diffuse * (float3(1.0, 1.0, 1.0) - FssEss - Fms * Ems);
+    color += FssEss * radiance * specularAo + (Fms * Ems + kD) * irradiance * diffuseAo;
+    color += m.emissive.rgb;
+
+    if ((gFrame.counts.z & FLAG_CASCADES) != 0u)
+    {
+        uint c = sunCascadeIndex(viewZ);
+        float3 tint = c == 0u ? float3(1.0, 0.3, 0.3) : c == 1u ? float3(0.3, 1.0, 0.3) : c == 2u ? float3(0.3, 0.5, 1.0) : c == 3u ? float3(1.0, 1.0, 0.3) : float3(1.0, 1.0, 1.0);
+        color *= tint;
+    }
+    if ((gFrame.counts.z & FLAG_AO_DEBUG) != 0u)
+        color = float3(ao, ao, ao) * (0.5 / max(gExposure[1], 1e-8));
+    if ((gFrame.counts.z & FLAG_CONTACT_DEBUG) != 0u)
+        color = float3(contact, contact, contact) * (0.5 / max(gExposure[1], 1e-8));
+    if ((gFrame.counts.z & FLAG_HEATMAP) != 0u)
+    {
+        float exposure = max(gExposure[1], 1e-8);
+        color = color * 0.15 + heatColor(float(lightCount)) * (0.6 / exposure);
+    }
+#ifdef MOTION
+    PSOutput Out;
+    Out.Color = float4(color, 1.0);
+    Out.Motion = (In.CurrClip.xy / In.CurrClip.w - In.PrevClip.xy / max(In.PrevClip.w, 1e-6)) * float2(0.5, -0.5);
+    RETURN(Out);
+#else
+    RETURN(float4(color, 1.0));
+#endif
+}

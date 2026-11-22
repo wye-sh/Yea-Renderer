@@ -1,0 +1,44 @@
+// Shadow casters: an instance-rate stream of (instance | view << 20), never SV_InstanceID.
+STRUCT(InstanceData)
+{
+    DATA(float4, row0, None);
+    DATA(float4, row1, None);
+    DATA(float4, row2, None);
+    DATA(uint4, misc, None);
+};
+
+STRUCT(ShadowView)
+{
+    DATA(float4, row0, None);
+    DATA(float4, row1, None);
+    DATA(float4, row2, None);
+    DATA(float4, row3, None);
+    DATA(float4, rect, None);
+    DATA(float4, info, None);
+};
+
+#include "Shadow.srt.h"
+
+STRUCT(VSInput)
+{
+    DATA(float3, Position, POSITION);
+    DATA(uint, Entry, TEXCOORD1);
+};
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN(VSInput In)
+{
+    INIT_MAIN;
+    VSOutput Out;
+    InstanceData inst = gInstances[In.Entry & 0xFFFFFu];
+    ShadowView   v = gViews[In.Entry >> 20];
+    float4 p = float4(In.Position, 1.0);
+    float4 w = float4(dot(inst.row0, p), dot(inst.row1, p), dot(inst.row2, p), 1.0);
+    Out.Position = float4(dot(v.row0, w), dot(v.row1, w), dot(v.row2, w), dot(v.row3, w));
+    RETURN(Out);
+}

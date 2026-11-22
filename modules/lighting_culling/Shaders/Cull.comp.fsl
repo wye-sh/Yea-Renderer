@@ -1,0 +1,116 @@
+// One group per screen tile: the tile's depth range from the prepass (sky pixels left out), then
+// every light's sphere against the tile's four side planes and depth range, into a bitmask
+// (Drobot 2017). The pixel shader ANDs it with its Z-bin's light range.
+#define MAX_WORDS 128u
+
+STRUCT(CullData)
+{
+    DATA(float4, view[3], None);  // world -> view rows (+z forward)
+    DATA(float4, proj, None);     // x P00, y P11, z near
+    DATA(uint4, size, None);      // x width, y height, z tile size, w tiles x
+    DATA(uint4, counts, None);    // x lights, y words per tile
+};
+
+STRUCT(CullLight)
+{
+    DATA(float4, pos, None);
+    DATA(float4, color, None);
+    DATA(float4, dir, None);
+    DATA(float4, params, None);
+    DATA(float4, sphere, None);
+};
+
+#include "Cull.srt.h"
+
+GroupShared(uint, gsMinDepth);
+GroupShared(uint, gsMaxDepth);
+GroupShared(uint, gsMask[MAX_WORDS]);
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(16, 16, 1)
+void CS_MAIN(SV_GroupID(uint3) gid, SV_GroupThreadID(uint3) tid, SV_GroupIndex(uint) gi)
+{
+    INIT_MAIN;
+    uint words = gCull.counts.y;
+    uint ts = gCull.size.z;
+    if (gi == 0u)
+    {
+        gsMinDepth = 0x7F7FFFFFu;
+        gsMaxDepth = 0u;
+    }
+    for (uint w = gi; w < words; w += 256u)
+        gsMask[w] = 0u;
+    GroupMemoryBarrier();
+
+    // Reversed-Z: larger is nearer; 0 is the sky.
+    float dmin = 1.0;
+    float dmax = 0.0;
+    for (uint py = tid.y; py < ts; py += 16u)
+        for (uint px = tid.x; px < ts; px += 16u)
+        {
+            uint2 p = gid.xy * ts + uint2(px, py);
+            if (p.x >= gCull.size.x || p.y >= gCull.size.y)
+                continue;
+#if SAMPLE_COUNT > 1
+            for (int s = 0; s < SAMPLE_COUNT; ++s)
+            {
+                float d = LoadTex2DMS(gDepth, NO_SAMPLER, int2(p), s).r;
+                if (d > 0.0)
+                {
+                    dmin = min(dmin, d);
+                    dmax = max(dmax, d);
+                }
+            }
+#else
+            float d = LoadTex2D(gDepth, NO_SAMPLER, int2(p), 0).r;
+            if (d > 0.0)
+            {
+                dmin = min(dmin, d);
+                dmax = max(dmax, d);
+            }
+#endif
+        }
+    if (dmax > 0.0)
+    {
+        AtomicMin(gsMinDepth, asuint(dmin));
+        AtomicMax(gsMaxDepth, asuint(dmax));
+    }
+    GroupMemoryBarrier();
+
+    if (gsMaxDepth != 0u)
+    {
+        float near = gCull.proj.z;
+        float zNear = near / asfloat(gsMaxDepth);
+        float zFar = near / max(asfloat(gsMinDepth), 1e-7);
+        float2 size = float2(gCull.size.xy);
+        float x0 = float(gid.x * ts) / size.x * 2.0 - 1.0;
+        float x1 = float(min((gid.x + 1u) * ts, gCull.size.x)) / size.x * 2.0 - 1.0;
+        float yTop = 1.0 - float(gid.y * ts) / size.y * 2.0;
+        float yBot = 1.0 - float(min((gid.y + 1u) * ts, gCull.size.y)) / size.y * 2.0;
+        float p00 = gCull.proj.x;
+        float p11 = gCull.proj.y;
+        float3 nl = normalize(float3(p00, 0.0, -x0));
+        float3 nr = normalize(float3(-p00, 0.0, x1));
+        float3 nb = normalize(float3(0.0, p11, -yBot));
+        float3 nt = normalize(float3(0.0, -p11, yTop));
+        for (uint i = gi; i < gCull.counts.x; i += 256u)
+        {
+            float4 sp = gLights[i].sphere;
+            float4 wc = float4(sp.xyz, 1.0);
+            float3 c = float3(dot(gCull.view[0], wc), dot(gCull.view[1], wc), dot(gCull.view[2], wc));
+            float  r = sp.w;
+            if (c.z + r < zNear || c.z - r > zFar)
+                continue;
+            if (dot(nl, c) < -r || dot(nr, c) < -r || dot(nb, c) < -r || dot(nt, c) < -r)
+                continue;
+            uint prev;
+            AtomicOr(gsMask[i >> 5], 1u << (i & 31u), prev);
+        }
+    }
+    GroupMemoryBarrier();
+
+    uint base = (gid.y * gCull.size.w + gid.x) * words;
+    for (uint w2 = gi; w2 < words; w2 += 256u)
+        gTileMasks[base + w2] = gsMask[w2];
+    RETURN();
+}

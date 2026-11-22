@@ -1,0 +1,27 @@
+#include "Common_3/Graphics/FSL/defaults.h"
+
+#rootsig default.rootsig
+#end
+
+#rootsig compute.rootsig
+#end
+
+#comp lighting_cull_1.comp
+#define SAMPLE_COUNT 1
+#include "Cull.comp.fsl"
+#end
+
+#comp lighting_cull_2.comp
+#define SAMPLE_COUNT 2
+#include "Cull.comp.fsl"
+#end
+
+#comp lighting_cull_4.comp
+#define SAMPLE_COUNT 4
+#include "Cull.comp.fsl"
+#end
+
+#comp lighting_cull_8.comp
+#define SAMPLE_COUNT 8
+#include "Cull.comp.fsl"
+#end

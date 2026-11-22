@@ -1,0 +1,9 @@
+{
+ "name": "lighting",
+ "title": "Lighting",
+ "version": "0.7.1",
+ "source": "https://github.com/wye-sh/Yea-Renderer",
+ "summary": "3D lighting and shadows: PBR materials, coloured sun, point and spot lights, light culling in compute, cascaded and atlas shadows, ambient occlusion, contact shadows, reflection probes, temporal antialiasing, auto exposure and tonemapping.",
+ "license": "MIT",
+ "requires": {}
+}

@@ -1,0 +1,28 @@
+#include "Common_3/Graphics/FSL/defaults.h"
+
+#rootsig default.rootsig
+#end
+
+#rootsig compute.rootsig
+#end
+
+#vert lighting_probe_capture.vert
+#include "Capture.vert.fsl"
+#end
+
+#frag lighting_probe_capture.frag
+#include "Capture.frag.fsl"
+#end
+
+#vert lighting_probe_fullscreen.vert
+#include "Fullscreen.vert.fsl"
+#end
+
+#frag lighting_probe_downsample.frag
+#define DOWNSAMPLE
+#include "Filter.frag.fsl"
+#end
+
+#frag lighting_probe_prefilter.frag
+#include "Filter.frag.fsl"
+#end

@@ -1,0 +1,52 @@
+// The exposure from the histogram: the mean log luminance between the 50th and 95th percentiles,
+// as EV100, eased towards over time. gExposureRW: [0] EV100, [1] exposure multiplier, [2] set.
+#include "ExposureCommon.h.fsl"
+#include "Exposure.srt.h"
+
+GroupShared(uint, gsHist[HISTOGRAM_BINS]);
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(128, 1, 1)
+void CS_MAIN(SV_GroupThreadID(uint3) tid)
+{
+    INIT_MAIN;
+    uint i = tid.x;
+    gsHist[i] = gHistogram[i];
+    gHistogram[i] = 0u;
+    GroupMemoryBarrier();
+    if (i == 0u)
+    {
+        float total = 0.0;
+        for (uint b = 1u; b < HISTOGRAM_BINS; ++b)
+            total += float(gsHist[b]);
+        float prevEv = gExposureRW[0];
+        bool  fresh = gExposureRW[2] == 0.0 || prevEv != prevEv;
+        float target = prevEv;
+        if (gExposureData.adapt.w > 0.5)
+            target = gExposureData.adapt.z;
+        else if (total > 0.0)
+        {
+            float lo = total * 0.5;
+            float hi = total * 0.95;
+            float seen = 0.0;
+            float sum = 0.0;
+            float weight = 0.0;
+            for (uint b = 1u; b < HISTOGRAM_BINS; ++b)
+            {
+                float n = float(gsHist[b]);
+                float take = clamp(seen + n, lo, hi) - clamp(seen, lo, hi);
+                seen += n;
+                float log2Lum = gExposureData.range.x + (float(b) - 0.5) / float(HISTOGRAM_BINS - 2u) * gExposureData.range.z;
+                sum += take * log2Lum;
+                weight += take;
+            }
+            // EV100 = log2(L * 100 / 12.5)
+            target = sum / max(weight, 1.0) + 3.0;
+        }
+        float ev = (fresh || gExposureData.adapt.w > 0.5) ? target : prevEv + (target - prevEv) * gExposureData.adapt.x;
+        gExposureRW[0] = ev;
+        gExposureRW[1] = exp2(gExposureData.adapt.y) / (1.2 * exp2(ev));
+        gExposureRW[2] = 1.0;
+    }
+    RETURN();
+}

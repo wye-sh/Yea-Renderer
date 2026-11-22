@@ -1,0 +1,114 @@
+// Ground-truth ambient occlusion (Jimenez et al. 2016, "Practical Realtime Strategies for Accurate
+// Indirect Occlusion"), from depth alone: the normal is rebuilt from neighbouring depths. Per pixel,
+// `slices` screen directions; along each, the highest horizon on both sides within `radius`, then the
+// visible arc integrated against the cosine-weighted normal projected into the slice.
+#include "AoCommon.h.fsl"
+
+float3 viewPos(float2 px, float d)
+{
+    float  z = viewDepth(d);
+    float2 u = px - gAo.screen.zw; // undo the TAA jitter the depth was drawn with
+    float2 ndc = float2(u.x / gAo.screen.x * 2.0 - 1.0, 1.0 - u.y / gAo.screen.y * 2.0);
+    return float3(ndc.x * z / gAo.proj.x, ndc.y * z / gAo.proj.y, z);
+}
+
+float3 viewPosAt(int2 q) { return viewPos(float2(q) + 0.5, DEPTH_AT(q)); }
+
+float fastAcos(float x)
+{
+    float a = abs(x);
+    float r = (-0.156583 * a + 1.570796) * sqrt(max(1.0 - a, 0.0));
+    return x >= 0.0 ? r : PI_AO - r;
+}
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) id)
+{
+    INIT_MAIN;
+    int2 size = int2(gAo.screen.xy);
+    int2 p = int2(id.xy);
+    if (p.x >= size.x || p.y >= size.y)
+        RETURN();
+    float d = DEPTH_AT(p);
+    if (d <= 0.0)
+    {
+        Write2D(gOut, p, 1.0); // sky
+        RETURN();
+    }
+    int2   last = size - int2(1, 1);
+    float3 P = viewPos(float2(p) + 0.5, d);
+    float3 L = viewPosAt(max(p - int2(1, 0), int2(0, 0)));
+    float3 R = viewPosAt(min(p + int2(1, 0), last));
+    float3 U = viewPosAt(max(p - int2(0, 1), int2(0, 0)));
+    float3 D = viewPosAt(min(p + int2(0, 1), last));
+    float3 dx = abs(R.z - P.z) < abs(P.z - L.z) ? R - P : P - L;
+    float3 dy = abs(D.z - P.z) < abs(P.z - U.z) ? D - P : P - U;
+    float3 N = normalize(cross(dx, dy));
+    if (dot(N, P) > 0.0)
+        N = -N;
+    float3 V = normalize(-P);
+
+    float screenRadius = min(gAo.proj.w * gAo.proj.x * 0.5 * gAo.screen.x / P.z, gAo.params.w);
+    if (screenRadius < 1.0)
+    {
+        Write2D(gOut, p, 1.0);
+        RETURN();
+    }
+    // Interleaved gradient noise (Jimenez 2014), offset per frame when TAA averages it.
+    float2 np = float2(p) + float(gAo.counts.z % 64u) * float2(5.588238, 5.588238);
+    float  noise = frac(52.9829189 * frac(dot(np, float2(0.06711056, 0.00583715))));
+    float  noise2 = frac(noise * 1.61803399 + 0.5);
+
+    uint  slices = gAo.counts.x;
+    uint  steps = gAo.counts.y;
+    float visibility = 0.0;
+    for (uint i = 0u; i < slices; ++i)
+    {
+        float  phi = (float(i) + noise) / float(slices) * PI_AO;
+        float2 s = float2(cos(phi), sin(phi)); // pixels, y down
+        float3 dir = float3(s.x, -s.y, 0.0);    // view space, y up
+        float3 ortho = dir - dot(dir, V) * V;
+        float3 axis = normalize(cross(ortho, V));
+        float3 projN = N - axis * dot(N, axis);
+        float  projLen = length(projN);
+        float  cosN = saturate(dot(projN, V) / max(projLen, 1e-5));
+        float  n = (dot(ortho, projN) < 0.0 ? -1.0 : 1.0) * fastAcos(cosN);
+        float  low0 = cos(n + PI_AO * 0.5);
+        float  low1 = cos(n - PI_AO * 0.5);
+        float  h0 = low0; // along +s
+        float  h1 = low1; // along -s
+        for (uint j = 0u; j < steps; ++j)
+        {
+            float t = (float(j) + noise2) / float(steps);
+            float2 o = s * max(t * t * screenRadius, float(j) + 1.0);
+            int2  q0 = int2(float2(p) + 0.5 + o);
+            int2  q1 = int2(float2(p) + 0.5 - o);
+            if (q0.x >= 0 && q0.y >= 0 && q0.x <= last.x && q0.y <= last.y)
+            {
+                float3 delta = viewPosAt(q0) - P;
+                float  dist = length(delta);
+                float  c = dot(delta, V) / max(dist, 1e-5);
+                c = lerp(c, low0, saturate((dist - gAo.params.x) * gAo.params.y));
+                h0 = max(h0, c);
+            }
+            if (q1.x >= 0 && q1.y >= 0 && q1.x <= last.x && q1.y <= last.y)
+            {
+                float3 delta = viewPosAt(q1) - P;
+                float  dist = length(delta);
+                float  c = dot(delta, V) / max(dist, 1e-5);
+                c = lerp(c, low1, saturate((dist - gAo.params.x) * gAo.params.y));
+                h1 = max(h1, c);
+            }
+        }
+        float a0 = n + clamp(fastAcos(h0) - n, -PI_AO * 0.5, PI_AO * 0.5);
+        float a1 = n + clamp(-fastAcos(h1) - n, -PI_AO * 0.5, PI_AO * 0.5);
+        float sinN = sin(n);
+        float arc0 = (cosN + 2.0 * a0 * sinN - cos(2.0 * a0 - n)) * 0.25;
+        float arc1 = (cosN + 2.0 * a1 * sinN - cos(2.0 * a1 - n)) * 0.25;
+        visibility += projLen * (arc0 + arc1);
+    }
+    visibility = saturate(visibility / float(slices));
+    Write2D(gOut, p, pow(visibility, gAo.params.z));
+    RETURN();
+}

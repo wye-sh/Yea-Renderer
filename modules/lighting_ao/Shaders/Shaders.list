@@ -1,0 +1,55 @@
+#include "Common_3/Graphics/FSL/defaults.h"
+
+#rootsig default.rootsig
+#end
+
+#rootsig compute.rootsig
+#end
+
+#comp lighting_gtao_1.comp
+#define SAMPLE_COUNT 1
+#define PI_AO 3.14159265
+#include "Gtao.comp.fsl"
+#end
+
+#comp lighting_gtao_2.comp
+#define SAMPLE_COUNT 2
+#define PI_AO 3.14159265
+#include "Gtao.comp.fsl"
+#end
+
+#comp lighting_gtao_4.comp
+#define SAMPLE_COUNT 4
+#define PI_AO 3.14159265
+#include "Gtao.comp.fsl"
+#end
+
+#comp lighting_gtao_8.comp
+#define SAMPLE_COUNT 8
+#define PI_AO 3.14159265
+#include "Gtao.comp.fsl"
+#end
+
+#comp lighting_ao_denoise_1.comp
+#define SAMPLE_COUNT 1
+#define PI_AO 3.14159265
+#include "Denoise.comp.fsl"
+#end
+
+#comp lighting_ao_denoise_2.comp
+#define SAMPLE_COUNT 2
+#define PI_AO 3.14159265
+#include "Denoise.comp.fsl"
+#end
+
+#comp lighting_ao_denoise_4.comp
+#define SAMPLE_COUNT 4
+#define PI_AO 3.14159265
+#include "Denoise.comp.fsl"
+#end
+
+#comp lighting_ao_denoise_8.comp
+#define SAMPLE_COUNT 8
+#define PI_AO 3.14159265
+#include "Denoise.comp.fsl"
+#end

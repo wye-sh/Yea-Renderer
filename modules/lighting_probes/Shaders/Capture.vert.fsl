@@ -1,0 +1,40 @@
+// The scene into one cube face of a probe: an instance-rate stream of (instance | view << 20), never
+// SV_InstanceID.
+#include "CaptureCommon.h.fsl"
+
+STRUCT(VSInput)
+{
+    DATA(float3, Position, POSITION);
+    DATA(float3, Normal, NORMAL);
+    DATA(uint, Entry, TEXCOORD1);
+};
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float3, WorldPos, TEXCOORD0);
+    DATA(float3, Normal, TEXCOORD1);
+    DATA(FLAT(uint), Material, TEXCOORD2);
+    DATA(FLAT(uint), View, TEXCOORD3);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN(VSInput In)
+{
+    INIT_MAIN;
+    VSOutput     Out;
+    InstanceData inst = gInstances[In.Entry & 0xFFFFFu];
+    CaptureView  v = gViews[In.Entry >> 20];
+    float4 p = float4(In.Position, 1.0);
+    float4 w = float4(dot(inst.row0, p), dot(inst.row1, p), dot(inst.row2, p), 1.0);
+    Out.Position = float4(dot(v.row0, w), dot(v.row1, w), dot(v.row2, w), dot(v.row3, w));
+    Out.WorldPos = w.xyz;
+    float3 a = inst.row0.xyz;
+    float3 b = inst.row1.xyz;
+    float3 c = inst.row2.xyz;
+    float3 n = In.Normal;
+    Out.Normal = float3(dot(cross(b, c), n), dot(cross(c, a), n), dot(cross(a, b), n));
+    Out.Material = inst.misc.x;
+    Out.View = In.Entry >> 20;
+    RETURN(Out);
+}

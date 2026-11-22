@@ -1,0 +1,17 @@
+// One triangle covering the target. Drawn with first vertex 0 (SV_VertexID).
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float2, UV, TEXCOORD0);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN(SV_VertexID(uint) id)
+{
+    INIT_MAIN;
+    VSOutput Out;
+    float2 uv = float2(float((id << 1) & 2), float(id & 2));
+    Out.Position = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+    Out.UV = uv;
+    RETURN(Out);
+}

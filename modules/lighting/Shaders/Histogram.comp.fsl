@@ -1,0 +1,37 @@
+// Luminance histogram over every other pixel (sample 0), log2 bins; bin 0 holds black.
+#include "ExposureCommon.h.fsl"
+#include "Exposure.srt.h"
+
+GroupShared(uint, gsBins[HISTOGRAM_BINS]);
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(16, 16, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) id, SV_GroupIndex(uint) gi)
+{
+    INIT_MAIN;
+    if (gi < HISTOGRAM_BINS)
+        gsBins[gi] = 0u;
+    GroupMemoryBarrier();
+    uint2 p = id.xy * 2u;
+    if (p.x < gExposureData.size.x && p.y < gExposureData.size.y)
+    {
+#if SAMPLE_COUNT > 1
+        float3 c = LoadTex2DMS(gHdr, NO_SAMPLER, int2(p), 0).rgb;
+#else
+        float3 c = LoadTex2D(gHdr, NO_SAMPLER, int2(p), 0).rgb;
+#endif
+        float lum = dot(c, float3(0.2126, 0.7152, 0.0722));
+        uint  bin = 0u;
+        if (lum > 1e-6)
+            bin = uint(saturate((log2(lum) - gExposureData.range.x) * gExposureData.range.y) * float(HISTOGRAM_BINS - 2u)) + 1u;
+        uint prev;
+        AtomicAdd(gsBins[bin], 1u, prev);
+    }
+    GroupMemoryBarrier();
+    if (gi < HISTOGRAM_BINS && gsBins[gi] != 0u)
+    {
+        uint prev;
+        AtomicAdd(gHistogram[gi], gsBins[gi], prev);
+    }
+    RETURN();
+}

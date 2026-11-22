@@ -1,0 +1,11 @@
+#ifndef LIGHTING_EXPOSURE_H
+#define LIGHTING_EXPOSURE_H
+#define HISTOGRAM_BINS 128u
+
+STRUCT(ExposureData)
+{
+    DATA(float4, range, None);  // x log2 min luminance, y 1 / log2 range, z log2 range
+    DATA(float4, adapt, None);  // x adaptation (0..1 this frame), y compensation (stops), z manual EV100, w 1 when manual
+    DATA(uint4, size, None);    // x width, y height
+};
+#endif
