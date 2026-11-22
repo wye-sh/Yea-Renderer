@@ -369,6 +369,21 @@ float4 PS_MAIN(VSOutput In)
         radiance = lerp(radiance, sr.rgb, sr.a);
         ssrFound = sr.a;
     }
+    float  rtFound = 0.0;
+    float3 rtSeen = float3(0.0, 0.0, 0.0);
+    if ((gFrame.counts.z & FLAG_RT) != 0u && m.params.z > 0.5)
+    {
+        // Ray-traced (renderer_rt): what the reflected ray hit, or the sky; fading out towards the roughness
+        // limit, where the probes' prefiltered reflections take over.
+        float4 traced = LoadTex2D(gRtReflection, NO_SAMPLER, int2(In.Position.xy), 0);
+        float  limit = gFrame.rt.x;
+        if (traced.a > 0.0)
+        {
+            rtFound = saturate((limit - r) / max(limit * 0.33, 1e-4));
+            radiance = lerp(radiance, traced.rgb, rtFound);
+            rtSeen = traced.rgb;
+        }
+    }
     radiance *= horizon * horizon;
     float3 FssEss = s.f0 * dfg.x + float3(dfg.y, dfg.y, dfg.y);
     float  Ems = 1.0 - Ess;
@@ -389,6 +404,11 @@ float4 PS_MAIN(VSOutput In)
         color = float3(ao, ao, ao); // shown at exposure 1
     if ((gFrame.counts.z & FLAG_CONTACT_DEBUG) != 0u)
         color = float3(contact, contact, contact);
+    if ((gFrame.counts.z & FLAG_RT_DEBUG) != 0u)
+    {
+        float exposure = max(gExposure[1], 1e-8);
+        color = color * 0.2 + rtSeen * (rtFound * 0.6 / exposure); // renderer_rt writes its debug colours
+    }
     if ((gFrame.counts.z & FLAG_SSR_DEBUG) != 0u)
     {
         float exposure = max(gExposure[1], 1e-8);

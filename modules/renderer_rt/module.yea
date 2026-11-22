@@ -1,0 +1,22 @@
+module renderer_rt
+
+# Called by renderer (the core) each frame with the address of its RenderFrame (frame.h).
+export bool rt_prepare(u64 frame)
+export void rt_run(u64 frame)
+
+category Ray-Traced Reflections
+# Reflections found by tracing rays through the scene, also of what is off screen or hidden. Only on GPUs
+# with ray tracing, with Anti-aliasing (TAA) on; elsewhere Screen Reflections and the probes show.
+setting bool enabled true
+# Surfaces rougher than this keep the probes' blurred reflections; traced ones fade out towards it.
+setting float max_roughness 0.5 0 1
+# Where what a ray hits is visible on screen, its fully lit colour from there (with all shadows and
+# lights); elsewhere it is lit at the hit.
+setting bool screen_colors true
+# Reflected things in shadow are dark: a shadow ray towards each light reaching what a ray hit.
+setting bool shadow_rays true
+# How far (metres) rays look for something to reflect.
+setting float max_distance 100 1 inf
+# Tints traced reflections: green where the hit was seen on screen, blue where it was lit at the hit,
+# grey where the ray found the sky.
+setting bool show_hits false

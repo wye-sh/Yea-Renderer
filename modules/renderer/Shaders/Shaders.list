@@ -96,3 +96,7 @@
 #frag renderer_gloss.frag
 #include "Gloss.frag.fsl"
 #end
+
+#frag renderer_surface.frag
+#include "Surface.frag.fsl"
+#end

@@ -1,0 +1,11 @@
+#include "Common_3/Graphics/FSL/defaults.h"
+
+#rootsig default.rootsig
+#end
+
+#rootsig compute.rootsig
+#end
+
+#comp FT_RAYTRACING renderer_rt_trace.comp
+#include "Trace.comp.fsl"
+#end

@@ -66,8 +66,23 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   made the rate image typeless, and binding it lost the GPU device. Vulkan caveat: FSL declares `RWTex2D(uint)` as `r32ui`,
   so the R8_UINT image is written through a mismatched format qualifier (fine on D3D12; unverified on Vulkan
   VRS hardware).
+- `renderer_rt`: ray-traced reflections, through Yea's ray-query service (`yea::raytracing()`, nullptr on GPUs
+  without inline ray queries: the module then does nothing and `renderer_ssr` runs as before; with it, SSR is
+  off). Owns the acceleration structures: one bottom-level structure per mesh (built on the frame's command list
+  when the mesh is new or its geometry moved; replaced ones freed once no frame in flight uses them) and one
+  top-level structure per frame in flight, its instances rewritten with `setInstances` and rebuilt every frame
+  (mask 1 every drawable, 2 shadow casters). The core's vertex and index buffers get the device-address and
+  build-input flags and a uint view when the service exists. While it runs, the prepass writes `surface`
+  (RGBA16F: x reflection roughness, yzw the normal; renderer_vrs reads x as its gloss). After the prepass, one
+  full-size compute dispatch traces each pixel below `max_roughness` along a GGX-jittered reflection (TAA
+  averages the lobe). A hit visible on screen now (its depth matches there) takes last frame's resolved colour
+  (`screen_colors`), fully lit with every shadow; elsewhere it is shaded at the hit: emission, the sun and up to
+  64 local lights (the core's light buffer now holds the lights outside the view after the visible ones,
+  `allLightCount`), at most 8 shadow rays per hit (`shadow_rays`), sky ambient. A miss sees the sky. The forward
+  pass blends it over the probes, fading out over the roughness limit's last third. Every GPU object is freed
+  in `unload()` (device-loss recovery unloads modules); nothing GPU-side is in tables.
 - The core calls the others through optional imports with a `RenderFrame*` (as `u64`): `frame.h`, copied
-  identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes`, `renderer_ssr` and `renderer_vrs` (`mathx.h` into the
+  identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes`, `renderer_ssr`, `renderer_vrs` and `renderer_rt` (`mathx.h` into the
   first three). Change all copies together and raise `RENDER_FRAME_VERSION`. `taa_prepare` runs first,
   before the camera, so the jitter reaches the projection.
 
@@ -110,7 +125,8 @@ multi_bounce, show_ao. `renderer_contact`: enabled, length, thickness, steps, in
 show_contact. `renderer_probes`: enabled, resolution (64-512), updates_per_frame, intensity, blend, parallax.
 `renderer_ssr`: enabled, half_resolution, max_roughness, thickness, max_distance, steps, edge_fade, intensity,
 show_hits (tints where reflections were found). `renderer_vrs`: enabled, aggressiveness, motion (0), keep_curved, glossy_below, allow_4x4,
-show_rates (green half rate, blue 2x2, magenta coarser).
+show_rates (green half rate, blue 2x2, magenta coarser). `renderer_rt`: enabled, max_roughness, screen_colors,
+shadow_rays, max_distance, show_hits (green: hit seen on screen, blue: lit at the hit, grey: sky).
 
 ## Reset
 
@@ -126,7 +142,9 @@ rate dispatch per 16 px tile and a small dilation dispatch with variable-rate sh
 depth copy for screen reflections (their march, up to `steps` plus 4 depth reads per crossing, runs in the forward pass for
 glossy pixels with reflections on, and shows in its timing), per re-captured probe 6 scene draws at half its
 resolution plus 6 small passes per mip, sun cascades redrawn, at most `updates_per_frame` local lights redrawn (oldest shadow first), two
-exposure dispatches, one full-screen TAA resolve (when on), one full-screen composite. No per-frame allocation. GPU memory at the defaults:
+exposure dispatches, with ray-traced reflections (instead of the SSR depth copy and march) one top-level
+rebuild and one full-size trace dispatch (a closest-hit ray per glossy pixel, plus up to 9 shadow rays where
+the hit isn't on screen), one full-screen TAA resolve (when on), one full-screen composite. No per-frame allocation. GPU memory at the defaults:
 HDR + depth at 4x MSAA, sun atlas 4096² D32 (64 MB), local atlas 4096² (64 MB), a screen-size R32F depth copy
 for screen reflections (a quarter of it at half resolution).
 

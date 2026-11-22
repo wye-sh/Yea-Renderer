@@ -1,0 +1,36 @@
+// The depth prepass's second output while renderer_rt runs: per pixel, x the roughness its reflections
+// have (with specular antialiasing, as the forward pass widens it; 1 for materials with reflections off,
+// and the clear, 1, for the sky), yzw the shading normal turned towards the viewer. The ray-traced
+// reflections start from it; renderer_vrs reads x as it reads the gloss output.
+#include "Common.h.fsl"
+#include "Scene.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float3, WorldPos, TEXCOORD0);
+    DATA(float3, Normal, TEXCOORD1);
+    DATA(FLAT(uint), Material, TEXCOORD2);
+    DATA(float4, CurrClip, TEXCOORD3);
+    DATA(float4, PrevClip, TEXCOORD4);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN(VSOutput In)
+{
+    INIT_MAIN;
+    MaterialData m = gMaterials[In.Material];
+    float3 N = normalize(In.Normal);
+    float3 V = normalize(gFrame.camPos.xyz - In.WorldPos);
+    if (dot(N, V) < 0.0)
+        N = -N;
+    float rough = clamp(m.albedoRough.a, 0.03, 1.0);
+    float a2 = rough * rough;
+    a2 *= a2;
+    float3 dndx = ddx(In.Normal);
+    float3 dndy = ddy(In.Normal);
+    float  variance = 0.25 * gFrame.misc.y * (dot(dndx, dndx) + dot(dndy, dndy));
+    a2 = saturate(a2 + min(2.0 * variance, 0.18));
+    float r = m.params.z > 0.5 ? sqrt(sqrt(a2)) : 1.0;
+    RETURN(float4(r, N));
+}

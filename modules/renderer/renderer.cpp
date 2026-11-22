@@ -5,6 +5,7 @@
 // host's own world quads draw over it.
 #include "yea_renderer.h"
 #include <yea/shadingrate.h>
+#include <yea/raytracing.h>
 #include "frame.h"
 #include "mathx.h"
 #include "scene.h"
@@ -53,6 +54,7 @@ struct GpuFrame
     float    probeParams[4];
     float    ssr[4];  // x max roughness, y thickness, z max distance, w edge fade
     float    ssr2[4]; // x intensity, y depth copy scale, z steps
+    float    rt[4];   // x max roughness of ray-traced reflections
 };
 struct GpuMaterial
 {
@@ -75,7 +77,7 @@ struct ExposureData
 
 const uint32_t kFlagCulled = 1, kFlagHeatmap = 2, kFlagCascades = 4, kFlagShadows = 8, kFlagAo = 16, kFlagAoDebug = 32, kFlagContact = 64,
                kFlagContactDebug = 128, kFlagUnlit = 256, kFlagSsr = 512, kFlagSsrDebug = 1024,
-               kFlagReceiverPlane = 2048;
+               kFlagReceiverPlane = 2048, kFlagRt = 4096, kFlagRtDebug = 8192;
 const uint32_t kMaxFrames = 4;
 const uint32_t kMaxUnculledLights = 256;
 const uint32_t kHistogramBins = 128;
@@ -92,6 +94,10 @@ Shader *gMotionDepthShader, *gMotionShader, *gSkyMotionShader; // TAA on: with m
 Shader*        gGlossShader;   // the prepass with a reflection-roughness output, for renderer_vrs
 Pipeline*      gDepthGlossPipe[2];
 RenderTarget*  gGloss;
+Shader*        gSurfaceShader; // the prepass with roughness and normal outputs, for renderer_rt
+Pipeline*      gDepthSurfacePipe[2];
+RenderTarget*  gSurface;
+const YeaRaytracing* gRaytracing; // nullptr: no ray queries on this GPU
 // The full forward shaders add PCSS, the debug views and Wireframe's unlit lines; the lean ones, used
 // otherwise, leave them out and so need fewer registers.
 Shader *gForwardFullShader, *gMotionFullShader;
@@ -138,6 +144,7 @@ GpuFrame             gFrameCpu;
 RenderCaster* gCasters;
 RenderCaster* gDrawables; // every instance, by mesh (reflection probes draw them all)
 RenderLight*  gLocal;
+uint32_t*     gOutside; // rows of lights outside the view, for what reflections see
 // Visible instances by key: mesh * 2 + double-sided, so single- and double-sided ones draw apart.
 uint32_t        gMeshCount[2048], gMeshStart[2048], gMeshCursor[2048];
 RenderFrame   gFrame;
@@ -157,7 +164,7 @@ uint32_t snapSamples(int32_t s) { return s >= 8 ? 8 : s >= 4 ? 4 : s >= 2 ? 2 : 
 uint32_t sampleIndex(uint32_t s) { return s == 8 ? 3 : s == 4 ? 2 : s == 2 ? 1 : 0; }
 
 Buffer* makeBuffer(uint64_t size, uint32_t stride, uint32_t descriptors, ResourceMemoryUsage usage, ResourceState start, const char* name,
-                   const void* data = nullptr, bool zero = false)
+                   const void* data = nullptr, bool zero = false, uint32_t flags = 0)
 {
     Buffer*        b = nullptr;
     BufferLoadDesc d = {};
@@ -168,6 +175,7 @@ Buffer* makeBuffer(uint64_t size, uint32_t stride, uint32_t descriptors, Resourc
     d.mDesc.mStartState = start;
     if (usage != RESOURCE_MEMORY_USAGE_GPU_ONLY)
         d.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+    d.mDesc.mFlags = (BufferCreationFlags)(d.mDesc.mFlags | flags);
     if (stride)
     {
         d.mDesc.mStructStride = stride;
@@ -292,6 +300,7 @@ void destroyScenePipelines()
     {
         freePipeline(gDepthPipe[s]);
         freePipeline(gDepthGlossPipe[s]);
+        freePipeline(gDepthSurfacePipe[s]);
         freePipeline(gForwardPipe[s]);
         freePipeline(gForwardFullPipe[s]);
         freePipeline(gForwardDepthPipe[s]);
@@ -349,6 +358,21 @@ void createScenePipelines(uint32_t samples, bool motion)
         {
             raster.mCullMode = s ? CULL_MODE_NONE : CULL_MODE_BACK;
             addPipeline(gRenderer, &desc, &gDepthGlossPipe[s]);
+        }
+        g.mRenderTargetCount = 0;
+        g.pColorFormats = nullptr;
+    }
+    if (motion && gSurfaceShader)
+    {
+        TinyImageFormat surfaceFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
+        g.mRenderTargetCount = 1;
+        g.pColorFormats = &surfaceFormat;
+        g.pShaderProgram = gSurfaceShader;
+        desc.pName = "renderer_depth_surface";
+        for (uint32_t s = 0; s < 2; ++s)
+        {
+            raster.mCullMode = s ? CULL_MODE_NONE : CULL_MODE_BACK;
+            addPipeline(gRenderer, &desc, &gDepthSurfacePipe[s]);
         }
         g.mRenderTargetCount = 0;
         g.pColorFormats = nullptr;
@@ -423,6 +447,7 @@ void destroyTargets()
     freeTarget(gDepth);
     freeTarget(gMotion);
     freeTarget(gGloss);
+    freeTarget(gSurface);
     gWidth = gHeight = gSamples = 0;
 }
 
@@ -458,6 +483,13 @@ void createTargets(uint32_t w, uint32_t h, uint32_t samples, bool motion)
         d.mClearValue = { { 1, 1, 1, 1 } };
         d.pName = "renderer_gloss";
         addRenderTarget(gRenderer, &d, &gGloss);
+        if (gRaytracing)
+        {
+            d.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
+            d.mClearValue = { { 1, 0, 0, 0 } };
+            d.pName = "renderer_surface";
+            addRenderTarget(gRenderer, &d, &gSurface);
+        }
     }
     gWidth = w;
     gHeight = h;
@@ -492,10 +524,13 @@ void uploadMeshes()
     if (!gUploadedVertices || !gUploadedIndices)
         return;
     // Mapped buffers the CPU writes directly: no copy queue to wait on.
-    gVertexBuf = makeBuffer((uint64_t)gUploadedVertices * kVertexStride, 0, DESCRIPTOR_TYPE_VERTEX_BUFFER, RESOURCE_MEMORY_USAGE_CPU_TO_GPU,
-                            RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, "renderer_vertices");
-    gIndexBuf = makeBuffer((uint64_t)gUploadedIndices * 4, 0, DESCRIPTOR_TYPE_INDEX_BUFFER, RESOURCE_MEMORY_USAGE_CPU_TO_GPU,
-                           RESOURCE_STATE_INDEX_BUFFER, "renderer_indices");
+    // With ray queries also acceleration-structure build inputs, and read as uint arrays by renderer_rt.
+    uint32_t rtFlags = gRaytracing ? (uint32_t)(BUFFER_CREATION_FLAG_SHADER_DEVICE_ADDRESS | BUFFER_CREATION_FLAG_ACCELERATION_STRUCTURE_BUILD_INPUT) : 0;
+    uint32_t rtRead = gRaytracing ? (uint32_t)DESCRIPTOR_TYPE_BUFFER : 0;
+    gVertexBuf = makeBuffer((uint64_t)gUploadedVertices * kVertexStride, gRaytracing ? 4 : 0, DESCRIPTOR_TYPE_VERTEX_BUFFER | rtRead,
+                            RESOURCE_MEMORY_USAGE_CPU_TO_GPU, RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, "renderer_vertices", nullptr, false, rtFlags);
+    gIndexBuf = makeBuffer((uint64_t)gUploadedIndices * 4, gRaytracing ? 4 : 0, DESCRIPTOR_TYPE_INDEX_BUFFER | rtRead, RESOURCE_MEMORY_USAGE_CPU_TO_GPU,
+                           RESOURCE_STATE_INDEX_BUFFER, "renderer_indices", nullptr, false, rtFlags);
     if (!gVertexBuf || !gIndexBuf || !gVertexBuf->pCpuMappedAddress || !gIndexBuf->pCpuMappedAddress)
     {
         yea::host()->log(2, "renderer: could not map the mesh buffers");
@@ -614,8 +649,8 @@ void barrierBuf(Cmd* cmd, Buffer* buf, ResourceState from, ResourceState to)
 // (that frame's fence has passed by then, so nothing waits), averaged and logged every 10 s.
 namespace
 {
-enum Timing : uint32_t { kTimeShadows, kTimeProbes, kTimePrepass, kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeVrs, kTimeForward, kTimeExposure, kTimeTaa, kTimeComposite, kTimeTotal, kTimings };
-const char* const kTimingNames[kTimings] = { "shadows", "probes", "prepass", "culling", "ao", "contact", "ssr", "vrs", "forward+sky", "exposure", "taa", "composite", "total" };
+enum Timing : uint32_t { kTimeShadows, kTimeProbes, kTimePrepass, kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeVrs, kTimeRt, kTimeForward, kTimeExposure, kTimeTaa, kTimeComposite, kTimeTotal, kTimings };
+const char* const kTimingNames[kTimings] = { "shadows", "probes", "prepass", "culling", "ao", "contact", "ssr", "vrs", "rt", "forward+sky", "exposure", "taa", "composite", "total" };
 QueryPool*        gTimePool[kMaxFrames];
 uint32_t          gTimeUsed[kMaxFrames]; // bits: what that frame recorded
 double            gTimeTicks;            // per second
@@ -686,6 +721,7 @@ int load(int reloaded)
     const YeaHost* host = yea::host();
     bindState(); // first: the exports use these blocks even if the GPU side fails below
     gShadingRate = yea::shadingRate();
+    gRaytracing = yea::raytracing();
     // A new material layout starts its table empty: instances would point at materials that are
     // gone, so the scene starts over and its owner builds it again (as on a clear()).
     if (Materials.size() == 0 && Instances.size() > 0)
@@ -713,6 +749,7 @@ int load(int reloaded)
     gMotionFullShader = loadShader("renderer_forward_motion.vert", "renderer_forward_motion_full.frag", nullptr);
     gSkyMotionShader = loadShader("renderer_fullscreen.vert", "renderer_sky_motion.frag", nullptr);
     gGlossShader = loadShader("renderer_forward_motion.vert", "renderer_gloss.frag", nullptr);
+    gSurfaceShader = gRaytracing ? loadShader("renderer_forward_motion.vert", "renderer_surface.frag", nullptr) : nullptr;
     const char* composite[4] = { "renderer_composite_1.frag", "renderer_composite_2.frag", "renderer_composite_4.frag",
                                  "renderer_composite_8.frag" };
     const char* histogram[4] = { "renderer_histogram_1.comp", "renderer_histogram_2.comp", "renderer_histogram_4.comp",
@@ -841,6 +878,7 @@ int load(int reloaded)
     gCasters = new RenderCaster[Instances.capacity()];
     gDrawables = new RenderCaster[Instances.capacity()];
     gLocal = new RenderLight[Lights.capacity()];
+    gOutside = new uint32_t[Lights.capacity()];
     gPrevRows = new PrevRows[Instances.capacity()];
     memset(gPrevRows, 0, sizeof(PrevRows) * Instances.capacity());
     gPrevCpu = new float[Instances.capacity()][3][4];
@@ -893,7 +931,7 @@ void unload()
     if (gShadowSampler)
         removeSampler(gRenderer, gShadowSampler);
     Shader* shaders[] = { gForwardDepthShader, gForwardShader, gSkyShader, gAdaptShader, gMotionDepthShader, gMotionShader, gSkyMotionShader,
-                          gForwardFullShader, gMotionFullShader, gGlossShader };
+                          gForwardFullShader, gMotionFullShader, gGlossShader, gSurfaceShader };
     for (Shader* s : shaders)
         if (s)
             removeShader(gRenderer, s);
@@ -1106,7 +1144,9 @@ void draw(uint32_t pass, const YeaFrame* yf)
             memcpy(c.sphere, info.sphere, sizeof c.sphere);
             c.moved = info.moved;
             c.twoSided = (info.flags >> 2) & 1;
-            c.reserved = 0;
+            c.mesh = info.mesh;
+            c.vertexCount = mesh.vertexCount;
+            c.castShadow = (info.flags >> 1) & 1;
         }
         if (info.flags & 2)
         {
@@ -1118,6 +1158,9 @@ void draw(uint32_t pass, const YeaFrame* yf)
             c.vertexOffset = (int32_t)mesh.firstVertex;
             memcpy(c.sphere, info.sphere, sizeof c.sphere);
             c.moved = info.moved;
+            c.mesh = info.mesh;
+            c.vertexCount = mesh.vertexCount;
+            c.castShadow = 1;
         }
     }
     (void)casterStart;
@@ -1125,7 +1168,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     // --- Lights -----------------------------------------------------------------------------
     GpuFrame* gf = &gFrameCpu;
     memset(gf, 0, sizeof *gf);
-    uint32_t dirCount = 0, localCount = 0;
+    uint32_t dirCount = 0, localCount = 0, outsideCount = 0;
     bool     sunShadow = false;
     for (uint32_t row = 0; row < Lights.size(); ++row)
     {
@@ -1179,7 +1222,10 @@ void draw(uint32_t pass, const YeaFrame* yf)
             }
         }
         if (!sphereInside(frustum, 5, c, r))
+        {
+            gOutside[outsideCount++] = row;
             continue;
+        }
         o.sphere[0] = c.x;
         o.sphere[1] = c.y;
         o.sphere[2] = c.z;
@@ -1211,6 +1257,8 @@ void draw(uint32_t pass, const YeaFrame* yf)
     F.vertices = gVertexBuf;
     F.indices = gIndexBuf;
     F.instances = gInstanceBuf[fi];
+    F.instanceRows = gInstCpu;
+    F.instanceCount = count;
     F.vertexStride = kVertexStride;
     F.casters = gCasters;
     F.casterCount = casterTotal;
@@ -1251,36 +1299,51 @@ void draw(uint32_t pass, const YeaFrame* yf)
     F.skyGround[0] = gnd.x * L, F.skyGround[1] = gnd.y * L, F.skyGround[2] = gnd.z * L;
     F.ambient = settings.ambient;
     bool probes = renderer_probes::probes_prepare((uint64_t)(uintptr_t)&F) && F.probes && F.probeData && F.probeCount;
-    bool ssr = taa && !viewMode && renderer_ssr::ssr_prepare((uint64_t)(uintptr_t)&F) && F.ssrOn && F.ssrDepth && F.previous;
+    // Ray-traced reflections where the GPU has ray queries; screen-space ones otherwise.
+    F.surface = gSurface;
+    bool rt = taa && !viewMode && gRaytracing && gSurface && gDepthSurfacePipe[0] && gDepthSurfacePipe[1] && F.previous &&
+              renderer_rt::rt_prepare((uint64_t)(uintptr_t)&F) && F.rtReflection;
+    bool ssr = !rt && taa && !viewMode && renderer_ssr::ssr_prepare((uint64_t)(uintptr_t)&F) && F.ssrOn && F.ssrDepth && F.previous;
     bool vrs = taa && !viewMode && renderer_vrs::vrs_prepare((uint64_t)(uintptr_t)&F) && F.rateImage && F.rateCopy;
 
-    // GPU lights in sorted order, with the shadow views renderer_shadows picked.
+    // GPU lights in sorted order, with the shadow views renderer_shadows picked; then, for reflections
+    // (renderer_rt), the lights outside the view, without shadows.
     RenderGpuLight* gl = gLightCpu;
-    for (uint32_t i = 0; i < F.lightCount; ++i)
+    for (uint32_t i = 0; i < F.lightCount + outsideCount; ++i)
     {
-        const RenderLight& o = gLocal[i];
-        const Light&         l = Lights[o.source];
-        RenderGpuLight&    g = gl[i];
-        float                cosInner = cosf(l.inner * 3.14159265f / 180.0f);
-        float                scale = 1.0f / maxf(cosInner - o.cosOuter, 1e-3f);
-        g.pos[0] = o.pos[0];
-        g.pos[1] = o.pos[1];
-        g.pos[2] = o.pos[2];
-        g.pos[3] = o.range;
+        bool         inside = i < F.lightCount;
+        uint32_t     row = inside ? gLocal[i].source : gOutside[i - F.lightCount];
+        const Light& l = Lights[row];
+        RenderGpuLight& g = gl[i];
+        v3           dir = normalize(V(l.dir.x, l.dir.y, l.dir.z));
+        float        range = maxf(l.range, 0.01f);
+        float        cosOuter = cosf(l.outer * 3.14159265f / 180.0f);
+        float        cosInner = cosf(l.inner * 3.14159265f / 180.0f);
+        float        scale = 1.0f / maxf(cosInner - cosOuter, 1e-3f);
+        g.pos[0] = l.pos.x;
+        g.pos[1] = l.pos.y;
+        g.pos[2] = l.pos.z;
+        g.pos[3] = range;
         g.color[0] = l.color.x * l.intensity;
         g.color[1] = l.color.y * l.intensity;
         g.color[2] = l.color.z * l.intensity;
-        g.color[3] = (float)o.type;
-        g.dir[0] = o.dir[0];
-        g.dir[1] = o.dir[1];
-        g.dir[2] = o.dir[2];
+        g.color[3] = (float)l.type;
+        g.dir[0] = dir.x;
+        g.dir[1] = dir.y;
+        g.dir[2] = dir.z;
         g.dir[3] = scale;
-        g.params[0] = -o.cosOuter * scale;
-        g.params[1] = shadows ? (float)o.shadow : -1.0f;
-        g.params[2] = 1.0f / (o.range * o.range);
+        g.params[0] = -cosOuter * scale;
+        g.params[1] = shadows && inside ? (float)gLocal[i].shadow : -1.0f;
+        g.params[2] = 1.0f / (range * range);
         g.params[3] = 0;
-        memcpy(g.sphere, o.sphere, sizeof g.sphere);
+        if (inside)
+            memcpy(g.sphere, gLocal[i].sphere, sizeof g.sphere);
+        else
+        {
+            g.sphere[0] = l.pos.x, g.sphere[1] = l.pos.y, g.sphere[2] = l.pos.z, g.sphere[3] = range;
+        }
     }
+    F.allLightCount = F.lightCount + outsideCount;
 
     // Materials.
     GpuMaterial* gm = gMaterialCpu;
@@ -1329,7 +1392,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
                     (ao && F.aoDebug ? kFlagAoDebug : 0) | (contact ? kFlagContact : 0) |
                     (contact && F.contactDebug ? kFlagContactDebug : 0) |
                     ((viewMode & YEA_VIEW_WIREFRAME) ? kFlagUnlit : 0) | (ssr ? kFlagSsr : 0) | (ssr && F.ssrDebug ? kFlagSsrDebug : 0) |
-                    (shadows && F.receiverPlane ? kFlagReceiverPlane : 0);
+                    (shadows && F.receiverPlane ? kFlagReceiverPlane : 0) | (rt ? kFlagRt : 0) | (rt && F.rtDebug ? kFlagRtDebug : 0);
     if (ssr)
     {
         gf->ssr[0] = F.ssrMaxRoughness;
@@ -1341,6 +1404,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         gf->ssr2[2] = (float)F.ssrSteps;
         gf->ssr2[3] = (float)((F.frameNumber % 64u) * 0.6180339887); // rotates the march's noise; TAA averages it
     }
+    gf->rt[0] = rt ? F.rtMaxRoughness : 0.0f;
     if (probes)
     {
         gf->probeInfo[0] = F.probeCount;
@@ -1386,7 +1450,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         visibleTotal += gMeshCount[k];
     memcpy(gInstanceBuf[fi]->pCpuMappedAddress, gInstCpu, (size_t)count * sizeof(RenderGpuInstance));
     memcpy(gStreamBuf[fi]->pCpuMappedAddress, gStream, (size_t)visibleTotal * 4);
-    memcpy(gLightBuf[fi]->pCpuMappedAddress, gLightCpu, (size_t)F.lightCount * sizeof(RenderGpuLight));
+    memcpy(gLightBuf[fi]->pCpuMappedAddress, gLightCpu, (size_t)F.allLightCount * sizeof(RenderGpuLight));
     memcpy(gMaterialBuf[fi]->pCpuMappedAddress, gMaterialCpu, (size_t)Materials.size() * sizeof(GpuMaterial));
     memcpy(gFrameCb[fi]->pCpuMappedAddress, &gFrameCpu, sizeof gFrameCpu);
     if (taa)
@@ -1441,13 +1505,14 @@ void draw(uint32_t pass, const YeaFrame* yf)
         Buffer*  masks = culled ? F.tileMasks : gDummyU32;
         Buffer*  bins = culled ? F.zbins : gDummyU32;
         Buffer*  views = shadows ? F.shadowViews : gDummyViews;
-        DescriptorData p[17] = {};
+        DescriptorData p[18] = {};
         Texture*       ssrDepth = ssr ? F.ssrDepth : gDummyDepth->pTexture;
         Texture*       previous = ssr ? F.previous->pTexture : gDummyColor->pTexture;
         Texture*       probeTex = probes ? F.probes->pTexture : gDummyArray->pTexture;
         Buffer*        probeData = probes ? F.probeData : gDummyProbes;
         Texture*       contactTex = contact ? F.contact : gDummyDepth->pTexture;
         Texture*       aoTex = ao ? F.ao : gDummyDepth->pTexture;
+        Texture*       rtTex = rt ? F.rtReflection : gDummyColor->pTexture;
         p[0].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gFrame);
         p[0].ppBuffers = &gFrameCb[fi];
         p[1].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gInstances);
@@ -1482,7 +1547,9 @@ void draw(uint32_t pass, const YeaFrame* yf)
         p[15].ppTextures = &ssrDepth;
         p[16].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gPrevColor);
         p[16].ppTextures = &previous;
-        updateDescriptorSet(gRenderer, fi, gSceneFrame, 17, p);
+        p[17].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gRtReflection);
+        p[17].ppTextures = &rtTex;
+        updateDescriptorSet(gRenderer, fi, gSceneFrame, 18, p);
 
         DescriptorData c[5] = {};
         c[0].mIndex = SRT_RES_IDX(CompositeSrt, PerFrame, gComposite);
@@ -1552,34 +1619,35 @@ void draw(uint32_t pass, const YeaFrame* yf)
     bind.mDepthStencil = { gDepth, LOAD_ACTION_CLEAR };
     bind.mDepthStencil.mStoreAction = STORE_ACTION_STORE;
     // With renderer_vrs, also each pixel's reflection roughness, so glossy surfaces keep full rate.
-    bool gloss = vrs && gGloss && gDepthGlossPipe[0] && gDepthGlossPipe[1];
-    if (gloss)
+    // With renderer_rt, each pixel's reflection roughness and normal instead (renderer_vrs reads its roughness too).
+    RenderTarget* second = rt ? gSurface : vrs && gGloss && gDepthGlossPipe[0] && gDepthGlossPipe[1] ? gGloss : nullptr;
+    if (second)
     {
-        barrierRt(cmd, gGloss, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_RENDER_TARGET);
+        barrierRt(cmd, second, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_RENDER_TARGET);
         bind.mRenderTargetCount = 1;
-        bind.mRenderTargets[0] = { gGloss, LOAD_ACTION_CLEAR };
+        bind.mRenderTargets[0] = { second, LOAD_ACTION_CLEAR };
     }
     cmdBindRenderTargets(cmd, &bind);
     cmdSetViewport(cmd, 0, 0, (float)w, (float)h, 0, 1);
     cmdSetScissor(cmd, 0, 0, w, h);
     if (geometry)
     {
-        drawVisible(cmd, fi, gloss ? gDepthGlossPipe : gDepthPipe);
+        drawVisible(cmd, fi, rt ? gDepthSurfacePipe : second ? gDepthGlossPipe : gDepthPipe);
     }
     cmdBindRenderTargets(cmd, nullptr);
-    if (gloss)
-        barrierRt(cmd, gGloss, RESOURCE_STATE_RENDER_TARGET, RESOURCE_STATE_SHADER_RESOURCE);
-    F.gloss = gloss ? gGloss : nullptr;
+    if (second)
+        barrierRt(cmd, second, RESOURCE_STATE_RENDER_TARGET, RESOURCE_STATE_SHADER_RESOURCE);
+    F.gloss = second;
     cmdEndDebugMarker(cmd);
     }
 
     timeEnd(cmd, fi, kTimePrepass);
-    if (culled || ao || contact || ssr || vrs)
+    if (culled || ao || contact || ssr || vrs || rt)
     {
         barrierRt(cmd, gDepth, RESOURCE_STATE_DEPTH_WRITE, RESOURCE_STATE_SHADER_RESOURCE);
-        const uint32_t which[5] = { kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeVrs };
-        const bool     run[5] = { culled, ao, contact, ssr, vrs };
-        for (uint32_t k = 0; k < 5; ++k)
+        const uint32_t which[6] = { kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeVrs, kTimeRt };
+        const bool     run[6] = { culled, ao, contact, ssr, vrs, rt };
+        for (uint32_t k = 0; k < 6; ++k)
         {
             if (!run[k])
                 continue;
@@ -1593,8 +1661,10 @@ void draw(uint32_t pass, const YeaFrame* yf)
                 renderer_contact::contact_run((uint64_t)(uintptr_t)&F);
             else if (k == 3)
                 renderer_ssr::ssr_run((uint64_t)(uintptr_t)&F);
-            else
+            else if (k == 4)
                 renderer_vrs::vrs_run((uint64_t)(uintptr_t)&F);
+            else
+                renderer_rt::rt_run((uint64_t)(uintptr_t)&F);
             timeEnd(cmd, fi, which[k]);
         }
         barrierRt(cmd, gDepth, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_DEPTH_WRITE);
@@ -1631,7 +1701,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     cmdSetScissor(cmd, 0, 0, w, h);
     if (geometry)
     {
-        bool full = (gf->counts[2] & (kFlagHeatmap | kFlagCascades | kFlagAoDebug | kFlagContactDebug | kFlagSsrDebug)) || (shadows && F.lightSize > 0);
+        bool full = (gf->counts[2] & (kFlagHeatmap | kFlagCascades | kFlagAoDebug | kFlagContactDebug | kFlagSsrDebug | kFlagRtDebug)) || (shadows && F.lightSize > 0);
         drawVisible(cmd, fi, viewMode ? gForwardDepthPipe : full ? gForwardFullPipe : gForwardPipe);
     }
     if (!viewMode)

@@ -1,0 +1,290 @@
+// Ray-traced reflections: per pixel below the roughness limit, the reflected ray (one GGX microfacet normal
+// per pixel and frame, Walter et al. 2007; TAA averages them into the lobe) traced with an inline ray query
+// against the scene's acceleration structure. What it hits gets its colour from last frame's anti-aliased
+// image where the hit is visible on screen (fully lit, with every shadow), verified against the depth there,
+// so a hidden or off-screen hit is never mistaken for what stands in front of it; elsewhere it is lit at the
+// hit: the sun (with a shadow ray), local lights, the sky's light, emission. A miss sees the sky.
+#include "fsl_ext.h"
+
+STRUCT(RtData)
+{
+    DATA(float4, right, None);       // camera basis (world), w P00
+    DATA(float4, up, None);          // w P11
+    DATA(float4, forward, None);     // w near
+    DATA(float4, camPos, None);      // w max roughness
+    DATA(float4, screen, None);      // xy size, zw TAA jitter (px)
+    DATA(float4, viewProj[4], None); // rows, this frame without jitter
+    DATA(float4, prevViewProj[4], None);
+    DATA(float4, sunDir, None);      // towards the sun, w 1 when on
+    DATA(float4, sunColor, None);    // rgb lux, w sky ambient multiplier
+    DATA(float4, skyZenith, None);
+    DATA(float4, skyHorizon, None);
+    DATA(float4, skyGround, None);
+    DATA(uint4, counts, None);       // x lights, y frame (noise), z flags, w instances
+    DATA(float4, params, None);      // x max distance (m), y edge fade (fraction of the screen)
+};
+
+STRUCT(InstanceData)
+{
+    DATA(float4, row0, None);
+    DATA(float4, row1, None);
+    DATA(float4, row2, None);
+    DATA(uint4, misc, None); // x material
+};
+
+STRUCT(MaterialData)
+{
+    DATA(float4, albedoRough, None);
+    DATA(float4, params, None);  // x metallic, y f0 (dielectric), z reflections on
+    DATA(float4, emissive, None);
+};
+
+STRUCT(LightData)
+{
+    DATA(float4, pos, None);     // xyz, w range
+    DATA(float4, color, None);   // rgb candela, w type (1 point, 2 spot)
+    DATA(float4, dir, None);     // xyz spot direction, w spot scale
+    DATA(float4, params, None);  // x spot offset, z 1/range^2
+    DATA(float4, sphere, None);
+};
+
+#include "Trace.srt.h"
+
+#define PI 3.14159265
+#define RT_MISS 60000.0
+#define FLAG_SCREEN 1u
+#define FLAG_SHADOW_RAYS 2u
+#define FLAG_DEBUG 4u
+#define MAX_HIT_LIGHTS 64u
+#define MAX_SHADOW_RAYS 8u
+
+float noise2(float2 p) { return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715)))); }
+
+float3 skyRadiance(float3 d)
+{
+    if (d.y >= 0.0)
+        return lerp(gRt.skyHorizon.rgb, gRt.skyZenith.rgb, sqrt(saturate(d.y)));
+    return lerp(gRt.skyHorizon.rgb, gRt.skyGround.rgb, saturate(-d.y * 3.0));
+}
+
+float3 skyIrradiance(float3 N)
+{
+    float3 up = lerp(gRt.skyHorizon.rgb, gRt.skyZenith.rgb, 0.6);
+    float3 down = lerp(gRt.skyHorizon.rgb, gRt.skyGround.rgb, 0.85);
+    return lerp(down, up, N.y * 0.5 + 0.5);
+}
+
+float3 vertexNormal(uint v)
+{
+    return float3(asfloat(gVertices[v * 6u + 3u]), asfloat(gVertices[v * 6u + 4u]), asfloat(gVertices[v * 6u + 5u]));
+}
+
+// GGX with height-correlated Smith visibility and Schlick's Fresnel, as the core's forward pass.
+float3 brdfLight(float3 N, float3 V, float3 L, float3 diffuse, float3 f0, float a2, float3 E)
+{
+    float NoL = saturate(dot(N, L));
+    if (NoL <= 0.0)
+        return float3(0.0, 0.0, 0.0);
+    float3 H = normalize(V + L);
+    float  NoH = saturate(dot(N, H));
+    float  NoV = max(dot(N, V), 1e-3);
+    float  VoH = saturate(dot(V, H));
+    float  d = (NoH * a2 - NoH) * NoH + 1.0;
+    float  D = a2 / (PI * d * d);
+    float  gv = NoL * sqrt(NoV * NoV * (1.0 - a2) + a2);
+    float  gl = NoV * sqrt(NoL * NoL * (1.0 - a2) + a2);
+    float  Vis = 0.5 / max(gv + gl, 1e-5);
+    float3 F = f0 + (float3(1.0, 1.0, 1.0) - f0) * pow(1.0 - VoH, 5.0);
+    return (diffuse * (1.0 / PI) + D * Vis * F) * E * NoL;
+}
+
+// Whether anything is between P and a light along L, up to tMax (one any-hit ray).
+float lightVisible(float3 P, float3 L, float tMax)
+{
+    if ((gRt.counts.z & FLAG_SHADOW_RAYS) == 0u)
+        return 1.0;
+    RayDesc shadowRay;
+    shadowRay.Origin = P;
+    shadowRay.Direction = L;
+    shadowRay.TMin = 0.0;
+    shadowRay.TMax = tMax;
+    RayQueryAnyHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RAY_FLAG_FORCE_OPAQUE, shadowRay, 2u, occluded) // casters only
+    return RayQueryIsHit(occluded) ? 0.0 : 1.0;
+}
+
+// The hit lit where it is: emission, the sun and local lights (those in view nearest first, then the rest),
+// each shadowed by a ray, and the sky's light.
+float3 shadeHit(float3 P, float3 N, float3 V, MaterialData m)
+{
+    float  metallic = saturate(m.params.x);
+    float3 albedo = m.albedoRough.rgb;
+    float3 diffuse = albedo * (1.0 - metallic);
+    float3 f0 = lerp(float3(m.params.y, m.params.y, m.params.y), albedo, metallic);
+    float  rough = clamp(m.albedoRough.a, 0.03, 1.0);
+    float  a2 = rough * rough;
+    a2 *= a2;
+    float3 color = m.emissive.rgb;
+    float3 offset = P + N * 0.01;
+    if (gRt.sunDir.w > 0.5)
+    {
+        float3 L = gRt.sunDir.xyz;
+        if (dot(N, L) > 0.0)
+            color += brdfLight(N, V, L, diffuse, f0, a2, gRt.sunColor.rgb * lightVisible(offset, L, 1000.0));
+    }
+    uint  lights = min(gRt.counts.x, MAX_HIT_LIGHTS);
+    uint  rays = 0u;
+    float exposure = gExposure[1];
+    for (uint i = 0u; i < lights; ++i)
+    {
+        LightData l = gLights[i];
+        float3 toLight = l.pos.xyz - P;
+        float  d2 = dot(toLight, toLight);
+        if (d2 >= l.pos.w * l.pos.w)
+            continue;
+        float3 L = toLight * rsqrt(max(d2, 1e-8));
+        float  f = d2 * l.params.z;
+        float  window = saturate(1.0 - f * f);
+        float  atten = window * window / max(d2, 1e-4);
+        if (l.color.w > 1.5)
+        {
+            float cone = saturate(dot(-L, l.dir.xyz) * l.dir.w + l.params.x);
+            atten *= cone * cone;
+        }
+        if (atten <= 0.0 || dot(N, L) <= 0.0)
+            continue;
+        float3 lit = brdfLight(N, V, L, diffuse, f0, a2, l.color.rgb * atten);
+        // A shadow ray only where the light could be seen (as the forward pass skips its shadow lookups),
+        // and for at most MAX_SHADOW_RAYS lights per hit.
+        if (rays < MAX_SHADOW_RAYS && max(lit.r, max(lit.g, lit.b)) * exposure >= 1.0 / 4096.0)
+        {
+            lit *= lightVisible(offset, L, max(sqrt(d2) - 0.05, 0.0));
+            rays += 1u;
+        }
+        color += lit;
+    }
+    float  ambient = gRt.sunColor.w;
+    float3 R = reflect(-V, N);
+    color += (diffuse * skyIrradiance(N) + f0 * lerp(skyRadiance(R), skyIrradiance(R), rough)) * ambient;
+    return color;
+}
+
+float4 clipOf(float4 rows[4], float3 W)
+{
+    float4 w = float4(W, 1.0);
+    return float4(dot(rows[0], w), dot(rows[1], w), dot(rows[2], w), dot(rows[3], w));
+}
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) id)
+{
+    INIT_MAIN;
+    int2 size = int2(gRt.screen.xy);
+    int2 p = int2(id.xy);
+    if (p.x >= size.x || p.y >= size.y)
+        RETURN();
+    float4 surface = LoadTex2D(gSurface, NO_SAMPLER, p, 0);
+    float  d = LoadTex2D(gDepth, NO_SAMPLER, p, 0).r;
+    float  rough = surface.x;
+    if (d <= 0.0 || rough >= gRt.camPos.w)
+    {
+        Write2D(gOut, p, float4(0.0, 0.0, 0.0, 0.0));
+        RETURN();
+    }
+
+    // The pixel's world position, from depth (reversed-Z, infinite far), undoing the TAA jitter it was drawn with.
+    float  z = gRt.forward.w / d;
+    float2 u = float2(p) + 0.5 - gRt.screen.zw;
+    float2 ndc = float2(u.x / gRt.screen.x * 2.0 - 1.0, 1.0 - u.y / gRt.screen.y * 2.0);
+    float3 P = gRt.camPos.xyz + gRt.right.xyz * (ndc.x * z / gRt.right.w) + gRt.up.xyz * (ndc.y * z / gRt.up.w) + gRt.forward.xyz * z;
+    float3 N = normalize(surface.yzw);
+    float3 V = normalize(gRt.camPos.xyz - P);
+
+    // The reflected ray, about one microfacet normal from the lobe; a mirror stays a mirror.
+    float  a2 = rough * rough;
+    a2 *= a2;
+    float3 R = reflect(-V, N);
+    if (a2 > 1e-6)
+    {
+        float2 q = float2(p) + float(gRt.counts.y) * float2(5.588238, 5.588238);
+        float  u1 = noise2(q);
+        float  u2 = noise2(q.yx + 17.0);
+        float  cosT = sqrt((1.0 - u1) / (1.0 + (a2 - 1.0) * u1));
+        float  sinT = sqrt(max(1.0 - cosT * cosT, 0.0));
+        float3 axis = abs(N.y) < 0.9 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+        float3 tx = normalize(cross(axis, N));
+        float3 ty = cross(N, tx);
+        float3 H = normalize(tx * (sinT * cos(u2 * 2.0 * PI)) + ty * (sinT * sin(u2 * 2.0 * PI)) + N * cosT);
+        float3 Rj = reflect(-V, H);
+        if (dot(Rj, N) > 0.0)
+            R = Rj;
+    }
+
+    RayDesc ray;
+    ray.Origin = P + N * (0.001 * z + 0.004); // off the surface, more further away where depth is coarser
+    ray.Direction = R;
+    ray.TMin = 0.0;
+    ray.TMax = gRt.params.x;
+    RayQueryClosestHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RAY_FLAG_FORCE_OPAQUE, ray, 1u, hit)
+    bool debug = (gRt.counts.z & FLAG_DEBUG) != 0u;
+    if (!RayQueryIsHit(hit))
+    {
+        float3 sky = skyRadiance(R) * gRt.sunColor.w;
+        Write2D(gOut, p, float4(debug ? float3(0.5, 0.5, 0.5) : sky, RT_MISS));
+        RETURN();
+    }
+    float  t = RayQueryRayT(hit);
+    uint   index = RayQueryInstanceID(hit);
+    uint   prim = RayQueryPrimitiveIndex(hit);
+    float2 bary = RayQueryBarycentrics(hit);
+    float3 Hp = ray.Origin + R * t;
+
+    // How much of the hit to take from the screen: visible there now (its depth matches) and last frame.
+    float  screenWeight = 0.0;
+    float3 screenColor = float3(0.0, 0.0, 0.0);
+    if ((gRt.counts.z & FLAG_SCREEN) != 0u)
+    {
+        float4 c = clipOf(gRt.viewProj, Hp);
+        float4 pc = clipOf(gRt.prevViewProj, Hp);
+        if (c.w > gRt.forward.w && pc.w > gRt.forward.w)
+        {
+            float2 uv = c.xy / c.w * float2(0.5, -0.5) + 0.5;
+            float2 uvPrev = pc.xy / pc.w * float2(0.5, -0.5) + 0.5;
+            float2 edge = min(min(uv, 1.0 - uv), min(uvPrev, 1.0 - uvPrev));
+            float  inside = saturate(min(edge.x, edge.y) / gRt.params.y);
+            if (inside > 0.0)
+            {
+                int2  q = clamp(int2(uv * gRt.screen.xy), int2(0, 0), size - int2(1, 1));
+                float seen = gRt.forward.w / max(LoadTex2D(gDepth, NO_SAMPLER, q, 0).r, 1e-7);
+                if (abs(seen - c.w) < 0.02 * c.w + 0.03)
+                {
+                    screenWeight = inside;
+                    screenColor = SampleLvlTex2D(gPrevious, gSamplerBilinearClamp, uvPrev, 0.0).rgb;
+                }
+            }
+        }
+    }
+    float3 color = screenColor;
+    if (screenWeight < 1.0)
+    {
+        uint4        inst = gRtInstances[index]; // x instance row, y first index, z first vertex
+        InstanceData row = gInstances[inst.x];
+        uint         i0 = gIndices[inst.y + prim * 3u] + inst.z;
+        uint         i1 = gIndices[inst.y + prim * 3u + 1u] + inst.z;
+        uint         i2 = gIndices[inst.y + prim * 3u + 2u] + inst.z;
+        float3       n = vertexNormal(i0) * (1.0 - bary.x - bary.y) + vertexNormal(i1) * bary.x + vertexNormal(i2) * bary.y;
+        // Object to world through the cofactor matrix (right for non-uniform scale), as the forward pass.
+        float3 c0 = cross(row.row1.xyz, row.row2.xyz);
+        float3 c1 = cross(row.row2.xyz, row.row0.xyz);
+        float3 c2 = cross(row.row0.xyz, row.row1.xyz);
+        float3 Nh = normalize(float3(dot(c0, n), dot(c1, n), dot(c2, n)));
+        if (dot(Nh, R) > 0.0)
+            Nh = -Nh; // the side the ray came from
+        float3 lit = shadeHit(Hp, Nh, -R, gMaterials[row.misc.x]);
+        color = lerp(lit, screenColor, screenWeight);
+    }
+    if (debug)
+        color = float3(0.0, screenWeight, 1.0 - screenWeight);
+    Write2D(gOut, p, float4(color, max(t, 1e-3)));
+    RETURN();
+}

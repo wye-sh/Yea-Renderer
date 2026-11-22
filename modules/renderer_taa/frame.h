@@ -1,5 +1,5 @@
 // The frame contract between the renderer modules: renderer (the core) fills a RenderFrame each
-// frame and passes its address (as u64) to the other renderer modules (culling, shadows, taa, ao, contact, probes, ssr, vrs). The same
+// frame and passes its address (as u64) to the other renderer modules (culling, shadows, taa, ao, contact, probes, ssr, vrs, rt). The same
 // file sits in each of them; keep the copies identical and raise RENDER_FRAME_VERSION on any change.
 #pragma once
 #include <stdint.h>
@@ -10,7 +10,7 @@ struct Buffer;
 struct RenderTarget;
 struct Texture;
 
-#define RENDER_FRAME_VERSION 11u
+#define RENDER_FRAME_VERSION 12u
 #define RENDER_MAX_CASCADES  4u
 #define RENDER_VIEW_SHIFT    20u // shadow instance stream entry: instance | view << 20
 
@@ -58,7 +58,10 @@ struct RenderCaster
     float    sphere[4];  // world bounding sphere
     uint64_t moved;      // frame number it last moved, appeared or changed mesh
     uint32_t twoSided;   // its material is double-sided: draw it without back-face culling
-    uint32_t reserved;
+    uint32_t mesh;       // the core's mesh row
+    uint32_t vertexCount; // the mesh's vertices, from vertexOffset
+    uint32_t castShadow;  // it casts shadows (every caster does; a drawable may not)
+    uint32_t pad;
 };
 
 // A visible local light, sorted by view depth (nearest first).
@@ -104,6 +107,8 @@ struct RenderFrame
     Buffer*               vertices;
     Buffer*               indices;     // u32
     Buffer*               instances;   // RenderGpuInstance[]
+    const RenderGpuInstance* instanceRows; // the same rows on the CPU, instanceCount of them
+    uint32_t              instanceCount;
     uint32_t              vertexStride;
     const RenderCaster* casters;
     uint32_t              casterCount;
@@ -116,7 +121,8 @@ struct RenderFrame
 
     // Camera depth (reversed-Z), in SHADER_RESOURCE state while renderer_culling runs.
     RenderTarget* depth;
-    Buffer*       lightBuffer; // RenderGpuLight[], this frame's
+    Buffer*       lightBuffer; // RenderGpuLight[], this frame's: lightCount visible ones, then the rest up to allLightCount
+    uint32_t      allLightCount; // also the lights outside the view (no shadows), for what reflections see
 
     // Out from renderer_culling.
     Buffer*  tileMasks;     // u32[tilesX * tilesY * wordsPerTile], SHADER_RESOURCE after cull_run
@@ -204,7 +210,19 @@ struct RenderFrame
     // bindRenderTargets).
     Texture* rateImage;       // Yea's R8_UINT rate image, a YEA_RATE_* per rateTile px tile
     Texture* rateCopy;        // the same rates, R32_UINT, SHADER_RESOURCE after vrs_run (Show Rates)
-    RenderTarget* gloss;      // R8: each pixel's reflection roughness (1: none), from the prepass, SHADER_RESOURCE in vrs_run
+    RenderTarget* gloss;      // .x: each pixel's reflection roughness (1: none), from the prepass, SHADER_RESOURCE in vrs_run
+                              // (R8, or `surface` while renderer_rt runs)
     uint32_t rateTile;
     uint32_t vrsDebug;        // tint the screen by rate
+
+    // Ray-traced reflections (renderer_rt), only on GPUs with inline ray queries (yea::raytracing()) and with TAA;
+    // screen-space reflections are then off. rt_prepare runs after probes_prepare; rt_run after the depth
+    // prepass, with depth and surface in SHADER_RESOURCE. The forward pass reads rtReflection.
+    RenderTarget* surface;    // RGBA16F from the prepass: x reflection roughness (specular AA in; 1: none), yzw the
+                              // shading normal (towards the viewer)
+    Texture* rtReflection;    // RGBA16F, full size, SHADER_RESOURCE after rt_run: rgb what the pixel's reflected ray
+                              // sees, a its distance (0: not traced, RENDER_RT_MISS: the sky)
+    float    rtMaxRoughness;  // traced below it, fading out over its last third
+    uint32_t rtDebug;         // show where rays were traced (green: hit seen on screen, blue: shaded at the hit)
 };
+#define RENDER_RT_MISS 60000.0f

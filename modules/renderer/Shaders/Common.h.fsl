@@ -36,6 +36,7 @@ STRUCT(FrameData)
     DATA(float4, probeParams, None);         // x intensity, y blend (m)
     DATA(float4, ssr, None);                 // x max roughness, y thickness (m), z max distance (m), w edge fade
     DATA(float4, ssr2, None);                // x intensity, y depth copy scale, z steps, w noise offset this frame
+    DATA(float4, rt, None);                  // x max roughness of ray-traced reflections (renderer_rt)
 };
 
 // A reflection probe (renderer_probes), smallest box first.
@@ -59,6 +60,9 @@ STRUCT(ProbeData)
 #define FLAG_SSR      512u
 #define FLAG_SSR_DEBUG 1024u
 #define FLAG_RECEIVER_PLANE 2048u
+#define FLAG_RT       4096u
+#define FLAG_RT_DEBUG 8192u
+#define RT_MISS       60000.0
 
 STRUCT(InstanceData)
 {
