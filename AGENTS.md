@@ -132,4 +132,5 @@ asks the host for the mouse each frame (`yea::captureMouse(true)`: hidden, kept 
 `yea_mouse_dx`/`yea_mouse_dy` (`look_sensitivity`); the move keys fly (WASD, Q/E down/up, `move_speed`).
 The host lets go when the button is up (it is no longer asked), F1 opens, focus is lost, or on a view switch
 or Reset. Reset: lights and camera
-back to the start. Exports `picture` (a fixed angle).
+back to the start. `benchmark_view` holds the camera at its start view (field of view 55) without moving the
+user's own, so GPU Timings compare between versions. Exports `picture` (a fixed angle).

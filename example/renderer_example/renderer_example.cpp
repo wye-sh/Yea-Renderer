@@ -42,9 +42,11 @@ bool   gLooking;
 bool   gPicture; // Yea is taking the card picture; a global so a reload never leaves it stuck on
 
 // Where the camera starts: 17 m from (0, 0.8, 0) at yaw 0.6 and 0.42 rad up, looking at it.
+const float kStartYaw = 0.6f, kStartPitch = 0.42f, kStartDist = 17.0f;
+
 void startCamera(State* s)
 {
-    const float yaw = 0.6f, pitch = 0.42f, dist = 17.0f;
+    const float yaw = kStartYaw, pitch = kStartPitch, dist = kStartDist;
     s->eye = { cosf(yaw) * cosf(pitch) * dist, 0.8f + sinf(pitch) * dist, sinf(yaw) * cosf(pitch) * dist };
     s->yaw = yaw + kPi;
     s->pitch = -pitch;
@@ -262,6 +264,14 @@ void moveCamera(State* s, float dt)
     s->eye.y += (f.y * my + mu) * step;
     s->eye.z += (r.z * mx + f.z * my) * step;
 
+    if (settings.benchmark_view)
+    {
+        // The start view at a fixed field of view; the user's own camera is kept for after.
+        const float yaw = kStartYaw, pitch = kStartPitch, dist = kStartDist;
+        yea_float3  eye = { cosf(yaw) * cosf(pitch) * dist, 0.8f + sinf(pitch) * dist, sinf(yaw) * cosf(pitch) * dist };
+        renderer::camera(eye, { 0, 0.8f, 0 }, 55);
+        return;
+    }
     if (gPicture)
     {
         // A fixed angle for the project card.

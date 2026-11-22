@@ -48,3 +48,5 @@ category Camera
 setting float fov 55 20 100
 setting float look_sensitivity 1 0.1 5
 setting float move_speed 6 0.5 40
+# The camera held at its start view (field of view 55), so GPU timings compare between versions.
+setting bool benchmark_view false
