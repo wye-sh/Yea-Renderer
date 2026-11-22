@@ -79,13 +79,6 @@ float interleavedGradientNoise(float2 px)
     return frac(52.9829189 * frac(dot(px, float2(0.06711056, 0.00583715))));
 }
 
-float2 vogelDisk(uint i, uint n, float phi)
-{
-    float r = sqrt((float(i) + 0.5) / float(n));
-    float t = float(i) * 2.39996323 + phi;
-    return r * float2(cos(t), sin(t));
-}
-
 // A direction turned by the golden angle: the next tap's on a Vogel disk.
 float2 vogelTurn(float2 d) { return float2(d.x * -0.73736888 - d.y * 0.67549029, d.x * 0.67549029 + d.y * -0.73736888); }
 
@@ -274,15 +267,27 @@ float localShadow(LightData l, float3 P, float3 N, float3 toLight, float phi, fl
         float dR = dot(v.row3, float4(Pb, 1.0));
         float nearZ = -b / a;
         float search = clamp(size * (dR - nearZ) / (dR * nearZ * v.info.x), 1.0, 12.0) * texel;
-        // The search disk's rim first: its last four taps, each a gather of the 2 x 2 texels there, compared with
-        // the receiver. When all 16 agree the pixel is fully lit or deep in the umbra (the same test as four
-        // filtered compares), and only penumbrae pay for the rest. Their depths are blockers already: four more
-        // gathers inside the rim give 32 in all for the blockers' average distance.
+        // The search disk's rim first: its last four taps as filtered compares, each one of the 2 x 2 texels
+        // there. When all four agree (all 16 texels), the pixel is fully lit or deep in the umbra, and only
+        // penumbrae pay for the blocker search: eight gathers over the disk, 32 depths for the blockers'
+        // average distance. Compares on the rim, not gathers: most pixels stop there, and a filtered compare
+        // is cheaper than a gather and its 16 depths to test. The disk's taps step by the golden angle from
+        // the pixel's angle (rot): tap 4 is rot turned four times.
+        float  rim = 0.0;
+        float2 dir = float2(rot.x * -0.98471349 + rot.y * 0.17418195, rot.x * -0.17418195 - rot.y * 0.98471349);
+        for (uint r = 4u; r < 8u; ++r, dir = vogelTurn(dir))
+        {
+            float2 uv = clamp(c.xy + dir * (sqrt((float(r) + 0.5) * 0.125) * search), bounds.xy, bounds.zw);
+            rim += CompareTex2D(gLocalAtlas, gShadowCmp, float3(uv, c.z + dot(g, uv - c.xy)));
+        }
+        if (rim == 0.0 || rim == 4.0)
+            return rim * 0.25;
         float blockers = 0.0;
         float count = 0.0;
-        for (uint r = 4u; r < 8u; ++r)
+        dir = rot;
+        for (uint i = 0u; i < 8u; ++i, dir = vogelTurn(dir))
         {
-            float2 uv = clamp(c.xy + vogelDisk(r, 8u, phi) * search, bounds.xy, bounds.zw);
+            float2 uv = clamp(c.xy + dir * (sqrt((float(i) + 0.5) * 0.125) * search), bounds.xy, bounds.zw);
             float4 d = GatherRedTex2D(gLocalAtlas, gSamplerPointClamp, uv);
             float  ref = c.z + dot(g, uv - c.xy) - 1e-7;
             float4 inFront = step(d, float4(ref, ref, ref, ref)); // 1: a blocker
@@ -291,17 +296,6 @@ float localShadow(LightData l, float3 P, float3 N, float3 toLight, float phi, fl
         }
         if (count == 0.0)
             return 1.0;
-        if (count == 16.0)
-            return 0.0;
-        for (uint i = 0u; i < 4u; ++i)
-        {
-            float2 uv = clamp(c.xy + vogelDisk(i, 8u, phi) * search, bounds.xy, bounds.zw);
-            float4 d = GatherRedTex2D(gLocalAtlas, gSamplerPointClamp, uv);
-            float  ref = c.z + dot(g, uv - c.xy) - 1e-7;
-            float4 inFront = step(d, float4(ref, ref, ref, ref));
-            blockers += dot(inFront, b / min(d - a, -1e-7));
-            count += dot(inFront, float4(1.0, 1.0, 1.0, 1.0));
-        }
         float dB = blockers / count;
         float tile = v.rect.z / texel;
         float pen = size * max(dR - dB, 0.0) / (max(dB, 1e-4) * dR * v.info.x);
