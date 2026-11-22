@@ -55,9 +55,30 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
     float2 np = float2(p) + float(gContact.counts.y % 64u) * float2(5.588238, 5.588238);
     float  noise = frac(52.9829189 * frac(dot(np, float2(0.06711056, 0.00583715))));
 
+    // The surface's normal from the nearer neighbour on each axis (so an edge beside it is left out).
+    // The march starts two pixels off the surface along it: from the surface itself, depth steps
+    // between pixels on a curved or grazing surface read as occluders, a dark line along silhouettes.
+    int2   last = size - int2(1, 1);
+    float3 L0 = viewPos(float2(max(p.x - 1, 0), p.y) + 0.5, DEPTH_AT(int2(max(p.x - 1, 0), p.y)));
+    float3 R0 = viewPos(float2(min(p.x + 1, last.x), p.y) + 0.5, DEPTH_AT(int2(min(p.x + 1, last.x), p.y)));
+    float3 U0 = viewPos(float2(p.x, max(p.y - 1, 0)) + 0.5, DEPTH_AT(int2(p.x, max(p.y - 1, 0))));
+    float3 D0 = viewPos(float2(p.x, min(p.y + 1, last.y)) + 0.5, DEPTH_AT(int2(p.x, min(p.y + 1, last.y))));
+    float3 dx = abs(R0.z - P.z) < abs(P.z - L0.z) ? R0 - P : P - L0;
+    float3 dy = abs(D0.z - P.z) < abs(P.z - U0.z) ? D0 - P : P - U0;
+    float3 N = normalize(cross(dy, dx));
+    if (dot(N, P) > 0.0)
+        N = -N; // towards the camera
+    float NoL = dot(N, gContact.light.xyz);
+    if (NoL <= 0.0)
+    {
+        Write2D(gOut, p, 1.0); // faces away from the sun: no sunlight to shadow
+        RETURN();
+    }
+    float  pixel = 2.0 * P.z / (gContact.proj.y * gContact.screen.y); // a pixel's size at P (m)
+
     uint   steps = gContact.counts.x;
     float3 stepV = gContact.light.xyz * (gContact.proj.w / float(steps));
-    float3 pos = P + stepV * noise;
+    float3 pos = P + N * (2.0 * pixel) + stepV * noise;
     float  occlusion = 0.0;
     for (uint i = 0u; i < steps; ++i)
     {

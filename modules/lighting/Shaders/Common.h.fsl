@@ -52,6 +52,7 @@ STRUCT(ProbeData)
 #define FLAG_AO_DEBUG 32u
 #define FLAG_CONTACT  64u
 #define FLAG_CONTACT_DEBUG 128u
+#define FLAG_UNLIT    256u // F1's Wireframe: each line in its material's own colour
 
 STRUCT(InstanceData)
 {

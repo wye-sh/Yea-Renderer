@@ -68,7 +68,7 @@ struct ExposureData
 };
 
 const uint32_t kFlagCulled = 1, kFlagHeatmap = 2, kFlagCascades = 4, kFlagShadows = 8, kFlagAo = 16, kFlagAoDebug = 32, kFlagContact = 64,
-               kFlagContactDebug = 128;
+               kFlagContactDebug = 128, kFlagUnlit = 256;
 const uint32_t kMaxFrames = 4;
 const uint32_t kMaxUnculledLights = 256;
 const uint32_t kHistogramBins = 128;
@@ -1034,7 +1034,8 @@ void draw(uint32_t pass, const YeaFrame* yf)
         F.lightCount = kMaxUnculledLights;
     bool shadows = lighting_shadows::shadows_prepare((uint64_t)(uintptr_t)&F) && F.shadowViews && F.sunAtlas && F.localAtlas;
     bool ao = lighting_ao::ao_prepare((uint64_t)(uintptr_t)&F) && F.aoOn && F.ao;
-    bool contact = lighting_contact::contact_prepare((uint64_t)(uintptr_t)&F) && F.contactOn && F.contact;
+    // Contact shadows refine the sun's: off with them.
+    bool contact = shadows && F.cascadeCount && lighting_contact::contact_prepare((uint64_t)(uintptr_t)&F) && F.contactOn && F.contact;
     const yea_float3 zen = settings.sky_color, hor = settings.horizon_color, gnd = settings.ground_color;
     float            L = settings.sky_luminance;
     F.drawables = gDrawables;
@@ -1120,7 +1121,8 @@ void draw(uint32_t pass, const YeaFrame* yf)
     gf->counts[2] = (culled ? kFlagCulled : 0) | (culled && F.heatmap ? kFlagHeatmap : 0) |
                     (shadows && (F.showCascades & 1) ? kFlagCascades : 0) | (shadows ? kFlagShadows : 0) | (ao ? kFlagAo : 0) |
                     (ao && F.aoDebug ? kFlagAoDebug : 0) | (contact ? kFlagContact : 0) |
-                    (contact && F.contactDebug ? kFlagContactDebug : 0);
+                    (contact && F.contactDebug ? kFlagContactDebug : 0) |
+                    ((viewMode & YEA_VIEW_WIREFRAME) ? kFlagUnlit : 0);
     if (probes)
     {
         gf->probeInfo[0] = F.probeCount;

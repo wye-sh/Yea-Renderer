@@ -202,7 +202,7 @@ void animate(State* s)
         float      radius = 2.5f + 8.0f * frac(fi * 0.618034f);
         float      speed = settings.light_speed * (0.4f + frac(fi * 0.371f)) * ((i & 1) ? 1.0f : -1.0f) * 3.0f / radius;
         float      a = fi * 2.39996f + t * speed;
-        float      y = 0.35f + 1.8f * frac(fi * 0.7311f) + 0.25f * sinf(t * 0.9f + fi);
+        float      y = 0.8f + 2.0f * frac(fi * 0.7311f) + 0.25f * sinf(t * 0.9f + fi);
         yea_float3 p = { cosf(a) * radius, y, sinf(a) * radius };
         yea_float3 c = hue(frac(fi * 0.618034f + 0.05f));
         lighting::light_place(s->lights[i], p, { 0, -1, 0 });

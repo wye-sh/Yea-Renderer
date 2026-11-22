@@ -65,8 +65,8 @@ materials, instances and lights once (when `instance_count()` is 0), then move w
 `lighting`: exposure_ev, auto_exposure, manual_ev100, adapt_speed, tonemapper (0 PBR Neutral, 1 filmic,
 2 Reinhard, 3 none), msaa (1/2/4/8), specular_aa, sky/horizon/ground colours, sky_luminance, ambient,
 sun_disk (degrees), near_plane. `lighting_culling`: enabled, max_lights, tile_size (8/16/32), z_bins,
-heatmap. `lighting_shadows`: enabled, cascades, shadow_distance, cascade_split, sun_resolution, softness,
-filter_taps, pcss, sun_size, normal_bias, slope_bias, shadowed_lights, local_atlas_resolution,
+heatmap. `lighting_shadows`: enabled (the sun's), cascades, shadow_distance, cascade_split, sun_resolution, softness,
+filter_taps, pcss, sun_size, normal_bias, slope_bias, light_shadows, shadowed_lights, local_atlas_resolution,
 updates_per_frame, show_cascades, show_atlas (the light shadow atlas, top right). `lighting_taa`: enabled, history_weight, clamp_width, sharpen, jitter,
 jitter_phases. `lighting_ao`: enabled, radius, intensity, falloff, slices, steps, denoise, specular_occlusion,
 multi_bounce, show_ao. `lighting_contact`: enabled, length, thickness, steps, intensity, max_distance,
@@ -91,6 +91,9 @@ HDR + depth at 4x MSAA, sun atlas 4096² D32 (64 MB), local atlas 4096² (64 MB)
   step aside; the core skips the prepass (the forward pass writes depth) and the sky, clears HDR to black,
   uses exposure 1 without tonemapping or dither (no sRGB encode in Overdraw) and holds auto exposure;
   shadow maps and probes are not redrawn while a mode is on, and every light's shadow is redrawn after.
+  Wireframe draws each line in its material's albedo plus emissive, unlit.
+- Contact shadows refine the sun's shadow maps and are off whenever those are. They march from two pixels
+  off the surface (normal rebuilt from depth): from the surface itself, silhouettes darken in thin lines.
 - A light's shadow is drawn from where it was when its tiles were last redrawn, which lags a moving light
   when more lights move than `updates_per_frame`. Shading must use that drawn position (point lights pick
   their cube face from it), never the light's current one, or points project off the tile's edge.

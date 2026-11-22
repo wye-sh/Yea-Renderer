@@ -337,7 +337,7 @@ void draw(uint32_t pass, const YeaFrame* frame) {}
 bool shadows_prepare(uint64_t address)
 {
     LightingFrame* F = (LightingFrame*)(uintptr_t)address;
-    if (!gReady || !settings.enabled || !F || F->version != LIGHTING_FRAME_VERSION)
+    if (!gReady || (!settings.enabled && !settings.light_shadows) || !F || F->version != LIGHTING_FRAME_VERSION)
         return false;
 
     // Atlases and pipelines follow the knobs.
@@ -388,7 +388,7 @@ bool shadows_prepare(uint64_t address)
         memset(views, 0, sizeof(LightingGpuShadowView) * kSunViews);
         gCascades = 0;
     }
-    if (!gFrozen && F->sunOn && F->sunShadow)
+    if (!gFrozen && settings.enabled && F->sunOn && F->sunShadow)
     {
         gCascades = cascades;
         v3    toSun = normalize(V(F->sunDir[0], F->sunDir[1], F->sunDir[2]));
@@ -442,7 +442,7 @@ bool shadows_prepare(uint64_t address)
     }
 
     // --- Local lights: pick, assign tiles, decide which to redraw ------------------------------
-    uint32_t wanted = clampu(settings.shadowed_lights, 0, kGroups);
+    uint32_t wanted = settings.light_shadows ? clampu(settings.shadowed_lights, 0, kGroups) : 0;
     uint32_t picked[kGroups];
     float    pickedScore[kGroups];
     uint32_t pickedCount = 0;

@@ -118,7 +118,7 @@ category Sky
 setting color sky_color 0.22 0.38 0.85
 setting color horizon_color 0.75 0.8 0.9
 setting color ground_color 0.3 0.27 0.24
-setting float sky_luminance 250 0 20000
+setting float sky_luminance 40 0 20000
 setting float ambient 1 0 4
 setting float sun_disk 0.6 0 5
 category Camera

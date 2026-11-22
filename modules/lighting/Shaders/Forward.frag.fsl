@@ -95,6 +95,18 @@ float4 PS_MAIN(VSOutput In)
 {
     INIT_MAIN;
     MaterialData m = gMaterials[In.Material];
+    if ((gFrame.counts.z & FLAG_UNLIT) != 0u)
+    {
+        float3 unlit = m.albedoRough.rgb + m.emissive.rgb;
+#ifdef MOTION
+        PSOutput Unlit;
+        Unlit.Color = float4(unlit, 1.0);
+        Unlit.Motion = float2(0.0, 0.0);
+        RETURN(Unlit);
+#else
+        RETURN(float4(unlit, 1.0));
+#endif
+    }
     float3 N = normalize(In.Normal);
     float3 V = normalize(gFrame.camPos.xyz - In.WorldPos);
     float  rough = clamp(m.albedoRough.a, 0.03, 1.0);

@@ -31,15 +31,15 @@ export bool picture(bool on)
 action look MouseLeft
 
 category Lights
-setting int light_count 64 0 512
-setting float light_intensity 300 0 5000
-setting float light_range 6 1 20
+setting int light_count 16 0 512
+setting float light_intensity 6000 0 20000
+setting float light_range 9 1 20
 setting float light_speed 0.4 0 3
-setting int shadowed_points 4 0 16
+setting int shadowed_points 16 0 32
 setting int spot_count 4 0 16
 setting float spot_intensity 4000 0 40000
 category Sun
-setting float sun_intensity 4000 0 120000
+setting float sun_intensity 400 0 120000
 setting color sun_color 1 0.82 0.65
 setting float sun_elevation 22 2 90
 setting float sun_azimuth 35 0 360

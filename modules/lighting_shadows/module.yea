@@ -18,7 +18,8 @@ setting float normal_bias 1.5 0 6
 setting float slope_bias 2 0 10
 setting bool show_cascades false
 category Light Shadows
-setting int shadowed_lights 8 0 32
+setting bool light_shadows true
+setting int shadowed_lights 24 0 32
 setting int local_atlas_resolution 4096 1024 8192
 setting int updates_per_frame 8 1 32
 setting bool show_atlas false
