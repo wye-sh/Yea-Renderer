@@ -44,6 +44,7 @@ struct Blas
 const uint32_t kMaxFrames = 4;
 const uint32_t kMaxMeshes = 1024;
 const uint32_t kMaxRetired = 256;
+const uint32_t kMaxInstances = 65536; // the core's Instance table
 const uint32_t kFlagScreen = 1, kFlagShadowRays = 2, kFlagDebug = 4;
 
 Renderer*            gRenderer;
@@ -89,6 +90,8 @@ AccelerationStructure*             gTlas[kMaxFrames];
 uint32_t                           gTlasCapacity[kMaxFrames];
 Buffer*                            gInstBuf[kMaxFrames]; // uint4 per top-level instance: row, first index, first vertex
 uint32_t                           gInstCapacity[kMaxFrames];
+// Made in load(), never in rt_prepare or rt_run: memory allocated in an export the core calls goes on the core's
+// heap, which is freed when the core reloads (renderer_rt then wrote through freed memory and crashed).
 AccelerationStructureInstanceDesc* gDescs;
 uint32_t                           gDescCapacity;
 uint32_t*                          gInstCpu;
@@ -288,6 +291,9 @@ int load(int reloaded)
         gRay = nullptr;
         return 0;
     }
+    gDescs = new AccelerationStructureInstanceDesc[kMaxInstances];
+    gInstCpu = new uint32_t[kMaxInstances * 4];
+    gDescCapacity = kMaxInstances;
     const char* names[kShaders] = { "renderer_rt_trace.comp", "renderer_rt_resolve.comp" };
     for (uint32_t k = 0; k < kShaders; ++k)
     {
@@ -440,20 +446,11 @@ void rt_run(uint64_t address)
         return;
     Cmd*     cmd = F->cmd;
     uint32_t fi = F->frameIndex;
-    uint32_t count = F->drawableCount;
+    uint32_t count = F->drawableCount < gDescCapacity ? F->drawableCount : gDescCapacity;
     freeRetired(F->frameNumber);
 
     cmdBeginDebugMarker(cmd, 0.5f, 0.8f, 1.0f, "Renderer ray-traced reflections");
     // Room for this frame's instances (grown rarely; the old top-level structure of this frame slot is done).
-    if (count > gDescCapacity)
-    {
-        uint32_t cap = grow(count);
-        delete[] gDescs;
-        delete[] gInstCpu;
-        gDescs = new AccelerationStructureInstanceDesc[cap];
-        gInstCpu = new uint32_t[cap * 4];
-        gDescCapacity = cap;
-    }
     if (count > gInstCapacity[fi])
     {
         if (gInstBuf[fi])

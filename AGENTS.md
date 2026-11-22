@@ -205,6 +205,8 @@ for screen reflections (a quarter of it at half resolution).
 - Take state blocks (`host()->state`) only in your own `load()`: the host files a block under the module
   running when it is asked for, so one asked for inside an export another module calls is that module's
   (the camera once never reached the renderer this way). `renderer` binds its blocks in `bindState()`.
+- The same goes for `new`: memory allocated inside an export the core calls (`*_prepare`, `*_run`) goes on the core's
+  heap and is freed when the core reloads. Allocate in your own `load()` (renderer_rt once crashed writing there).
 - A probe sees the objects inside its box too, so a shiny object reflects itself where it is near the probe.
 
 ## Example view (`example/renderer_example`)
