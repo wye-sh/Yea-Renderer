@@ -1,1 +1,40 @@
-[]
+[
+  {
+    "name": "ACES Fitted (Stephen Hill's fit, from BakingLab)",
+    "version": "BakingLab master (ACES.hlsl)",
+    "license": "MIT",
+    "source": "https://github.com/TheRealMJP/BakingLab/blob/master/BakingLab/ACES.hlsl",
+    "licenseUrl": "https://github.com/TheRealMJP/BakingLab/blob/master/LICENSE",
+    "usedBy": [
+      "modules/renderer/Shaders/Composite.frag.fsl"
+    ],
+    "notice": "Copyright (c) 2016 MJP. The ACES fit was originally written by Stephen Hill (@self_shadow).",
+    "when": [
+      {
+        "setting": "renderer.tonemapper",
+        "is": [
+          "ACES_Fitted"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "Tony McMapface",
+    "version": "0f249d3",
+    "license": "MIT OR Apache-2.0",
+    "source": "https://github.com/h3r2tic/tony-mc-mapface",
+    "licenseUrl": "https://github.com/h3r2tic/tony-mc-mapface/blob/0f249d366c9e960aa9828818786a6d5900fd85d9/LICENSE-MIT",
+    "usedBy": [
+      "modules/renderer/Assets/tony_mc_mapface.dds"
+    ],
+    "notice": "Copyright (c) 2023 Tomasz Stachowiak",
+    "when": [
+      {
+        "setting": "renderer.tonemapper",
+        "is": [
+          "Tony_McMapface"
+        ]
+      }
+    ]
+  }
+]

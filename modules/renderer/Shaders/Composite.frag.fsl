@@ -1,6 +1,7 @@
 // Exposure and tonemapping per MSAA sample, then the average: edges against bright lights stay
 // smooth. Tonemappers (renderer's tonemapper choice, in its order): Khronos PBR Neutral (from its
-// specification), AgX (our own: below), Hable's filmic curve, Reinhard on luminance, or none. After TAA, an optional contrast-limited sharpen of the tonemapped
+// specification), AgX (our own: below), Hable's filmic curve, Reinhard on luminance, none, ACES (Hill's fit)
+// or Tony McMapface (its table). After TAA, an optional contrast-limited sharpen of the tonemapped
 // image (never fed back into TAA's history).
 STRUCT(CompositeData)
 {
@@ -77,6 +78,34 @@ float3 agx(float3 c)
     return pow(saturate(v), float3(2.2, 2.2, 2.2));
 }
 
+// ACES Fitted, compiled only while TONEMAPPER_ACES_FITTED is 1 (a build that bakes in another tonemapper sets it
+// to 0, and its licence entry then ships nothing; mode 5 is then Khronos PBR Neutral).
+#ifndef TONEMAPPER_ACES_FITTED
+#define TONEMAPPER_ACES_FITTED 1
+#endif
+#if TONEMAPPER_ACES_FITTED
+// ACES Fitted: Stephen Hill's fit of ACES's reference rendering and sRGB output transforms, from MJP's BakingLab
+// (MIT, licenses.json): into ACES's working space with its saturation, the fitted curve, back out to Rec.709.
+float3 acesFitted(float3 c)
+{
+    c = float3(dot(c, float3(0.59719, 0.35458, 0.04823)), dot(c, float3(0.07600, 0.90834, 0.01566)),
+               dot(c, float3(0.02840, 0.13383, 0.83777)));
+    float3 a = c * (c + 0.0245786) - 0.000090537;
+    float3 b = c * (0.983729 * c + 0.4329510) + 0.238081;
+    c = a / b;
+    return float3(dot(c, float3(1.60475, -0.53108, -0.07367)), dot(c, float3(-0.10208, 1.10813, -0.00605)),
+                  dot(c, float3(-0.00327, -0.07276, 1.07602)));
+}
+#endif
+
+// Tony McMapface (Tomasz Stachowiak): its 48^3 table (Assets/tony_mc_mapface.dds, MIT or Apache-2.0, licenses.json),
+// indexed by c / (c + 1) at texel centres.
+float3 tonyMcMapface(float3 c)
+{
+    float3 uv = c / (c + 1.0) * (47.0 / 48.0) + 0.5 / 48.0;
+    return SampleLvlTex3D(gTony, gSamplerBilinearClamp, uv, 0.0).rgb;
+}
+
 float3 tonemap(float3 c, uint mode)
 {
     c = max(c, float3(0.0, 0.0, 0.0));
@@ -93,6 +122,15 @@ float3 tonemap(float3 c, uint mode)
         float t = (1.0 + l / w2) / (1.0 + l);
         return c * t;
     }
+#if TONEMAPPER_ACES_FITTED
+    if (mode == 5u)
+        return acesFitted(c);
+#else
+    if (mode == 5u)
+        return pbrNeutral(c);
+#endif
+    if (mode == 6u)
+        return tonyMcMapface(c);
     return c;
 }
 
