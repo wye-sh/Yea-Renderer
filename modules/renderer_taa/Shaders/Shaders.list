@@ -1,0 +1,15 @@
+#include "Common_3/Graphics/FSL/defaults.h"
+
+#rootsig default.rootsig
+#end
+
+#rootsig compute.rootsig
+#end
+
+#vert renderer_taa_fullscreen.vert
+#include "Fullscreen.vert.fsl"
+#end
+
+#frag renderer_taa.frag
+#include "Taa.frag.fsl"
+#end

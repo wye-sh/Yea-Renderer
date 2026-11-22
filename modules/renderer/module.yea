@@ -1,0 +1,125 @@
+module renderer
+
+# The scene games build through the exports below. Rows are never moved: removed ones are marked
+# dead and reused, so handles (row | generation << 20) stay valid.
+table Mesh none 1024
+  u32 firstVertex
+  u32 vertexCount
+  u32 firstIndex
+  u32 indexCount
+  float3 center
+  float radius
+end
+table Vertex none 262144
+  float3 pos
+  float3 normal
+end
+table Index none 1048576
+  u32 v
+end
+table Material none 4096
+  float3 albedo
+  float roughness
+  float metallic
+  float reflectance
+  float3 emissive
+  u32 reflections
+  u32 gen
+  u32 alive
+end
+table Instance none 65536
+  u32 mesh
+  u32 material
+  float3 pos
+  float4 rot
+  float3 scale
+  u32 shadow
+  u64 moved
+  u32 gen
+  u32 alive
+end
+table Light none 4096
+  u32 type
+  float3 pos
+  float3 dir
+  float3 color
+  float intensity
+  float range
+  float inner
+  float outer
+  u32 shadow
+  u32 gen
+  u32 alive
+end
+
+# Meshes: built-in shapes, or your own, vertex by vertex. Each returns a mesh id (4294967295 when full).
+export u32 mesh_box()
+export u32 mesh_sphere(u32 segments)
+export u32 mesh_plane()
+export u32 mesh_cylinder(u32 segments)
+export u32 mesh_cone(u32 segments)
+export u32 mesh_torus(float thickness, u32 segments)
+export bool mesh_begin()
+export u32 mesh_vertex(float3 pos, float3 normal)
+export void mesh_triangle(u32 a, u32 b, u32 c)
+export u32 mesh_end()
+
+export handle material_add(float3 albedo, float roughness, float metallic)
+export void material_set(handle m, float3 albedo, float roughness, float metallic)
+export void material_emissive(handle m, float3 color, float luminance)
+# Whether the material shows reflections of its surroundings (on by default), apart from how shiny
+# or metallic it is. Off: no reflected image (probes or sky), only the sky's soft light on it.
+export void material_reflections(handle m, bool on)
+
+export handle instance_add(u32 mesh, handle material)
+export void instance_place(handle i, float3 pos, float4 rotation, float3 scale)
+export void instance_material(handle i, handle material)
+export void instance_shadow(handle i, bool cast)
+export void instance_remove(handle i)
+export u32 instance_count()
+
+# type: 0 directional (the sun), 1 point, 2 spot. Intensity: lux for the sun, candela otherwise.
+export handle light_add(u32 type)
+export void light_place(handle l, float3 pos, float3 dir)
+export void light_color(handle l, float3 color, float intensity)
+export void light_range(handle l, float range)
+export void light_cone(handle l, float inner_deg, float outer_deg)
+export void light_shadow(handle l, bool cast)
+export void light_remove(handle l)
+export u32 light_count()
+
+export void camera(float3 eye, float3 target, float fov_deg)
+# Removes every mesh, material, instance and light.
+export void clear()
+
+import renderer_culling bool cull_prepare(u64 frame) = false
+import renderer_culling void cull_run(u64 frame)
+import renderer_shadows bool shadows_prepare(u64 frame) = false
+import renderer_shadows void shadows_render(u64 frame)
+import renderer_taa bool taa_prepare(u64 frame) = false
+import renderer_taa void taa_resolve(u64 frame)
+import renderer_ao bool ao_prepare(u64 frame) = false
+import renderer_ao void ao_run(u64 frame)
+import renderer_contact bool contact_prepare(u64 frame) = false
+import renderer_contact void contact_run(u64 frame)
+import renderer_probes bool probes_prepare(u64 frame) = false
+import renderer_probes void probes_render(u64 frame)
+
+category Exposure
+setting float exposure_ev 0 -6 6
+setting bool auto_exposure true
+setting float manual_ev100 9 -4 18
+setting float adapt_speed 1.5 0.1 10
+setting int tonemapper 0 0 3
+category Anti-aliasing
+setting int msaa 4 1 8
+setting float specular_aa 1 0 2
+category Sky
+setting color sky_color 0.22 0.38 0.85
+setting color horizon_color 0.75 0.8 0.9
+setting color ground_color 0.3 0.27 0.24
+setting float sky_luminance 40 0 20000
+setting float ambient 1 0 4
+setting float sun_disk 0.6 0 5
+category Camera
+setting float near_plane 0.05 0.01 2
