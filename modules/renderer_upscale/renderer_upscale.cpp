@@ -691,6 +691,14 @@ bool           gDlssFailed; // an evaluate failed: FSR until the upscaler is pic
 Active         gActive, gLastActive;
 // The quality modes' DLSS modes: Native is DLAA.
 const uint32_t kDlssMode[5] = { YEA_DLSS_DLAA, YEA_DLSS_QUALITY, YEA_DLSS_BALANCED, YEA_DLSS_PERFORMANCE, YEA_DLSS_ULTRA_PERFORMANCE };
+// DLSS's models: CNN is NVIDIA's preset E, Transformer NVIDIA's own choice per mode (K for DLAA to Balanced, M for
+// Performance, L for Ultra Performance). A Yea from before the CNN preset refuses it: NVIDIA's own then, said once.
+bool           gDlssCnnRefused; // this Yea refused E: the default model until the module reloads
+bool           gDlssCnnSaid;    // that CNN ran, said once
+
+// The GPU runs FP8, where NVIDIA's transformer models are cheap (RTX 40 and later): Auto's Transformer. From yea::device(),
+// taken in load(); off on a Yea without it, so Auto is CNN there.
+bool           gFp8;
 
 void dlssLetGo()
 {
@@ -719,12 +727,27 @@ bool dlssRun(const RenderFrame* F, RenderTarget* out, bool reset, uint32_t q)
     in.motionScaleY = -(float)F->height;
     in.preExposure = 1.0f;
     in.mode = kDlssMode[q];
-    in.preset = YEA_DLSS_PRESET_DEFAULT;
+    const bool transformer = settings.dlss_model == DlssModel::Transformer || (settings.dlss_model == DlssModel::Auto && gFp8);
+    const bool cnn = !transformer && !gDlssCnnRefused;
+    in.preset = cnn ? YEA_DLSS_PRESET_E : YEA_DLSS_PRESET_DEFAULT;
     in.flags = YEA_DLSS_HDR | YEA_DLSS_DEPTH_INVERTED;
     in.reset = reset ? 1u : 0u;
     in.viewport = 0;
     gDlssUsed = true;
-    const bool ok = gDlss->evaluate(F->cmd, &in) != 0;
+    bool ok = gDlss->evaluate(F->cmd, &in) != 0;
+    if (cnn && !ok)
+    {
+        // A Yea before the CNN preset refuses it: NVIDIA's default model, this frame on.
+        say("renderer_upscale: this Yea's DLSS refused the CNN model; NVIDIA's default model instead");
+        gDlssCnnRefused = true;
+        in.preset = YEA_DLSS_PRESET_DEFAULT;
+        ok = gDlss->evaluate(F->cmd, &in) != 0;
+    }
+    else if (cnn && !gDlssCnnSaid)
+    {
+        say("renderer_upscale: DLSS runs NVIDIA's CNN model", 0);
+        gDlssCnnSaid = true;
+    }
     forgetForgeState(F->cmd);
     return ok;
 }
@@ -741,6 +764,10 @@ int load(int reloaded)
     gDevice = yea::device();
 #endif
     gDlss = yea::dlss();
+    {
+        const YeaDevice* device = yea::device();
+        gFp8 = device && (device->features & YEA_DEVICE_FP8);
+    }
 
     ShaderLoadDesc sd = {};
     sd.mComp.pFileName = "renderer_upscale_exposure.comp";

@@ -13,5 +13,10 @@ setting choice upscaler TAA TAA FSR DLSS
 # The render resolution for an upscaler: Native (100%, the upscaler's own anti-aliasing; DLAA for DLSS), Quality (67%),
 # Balanced (59%), Performance (50%), Ultra Performance (33%).
 setting choice quality_mode Quality Native Quality Balanced Performance Ultra_Performance
+# DLSS's model. Auto: Transformer on GPUs that run FP8 (RTX 40 and later), CNN elsewhere. CNN: NVIDIA's convolutional
+# model, cheap on every RTX (about 0.7 ms at 1440p on an RTX 2080). Transformer: NVIDIA's newer model for each mode
+# (sharper, steadier detail), affordable with FP8 but two to five times CNN's cost on RTX 20 and 30, where it can cost
+# more than rendering at full size saves.
+setting choice dlss_model Auto Auto CNN Transformer
 # NVIDIA's DLSS files ship with the game only while DLSS is picked.
 service dlss when upscaler DLSS
