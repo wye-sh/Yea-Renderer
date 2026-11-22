@@ -1270,6 +1270,13 @@ void draw(uint32_t pass, const YeaFrame* yf)
     composite.mode[2] = samples;
     composite.mode[3] = w | (h << 16);
     composite.params[0] = taa ? F.sharpen : 0.0f;
+    // Show AO and Show Contact write their values as they are: shown at exposure 1, untonemapped.
+    const bool rawDebug = (ao && F.aoDebug) || (contact && F.contactDebug);
+    if (rawDebug && !viewMode)
+    {
+        composite.mode[0] = 3;
+        composite.params[3] = 1.0f;
+    }
     if (viewMode)
     {
         composite.mode[0] = 3; // no tonemapping
@@ -1489,9 +1496,9 @@ void draw(uint32_t pass, const YeaFrame* yf)
     cmdEndDebugMarker(cmd);
     timeEnd(cmd, fi, kTimeForward);
 
-    // Auto exposure: histogram, then the adapted exposure. Held still in a view mode, so it doesn't
-    // adapt to the wireframe or overdraw image and is where it was when the mode ends.
-    if (!viewMode)
+    // Auto exposure: histogram, then the adapted exposure. Held still in a view mode or a debug view,
+    // so it never meters (and chases) the debug image, and is where it was when it ends.
+    if (!viewMode && !rawDebug && !(culled && F.heatmap))
     {
         if (timed)
             timeBegin(cmd, fi, kTimeExposure);

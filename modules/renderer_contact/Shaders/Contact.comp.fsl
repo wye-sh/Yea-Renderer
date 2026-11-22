@@ -76,7 +76,15 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
     }
     float  pixel = 2.0 * P.z / (gContact.proj.y * gContact.screen.y); // a pixel's size at P (m)
 
+    // No more steps than the ray covers pixels on screen: far away a whole ray spans a few pixels, and
+    // more steps would only read the same depths again.
     uint   steps = gContact.counts.x;
+    float3 rayEnd = P + gContact.light.xyz * gContact.proj.w;
+    if (rayEnd.z > gContact.proj.z)
+    {
+        float2 span = toPixel(rayEnd) - toPixel(P);
+        steps = clamp(uint(ceil(max(abs(span.x), abs(span.y)))), 2u, steps);
+    }
     float3 stepV = gContact.light.xyz * (gContact.proj.w / float(steps));
     float3 pos = P + N * (2.0 * pixel) + stepV * noise;
     float  occlusion = 0.0;

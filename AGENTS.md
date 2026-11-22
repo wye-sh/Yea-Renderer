@@ -80,13 +80,16 @@ builds it again. GPU objects and shadow caches are rebuilt on load.
 ## Cost
 
 Per frame: one depth prepass and one forward pass (draws grouped by mesh, instanced), one culling
-dispatch per 16 px tile, a GTAO dispatch and `denoise` blur dispatches (at half size with half_resolution, plus a full-size upsample), one contact shadow dispatch (all full size), per re-captured probe 6 scene draws at half its
+dispatch per 16 px tile, a GTAO dispatch and `denoise` blur dispatches (at half size with half_resolution, plus a full-size upsample), one contact shadow dispatch (all full size; its march takes no more steps than the ray spans pixels), per re-captured probe 6 scene draws at half its
 resolution plus 6 small passes per mip, sun cascades redrawn, at most `updates_per_frame` local lights redrawn (oldest shadow first), two
 exposure dispatches, one full-screen TAA resolve (when on), one full-screen composite. No per-frame allocation. GPU memory at the defaults:
 HDR + depth at 4x MSAA, sun atlas 4096² D32 (64 MB), local atlas 4096² (64 MB).
 
 ## Pitfalls
 
+- Debug views must not feed auto exposure: Show AO and Show Contact write raw values shown at exposure 1, and
+  exposure holds while they or the heatmap are on. A view scaled by 1/exposure is metered by the histogram,
+  which lowers exposure every frame until the HDR image saturates (Show AO once read flat grey this way).
 - F1's Wireframe and Overdraw (`yea::viewMode()`, development only): TAA, AO, contact shadows and light culling
   step aside; the core skips the prepass (the forward pass writes depth) and the sky, clears HDR to black,
   uses exposure 1 without tonemapping or dither (no sRGB encode in Overdraw) and holds auto exposure;
