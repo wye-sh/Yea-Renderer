@@ -307,7 +307,7 @@ float4 PS_MAIN(VSOutput In)
                 {
                     uint b = FirstBitLow(mask);
                     mask &= mask - 1u;
-                    color += shadeLocalLight(w * 32u + b, s, phi);
+                    color += shadeLocalLight(w * 32u + b, s);
                     lightCount += 1u;
                 }
             }
@@ -316,7 +316,7 @@ float4 PS_MAIN(VSOutput In)
     else
     {
         for (uint i = 0u; i < gFrame.counts.x; ++i)
-            color += shadeLocalLight(i, s, phi);
+            color += shadeLocalLight(i, s);
         lightCount = gFrame.counts.x;
     }
 

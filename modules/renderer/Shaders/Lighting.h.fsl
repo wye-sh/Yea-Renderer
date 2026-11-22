@@ -233,7 +233,8 @@ float sunShadow(float3 P, float3 N, float viewZ, float2 rot, float dither)
     return s;
 }
 
-float localShadow(LightData l, float3 P, float3 N, float3 toLight, float phi, float2 rot)
+// dist: the light's distance; NoL: N.L towards it (both from the caller, which has them).
+float localShadow(LightData l, float3 P, float3 N, float dist, float NoL, float2 rot)
 {
     if (l.params.y < 0.0)
         return 1.0;
@@ -250,11 +251,10 @@ float localShadow(LightData l, float3 P, float3 N, float3 toLight, float phi, fl
     }
     ShadowView v = gShadowViews[view];
     float  texel = gFrame.shadow2.y;
-    float  dist = length(toLight);
     float3 Pb = P + N * (gFrame.shadow.w * v.info.x * dist);
     float3 c = viewToAtlas(v, Pb);
     float4 bounds = float4(v.rect.xy + texel, v.rect.xy + v.rect.zw - texel);
-    float2 g = receiverSlope(v, Pb, N, dot(N, toLight) / max(dist, 1e-4));
+    float2 g = receiverSlope(v, Pb, N, NoL);
     float  radius = gFrame.shadow.y * texel;
     float  size = gFrame.shadow2.w;
     if (size > 0.0)
@@ -309,14 +309,15 @@ float localShadow(LightData l, float3 P, float3 N, float3 toLight, float phi, fl
 
 // --- Lights ----------------------------------------------------------------------------------
 
-float3 shadeLocalLight(uint i, Surface s, float phi)
+float3 shadeLocalLight(uint i, Surface s)
 {
     LightData l = gLights[i];
     float3 toLight = l.pos.xyz - s.P;
     float  d2 = dot(toLight, toLight);
     if (d2 >= l.pos.w * l.pos.w)
         return float3(0.0, 0.0, 0.0);
-    float3 L = toLight * rsqrt(max(d2, 1e-8));
+    float  invDist = rsqrt(max(d2, 1e-8));
+    float3 L = toLight * invDist;
     float  f = d2 * l.params.z;
     float  window = saturate(1.0 - f * f);
     float  atten = window * window / max(d2, 1e-4);
@@ -325,14 +326,15 @@ float3 shadeLocalLight(uint i, Surface s, float phi)
         float cone = saturate(dot(-L, l.dir.xyz) * l.dir.w + l.params.x);
         atten *= cone * cone;
     }
-    if (atten <= 0.0 || dot(s.N, L) <= 0.0)
+    float NoL = dot(s.N, L);
+    if (atten <= 0.0 || NoL <= 0.0)
         return float3(0.0, 0.0, 0.0);
     float3 lit = brdfLight(s, L, l.color.rgb * atten);
     // Where the light adds under one 8-bit step on screen even in the darkest areas (the edge of its
     // range; sRGB steepens darks 12.92x), its shadow can't be seen: the lookup is skipped.
     if ((gFrame.counts.z & FLAG_SHADOWS) == 0u || max(lit.r, max(lit.g, lit.b)) * gExposure[1] < 1.0 / 4096.0)
         return lit;
-    return lit * localShadow(l, s.P, s.N, toLight, phi, s.rot);
+    return lit * localShadow(l, s.P, s.N, d2 * invDist, NoL, s.rot);
 }
 
 #endif
