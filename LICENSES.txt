@@ -290,8 +290,8 @@ Copyright 2023 Sony Interactive Entertainment.
 
 AMD FSR SDK (FSR upscaling)
 ---------------------------
-What uses it: the FSR option of the Upscaler setting (renderer_upscale), on Windows (Direct3D 12) only, and only
-shipped while a game picks it.
+What uses it: the FSR and DLSS options of the Upscaler setting (renderer_upscale; FSR is DLSS's fallback), on
+Windows (Direct3D 12) only, and only shipped while a game picks one.
 Source: https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK (release v2.4.0)
 
 AMD's signed runtime DLLs, shipped unchanged: modules/renderer_upscale/Assets/windows/amd_fidelityfx_loader_dx12.dll and
@@ -325,8 +325,8 @@ THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR I
 
 AMD FidelityFX SDK: FSR 3.1 upscaler and Vulkan backend (source)
 ----------------------------------------------------------------
-What uses it: the FSR option of the Upscaler setting (renderer_upscale) on Linux (Vulkan), and only shipped while a
-game picks it: modules/renderer_upscale/third_party/ffx_vk, compiled into the module.
+What uses it: the FSR and DLSS options of the Upscaler setting (renderer_upscale) on Linux (Vulkan), and only shipped
+while a game picks one: modules/renderer_upscale/third_party/ffx_vk, compiled into the module.
 Source: https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK (release v1.1.4, sdk/)
 Modified: include paths; include/FidelityFX/host/ffx_types.h (context size for a 4-byte wchar_t),
 include/FidelityFX/gpu/fsr3upscaler/ffx_fsr3upscaler_callbacks_glsl.h (luma history format), and

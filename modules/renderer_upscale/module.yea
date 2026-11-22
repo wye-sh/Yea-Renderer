@@ -7,9 +7,11 @@ export void upscale_run(u64 frame)
 
 category Upscaling
 # TAA: the Renderer's own anti-aliasing at full resolution. FSR: AMD's upscaler (FSR 4 on Radeon RX 6000 and later,
-# FSR 3.1 elsewhere): the scene renders at the quality's resolution and FSR brings it back to the screen's. Where an
-# upscaler can't run, TAA.
-setting choice upscaler TAA TAA FSR
-# The render resolution for an upscaler: Native (100%, the upscaler's own anti-aliasing), Quality (67%), Balanced (59%),
-# Performance (50%), Ultra Performance (33%).
+# FSR 3.1 elsewhere): the scene renders at the quality's resolution and FSR brings it back to the screen's. DLSS:
+# NVIDIA's, on GeForce RTX under Windows (Yea's service); FSR wherever DLSS can't run. Where neither can, TAA.
+setting choice upscaler TAA TAA FSR DLSS
+# The render resolution for an upscaler: Native (100%, the upscaler's own anti-aliasing; DLAA for DLSS), Quality (67%),
+# Balanced (59%), Performance (50%), Ultra Performance (33%).
 setting choice quality_mode Quality Native Quality Balanced Performance Ultra_Performance
+# NVIDIA's DLSS files ship with the game only while DLSS is picked.
+service dlss when upscaler DLSS

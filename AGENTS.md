@@ -115,7 +115,10 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   frees its history and stands aside (its `sharpen` still applies, after the upscale). Not upscaling (native size, the
   default), it returns false and the frame is exactly as without it: no pass, copy or target added. Shadow tiles size
   by `displayHeight`. renderer_vrs reads last frame's image through `_up` shader variants only while upscaled.
-  Upscalers (`upscaler`: TAA, FSR): FSR where it can run; where it can't or stops (logged once, with the reason), TAA.
+  Upscalers (`upscaler`: TAA, FSR, DLSS): DLSS through Yea's host service (`yea::dlss()`, Windows, NVIDIA RTX; the
+  `service dlss when upscaler DLSS` line ties NVIDIA's files, which are Yea's own licence entries), taken in `load()`,
+  evaluated from `upscale_run`, released in `unload()`; Native is DLAA. FSR where DLSS can't run or stops; where FSR
+  can't either (logged once, with the reason), TAA.
   FSR on Windows (Direct3D 12): AMD's signed FSR SDK 2.4 DLLs in `Assets/windows/` (a Yea from 133 puts them at the
   top of Assets/), loaded only while picked, upscaler first, each by its full path with backslashes and
   `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS` (Assets/ isn't on Windows' DLL search path, and
@@ -126,8 +129,8 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   `third_party/ffx_vk/generated`, made by `fsr_vk_shaders.py` (glslangValidator; run it after changing AMD's GLSL).
   Its 16-bit and wave64 shaders run only where `yea::device()` says the device has them on. Its working memory is
   allocated in this module's own `update()`, never in `upscale_prepare`. Jitter: Halton 2,3 over 8 x ratio² phases;
-  the render size is the vendors' ratio per quality mode; the core's exposure is copied into a 1x1 texture (one tiny
-  dispatch); FSR's own sharpening is off. After it records, The Forge's bound state is forgotten so its next binds
+  the render size is the vendors' ratio per quality mode (DLSS's own `renderSize` for DLSS); the core's exposure is copied into a 1x1 texture (one tiny
+  dispatch); the upscalers' own sharpening is off. After one records, The Forge's bound state is forgotten so its next binds
   are made in full. Lines said from `upscale_prepare` wait for this module's `update()`, so they are filed under
   renderer_upscale: which upscaler is picked and runs, its sizes, and why FSR can't run.
 - The core calls the others through optional imports with a `RenderFrame*` (as `u64`): `frame.h`, copied
@@ -175,7 +178,7 @@ sun_disk (degrees), near_plane, gpu_timings (logs each pass's GPU time every 10 
 heatmap. `renderer_shadows`: enabled (the sun's), cascades, shadow_distance, cascade_split, sun_resolution, softness,
 filter_taps, pcss, sun_size, normal_bias, slope_bias, receiver_plane, light_shadows, shadowed_lights, local_atlas_resolution,
 updates_per_frame, max_tile_resolution, contact_hardening, light_size (m), show_cascades, show_atlas (the light shadow atlas, top right). `renderer_taa`: enabled, history_weight, clamp_width, sharpen, jitter,
-jitter_phases. `renderer_upscale`: upscaler (TAA, FSR), quality_mode (Native, Quality 67%, Balanced 59%,
+jitter_phases. `renderer_upscale`: upscaler (TAA, FSR, DLSS), quality_mode (Native, Quality 67%, Balanced 59%,
 Performance 50%, Ultra_Performance 33%; for an upscaler only). `renderer_ao`: enabled, half_resolution (GTAO and its blur at half size, upsampled along edges in the forward pass), radius, intensity, falloff, slices, steps, denoise, specular_occlusion,
 multi_bounce, show_ao. `renderer_contact`: enabled, surface_thickness (a part of the distance), edge_threshold, contrast, ignore_edges,
 intensity, max_distance, show_contact. `renderer_probes`: enabled, resolution (64-512), updates_per_frame, intensity, blend, parallax.
