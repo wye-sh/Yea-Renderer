@@ -104,10 +104,20 @@ float3 viewToAtlas(ShadowView v, float3 P)
 
 float sunPcf(float3 c, float radius, float4 bounds, uint taps, float phi)
 {
-    float sum = 0.0;
-    for (uint i = 0u; i < taps; ++i)
+    // The disk's last four taps lie on its rim, spread by the golden angle: when they agree (fully lit
+    // or fully shadowed) the whole disk does, and only penumbrae pay for the rest.
+    float rim = 0.0;
+    for (uint i = taps - 4u; i < taps; ++i)
     {
         float2 uv = clamp(c.xy + vogelDisk(i, taps, phi) * radius, bounds.xy, bounds.zw);
+        rim += CompareTex2D(gSunAtlas, gShadowCmp, float3(uv, c.z));
+    }
+    if (rim == 0.0 || rim == 4.0)
+        return rim * 0.25;
+    float sum = rim;
+    for (uint j = 0u; j < taps - 4u; ++j)
+    {
+        float2 uv = clamp(c.xy + vogelDisk(j, taps, phi) * radius, bounds.xy, bounds.zw);
         sum += CompareTex2D(gSunAtlas, gShadowCmp, float3(uv, c.z));
     }
     return sum / float(taps);
@@ -115,10 +125,20 @@ float sunPcf(float3 c, float radius, float4 bounds, uint taps, float phi)
 
 float localPcf(float3 c, float radius, float4 bounds, uint taps, float phi)
 {
-    float sum = 0.0;
-    for (uint i = 0u; i < taps; ++i)
+    // The disk's last four taps lie on its rim, spread by the golden angle: when they agree (fully lit
+    // or fully shadowed) the whole disk does, and only penumbrae pay for the rest.
+    float rim = 0.0;
+    for (uint i = taps - 4u; i < taps; ++i)
     {
         float2 uv = clamp(c.xy + vogelDisk(i, taps, phi) * radius, bounds.xy, bounds.zw);
+        rim += CompareTex2D(gLocalAtlas, gShadowCmp, float3(uv, c.z));
+    }
+    if (rim == 0.0 || rim == 4.0)
+        return rim * 0.25;
+    float sum = rim;
+    for (uint j = 0u; j < taps - 4u; ++j)
+    {
+        float2 uv = clamp(c.xy + vogelDisk(j, taps, phi) * radius, bounds.xy, bounds.zw);
         sum += CompareTex2D(gLocalAtlas, gShadowCmp, float3(uv, c.z));
     }
     return sum / float(taps);
