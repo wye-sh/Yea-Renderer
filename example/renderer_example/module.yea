@@ -24,6 +24,7 @@ import renderer void camera(float3 eye, float3 target, float fov_deg)
 import renderer void clear()
 import renderer_probes handle probe_add(float3 pos, float3 box_min, float3 box_max) = 4294967295
 import renderer_probes void probe_clear()
+import renderer_probes u32 probe_count() = 0
 
 export bool picture(bool on)
 

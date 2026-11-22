@@ -96,6 +96,13 @@ void addSpin(State* s, uint32_t mesh, yea_handle material, yea_float3 pos, yea_f
     renderer::instance_place(s->spin[i], pos, kNoRotation, scale);
 }
 
+// Reflection probes: one over the sphere rows, one for the whole yard; the floor is their boxes' bottom.
+void addProbes()
+{
+    renderer_probes::probe_add({ 0, 1.0f, -2.8f }, { -9.0f, -0.5f, -6.0f }, { 9.0f, 4.0f, 0.5f });
+    renderer_probes::probe_add({ 0, 2.0f, 1.5f }, { -16.0f, -0.5f, -16.0f }, { 16.0f, 10.0f, 16.0f });
+}
+
 void build(State* s)
 {
     renderer::clear();
@@ -147,9 +154,7 @@ void build(State* s)
     addSpin(s, box, blue, { 8.5f, 1.2f, -1.0f }, { 1.2f, 1.2f, 1.2f }, { 1, 1, 0 });
     addSpin(s, torus, white, { -8.5f, 1.3f, -1.0f }, { 2.2f, 2.2f, 2.2f }, { 0, 0, 1 });
 
-    // Reflection probes: one over the sphere rows, one for the whole yard; the floor is their boxes' bottom.
-    renderer_probes::probe_add({ 0, 1.0f, -2.8f }, { -9.0f, -0.5f, -6.0f }, { 9.0f, 4.0f, 0.5f });
-    renderer_probes::probe_add({ 0, 2.0f, 1.5f }, { -16.0f, -0.5f, -16.0f }, { 16.0f, 10.0f, 16.0f });
+    addProbes();
 
     s->sun = renderer::light_add(0);
     renderer::light_shadow(s->sun, true);
@@ -292,6 +297,8 @@ void update(uint32_t phase, float dt)
     State* s = state();
     if (!s->built || renderer::instance_count() == 0)
         build(s);
+    else if (renderer_probes::probe_count() == 0)
+        addProbes(); // renderer_probes came up after the scene was built: its import was a stub then
     s->t += dt;
     syncLights(s);
     animate(s);

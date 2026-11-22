@@ -97,6 +97,9 @@ HDR + depth at 4x MSAA, sun atlas 4096² D32 (64 MB), local atlas 4096² (64 MB)
   Wireframe draws each line in its material's albedo plus emissive, unlit.
 - Contact shadows refine the sun's shadow maps and are off whenever those are. They march from two pixels
   off the surface (normal rebuilt from depth): from the surface itself, silhouettes darken in thin lines.
+- A module that fills the scene can update before the others have loaded, when its imports are stubs
+  that do nothing; the scene lives in tables, so it is not built again. Check counts each frame and
+  add what is missing (the example adds its probes whenever `probe_count()` is 0).
 - A light's shadow is drawn from where it was when its tiles were last redrawn, which lags a moving light
   when more lights move than `updates_per_frame`. Shading must use that drawn position (point lights pick
   their cube face from it), never the light's current one, or points project off the tile's edge.
