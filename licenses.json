@@ -36,5 +36,17 @@
         ]
       }
     ]
+  },
+  {
+    "name": "Bend Studio screen space shadows",
+    "version": "SIGGRAPH 2023 code release (code_final_candidate.zip)",
+    "license": "Apache-2.0",
+    "source": "https://www.bendstudio.com/blog/inside-bend-screen-space-shadows",
+    "licenseUrl": "https://www.apache.org/licenses/LICENSE-2.0.txt",
+    "usedBy": [
+      "modules/renderer_contact/third_party/bend_sss/",
+      "modules/renderer_contact/Shaders/BendSss.h.fsl"
+    ],
+    "notice": "Copyright 2023 Sony Interactive Entertainment. Shaders/BendSss.h.fsl is a modified version of bend_sss_gpu.h (its header lists the changes); bend_sss_cpu.h is unmodified."
   }
 ]

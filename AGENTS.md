@@ -36,9 +36,11 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   in y, so the blurs and the upsample read no depth). The forward pass darkens sky ambient by it:
   diffuse with the multi-bounce fit, specular with Lagarde's specular occlusion. Direct light is untouched.
   Runs between the prepass and the forward pass, beside culling. Noise rotates per frame only with TAA on.
-- `renderer_contact`: sun contact shadows. A screen-space march from each pixel towards the sun over
-  `length` metres against the prepass depth (the normal rebuilt from two depth gathers), into a full-size R32F texture the forward pass multiplies the
-  sun's shadow by. Catches small and thin shadows the cascades miss. Off when there is no sun.
+- `renderer_contact`: sun contact shadows, Bend Studio's screen space shadows (Apache-2.0; `third_party/bend_sss/bend_sss_cpu.h`
+  unmodified, `Shaders/BendSss.h.fsl` our FSL port of its GPU half, its header listing every change: keep that list current,
+  as the licence requires). 64-thread groups each take one stretch of a ray from the sun's point on screen, share their depth
+  reads in groupshared memory, and test 60 pixels towards the sun, into a full-size R32F texture the forward pass multiplies
+  the sun's shadow by. Bend's dispatch list is merged into one dispatch (a table in the constant buffer). Off when there is no sun.
 - `renderer_probes`: reflection probes games place (its own `Probe` table, up to 16). Each is captured as a
   cube (the scene lit diffusely: sky ambient, sun without shadow, the nearest 64 local lights; alpha =
   coverage), halved level by level, prefiltered (GGX) into one slice of an RGBA16F octahedral 2D array, a mip
@@ -151,8 +153,8 @@ heatmap. `renderer_shadows`: enabled (the sun's), cascades, shadow_distance, cas
 filter_taps, pcss, sun_size, normal_bias, slope_bias, receiver_plane, light_shadows, shadowed_lights, local_atlas_resolution,
 updates_per_frame, max_tile_resolution, contact_hardening, light_size (m), show_cascades, show_atlas (the light shadow atlas, top right). `renderer_taa`: enabled, history_weight, clamp_width, sharpen, jitter,
 jitter_phases. `renderer_ao`: enabled, half_resolution (GTAO and its blur at half size, then a depth-aware upsample), radius, intensity, falloff, slices, steps, denoise, specular_occlusion,
-multi_bounce, show_ao. `renderer_contact`: enabled, length, thickness, steps, intensity, max_distance,
-show_contact. `renderer_probes`: enabled, resolution (64-512), updates_per_frame, intensity, blend, parallax.
+multi_bounce, show_ao. `renderer_contact`: enabled, surface_thickness (a part of the distance), edge_threshold, contrast, ignore_edges,
+intensity, max_distance, show_contact. `renderer_probes`: enabled, resolution (64-512), updates_per_frame, intensity, blend, parallax.
 `renderer_ssr`: enabled, half_resolution, max_roughness, thickness, max_distance, steps, edge_fade, intensity,
 show_hits (tints where reflections were found). `renderer_vrs`: enabled, aggressiveness, motion (0), keep_curved, glossy_below, allow_4x4,
 show_rates (green half rate, blue 2x2, magenta coarser). `renderer_rt`: enabled, max_roughness, half_resolution, full_below, screen_colors,
@@ -167,7 +169,7 @@ builds it again. GPU objects and shadow caches are rebuilt on load.
 
 Per frame: one depth prepass and one forward pass (draws grouped by mesh and sidedness, instanced; back
 faces culled except for double-sided materials; a leaner forward shader unless PCSS or a debug view is on), one culling
-dispatch per 16 px tile, a GTAO dispatch and `denoise` blur dispatches (at half size with half_resolution, plus a full-size upsample), one contact shadow dispatch (all full size; its march takes no more steps than the ray spans pixels), one
+dispatch per 16 px tile, a GTAO dispatch and `denoise` blur dispatches (at half size with half_resolution, plus a full-size upsample), one contact shadow dispatch (all full size; 64-pixel stretches of rays from the sun's point on screen, two bilinear depth reads per pixel), one
 rate dispatch per 16 px tile and a small dilation dispatch with variable-rate shading (the forward pass then shades smooth tiles at 2x2), one
 depth copy for screen reflections (their march, up to `steps` plus 4 depth reads per crossing, runs in the forward pass for
 glossy pixels with reflections on, and shows in its timing), per re-captured probe 6 scene draws at half its
@@ -198,8 +200,8 @@ for screen reflections (a quarter of it at half resolution).
   uses exposure 1 without tonemapping or dither (no sRGB encode in Overdraw) and holds auto exposure;
   shadow maps and probes are not redrawn while a mode is on, and every light's shadow is redrawn after.
   Wireframe draws each line in its material's albedo plus emissive, unlit.
-- Contact shadows refine the sun's shadow maps and are off whenever those are. They march from two pixels
-  off the surface (normal rebuilt from depth): from the surface itself, silhouettes darken in thin lines.
+- Contact shadows refine the sun's shadow maps and are off whenever those are. Bend's thickness and edge threshold are parts
+  of the depth (reversed Z: near / z), so of the view distance, not metres.
 - A module that fills the scene can update before the others have loaded, when its imports are stubs
   that do nothing; the scene lives in tables, so it is not built again. Check counts each frame and
   add what is missing (the example adds its probes whenever `probe_count()` is 0).

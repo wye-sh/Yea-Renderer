@@ -1,14 +1,14 @@
-// Screen-space contact shadows for the sun: from each pixel's view position, `steps` steps towards
-// the sun over `length` metres, each projected to the screen and compared with the depth there. A
-// sample behind the surface seen there (by more than a depth-scaled bias, less than `thickness`) is
-// in shadow. Catches the small and thin shadows the cascades are too coarse for.
+// Screen-space contact shadows for the sun: Bend Studio's screen space shadows (BendSss.h.fsl, Apache-2.0,
+// licenses.json). Each 64-thread group is one stretch of a ray from the sun's point on screen; every thread
+// reads two depths, shares them in groupshared memory, and each pixel then tests the 60 pixels towards the
+// sun from there. Catches the small, thin and distant shadows the cascades are too coarse for.
 STRUCT(ContactData)
 {
-    DATA(float4, proj, None);   // x P00, y P11, z near, w length (m)
-    DATA(float4, light, None);  // xyz towards the sun in view space, w thickness (m)
-    DATA(float4, screen, None); // xy size, zw jitter (px)
-    DATA(float4, params, None); // x intensity, y max distance, z 1 / fade range
-    DATA(uint4, counts, None);  // x steps, y frame (noise)
+    DATA(float4, light, None);       // the sun's point on screen: xy pixels, z depth, w 1 in front of the camera, -1 behind
+    DATA(float4, params, None);      // x surface thickness, y edge threshold, z contrast, w intensity
+    DATA(float4, fade, None);        // x near, y max distance (m), z 1 / fade range, w 1 when edge pixels cast nothing
+    DATA(float4, size, None);        // xy screen size, z dispatch count, w depth at max distance
+    DATA(float4, dispatch[8], None); // xy wave offset (pixels), z wave count y, w groups before this dispatch
 };
 
 #include "Contact.srt.h"
@@ -19,118 +19,17 @@ STRUCT(ContactData)
 #define DEPTH_AT(q) LoadTex2D(gDepth, NO_SAMPLER, q, 0).r
 #endif
 
-float viewDepth(float d) { return gContact.proj.z / max(d, 1e-7); } // reversed-Z, infinite far
-
-float3 viewPos(float2 px, float d)
-{
-    float  z = viewDepth(d);
-    float2 u = px - gContact.screen.zw; // undo the TAA jitter the depth was drawn with
-    float2 ndc = float2(u.x / gContact.screen.x * 2.0 - 1.0, 1.0 - u.y / gContact.screen.y * 2.0);
-    return float3(ndc.x * z / gContact.proj.x, ndc.y * z / gContact.proj.y, z);
-}
-
-float2 toPixel(float3 v)
-{
-    float2 ndc = v.xy * gContact.proj.xy / v.z;
-    return float2((ndc.x * 0.5 + 0.5) * gContact.screen.x, (0.5 - ndc.y * 0.5) * gContact.screen.y) + gContact.screen.zw;
-}
+#define WAVE_SIZE 64
+#define HARD_SHADOW_SAMPLES 4
+#define FADE_OUT_SAMPLES 8
+#define BEND_SAMPLE_COUNT 60 // shadow samples per pixel: the shadow's length in pixels
+#include "BendSss.h.fsl"
 
 ROOT_SIGNATURE(ComputeRootSignature)
-NUM_THREADS(8, 8, 1)
-void CS_MAIN(SV_DispatchThreadID(uint3) id)
+NUM_THREADS(64, 1, 1)
+void CS_MAIN(SV_GroupID(uint3) gid, SV_GroupThreadID(uint3) tid)
 {
     INIT_MAIN;
-    int2 size = int2(gContact.screen.xy);
-    int2 p = int2(id.xy);
-    if (p.x >= size.x || p.y >= size.y)
-        RETURN();
-#if SAMPLE_COUNT > 1
-    float d = DEPTH_AT(p);
-    int2  last = size - int2(1, 1);
-    float dL = DEPTH_AT(int2(max(p.x - 1, 0), p.y));
-    float dR = DEPTH_AT(int2(min(p.x + 1, last.x), p.y));
-    float dU = DEPTH_AT(int2(p.x, max(p.y - 1, 0)));
-    float dD = DEPTH_AT(int2(p.x, min(p.y + 1, last.y)));
-#else
-    // The pixel and its four neighbours from two gathers, at its top-left and bottom-right corners (the
-    // clamping sampler repeats the edge, as the loads did): w x y z are top-left, bottom-left, bottom-right, top-right.
-    float4 g0 = GatherRedTex2D(gDepth, gSamplerPointClamp, float2(p) / gContact.screen.xy);
-    float4 g1 = GatherRedTex2D(gDepth, gSamplerPointClamp, (float2(p) + 1.0) / gContact.screen.xy);
-    float  d = g0.y;
-    float  dL = g0.x;
-    float  dU = g0.z;
-    float  dR = g1.z;
-    float  dD = g1.x;
-#endif
-    float3 P = viewPos(float2(p) + 0.5, d);
-    float distanceFade = saturate((gContact.params.y - P.z) * gContact.params.z);
-    if (d <= 0.0 || distanceFade <= 0.0)
-    {
-        Write2D(gOut, p, 1.0);
-        RETURN();
-    }
-    float2 np = float2(p) + float(gContact.counts.y % 64u) * float2(5.588238, 5.588238);
-    float  noise = frac(52.9829189 * frac(dot(np, float2(0.06711056, 0.00583715))));
-
-    // The surface's normal from the nearer neighbour on each axis (so an edge beside it is left out).
-    // The march starts two pixels off the surface along it: from the surface itself, depth steps
-    // between pixels on a curved or grazing surface read as occluders, a dark line along silhouettes.
-    float3 L0 = viewPos(float2(p.x - 1, p.y) + 0.5, dL);
-    float3 R0 = viewPos(float2(p.x + 1, p.y) + 0.5, dR);
-    float3 U0 = viewPos(float2(p.x, p.y - 1) + 0.5, dU);
-    float3 D0 = viewPos(float2(p.x, p.y + 1) + 0.5, dD);
-    float3 dx = abs(R0.z - P.z) < abs(P.z - L0.z) ? R0 - P : P - L0;
-    float3 dy = abs(D0.z - P.z) < abs(P.z - U0.z) ? D0 - P : P - U0;
-    float3 N = normalize(cross(dy, dx));
-    if (dot(N, P) > 0.0)
-        N = -N; // towards the camera
-    float NoL = dot(N, gContact.light.xyz);
-    if (NoL <= 0.0)
-    {
-        Write2D(gOut, p, 1.0); // faces away from the sun: no sunlight to shadow
-        RETURN();
-    }
-    float  pixel = 2.0 * P.z / (gContact.proj.y * gContact.screen.y); // a pixel's size at P (m)
-
-    // No more steps than the ray covers pixels on screen: far away a whole ray spans a few pixels, and
-    // more steps would only read the same depths again.
-    uint   steps = gContact.counts.x;
-    float3 rayEnd = P + gContact.light.xyz * gContact.proj.w;
-    if (rayEnd.z > gContact.proj.z)
-    {
-        float2 span = toPixel(rayEnd) - toPixel(P);
-        steps = clamp(uint(ceil(max(abs(span.x), abs(span.y)))), 2u, steps);
-    }
-    float3 stepV = gContact.light.xyz * (gContact.proj.w / float(steps));
-    float3 pos = P + N * (2.0 * pixel) + stepV * noise;
-    // Stepped in the screen's homogeneous coordinates (pixel x and y times view depth, and view depth),
-    // where the ray is still a straight line: one reciprocal per step gives the pixel and the depth.
-    float2 k = float2(0.5, -0.5) * gContact.proj.xy * gContact.screen.xy;
-    float2 c = 0.5 * gContact.screen.xy + gContact.screen.zw;
-    float3 h = float3(pos.xy * k + pos.z * c, pos.z);
-    float3 dh = float3(stepV.xy * k + stepV.z * c, stepV.z);
-    float  near = gContact.proj.z;
-    float  occlusion = 0.0;
-    for (uint i = 0u; i < steps; ++i)
-    {
-        h += dh;
-        if (h.z <= near)
-            break;
-        float2 px = h.xy * (1.0 / h.z);
-        if (px.x < 0.0 || px.y < 0.0 || px.x >= gContact.screen.x || px.y >= gContact.screen.y)
-            break;
-        // Behind what is seen there by more than the bias and less than the thickness. The depth read,
-        // seen, stands for view depth near / seen; multiplied out, z - near / seen > bias is (z - bias) seen > near.
-        float seen = max(DEPTH_AT(int2(px)), 1e-7);
-        float bias = 0.002 * h.z + 0.004;
-        if ((h.z - bias) * seen > near && (h.z - gContact.light.w) * seen < near)
-        {
-            // Softer towards the screen's edges, where what casts may be off screen.
-            float2 e = min(px, gContact.screen.xy - px) / (gContact.screen.xy * 0.05);
-            occlusion = saturate(min(e.x, e.y));
-            break;
-        }
-    }
-    Write2D(gOut, p, 1.0 - occlusion * gContact.params.x * distanceFade);
+    WriteScreenSpaceShadow(int3(gid), int(tid.x));
     RETURN();
 }

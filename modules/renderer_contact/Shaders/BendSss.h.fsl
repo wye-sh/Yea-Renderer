@@ -1,0 +1,291 @@
+// Copyright 2023 Sony Interactive Entertainment.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// MODIFIED FILE. This is bend_sss_gpu.h from Bend Studio's screen space shadows
+// (https://www.bendstudio.com/blog/inside-bend-screen-space-shadows), changed in 2026 by
+// Alexander Hållenius for Yea's Renderer component:
+// - ported from HLSL to The Forge's shading language (FSL), so it builds for Direct3D 12 and Vulkan, with
+//   SAMPLE_COUNT renamed BEND_SAMPLE_COUNT (FSL's SAMPLE_COUNT is the depth's MSAA count);
+// - DispatchParameters read from the ContactData constant buffer, with the far depth 0 and near depth 1
+//   (reversed Z), USE_UV_PIXEL_BIAS off and BilinearSamplingOffsetMode, UsePrecisionOffset and the debug
+//   outputs removed;
+// - depth read with bounds-checked loads (far depth off screen) instead of a clamp-to-border sampler;
+// - all of a light's dispatches merged into one, each group finding its own dispatch from a table;
+// - the early-out coordinated through groupshared memory alone, with no wave intrinsics, and skipped
+//   pixels written as unshadowed;
+// - writes kept on screen, and the result faded by the Renderer's intensity and distance.
+
+// Number of bilinear sample reads performed per-thread
+#define READ_COUNT (BEND_SAMPLE_COUNT / WAVE_SIZE + 2)
+
+GroupShared(float, DepthData[READ_COUNT * WAVE_SIZE]);
+GroupShared(uint, LdsAnyLive);
+
+// Depth at pixel xy (already floored); the far depth (0) off screen, as the border sampler gave.
+float BendDepth(float2 xy)
+{
+    int2 q = int2(xy);
+    int2 size = int2(gContact.size.xy);
+    float d = DEPTH_AT(clamp(q, int2(0, 0), size - int2(1, 1)));
+    if (q.x < 0 || q.y < 0 || q.x >= size.x || q.y >= size.y)
+        d = 0.0;
+    return d;
+}
+
+// Writes visibility at pixel xy if it is on screen, faded by intensity and by distance (start depth d).
+void BendWrite(float2 xy, float result, float d)
+{
+    int2 q = int2(xy);
+    int2 size = int2(gContact.size.xy);
+    if (q.x < 0 || q.y < 0 || q.x >= size.x || q.y >= size.y)
+        return;
+    float z = gContact.fade.x / max(d, 1e-7); // view depth (reversed Z, infinite far)
+    float distanceFade = saturate((gContact.fade.y - z) * gContact.fade.z);
+    Write2D(gOut, q, 1.0 - (1.0 - result) * gContact.params.w * distanceFade);
+}
+
+// Generate the shadow. Call this function from a compute shader with thread dimensions numthreads[WAVE_SIZE, 1, 1].
+void WriteScreenSpaceShadow(int3 inGroupID, int inGroupThreadID)
+{
+    const float FarDepthValue = 0.0;
+    const float NearDepthValue = 1.0;
+    float4 LightCoordinate = gContact.light;
+
+    // This group's dispatch (all of the light's dispatches are one), and its group id within it.
+    int groupIndex = inGroupID.y;
+    int d = 0;
+    for (int k = 1; k < int(gContact.size.z); ++k)
+        if (groupIndex >= int(gContact.dispatch[k].w))
+            d = k;
+    int local = groupIndex - int(gContact.dispatch[d].w);
+    int countY = int(gContact.dispatch[d].z);
+    int3 groupID = int3(inGroupID.x, local % countY, local / countY);
+    int2 WaveOffset = int2(gContact.dispatch[d].xy);
+
+    // ComputeWavefrontExtents: the start pixel for the pixels in the wavefront, and the delta to get to the
+    // next pixel after WAVE_SIZE pixels along the ray.
+    float2 xy_delta;
+    float2 pixel_xy;
+    float pixel_distance;
+    bool x_axis_major; // major axis is x axis? abs(xy_delta.x) > abs(xy_delta.y).
+    {
+        int2 xy = groupID.yz * WAVE_SIZE + WaveOffset;
+
+        // integer light position / fractional component
+        float2 light_xy = floor(LightCoordinate.xy) + 0.5;
+        float2 light_xy_fraction = LightCoordinate.xy - light_xy;
+        bool reverse_direction = LightCoordinate.w > 0.0;
+
+        int2 sign_xy = int2(sign(float2(xy)));
+        bool horizontal = abs(xy.x + sign_xy.y) < abs(xy.y - sign_xy.x);
+
+        int2 axis;
+        axis.x = horizontal ? (+sign_xy.y) : (0);
+        axis.y = horizontal ? (0) : (-sign_xy.x);
+
+        // Apply wave offset
+        xy = axis * groupID.x + xy;
+        float2 xy_f = float2(xy);
+
+        // For interpolation to the light center, we only really care about the larger of the two axis
+        x_axis_major = abs(xy_f.x) > abs(xy_f.y);
+        float major_axis = x_axis_major ? xy_f.x : xy_f.y;
+
+        float major_axis_start = abs(major_axis);
+        float major_axis_end = abs(major_axis) - float(WAVE_SIZE);
+
+        float ma_light_frac = x_axis_major ? light_xy_fraction.x : light_xy_fraction.y;
+        ma_light_frac = major_axis > 0.0 ? -ma_light_frac : ma_light_frac;
+
+        // back in to screen direction
+        float2 start_xy = xy_f + light_xy;
+
+        // For the very inner most ring, we need to interpolate to a pixel centered UV, so the UV->pixel rounding doesn't skip output pixels
+        float2 end_xy = lerp(LightCoordinate.xy, start_xy, (major_axis_end + ma_light_frac) / (major_axis_start + ma_light_frac));
+
+        // The major axis should be a round number
+        xy_delta = (start_xy - end_xy);
+
+        // Inverse the read order when reverse direction is true
+        float thread_step = float(uint(inGroupThreadID) ^ (reverse_direction ? 0u : uint(WAVE_SIZE - 1)));
+
+        pixel_xy = lerp(start_xy, end_xy, thread_step / float(WAVE_SIZE));
+        pixel_distance = major_axis_start - thread_step + ma_light_frac;
+    }
+
+    // Read in the depth values
+    float sampling_depth[READ_COUNT];
+    float shadowing_depth[READ_COUNT];
+    float depth_thickness_scale[READ_COUNT];
+    float sample_distance[READ_COUNT];
+
+    const float direction = -LightCoordinate.w;
+    const float z_sign = NearDepthValue > FarDepthValue ? -1.0 : +1.0;
+
+    float2 write_xy = floor(pixel_xy);
+
+    UNROLL
+    for (int i = 0; i < READ_COUNT; i++)
+    {
+        // We sample depth twice per pixel per sample, and interpolate with an edge detect filter
+        // Interpolation should only occur on the minor axis of the ray - major axis coordinates should be at pixel centers
+        float2 read_xy = floor(pixel_xy);
+        float minor_axis = x_axis_major ? pixel_xy.y : pixel_xy.x;
+
+        // If a pixel has been detected as an edge, then optionally (ignore edges) don't include it in the shadow
+        const float edge_skip = 1e20; // if edge skipping is enabled, apply an extreme value/blend on edge samples to push the value out of range
+
+        float bilinear = frac(minor_axis) - 0.5;
+        float bias = bilinear > 0.0 ? 1.0 : -1.0;
+        float2 offset_xy = float2(x_axis_major ? 0.0 : bias, x_axis_major ? bias : 0.0);
+
+        float2 depths;
+        depths.x = BendDepth(read_xy);
+        depths.y = BendDepth(read_xy + offset_xy);
+
+        // Depth thresholds (bilinear/shadow thickness) are based on a fractional ratio of the difference between sampled depth and the far clip depth
+        depth_thickness_scale[i] = abs(FarDepthValue - depths.x);
+
+        // If depth variance is more than a specific threshold, then just use point filtering
+        bool use_point_filter = abs(depths.x - depths.y) > depth_thickness_scale[i] * gContact.params.y;
+
+        // The pixel starts sampling at this depth
+        sampling_depth[i] = depths.x;
+
+        float edge_depth = gContact.fade.w > 0.5 ? edge_skip : depths.x;
+        // Any sample in this wavefront is possibly interpolated towards the bilinear sample
+        // So use should use a shadowing depth that is further away, based on the difference between the two samples
+        float shadow_depth = depths.x + abs(depths.x - depths.y) * z_sign;
+
+        // Shadows cast from this depth
+        shadowing_depth[i] = use_point_filter ? edge_depth : shadow_depth;
+
+        // Store for later
+        sample_distance[i] = pixel_distance + float(WAVE_SIZE * i) * direction;
+
+        // Iterate to the next pixel along the ray. This will be WAVE_SIZE pixels along the ray...
+        pixel_xy += xy_delta * direction;
+    }
+
+    // Early out: sky, or past the fade distance (outside the depth bounds). The whole group leaves together
+    // when none of its pixels need a shadow; skipped pixels are written unshadowed.
+    bool skip_pixel = sampling_depth[0] >= NearDepthValue || sampling_depth[0] <= gContact.size.w;
+    if (inGroupThreadID == 0)
+        LdsAnyLive = 0u;
+    GroupMemoryBarrier();
+    if (!skip_pixel)
+        LdsAnyLive = 1u;
+    GroupMemoryBarrier();
+    if (LdsAnyLive == 0u)
+    {
+        BendWrite(write_xy, 1.0, sampling_depth[0]);
+        return;
+    }
+
+    // Write the shadow depths to LDS
+    UNROLL
+    for (int j = 0; j < READ_COUNT; j++)
+    {
+        // Perspective correct the shadowing depth, in this space, all light rays are parallel
+        float stored_depth = (shadowing_depth[j] - LightCoordinate.z) / sample_distance[j];
+
+        if (j != 0)
+        {
+            // For pixels within sampling distance of the light, it is possible that sampling will
+            // overshoot the light coordinate for extended reads. We want to ignore these samples
+            stored_depth = sample_distance[j] > 0.0 ? stored_depth : 1e10;
+        }
+
+        // Store the depth values in groupshared
+        DepthData[(j * WAVE_SIZE) + inGroupThreadID] = stored_depth;
+    }
+
+    // Sync wavefronts now groupshared DepthData is written
+    GroupMemoryBarrier();
+
+    // If the starting depth isn't in depth bounds, then we don't need a shadow
+    if (skip_pixel)
+    {
+        BendWrite(write_xy, 1.0, sampling_depth[0]);
+        return;
+    }
+
+    // perspective correct the depth
+    float start_depth = (sampling_depth[0] - LightCoordinate.z) / sample_distance[0];
+
+    // Start by reading the next value
+    int sample_index = inGroupThreadID + 1;
+
+    float4 shadow_value = float4(1.0, 1.0, 1.0, 1.0);
+    float hard_shadow = 1.0;
+
+    // This is the inverse of how large the shadowing window is for the projected sample data.
+    // All values in the LDS sample list are scaled by 1.0 / sample_distance, such that all light directions become parallel.
+    // The multiply by sample_distance[0] here is to compensate for the projection divide in the data.
+    // The 1.0 / SurfaceThickness is to adjust user selected thickness. So a 0.5% thickness will scale depth values from [0,1] to [0,200]. The shadow window is always 1 wide.
+    // 1.0 / depth_thickness_scale[0] is because SurfaceThickness is percentage of remaining depth between the sample and the far clip - not a percentage of the full depth range.
+    // The min() function is to make sure the window is a minimum width when very close to the light. The +direction term will bias the result so the pixel at the very center of the light is either fully lit or shadowed
+    float depth_scale = min(sample_distance[0] + direction, 1.0 / gContact.params.x) * sample_distance[0] / depth_thickness_scale[0];
+
+    start_depth = start_depth * depth_scale - z_sign;
+
+    // The first number of hard shadow samples, a single pixel can produce a full shadow
+    UNROLL
+    for (int h = 0; h < HARD_SHADOW_SAMPLES; h++)
+    {
+        float depth_delta = abs(start_depth - DepthData[sample_index + h] * depth_scale);
+
+        // We want to find the distance of the sample that is closest to the reference depth
+        hard_shadow = min(hard_shadow, depth_delta);
+    }
+
+    // Brute force go!
+    // The main shadow samples, averaged in to a set of 4 shadow values
+    UNROLL
+    for (int m = HARD_SHADOW_SAMPLES; m < BEND_SAMPLE_COUNT - FADE_OUT_SAMPLES; m++)
+    {
+        float depth_delta = abs(start_depth - DepthData[sample_index + m] * depth_scale);
+
+        // Do the same as the hard_shadow code above, but this will accumulate to 4 separate values.
+        // By using 4 values, the average shadow can be taken, which can help soften single-pixel shadows.
+        shadow_value[m & 3] = min(shadow_value[m & 3], depth_delta);
+    }
+
+    // Final fade out samples
+    UNROLL
+    for (int f = BEND_SAMPLE_COUNT - FADE_OUT_SAMPLES; f < BEND_SAMPLE_COUNT; f++)
+    {
+        float depth_delta = abs(start_depth - DepthData[sample_index + f] * depth_scale);
+
+        // Add the fade value to these samples
+        const float fade_out = float(f + 1 - (BEND_SAMPLE_COUNT - FADE_OUT_SAMPLES)) / float(FADE_OUT_SAMPLES + 1) * 0.75;
+
+        shadow_value[f & 3] = min(shadow_value[f & 3], depth_delta + fade_out);
+    }
+
+    // Apply the contrast value.
+    // A value of 0 indicates a sample was exactly matched to the reference depth (and the result is fully shadowed)
+    // We want some boost to this range, so samples don't have to exactly match to produce a full shadow.
+    float contrast = gContact.params.z;
+    shadow_value = saturate(shadow_value * contrast + (1.0 - contrast));
+    hard_shadow = saturate(hard_shadow * contrast + (1.0 - contrast));
+
+    // Take the average of 4 samples, this is useful to reduces aliasing noise in the source depth, especially with long shadows.
+    float result = dot(shadow_value, float4(0.25, 0.25, 0.25, 0.25));
+
+    // If the first samples are always producing a hard shadow, then compute this value separately.
+    result = min(hard_shadow, result);
+
+    BendWrite(write_xy, result, sampling_depth[0]);
+}

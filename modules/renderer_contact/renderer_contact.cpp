@@ -1,8 +1,9 @@
-// Contact shadows for the renderer core: a screen-space march towards the sun from the depth prepass
-// (Shaders/Contact.comp.fsl) into a full-size R32F visibility texture the forward pass multiplies the
-// sun's shadow by.
+// Contact shadows for the renderer core: Bend Studio's screen space shadows (Shaders/Contact.comp.fsl and
+// BendSss.h.fsl; third_party/bend_sss, Apache-2.0) from the depth prepass towards the sun, into a full-size R32F
+// visibility texture the forward pass multiplies the sun's shadow by.
 #include "yea_renderer_contact.h"
 #include "frame.h"
+#include "third_party/bend_sss/bend_sss_cpu.h"
 
 #include <Common_3/Graphics/Interfaces/IGraphics.h>
 #include <Common_3/Resources/ResourceLoader/Interfaces/IResourceLoader.h>
@@ -19,11 +20,11 @@ namespace
 {
 struct ContactData
 {
-    float    proj[4];
-    float    light[4];
-    float    screen[4];
-    float    params[4];
-    uint32_t counts[4];
+    float light[4];
+    float params[4];
+    float fade[4];
+    float size[4];
+    float dispatch[8][4];
 };
 
 const uint32_t kMaxFrames = 4;
@@ -37,6 +38,7 @@ DescriptorSet* gSet;
 Buffer*        gCb[kMaxFrames];
 Texture*       gTex; // SHADER_RESOURCE between frames
 uint32_t       gWidth, gHeight;
+uint32_t       gGroups[kMaxFrames]; // this frame's groups along y (all of Bend's dispatches as one)
 bool           gReady;
 
 uint32_t sampleIndex(uint32_t s) { return s == 8 ? 3 : s == 4 ? 2 : s == 2 ? 1 : 0; }
@@ -159,26 +161,44 @@ bool contact_prepare(uint64_t address)
     if (!gTex)
         return false;
 
-    float       maxDistance = settings.max_distance < 1 ? 1 : settings.max_distance;
-    int32_t     steps = settings.steps < 4 ? 4 : (settings.steps > 64 ? 64 : settings.steps);
+    float maxDistance = settings.max_distance < 1 ? 1 : settings.max_distance;
+    // The sun's homogeneous point on screen: its direction (w 0) through the view and the jittered projection,
+    // the jitter (pixels) as the ndc offset it adds per unit of view depth.
     const float(*v)[4] = F->view;
-    ContactData d = {};
-    d.proj[0] = F->p00;
-    d.proj[1] = F->p11;
-    d.proj[2] = F->nearZ;
-    d.proj[3] = clampf(settings.length, 0.01f, 1e6f);
+    float       dir[3];
     for (int r = 0; r < 3; ++r)
-        d.light[r] = v[r][0] * F->sunDir[0] + v[r][1] * F->sunDir[1] + v[r][2] * F->sunDir[2];
-    d.light[3] = clampf(settings.thickness, 0.005f, 1e6f);
-    d.screen[0] = (float)F->width;
-    d.screen[1] = (float)F->height;
-    d.screen[2] = F->jitter[0];
-    d.screen[3] = F->jitter[1];
-    d.params[0] = clampf(settings.intensity, 0, 1);
-    d.params[1] = maxDistance;
-    d.params[2] = 1.0f / (maxDistance * 0.2f);
-    d.counts[0] = (uint32_t)steps;
-    d.counts[1] = F->taaOn ? (uint32_t)(F->frameNumber % 64) : 0; // TAA averages the noise over frames
+        dir[r] = v[r][0] * F->sunDir[0] + v[r][1] * F->sunDir[1] + v[r][2] * F->sunDir[2];
+    float lightProj[4] = { F->p00 * dir[0] + 2.0f * F->jitter[0] / (float)F->width * dir[2],
+                           F->p11 * dir[1] - 2.0f * F->jitter[1] / (float)F->height * dir[2], 0.0f, dir[2] };
+    int               viewport[2] = { (int)F->width, (int)F->height };
+    int               lo[2] = { 0, 0 };
+    Bend::DispatchList list = Bend::BuildDispatchList(lightProj, viewport, lo, viewport);
+
+    ContactData d = {};
+    memcpy(d.light, list.LightCoordinate_Shader, sizeof d.light);
+    d.params[0] = clampf(settings.surface_thickness, 0.0001f, 1.0f);
+    d.params[1] = clampf(settings.edge_threshold, 0.0001f, 1.0f);
+    d.params[2] = clampf(settings.contrast, 1.0f, 1e6f);
+    d.params[3] = clampf(settings.intensity, 0, 1);
+    d.fade[0] = F->nearZ;
+    d.fade[1] = maxDistance;
+    d.fade[2] = 1.0f / (maxDistance * 0.2f);
+    d.fade[3] = settings.ignore_edges ? 1.0f : 0.0f;
+    d.size[0] = (float)F->width;
+    d.size[1] = (float)F->height;
+    d.size[2] = (float)list.DispatchCount;
+    d.size[3] = F->nearZ / maxDistance; // reversed Z: depth near / z
+    uint32_t groups = 0;
+    for (int i = 0; i < list.DispatchCount; ++i)
+    {
+        const Bend::DispatchData& b = list.Dispatch[i];
+        d.dispatch[i][0] = (float)b.WaveOffset_Shader[0];
+        d.dispatch[i][1] = (float)b.WaveOffset_Shader[1];
+        d.dispatch[i][2] = (float)b.WaveCount[1];
+        d.dispatch[i][3] = (float)groups;
+        groups += (uint32_t)(b.WaveCount[1] * b.WaveCount[2]); // WaveCount[0] is always 64: the dispatch's x
+    }
+    gGroups[F->frameIndex] = groups;
     memcpy(gCb[F->frameIndex]->pCpuMappedAddress, &d, sizeof d);
 
     F->contact = gTex;
@@ -206,7 +226,8 @@ void contact_run(uint64_t address)
     barrier(cmd, gTex, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
     cmdBindPipeline(cmd, gPipe[sampleIndex(F->sampleCount)]);
     cmdBindDescriptorSet(cmd, F->frameIndex, gSet);
-    cmdDispatch(cmd, (F->width + 7) / 8, (F->height + 7) / 8, 1);
+    if (gGroups[F->frameIndex])
+        cmdDispatch(cmd, 64, gGroups[F->frameIndex], 1);
     barrier(cmd, gTex, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE);
     cmdEndDebugMarker(cmd);
 }

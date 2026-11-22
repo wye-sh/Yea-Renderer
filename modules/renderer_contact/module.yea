@@ -6,11 +6,15 @@ export void contact_run(u64 frame)
 
 category Contact Shadows
 setting bool enabled true
-# How far (metres) towards the sun each pixel looks for something in the way.
-setting float length 0.6 0.05 inf
-# How thick (metres) things in front are taken to be: lower lets light under thin objects.
-setting float thickness 0.25 0.01 inf
-setting int steps 16 4 64
+# How thick each surface is taken to be, as a part of its distance from the camera (0.005: 5 cm at 10 m).
+setting float surface_thickness 0.005 0.0005 0.05
+# Neighbouring depths further apart than this (a part of the distance) are separate surfaces, not blended.
+setting float edge_threshold 0.02 0.002 0.2
+# How sharply each pixel goes from lit to shadowed: higher is darker and harder.
+setting float contrast 4 1 inf
+# Pixels on a depth edge cast no shadow: fewer stripes on large flat surfaces seen at grazing angles,
+# thinner shadows from foliage.
+setting bool ignore_edges false
 setting float intensity 1 0 1
 # Beyond this distance (metres) there are none; they fade out over the last fifth.
 setting float max_distance 60 5 inf
