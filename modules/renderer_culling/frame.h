@@ -160,7 +160,7 @@ struct RenderFrame
 
     // Ambient occlusion (renderer_ao). ao_prepare runs after cull_prepare (jitter and taaOn are set);
     // ao_run right after it, after the depth prepass, with depth in SHADER_RESOURCE.
-    Texture* ao;            // R32F visibility (1: open), full size, SHADER_RESOURCE after ao_run
+    Texture* ao;            // RG16F, x visibility (1: open), full size, SHADER_RESOURCE after ao_run
     uint32_t aoOn;
     float    aoSpecular;    // specular occlusion, 0..1
     uint32_t aoMultiBounce; // brighter occlusion on bright surfaces (light bouncing between them)
