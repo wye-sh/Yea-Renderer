@@ -54,7 +54,6 @@ STRUCT(ShadowView)
 #define RT_MISS 60000.0
 #define FLAG_SCREEN 1u
 #define FLAG_DEBUG 4u
-#define FLAG_PACK 8u // hits to light gathered per group (pack_hits); else each thread lights its own
 // How a hit's local lights are shadowed (shadowMode.y). The sun always takes a ray.
 #define SHADOWS_SCENE 0u // as the scene: from the light's shadow map where it has one, else a ray
 #define SHADOWS_RAYS 1u  // a ray for every light (the scene's ray-traced mode, or the comparison knob)
@@ -377,30 +376,17 @@ int2 blockOffset()
 // half_resolution off) into gOutFull, then with half_resolution on the block's pixel for this frame (unless it is
 // one of those) into gOutHalf. A pixel that reflects marks its 8 x 8 tile in gTiles (cleared by last frame's
 // resolve), so the resolve skips the others.
-// It runs in five rounds (the block's four pixels at full resolution, then its half-resolution one). Each
-// round traces one pixel per thread, and the hits to light where they are (shadow rays and the lights' loop,
-// most of the cost where the reflection shows what is off screen) go into a list the whole group then lights,
-// one hit per thread: lit inline, a thread with such a hit kept its whole warp waiting while the others had
-// none. Two lists alternate, so one barrier a round keeps a list from being refilled while it is read.
-#define GROUP_THREADS 64u
-GroupShared(float4, gsPos[2 * GROUP_THREADS]);
-GroupShared(float4, gsNormal[2 * GROUP_THREADS]);
-GroupShared(float4, gsRay[2 * GROUP_THREADS]);
-GroupShared(float4, gsScreen[2 * GROUP_THREADS]);
-GroupShared(uint2, gsWhere[2 * GROUP_THREADS]); // x the pixel (x | y << 15 | 1 << 30 for gOutHalf), y the material
-GroupShared(uint, gsCount[5]);
-
+// It runs in five rounds (the block's four pixels at full resolution, then its half-resolution one), each
+// tracing one pixel per thread and lighting its hit where it is. (Gathering the hits to light per group and
+// lighting them one per thread, Renderer 2.2.6 to 2.2.9, was no faster on an RTX 2080 and slower in the start view.)
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(8, 8, 1)
-void CS_MAIN(SV_DispatchThreadID(uint3) id, SV_GroupIndex(uint) gi)
+void CS_MAIN(SV_DispatchThreadID(uint3) id)
 {
     INIT_MAIN;
     int2 size = int2(gRt.screen.xy);
     int2 b = int2(id.xy);
     bool inside = b.x < (size.x + 1) / 2 && b.y < (size.y + 1) / 2;
-    if (gi < 5u)
-        gsCount[gi] = 0u;
-    GroupMemoryBarrier();
     bool reflects = false;
     for (uint k = 0u; k < 5u; ++k)
     {
@@ -413,44 +399,19 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id, SV_GroupIndex(uint) gi)
         bool glossy = surface.x < gRt.camPos.w;
         reflects = reflects || (glossy && !isHalf);
         bool trace = glossy && (isHalf ? gRt.temporal.w > 0.5 && surface.x >= gRt.params.z : surface.x < gRt.params.z);
-        uint list = (k & 1u) * GROUP_THREADS;
         if (trace)
         {
             Hit h = traceRay(p, surface, LoadTex2D(gDepth, NO_SAMPLER, p, 0).r);
-            if (h.result.a < 0.0 && (gRt.counts.z & FLAG_PACK) == 0u)
-                h.result = lightHit(h.pos, h.normal, h.ray, h.screen.rgb, h.material, isHalf ? b : p); // as the list's
-            if (h.result.a >= 0.0)
-            {
-                if (isHalf)
-                    Write2D(gOutHalf, b, h.result);
-                else
-                    Write2D(gOutFull, p, h.result);
-            }
+            // The maps' filter is turned by where the sample is written (the half-size texel at half resolution).
+            if (h.result.a < 0.0)
+                h.result = lightHit(h.pos, h.normal, h.ray, h.screen.rgb, h.material, isHalf ? b : p);
+            if (isHalf)
+                Write2D(gOutHalf, b, h.result);
             else
-            {
-                uint at;
-                AtomicAdd(gsCount[k], 1u, at);
-                int2 q = isHalf ? b : p;
-                gsPos[list + at] = h.pos;
-                gsNormal[list + at] = h.normal;
-                gsRay[list + at] = h.ray;
-                gsScreen[list + at] = h.screen;
-                gsWhere[list + at] = uint2(uint(q.x) | (uint(q.y) << 15u) | (isHalf ? 1u << 30u : 0u), h.material);
-            }
+                Write2D(gOutFull, p, h.result);
         }
         else if (isHalf && inside && gRt.temporal.w > 0.5)
             Write2D(gOutHalf, b, float4(0.0, 0.0, 0.0, 0.0));
-        GroupMemoryBarrier();
-        if (gi < gsCount[k])
-        {
-            uint2  where = gsWhere[list + gi];
-            int2   q = int2(int(where.x & 0x7FFFu), int((where.x >> 15u) & 0x7FFFu));
-            float4 v = lightHit(gsPos[list + gi], gsNormal[list + gi], gsRay[list + gi], gsScreen[list + gi].rgb, where.y, q);
-            if ((where.x >> 30u) != 0u)
-                Write2D(gOutHalf, q, v);
-            else
-                Write2D(gOutFull, q, v);
-        }
     }
     if (reflects)
         gTiles[gRt.tiles.z + (b.y >> 2) * gRt.tiles.x + (b.x >> 2)] = 1u;

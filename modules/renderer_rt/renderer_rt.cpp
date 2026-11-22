@@ -49,7 +49,7 @@ const uint32_t kMaxFrames = 4;
 const uint32_t kMaxMeshes = 1024;
 const uint32_t kMaxRetired = 256;
 const uint32_t kMaxInstances = 65536; // the core's Instance table
-const uint32_t kFlagScreen = 1, kFlagDebug = 4, kFlagPack = 8;
+const uint32_t kFlagScreen = 1, kFlagDebug = 4;
 // How hits are shadowed (Trace.comp.fsl SHADOWS_*): as the scene, rays for every light, none.
 enum { kShadowsScene, kShadowsRays, kShadowsOff };
 
@@ -470,8 +470,7 @@ bool rt_prepare(uint64_t address)
     d.sunColor[3] = F->ambient;
     d.counts[0] = F->allLightCount;
     d.counts[1] = (uint32_t)(F->frameNumber % 64u);
-    d.counts[2] = (settings.screen_colors ? kFlagScreen : 0) | (settings.show_hits ? kFlagDebug : 0) |
-                  (settings.pack_hits ? kFlagPack : 0);
+    d.counts[2] = (settings.screen_colors ? kFlagScreen : 0) | (settings.show_hits ? kFlagDebug : 0);
     // Hits are shadowed as the scene is: from the local lights' maps (the same filter, normal bias and
     // contact-hardening as the forward pass), a ray where a light casts but has no map, a ray for the sun. When the
     // scene gains a ray-traced shadow mode, picking it here (kShadowsRays) is all reflections need.

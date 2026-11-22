@@ -91,9 +91,8 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   map in renderer_shadows' atlas from that map, filtered as the forward pass does (`Shaders/Shadow.h.fsl` copies the
   core's localShadow: keep them in step), a light that casts in the scene but has no map (outside the view, over the
   budget; the core's LightData params.w) by a ray, the sun by a ray; at most 8 rays per hit. A scene ray-traced shadow
-  mode would pick `kShadowsRays` in rt_prepare. Rays traces every light (to compare), Off none. Each round of the
-  trace packs its hits to light (most of the cost where reflections show what is off screen) into a group-shared list
-  the whole thread group then lights, one hit a thread. A miss sees the sky. The forward
+  mode would pick `kShadowsRays` in rt_prepare. Rays traces every light (to compare), Off none. Each thread lights its own
+  hits (gathering them per group to light was no faster on an RTX 2080: Benchmark v7). A miss sees the sky. The forward
   pass blends it over the probes, fading out over the roughness limit's last third. Two passes, both
   `Shaders/Trace.comp.fsl`. The trace runs a thread per 2x2 block, so no lane idles: pixels smoother than `full_below`
   (0.15: mirrors) are traced at every pixel, so mirrors are exactly as at full resolution, and with `half_resolution`
@@ -174,8 +173,7 @@ intensity, max_distance, show_contact. `renderer_probes`: enabled, resolution (6
 `renderer_ssr`: enabled, half_resolution, max_roughness, thickness, max_distance, steps, edge_fade, intensity,
 show_hits (tints where reflections were found). `renderer_vrs`: enabled, aggressiveness, motion (0), keep_curved, glossy_below, allow_4x4,
 show_rates (green half rate, blue 2x2, magenta coarser). `renderer_rt`: enabled, max_roughness, half_resolution, full_below, screen_colors,
-reflected_shadows (Scene, Rays, Off), history_frames, brightest, max_distance, show_hits (green: hit seen on screen, blue: lit at the hit, grey: sky),
-pack_hits (off: each thread lights its own hit, bit-identical; to compare the packing's cost).
+reflected_shadows (Scene, Rays, Off), history_frames, brightest, max_distance, show_hits (green: hit seen on screen, blue: lit at the hit, grey: sky).
 
 ## Reset
 
