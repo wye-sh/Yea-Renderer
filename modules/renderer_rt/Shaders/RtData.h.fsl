@@ -28,4 +28,5 @@ STRUCT(RtData)
     DATA(uint4, shadowMode, None);   // x filter taps, y how hits are shadowed (SHADOWS_*), z receiver-plane bias,
                                      // w 1 when the atlas is drawn this frame
     DATA(float4, taps[32], None);    // xy: the filters' Vogel disk, unturned (as the core's)
+    DATA(uint4, probe, None);        // TEMPORARY (probe_rays): x shadow rays per pixel to measure, 0 none
 };

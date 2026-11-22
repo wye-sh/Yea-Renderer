@@ -638,3 +638,72 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id, SV_GroupID(uint3) gid, SV_GroupIndex
     RETURN();
 }
 #endif
+
+#if defined(PROBE_PASS)
+// TEMPORARY (probe_rays): the shadow rays ray-traced shadows would cast from each pixel on screen, traced and thrown
+// away to measure them: the sun's (towards a point on its disc), then local lights' (towards a point on the light,
+// only where it reaches and faces the surface), probe.x in all. The result is kept only behind a write that never
+// happens, so the rays can't be optimised out.
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) id)
+{
+    INIT_MAIN;
+    int2 p = int2(id.xy);
+    int2 size = int2(gRt.screen.xy);
+    if (p.x >= size.x || p.y >= size.y)
+        RETURN();
+    float d = LoadTex2D(gDepth, NO_SAMPLER, p, 0).r;
+    if (d <= 0.0)
+        RETURN();
+    float4 surface = LoadTex2D(gSurface, NO_SAMPLER, p, 0);
+    float  z = gRt.forward.w / d;
+    float2 u = float2(p) + 0.5 - gRt.screen.zw;
+    float2 ndc = float2(u.x / gRt.screen.x * 2.0 - 1.0, 1.0 - u.y / gRt.screen.y * 2.0);
+    float3 P = gRt.camPos.xyz + gRt.right.xyz * (ndc.x * z / gRt.right.w) + gRt.up.xyz * (ndc.y * z / gRt.up.w) + gRt.forward.xyz * z;
+    float3 N = normalize(surface.yzw);
+    float3 origin = P + N * (0.001 * z + 0.004);
+    float2 xi = sample2(p);
+    float  phi = xi.x * 2.0 * PI;
+    float2 disc = sqrt(xi.y) * float2(cos(phi), sin(phi));
+    uint   budget = gRt.probe.x;
+    uint   hits = 0u;
+    if (budget > 0u && gRt.sunDir.w > 0.5 && dot(N, gRt.sunDir.xyz) > 0.0)
+    {
+        float3 L = gRt.sunDir.xyz;
+        float3 axis = abs(L.y) < 0.9 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+        float3 tx = normalize(cross(axis, L));
+        float3 ty = cross(L, tx);
+        RayDesc ray;
+        ray.Origin = origin;
+        ray.Direction = normalize(L + (tx * disc.x + ty * disc.y) * 0.0047); // the sun's angular radius
+        ray.TMin = 0.0;
+        ray.TMax = 1000.0;
+        RayQueryAnyHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RT_RAY_FLAGS, ray, 2u, sunHit)
+        hits += RayQueryIsHit(sunHit) ? 1u : 0u;
+    }
+    uint  lights = min(budget > 0u ? budget - 1u : 0u, gRt.counts.x);
+    float radius = max(gRt.shadow.w, 0.06);
+    for (uint i = 0u; i < lights; ++i)
+    {
+        LightData l = gLights[i];
+        float3 toLight = l.pos.xyz - P;
+        float  d2 = dot(toLight, toLight);
+        if (d2 >= l.pos.w * l.pos.w || dot(N, toLight) <= 0.0)
+            continue;
+        float3 target = l.pos.xyz + float3(disc.x, disc.y, xi.x - 0.5) * radius;
+        float3 toTarget = target - origin;
+        float  dist = length(toTarget);
+        RayDesc ray;
+        ray.Origin = origin;
+        ray.Direction = toTarget / max(dist, 1e-4);
+        ray.TMin = 0.0;
+        ray.TMax = max(dist - radius, 0.0);
+        RayQueryAnyHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RT_RAY_FLAGS, ray, 2u, probeHit)
+        hits += RayQueryIsHit(probeHit) ? 1u : 0u;
+    }
+    if (hits == gRt.counts.w + 100000u) // never: at most 9 hits
+        Write2D(gOutHalf, int2(0, 0), float4(0.0, 0.0, 0.0, 0.0));
+    RETURN();
+}
+#endif

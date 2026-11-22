@@ -35,6 +35,7 @@ struct RtData
     float    shadow[4];
     uint32_t shadowMode[4];
     float    taps[32][4];
+    uint32_t probe[4]; // TEMPORARY (probe_rays)
 };
 
 struct Blas
@@ -58,7 +59,7 @@ Queue*               gQueue;
 uint32_t             gFrames;
 const YeaRaytracing* gService;
 Raytracing*          gRay;
-enum { kTrace, kResolve, kShaders };
+enum { kTrace, kResolve, kProbe, kShaders };
 Shader*              gShader[kShaders];
 Pipeline*            gPipe[kShaders];
 DescriptorSet*       gSet; // two per frame in flight: the trace and the resolve
@@ -307,7 +308,7 @@ int load(int reloaded)
     gDescs = new AccelerationStructureInstanceDesc[kMaxInstances];
     gInstCpu = new uint32_t[kMaxInstances * 4];
     gDescCapacity = kMaxInstances;
-    const char* names[kShaders] = { "renderer_rt_trace.comp", "renderer_rt_resolve.comp" };
+    const char* names[kShaders] = { "renderer_rt_trace.comp", "renderer_rt_resolve.comp", "renderer_rt_probe.comp" };
     for (uint32_t k = 0; k < kShaders; ++k)
     {
         ShaderLoadDesc sd = {};
@@ -485,6 +486,7 @@ bool rt_prepare(uint64_t address)
     d.shadow[1] = F->normalBias;
     d.shadow[2] = F->localTexel;
     d.shadow[3] = F->localLightSize;
+    d.probe[0] = settings.probe_rays < 0 ? 0 : (uint32_t)settings.probe_rays;
     for (uint32_t i = 0; i < d.shadowMode[0]; ++i)
     {
         float r = sqrtf(((float)i + 0.5f) / (float)d.shadowMode[0]), t = (float)i * 2.39996323f;
@@ -675,6 +677,14 @@ void rt_run(uint64_t address)
                              { gAccumZ[w], RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS } };
     cmdResourceBarrier(cmd, 1, &tb, 4, in, 0, nullptr);
     gTilesState = RESOURCE_STATE_UNORDERED_ACCESS;
+    if (settings.probe_rays > 0)
+    {
+        // TEMPORARY (probe_rays): the main view's shadow rays, traced and thrown away, to measure them.
+        cmdBindPipeline(cmd, gPipe[kProbe]);
+        cmdBindDescriptorSet(cmd, 0, gPersistent);
+        cmdBindDescriptorSet(cmd, fi * 2, gSet);
+        cmdDispatch(cmd, (F->width + 7) / 8, (F->height + 7) / 8, 1);
+    }
     cmdBindPipeline(cmd, gPipe[kTrace]); // a thread per 2 x 2 block
     cmdBindDescriptorSet(cmd, 0, gPersistent);
     cmdBindDescriptorSet(cmd, fi * 2, gSet);

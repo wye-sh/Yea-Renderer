@@ -29,3 +29,6 @@ setting float max_distance 100 1 inf
 # Tints traced reflections: green where the hit was seen on screen, blue where it was lit at the hit,
 # grey where the ray found the sky.
 setting bool show_hits false
+# Temporary, to measure ray-traced shadows' cost: shadow rays traced from every pixel on screen and thrown away
+# (1 the sun's, each more one local light's). The picture doesn't change.
+setting int probe_rays 0 0 9
