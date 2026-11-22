@@ -184,6 +184,7 @@ bool taa_prepare(uint64_t address)
 
     // Without last frame's resolve (first frame, a resize, a gap) the history is not used.
     bool     valid = gResolvedFrame && gResolvedFrame + 1 == F->frameNumber;
+    F->previous = valid ? gHistory[gCurrent ^ 1] : nullptr;
     float    keep = settings.history_weight < 0 ? 0 : (settings.history_weight > 0.99f ? 0.99f : settings.history_weight);
     TaaData  d = {};
     d.params[0] = valid ? 1.0f - keep : 1.0f;

@@ -33,6 +33,8 @@ STRUCT(FrameData)
     DATA(float4, aoParams, None);            // x specular occlusion, y multi-bounce on
     DATA(uint4, probeInfo, None);            // x probes, y mips, z parallax on
     DATA(float4, probeParams, None);         // x intensity, y blend (m)
+    DATA(float4, ssr, None);                 // x max roughness, y thickness (m), z max distance (m), w edge fade
+    DATA(float4, ssr2, None);                // x intensity, y depth copy scale, z steps
 };
 
 // A reflection probe (renderer_probes), smallest box first.
@@ -53,6 +55,8 @@ STRUCT(ProbeData)
 #define FLAG_CONTACT  64u
 #define FLAG_CONTACT_DEBUG 128u
 #define FLAG_UNLIT    256u // F1's Wireframe: each line in its material's own colour
+#define FLAG_SSR      512u
+#define FLAG_SSR_DEBUG 1024u
 
 STRUCT(InstanceData)
 {

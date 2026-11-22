@@ -111,6 +111,8 @@ import renderer_contact bool contact_prepare(u64 frame) = false
 import renderer_contact void contact_run(u64 frame)
 import renderer_probes bool probes_prepare(u64 frame) = false
 import renderer_probes void probes_render(u64 frame)
+import renderer_ssr bool ssr_prepare(u64 frame) = false
+import renderer_ssr void ssr_run(u64 frame)
 
 category Exposure
 setting float exposure_ev 0 -6 6

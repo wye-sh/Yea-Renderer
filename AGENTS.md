@@ -33,8 +33,14 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   per roughness step. Dirty probes are captured first (at most `updates_per_frame`, or 1), then that many more
   in turn. The forward pass blends the probes whose boxes hold the pixel, smallest box first, projects onto
   the box (parallax), and lets the live sky show where the capture saw none.
+- `renderer_ssr`: screen-space reflections over the probes. It copies the prepass depth (full or half size);
+  the core's forward pass marches each glossy pixel's reflected ray across the screen against that copy
+  (1/depth linear in screen space, thickness test, 4 halvings), and takes the colour from last frame's
+  TAA-resolved image (`previous`), reprojected. Where nothing is found, off screen, near the screen's edges
+  or above `max_roughness`, the probes show. Needs TAA: without it there is no previous image and it is off.
+  Only on screen: what is behind the camera or hidden keeps the probes' (box-projected) reflection.
 - The core calls the others through optional imports with a `RenderFrame*` (as `u64`): `frame.h`, copied
-  identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact` and `renderer_probes` (`mathx.h` into the
+  identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes` and `renderer_ssr` (`mathx.h` into the
   first three). Change all copies together and raise `RENDER_FRAME_VERSION`. `taa_prepare` runs first,
   before the camera, so the jitter reaches the projection.
 
@@ -75,6 +81,8 @@ updates_per_frame, max_tile_resolution, show_cascades, show_atlas (the light sha
 jitter_phases. `renderer_ao`: enabled, half_resolution (GTAO and its blur at half size, then a depth-aware upsample), radius, intensity, falloff, slices, steps, denoise, specular_occlusion,
 multi_bounce, show_ao. `renderer_contact`: enabled, length, thickness, steps, intensity, max_distance,
 show_contact. `renderer_probes`: enabled, resolution (64-512), updates_per_frame, intensity, blend, parallax.
+`renderer_ssr`: enabled, half_resolution, max_roughness, thickness, max_distance, steps, edge_fade, intensity,
+show_hits (tints where reflections were found).
 
 ## Reset
 
@@ -85,10 +93,13 @@ builds it again. GPU objects and shadow caches are rebuilt on load.
 
 Per frame: one depth prepass and one forward pass (draws grouped by mesh and sidedness, instanced; back
 faces culled except for double-sided materials; a leaner forward shader unless PCSS or a debug view is on), one culling
-dispatch per 16 px tile, a GTAO dispatch and `denoise` blur dispatches (at half size with half_resolution, plus a full-size upsample), one contact shadow dispatch (all full size; its march takes no more steps than the ray spans pixels), per re-captured probe 6 scene draws at half its
+dispatch per 16 px tile, a GTAO dispatch and `denoise` blur dispatches (at half size with half_resolution, plus a full-size upsample), one contact shadow dispatch (all full size; its march takes no more steps than the ray spans pixels), one
+depth copy for screen reflections (their march, up to `steps` plus 4 depth reads, runs in the forward pass for
+glossy pixels with reflections on, and shows in its timing), per re-captured probe 6 scene draws at half its
 resolution plus 6 small passes per mip, sun cascades redrawn, at most `updates_per_frame` local lights redrawn (oldest shadow first), two
 exposure dispatches, one full-screen TAA resolve (when on), one full-screen composite. No per-frame allocation. GPU memory at the defaults:
-HDR + depth at 4x MSAA, sun atlas 4096² D32 (64 MB), local atlas 4096² (64 MB).
+HDR + depth at 4x MSAA, sun atlas 4096² D32 (64 MB), local atlas 4096² (64 MB), a screen-size R32F depth copy
+for screen reflections (a quarter of it at half resolution).
 
 ## Pitfalls
 

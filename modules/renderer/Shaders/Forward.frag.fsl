@@ -86,6 +86,104 @@ float3 environment(float3 P, float3 R, float rough, bool reflections)
     return color + sky * remaining;
 }
 
+float4 clipOf(float3 W)
+{
+    float4 w = float4(W, 1.0);
+    return float4(dot(gFrame.viewProj[0], w), dot(gFrame.viewProj[1], w), dot(gFrame.viewProj[2], w), dot(gFrame.viewProj[3], w));
+}
+
+float2 pixelOf(float4 c) { return (c.xy / c.w * float2(0.5, -0.5) + 0.5) * gFrame.screen.xy; }
+
+// How far the ray is behind what the depth copy shows at pixel s (view metres; negative: in front).
+float behind(float2 s, float rayZ)
+{
+    float2 size = floor(gFrame.screen.xy * gFrame.ssr2.y);
+    int2   q = int2(clamp(s * gFrame.ssr2.y, float2(0.0, 0.0), size - 1.0));
+    float  d = LoadTex2D(gSsrDepth, NO_SAMPLER, q, 0).r;
+    return rayZ - gFrame.camPos.w / max(d, 1e-7); // reversed-Z, infinite far: sky is never in front
+}
+
+// Screen-space reflection (renderer_ssr): the reflected ray marched across the screen against the depth
+// copy, 1/depth stepped linearly in screen space (perspective-correct, McGuire and Mara 2014); at the first
+// step behind what the depth shows by less than `thickness`, refined by halving, the colour there from
+// last frame's anti-aliased image, reprojected. rgb, and how much to trust it (0: nothing found, off
+// screen, too rough); it fades out towards the screen's edges, the ray's end and the roughness limit.
+float4 screenReflection(float3 P, float3 R, float rough, float noise)
+{
+    float limit = gFrame.ssr.x;
+    float fade = saturate((limit - rough) / max(limit * 0.33, 1e-4));
+    if (fade <= 0.0)
+        return float4(0.0, 0.0, 0.0, 0.0);
+    float4 c0 = clipOf(P);
+    float  dz = dot(gFrame.view[2].xyz, R); // view depth per metre along R
+    float  len = gFrame.ssr.z;
+    if (dz < 0.0)
+        len = min(len, (c0.w - gFrame.camPos.w * 2.0) / -dz); // stop short of the near plane
+    if (len < 0.05)
+        return float4(0.0, 0.0, 0.0, 0.0);
+    float4 c1 = clipOf(P + R * len);
+    float2 s0 = pixelOf(c0);
+    float2 s1 = pixelOf(c1);
+    // Only the part of the line on screen.
+    float2 ds = s1 - s0;
+    float2 size = gFrame.screen.xy;
+    float  tEnd = 1.0;
+    if (ds.x > 1e-4) tEnd = min(tEnd, (size.x - s0.x) / ds.x);
+    if (ds.x < -1e-4) tEnd = min(tEnd, -s0.x / ds.x);
+    if (ds.y > 1e-4) tEnd = min(tEnd, (size.y - s0.y) / ds.y);
+    if (ds.y < -1e-4) tEnd = min(tEnd, -s0.y / ds.y);
+    float span = length(ds) * tEnd * gFrame.ssr2.y; // depth-copy pixels crossed
+    if (span < 1.0)
+        return float4(0.0, 0.0, 0.0, 0.0);
+    float k0 = 1.0 / c0.w;
+    float k1 = 1.0 / c1.w;
+    float steps = min(gFrame.ssr2.z, span);
+    float dt = tEnd / steps;
+    float tStart = min(1.5 / span, 0.5) * tEnd; // off the surface itself
+    float tPrev = tStart;
+    float tHit = -1.0;
+    for (float i = 0.0; i < steps; i += 1.0)
+    {
+        float t = tStart + (i + noise) * dt;
+        if (t > tEnd)
+            break;
+        float rayZ = 1.0 / lerp(k0, k1, t);
+        float b = behind(lerp(s0, s1, t), rayZ);
+        if (b > 0.002 * rayZ && b < gFrame.ssr.y)
+        {
+            tHit = t;
+            break;
+        }
+        tPrev = t; // in front, or behind something thicker than `thickness`: it passes behind it
+    }
+    if (tHit < 0.0)
+        return float4(0.0, 0.0, 0.0, 0.0);
+    float lo = tPrev;
+    for (uint r = 0u; r < 4u; ++r)
+    {
+        float mid = 0.5 * (lo + tHit);
+        if (behind(lerp(s0, s1, mid), 1.0 / lerp(k0, k1, mid)) > 0.002 / lerp(k0, k1, mid))
+            tHit = mid;
+        else
+            lo = mid;
+    }
+    float  rayZ = 1.0 / lerp(k0, k1, tHit);
+    float  u = abs(c1.w - c0.w) > 1e-4 ? saturate((rayZ - c0.w) / (c1.w - c0.w)) : tHit; // along P..P + R len
+    float3 H = P + R * (len * u);
+    float4 pc = float4(dot(gFrame.prevViewProj[0], float4(H, 1.0)), dot(gFrame.prevViewProj[1], float4(H, 1.0)),
+                       dot(gFrame.prevViewProj[2], float4(H, 1.0)), dot(gFrame.prevViewProj[3], float4(H, 1.0)));
+    if (pc.w <= 1e-4)
+        return float4(0.0, 0.0, 0.0, 0.0);
+    float2 uvPrev = pc.xy / pc.w * float2(0.5, -0.5) + 0.5;
+    float2 uvHit = lerp(s0, s1, tHit) * gFrame.screen.zw;
+    float2 edge = min(min(uvHit, 1.0 - uvHit), min(uvPrev, 1.0 - uvPrev));
+    float  w = saturate(min(edge.x, edge.y) / gFrame.ssr.w) * saturate((1.0 - u) * 5.0) * fade * gFrame.ssr2.x;
+    if (w <= 0.0)
+        return float4(0.0, 0.0, 0.0, 0.0);
+    float3 c = SampleLvlTex2D(gPrevColor, gSamplerBilinearClamp, uvPrev, 0.0).rgb;
+    return float4(c, w);
+}
+
 ROOT_SIGNATURE(DefaultRootSignature)
 #ifdef MOTION
 PSOutput PS_MAIN(VSOutput In)
@@ -221,7 +319,15 @@ float4 PS_MAIN(VSOutput In)
     float  horizon = saturate(1.0 + dot(R, normalize(In.Normal) * (dot(In.Normal, V) < 0.0 ? -1.0 : 1.0)));
     float3 irradiance = skyIrradiance(N) * ambient;
     float  r = sqrt(sqrt(a2));
-    float3 radiance = environment(In.WorldPos, R, r, m.params.z > 0.5) * (horizon * horizon);
+    float3 radiance = environment(In.WorldPos, R, r, m.params.z > 0.5);
+    float  ssrFound = 0.0;
+    if ((gFrame.counts.z & FLAG_SSR) != 0u && m.params.z > 0.5)
+    {
+        float4 sr = screenReflection(In.WorldPos, R, m.albedoRough.a, frac(phi * (0.5 / PI) + 0.37));
+        radiance = lerp(radiance, sr.rgb, sr.a);
+        ssrFound = sr.a;
+    }
+    radiance *= horizon * horizon;
     float3 FssEss = s.f0 * dfg.x + float3(dfg.y, dfg.y, dfg.y);
     float  Ems = 1.0 - Ess;
     float3 Favg = s.f0 + (float3(1.0, 1.0, 1.0) - s.f0) * (1.0 / 21.0);
@@ -241,6 +347,11 @@ float4 PS_MAIN(VSOutput In)
         color = float3(ao, ao, ao); // shown at exposure 1
     if ((gFrame.counts.z & FLAG_CONTACT_DEBUG) != 0u)
         color = float3(contact, contact, contact);
+    if ((gFrame.counts.z & FLAG_SSR_DEBUG) != 0u)
+    {
+        float exposure = max(gExposure[1], 1e-8);
+        color = color * 0.2 + float3(0.0, 0.9, 0.6) * (ssrFound * 0.6 / exposure);
+    }
     if ((gFrame.counts.z & FLAG_HEATMAP) != 0u)
     {
         float exposure = max(gExposure[1], 1e-8);

@@ -50,6 +50,8 @@ struct GpuFrame
     float    aoParams[4];
     uint32_t probeInfo[4];
     float    probeParams[4];
+    float    ssr[4];  // x max roughness, y thickness, z max distance, w edge fade
+    float    ssr2[4]; // x intensity, y depth copy scale, z steps
 };
 struct GpuMaterial
 {
@@ -70,7 +72,7 @@ struct ExposureData
 };
 
 const uint32_t kFlagCulled = 1, kFlagHeatmap = 2, kFlagCascades = 4, kFlagShadows = 8, kFlagAo = 16, kFlagAoDebug = 32, kFlagContact = 64,
-               kFlagContactDebug = 128, kFlagUnlit = 256;
+               kFlagContactDebug = 128, kFlagUnlit = 256, kFlagSsr = 512, kFlagSsrDebug = 1024;
 const uint32_t kMaxFrames = 4;
 const uint32_t kMaxUnculledLights = 256;
 const uint32_t kHistogramBins = 128;
@@ -92,7 +94,7 @@ DescriptorSet *gScenePersistent, *gSceneFrame, *gCompositeSet, *gExposureSet;
 // Scene pipelines in pairs: [0] culls back faces, [1] draws both sides (double-sided materials).
 Pipeline *     gDepthPipe[2], *gForwardPipe[2], *gForwardFullPipe[2], *gForwardDepthPipe[2];
 Pipeline *     gSkyPipe, *gCompositePipe, *gHistogramPipe, *gAdaptPipe;
-RenderTarget * gHdr, *gDepth, *gDummyDepth, *gMotion, *gDummyArray;
+RenderTarget * gHdr, *gDepth, *gDummyDepth, *gMotion, *gDummyArray, *gDummyColor;
 Buffer *       gFrameCb[kMaxFrames], *gInstanceBuf[kMaxFrames], *gMaterialBuf[kMaxFrames], *gLightBuf[kMaxFrames], *gStreamBuf[kMaxFrames];
 Buffer *       gCompositeCb[kMaxFrames], *gExposureCb[kMaxFrames];
 Buffer *       gDfg, *gExposure, *gHistogram, *gDummyU32, *gDummyViews, *gDummyProbes;
@@ -583,8 +585,8 @@ void barrierBuf(Cmd* cmd, Buffer* buf, ResourceState from, ResourceState to)
 // (that frame's fence has passed by then, so nothing waits), averaged and logged every 10 s.
 namespace
 {
-enum Timing : uint32_t { kTimeShadows, kTimeProbes, kTimePrepass, kTimeCulling, kTimeAo, kTimeContact, kTimeForward, kTimeExposure, kTimeTaa, kTimeComposite, kTimeTotal, kTimings };
-const char* const kTimingNames[kTimings] = { "shadows", "probes", "prepass", "culling", "ao", "contact", "forward+sky", "exposure", "taa", "composite", "total" };
+enum Timing : uint32_t { kTimeShadows, kTimeProbes, kTimePrepass, kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeForward, kTimeExposure, kTimeTaa, kTimeComposite, kTimeTotal, kTimings };
+const char* const kTimingNames[kTimings] = { "shadows", "probes", "prepass", "culling", "ao", "contact", "ssr", "forward+sky", "exposure", "taa", "composite", "total" };
 QueryPool*        gTimePool[kMaxFrames];
 uint32_t          gTimeUsed[kMaxFrames]; // bits: what that frame recorded
 double            gTimeTicks;            // per second
@@ -763,7 +765,10 @@ int load(int reloaded)
     d.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
     d.pName = "renderer_dummy_depth";
     addRenderTarget(gRenderer, &d, &gDummyDepth);
-    d.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT; // stands in for the probe array: two slices, so an array view
+    d.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
+    d.pName = "renderer_dummy_color";
+    addRenderTarget(gRenderer, &d, &gDummyColor);
+    // stands in for the probe array: two slices, so an array view
     d.mArraySize = 2;
     d.pName = "renderer_dummy_probes";
     addRenderTarget(gRenderer, &d, &gDummyArray);
@@ -812,6 +817,7 @@ void unload()
     destroyTargets();
     freeTarget(gDummyDepth);
     freeTarget(gDummyArray);
+    freeTarget(gDummyColor);
     for (uint32_t i = 0; i < gFrames; ++i)
     {
         freeBuffer(gFrameCb[i]);
@@ -1195,6 +1201,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     F.skyGround[0] = gnd.x * L, F.skyGround[1] = gnd.y * L, F.skyGround[2] = gnd.z * L;
     F.ambient = settings.ambient;
     bool probes = renderer_probes::probes_prepare((uint64_t)(uintptr_t)&F) && F.probes && F.probeData && F.probeCount;
+    bool ssr = taa && !viewMode && renderer_ssr::ssr_prepare((uint64_t)(uintptr_t)&F) && F.ssrOn && F.ssrDepth && F.previous;
 
     // GPU lights in sorted order, with the shadow views renderer_shadows picked.
     RenderGpuLight* gl = gLightCpu;
@@ -1270,7 +1277,17 @@ void draw(uint32_t pass, const YeaFrame* yf)
                     (shadows && (F.showCascades & 1) ? kFlagCascades : 0) | (shadows ? kFlagShadows : 0) | (ao ? kFlagAo : 0) |
                     (ao && F.aoDebug ? kFlagAoDebug : 0) | (contact ? kFlagContact : 0) |
                     (contact && F.contactDebug ? kFlagContactDebug : 0) |
-                    ((viewMode & YEA_VIEW_WIREFRAME) ? kFlagUnlit : 0);
+                    ((viewMode & YEA_VIEW_WIREFRAME) ? kFlagUnlit : 0) | (ssr ? kFlagSsr : 0) | (ssr && F.ssrDebug ? kFlagSsrDebug : 0);
+    if (ssr)
+    {
+        gf->ssr[0] = F.ssrMaxRoughness;
+        gf->ssr[1] = F.ssrThickness;
+        gf->ssr[2] = F.ssrMaxDistance;
+        gf->ssr[3] = F.ssrEdgeFade;
+        gf->ssr2[0] = F.ssrIntensity;
+        gf->ssr2[1] = F.ssrScale;
+        gf->ssr2[2] = (float)F.ssrSteps;
+    }
     if (probes)
     {
         gf->probeInfo[0] = F.probeCount;
@@ -1366,7 +1383,9 @@ void draw(uint32_t pass, const YeaFrame* yf)
         Buffer*  masks = culled ? F.tileMasks : gDummyU32;
         Buffer*  bins = culled ? F.zbins : gDummyU32;
         Buffer*  views = shadows ? F.shadowViews : gDummyViews;
-        DescriptorData p[15] = {};
+        DescriptorData p[17] = {};
+        Texture*       ssrDepth = ssr ? F.ssrDepth : gDummyDepth->pTexture;
+        Texture*       previous = ssr ? F.previous->pTexture : gDummyColor->pTexture;
         Texture*       probeTex = probes ? F.probes->pTexture : gDummyArray->pTexture;
         Buffer*        probeData = probes ? F.probeData : gDummyProbes;
         Texture*       contactTex = contact ? F.contact : gDummyDepth->pTexture;
@@ -1401,7 +1420,11 @@ void draw(uint32_t pass, const YeaFrame* yf)
         p[13].ppTextures = &probeTex;
         p[14].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gProbeData);
         p[14].ppBuffers = &probeData;
-        updateDescriptorSet(gRenderer, fi, gSceneFrame, 15, p);
+        p[15].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gSsrDepth);
+        p[15].ppTextures = &ssrDepth;
+        p[16].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gPrevColor);
+        p[16].ppTextures = &previous;
+        updateDescriptorSet(gRenderer, fi, gSceneFrame, 17, p);
 
         DescriptorData c[4] = {};
         c[0].mIndex = SRT_RES_IDX(CompositeSrt, PerFrame, gComposite);
@@ -1479,12 +1502,12 @@ void draw(uint32_t pass, const YeaFrame* yf)
     }
 
     timeEnd(cmd, fi, kTimePrepass);
-    if (culled || ao || contact)
+    if (culled || ao || contact || ssr)
     {
         barrierRt(cmd, gDepth, RESOURCE_STATE_DEPTH_WRITE, RESOURCE_STATE_SHADER_RESOURCE);
-        const uint32_t which[3] = { kTimeCulling, kTimeAo, kTimeContact };
-        const bool     run[3] = { culled, ao, contact };
-        for (uint32_t k = 0; k < 3; ++k)
+        const uint32_t which[4] = { kTimeCulling, kTimeAo, kTimeContact, kTimeSsr };
+        const bool     run[4] = { culled, ao, contact, ssr };
+        for (uint32_t k = 0; k < 4; ++k)
         {
             if (!run[k])
                 continue;
@@ -1494,8 +1517,10 @@ void draw(uint32_t pass, const YeaFrame* yf)
                 renderer_culling::cull_run((uint64_t)(uintptr_t)&F);
             else if (k == 1)
                 renderer_ao::ao_run((uint64_t)(uintptr_t)&F);
-            else
+            else if (k == 2)
                 renderer_contact::contact_run((uint64_t)(uintptr_t)&F);
+            else
+                renderer_ssr::ssr_run((uint64_t)(uintptr_t)&F);
             timeEnd(cmd, fi, which[k]);
         }
         barrierRt(cmd, gDepth, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_DEPTH_WRITE);
@@ -1528,7 +1553,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     cmdSetScissor(cmd, 0, 0, w, h);
     if (geometry)
     {
-        bool full = (gf->counts[2] & (kFlagHeatmap | kFlagCascades | kFlagAoDebug | kFlagContactDebug)) || (shadows && F.lightSize > 0);
+        bool full = (gf->counts[2] & (kFlagHeatmap | kFlagCascades | kFlagAoDebug | kFlagContactDebug | kFlagSsrDebug)) || (shadows && F.lightSize > 0);
         drawVisible(cmd, fi, viewMode ? gForwardDepthPipe : full ? gForwardFullPipe : gForwardPipe);
     }
     if (!viewMode)

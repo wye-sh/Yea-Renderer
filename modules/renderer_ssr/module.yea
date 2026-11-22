@@ -1,0 +1,23 @@
+module renderer_ssr
+
+# Called by renderer (the core) each frame with the address of its RenderFrame (frame.h).
+export bool ssr_prepare(u64 frame)
+export void ssr_run(u64 frame)
+
+category Screen Reflections
+# Glossy surfaces reflect what is on screen exactly (from last frame's image), over the reflection
+# probes; where the reflected thing is off screen, the probes show. Needs Anti-aliasing (TAA) on.
+setting bool enabled true
+# Traces against half-size depth: faster, thin things may be missed.
+setting bool half_resolution false
+# Rougher materials keep the probes alone; reflections fade out over the last third.
+setting float max_roughness 0.4 0 1
+# How thick (metres) things on screen are taken to be behind what is seen of them.
+setting float thickness 0.35 0.02 3
+# How far (metres) a reflection is looked for.
+setting float max_distance 25 1 200
+setting int steps 32 8 96
+# The fraction of the screen at its edges over which reflections fade into the probes.
+setting float edge_fade 0.1 0 0.5
+setting float intensity 1 0 1
+setting bool show_hits false

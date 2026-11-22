@@ -1,5 +1,5 @@
 // The frame contract between the renderer modules: renderer (the core) fills a RenderFrame each
-// frame and passes its address (as u64) to the other renderer modules (culling, shadows, taa, ao, contact, probes). The same
+// frame and passes its address (as u64) to the other renderer modules (culling, shadows, taa, ao, contact, probes, ssr). The same
 // file sits in each of them; keep the copies identical and raise RENDER_FRAME_VERSION on any change.
 #pragma once
 #include <stdint.h>
@@ -10,7 +10,7 @@ struct Buffer;
 struct RenderTarget;
 struct Texture;
 
-#define RENDER_FRAME_VERSION 6u
+#define RENDER_FRAME_VERSION 7u
 #define RENDER_MAX_CASCADES  4u
 #define RENDER_VIEW_SHIFT    20u // shadow instance stream entry: instance | view << 20
 
@@ -147,6 +147,7 @@ struct RenderFrame
     RenderTarget* motion;     // RG16F: uv now - uv last frame, SHADER_RESOURCE; depth too
     Buffer*       exposure;   // float[]: [1] the exposure in use
     RenderTarget* resolved;   // the target taa_resolve writes the anti-aliased HDR image to; SHADER_RESOURCE after
+    RenderTarget* previous;   // last frame's resolved image (linear, like hdr), SHADER_RESOURCE all frame; or nullptr
 
     // Ambient occlusion (renderer_ao). ao_prepare runs after cull_prepare (jitter and taaOn are set);
     // ao_run right after it, after the depth prepass, with depth in SHADER_RESOURCE.
@@ -179,4 +180,18 @@ struct RenderFrame
     float                 probeIntensity;
     float                 probeBlend;    // metres over which a probe fades in from its box's sides
     uint32_t              probeParallax;
+
+    // Screen-space reflections (renderer_ssr). ssr_prepare runs after probes_prepare, and only with TAA (it
+    // reflects `previous`); ssr_run after the depth prepass, with depth in SHADER_RESOURCE. The core's
+    // forward pass traces against ssrDepth.
+    Texture* ssrDepth;        // R32F camera depth (reversed-Z) at ssrScale of the screen, SHADER_RESOURCE after ssr_run
+    uint32_t ssrOn;
+    uint32_t ssrSteps;
+    uint32_t ssrDebug;        // show where reflections were found on screen
+    float    ssrMaxRoughness;
+    float    ssrThickness;    // metres
+    float    ssrMaxDistance;  // metres
+    float    ssrEdgeFade;     // fraction of the screen
+    float    ssrIntensity;
+    float    ssrScale;        // 1 or 0.5
 };
