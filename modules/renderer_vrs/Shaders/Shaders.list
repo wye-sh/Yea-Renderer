@@ -6,7 +6,18 @@
 #rootsig compute.rootsig
 #end
 
-#comp renderer_vrs_rate.comp
+#comp renderer_vrs_rate_8.comp
+#define TILE 8u
+#include "Rate.comp.fsl"
+#end
+
+#comp renderer_vrs_rate_16.comp
+#define TILE 16u
+#include "Rate.comp.fsl"
+#end
+
+#comp renderer_vrs_rate_32.comp
+#define TILE 32u
 #include "Rate.comp.fsl"
 #end
 

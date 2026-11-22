@@ -16,9 +16,10 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   128 to max_tile_resolution px, sized to the light's reach on screen and halved, largest first, until
   all fit 90% of the atlas; a light changes size only when its wanted size doubles or halves.
   Sampling (in the core's Lighting.h.fsl): every filter tap compares against the receiver's own depth
-  there (receiver-plane bias, from two points on the surface's tangent plane, as lights are shaded in
-  loops where screen derivatives are invalid), so the normal offset can stay small. Point and spot lights
-  harden at contact (PCSS: 8-tap blocker search, penumbra from `light_size`). With TAA, cascade transitions
+  there (receiver-plane bias: the surface's tangent plane carried into the view's ndc by the first three
+  columns of its inverse, `inv` in the shadow view, three dot products; no screen derivatives, as lights are
+  shaded in loops), so the normal offset can stay small. Point and spot lights harden at contact (PCSS: 4 rim
+  taps at the search radius first, then, only in penumbrae, an 8-tap blocker search and a penumbra from `light_size`). With TAA, cascade transitions
   pick one cascade per pixel (dithered) and the filters' noise turns each frame.
 - `renderer_taa`: temporal antialiasing. Picks a Halton sub-pixel jitter each frame; the core then renders
   at one sample (TAA replaces `msaa`) with a motion vector target (RG16F, from last frame's instance rows and
@@ -50,7 +51,8 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   Only on screen: what is behind the camera or hidden keeps the probes' (box-projected) reflection.
 - `renderer_vrs`: variable-rate shading of the forward pass, through Yea's shading-rate service
   (`yea::shadingRate()`, nullptr on GPUs without it: then the module does nothing). After the prepass, one
-  compute group per rate tile (16 px on an RTX 2080) loads the tile once into group memory and measures
+  compute group per rate tile (16 px on an RTX 2080; a shader variant per tile size, 8/16/32, so group memory
+  fits the tile and enough groups run at once) loads the tile once into group memory and measures
   last frame's TAA-resolved image as seen (exposed and compressed): the RMS luminance step between
   horizontal and between vertical neighbours. While it runs, the core's depth prepass also writes each
   pixel's reflection roughness (R8, `gloss` in frame.h); a tile with a pixel smoother than glossy_below

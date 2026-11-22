@@ -106,7 +106,8 @@ int load(int reloaded)
         return 0; // nothing to do on this GPU: the core draws at full rate
     gTile = gRate->tile ? gRate->tile : 16;
     ShaderLoadDesc sd = {};
-    sd.mComp.pFileName = "renderer_vrs_rate.comp";
+    // Group memory sized for the GPU's tile: a variant per tile size.
+    sd.mComp.pFileName = gTile <= 8 ? "renderer_vrs_rate_8.comp" : gTile <= 16 ? "renderer_vrs_rate_16.comp" : "renderer_vrs_rate_32.comp";
     addShader(gRenderer, &sd, &gShader);
     if (!gShader)
         return 1;

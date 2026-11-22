@@ -10,7 +10,7 @@ struct Buffer;
 struct RenderTarget;
 struct Texture;
 
-#define RENDER_FRAME_VERSION 10u
+#define RENDER_FRAME_VERSION 11u
 #define RENDER_MAX_CASCADES  4u
 #define RENDER_VIEW_SHIFT    20u // shadow instance stream entry: instance | view << 20
 
@@ -37,6 +37,7 @@ struct RenderGpuShadowView
     float row[4][4]; // world -> clip (ndc xy in -1..1, z 0..1)
     float rect[4];   // tile in the atlas: u, v, width, height
     float info[4];   // x world size of a texel (at distance 1 when perspective); sun: y depth range; lights: yzw drawn from
+    float inv[3][4]; // columns 0-2 of row's inverse: a world plane p (n, -n.P) is dot(inv[i], p) x + ... = 0 in the view's ndc
 };
 
 // A reflection probe as the shaders read it (renderer's Shaders/Common.h.fsl ProbeData).

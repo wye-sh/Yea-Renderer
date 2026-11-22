@@ -100,6 +100,9 @@ STRUCT(ShadowView)
     DATA(float4, row3, None);
     DATA(float4, rect, None);         // tile: u, v, width, height
     DATA(float4, info, None);         // x texel world size (at distance 1 if perspective), y depth range, z perspective, w near
+    DATA(float4, inv0, None);         // columns 0-2 of the inverse of rows 0-3 (receiver-plane bias)
+    DATA(float4, inv1, None);
+    DATA(float4, inv2, None);
 };
 
 #endif

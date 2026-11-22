@@ -103,22 +103,23 @@ float3 viewToAtlas(ShadowView v, float3 P)
 }
 
 // Receiver-plane depth bias (Isidoro 2006): how the receiver's depth in the map changes per unit of
-// atlas uv, from two points on its tangent plane projected like P. Each filter tap then compares against
-// the receiver's own depth there, not the centre's, so wide kernels on tilted surfaces don't shadow
-// themselves (acne). Screen derivatives can't be used: lights are shaded in loops and branches. 0 where
-// the plane is nearly edge-on to the light, where the normal offset does the work.
-float2 receiverSlope(ShadowView v, float3 P, float3 N, float3 c, float eps)
+// atlas uv. Each filter tap then compares against the receiver's own depth there, not the centre's, so
+// wide kernels on tilted surfaces don't shadow themselves (acne). A plane stays a plane under the view's
+// projection: the receiver's tangent plane (N, -N.P) carried into the view's ndc by the inverse's columns
+// gives a x + b y + c z + d = 0 there, so the slope is exact with three dot products, no screen
+// derivatives (lights are shaded in loops and branches). 0 where the plane is nearly edge-on to the light
+// (NoL small), where the normal offset does the work.
+float2 receiverSlope(ShadowView v, float3 P, float3 N, float NoL)
 {
-    if ((gFrame.counts.z & FLAG_RECEIVER_PLANE) == 0u)
+    if ((gFrame.counts.z & FLAG_RECEIVER_PLANE) == 0u || NoL < 0.1)
         return float2(0.0, 0.0);
-    float3 t1 = normalize(cross(N, abs(N.y) < 0.9 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0)));
-    float3 t2 = cross(N, t1);
-    float3 c1 = viewToAtlas(v, P + t1 * eps) - c;
-    float3 c2 = viewToAtlas(v, P + t2 * eps) - c;
-    float  det = c1.x * c2.y - c1.y * c2.x;
-    if (abs(det) < 0.1 * length(c1.xy) * length(c2.xy) + 1e-20)
-        return float2(0.0, 0.0);
-    return float2(c1.z * c2.y - c2.z * c1.y, c1.x * c2.z - c2.x * c1.z) / det;
+    float4 plane = float4(N, -dot(N, P));
+    float  a = dot(v.inv0, plane);
+    float  b = dot(v.inv1, plane);
+    float  c = dot(v.inv2, plane);
+    // dz/dx = -a/c, dz/dy = -b/c in ndc; u = (x/2 + 1/2) rect.z, v = (1/2 - y/2) rect.w.
+    float2 g = float2(-a, b) * (2.0 / (v.rect.zw * (abs(c) > 1e-20 ? c : 1e-20)));
+    return g;
 }
 
 float sunPcf(float3 c, float2 g, float radius, float4 bounds, uint taps, float phi)
@@ -170,7 +171,7 @@ float sunCascade(uint cascade, float3 P, float3 N, float phi)
     float4 bounds = float4(v.rect.xy + texel, v.rect.xy + v.rect.zw - texel);
     if (c.z >= 1.0)
         return 1.0;
-    float2 g = receiverSlope(v, Pb, N, c, 0.1);
+    float2 g = receiverSlope(v, Pb, N, dot(N, gFrame.sunDir[0].xyz));
     float radius = gFrame.shadow.y * texel;
     uint  taps = gFrame.counts.w;
 #ifdef FULL
@@ -258,7 +259,7 @@ float localShadow(LightData l, float3 P, float3 N, float3 toLight, float phi)
     float3 Pb = P + N * (gFrame.shadow.w * v.info.x * dist);
     float3 c = viewToAtlas(v, Pb);
     float4 bounds = float4(v.rect.xy + texel, v.rect.xy + v.rect.zw - texel);
-    float2 g = receiverSlope(v, Pb, N, c, 0.01 * max(dist, 0.1));
+    float2 g = receiverSlope(v, Pb, N, dot(N, toLight) / max(dist, 1e-4));
     float  radius = gFrame.shadow.y * texel;
     float  size = gFrame.shadow2.w;
     if (size > 0.0)
@@ -271,6 +272,16 @@ float localShadow(LightData l, float3 P, float3 N, float3 toLight, float phi)
         float dR = dot(v.row3, float4(Pb, 1.0));
         float nearZ = -b / a;
         float search = clamp(size * (dR - nearZ) / (dR * nearZ * v.info.x), 1.0, 12.0) * texel;
+        // The search disk's rim first (its last four taps, compared): when they agree, the pixel is fully
+        // lit or deep in the umbra, and only penumbrae pay for the blocker search and the filter.
+        float rim = 0.0;
+        for (uint r = 4u; r < 8u; ++r)
+        {
+            float2 uv = clamp(c.xy + vogelDisk(r, 8u, phi) * search, bounds.xy, bounds.zw);
+            rim += CompareTex2D(gLocalAtlas, gShadowCmp, float3(uv, c.z + dot(g, uv - c.xy)));
+        }
+        if (rim == 0.0 || rim == 4.0)
+            return rim * 0.25;
         float blockers = 0.0;
         float count = 0.0;
         for (uint i = 0u; i < 8u; ++i)

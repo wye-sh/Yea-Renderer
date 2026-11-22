@@ -15,6 +15,9 @@ STRUCT(ShadowView)
     DATA(float4, row3, None);
     DATA(float4, rect, None);
     DATA(float4, info, None);
+    DATA(float4, inv0, None);
+    DATA(float4, inv1, None);
+    DATA(float4, inv2, None);
 };
 
 #include "Shadow.srt.h"
