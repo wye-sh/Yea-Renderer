@@ -19,19 +19,22 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   there (receiver-plane bias: the surface's tangent plane carried into the view's ndc by the first three
   columns of its inverse, `inv` in the shadow view, three dot products; no screen derivatives, as lights are
   shaded in loops), so the normal offset can stay small. Point and spot lights harden at contact (PCSS: 4 rim
-  taps at the search radius first, then, only in penumbrae, an 8-tap blocker search and a penumbra from `light_size`). With TAA, cascade transitions
+  gathers at the search radius first, 16 depths that decide fully lit or umbra as 4 filtered taps would; only in
+  penumbrae 4 inner gathers more, the 32 depths' blockers giving a penumbra from `light_size`). With TAA, cascade transitions
   pick one cascade per pixel (dithered) and the filters' noise turns each frame.
 - `renderer_taa`: temporal antialiasing. Picks a Halton sub-pixel jitter each frame; the core then renders
   at one sample (TAA replaces `msaa`) with a motion vector target (RG16F, from last frame's instance rows and
-  camera); the resolve reprojects two ping-pong RGBA16F histories (Catmull-Rom), clips them to the 3x3
+  camera); the resolve (compute, `Shaders/Taa.comp.fsl`: each 8x8 group reads its pixels and a one-pixel border
+  into shared memory once) reprojects two ping-pong RGBA16F histories (5-tap Catmull-Rom), clips them to the 3x3
   neighbourhood's spread in YCoCg, blends. Sharpening is in the core's composite, after TAA, never in history.
   Switch off: the core renders with `msaa` as before.
 - `renderer_ao`: GTAO (Jimenez 2016) from the prepass depth alone (normals rebuilt from depth), then
-  `denoise` depth-aware 3x3 blurs, into a full-size R32F texture. The forward pass darkens sky ambient by it:
+  `denoise` depth-aware 3x3 blurs, into a full-size RG16F texture (x visibility; every pass carries the view depth
+  in y, so the blurs and the upsample read no depth). The forward pass darkens sky ambient by it:
   diffuse with the multi-bounce fit, specular with Lagarde's specular occlusion. Direct light is untouched.
   Runs between the prepass and the forward pass, beside culling. Noise rotates per frame only with TAA on.
 - `renderer_contact`: sun contact shadows. A screen-space march from each pixel towards the sun over
-  `length` metres against the prepass depth, into a full-size R32F texture the forward pass multiplies the
+  `length` metres against the prepass depth (the normal rebuilt from two depth gathers), into a full-size R32F texture the forward pass multiplies the
   sun's shadow by. Catches small and thin shadows the cascades miss. Off when there is no sun.
 - `renderer_probes`: reflection probes games place (its own `Probe` table, up to 16). Each is captured as a
   cube (the scene lit diffusely: sky ambient, sun without shadow, the nearest 64 local lights; alpha =
@@ -164,6 +167,8 @@ for screen reflections (a quarter of it at half resolution).
 
 ## Pitfalls
 
+- Third-party material: every addition or removal updates both `licenses.json` and `LICENSES.txt` (its name,
+  what uses it, source, verbatim licence text with its copyright line) in the same commit.
 - Back faces are culled in the prepass, forward pass and probe captures; the camera space is left-handed,
   so front faces are clockwise on screen (`FRONT_FACE_CW`). Shadow maps cull nothing: a single-sided
   surface must cast from both sides (a ceiling plane lit from above), and the biases were tuned so.

@@ -1,4 +1,5 @@
-// One pass of a 3x3 depth-aware blur of the occlusion: neighbours at a different depth count less.
+// One pass of a 3x3 depth-aware blur of the occlusion: neighbours at a different depth count less. Each texel
+// carries its own view depth, so only the occlusion texture is read.
 #include "AoCommon.h.fsl"
 
 ROOT_SIGNATURE(ComputeRootSignature)
@@ -10,22 +11,22 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
     int2 p = int2(id.xy);
     if (p.x >= size.x || p.y >= size.y)
         RETURN();
-    int2  last = size - int2(1, 1);
-    int2  full = int2(gAo.screen.xy) - int2(1, 1);
-    float z = viewDepth(DEPTH_AT(min(p * aoScale(), full)));
-    float sum = 0.0;
-    float total = 0.0;
+    int2   last = size - int2(1, 1);
+    float2 c = LoadTex2D(gIn, NO_SAMPLER, p, 0).xy;
+    float  z = c.y;
+    float  sum = 0.0;
+    float  total = 0.0;
     for (int dy = -1; dy <= 1; ++dy)
     {
         for (int dx = -1; dx <= 1; ++dx)
         {
-            int2  q = clamp(p + int2(dx, dy), int2(0, 0), last);
-            float w = (dx == 0 ? 2.0 : 1.0) * (dy == 0 ? 2.0 : 1.0);
-            w *= saturate(1.0 - abs(viewDepth(DEPTH_AT(min(q * aoScale(), full))) - z) / (z * 0.03));
-            sum += LoadTex2D(gIn, NO_SAMPLER, q, 0).r * w;
+            float2 q = dx == 0 && dy == 0 ? c : LoadTex2D(gIn, NO_SAMPLER, clamp(p + int2(dx, dy), int2(0, 0), last), 0).xy;
+            float  w = (dx == 0 ? 2.0 : 1.0) * (dy == 0 ? 2.0 : 1.0);
+            w *= saturate(1.0 - abs(q.y - z) / (z * 0.03));
+            sum += q.x * w;
             total += w;
         }
     }
-    Write2D(gOut, p, sum / max(total, 1e-5));
+    writeAo(p, sum / max(total, 1e-5), z);
     RETURN();
 }

@@ -76,7 +76,7 @@ void createTextures(uint32_t w, uint32_t h, uint32_t scale)
         d.mHeight = i < 2 ? (h + scale - 1) / scale : h;
         d.mDepth = d.mArraySize = d.mMipLevels = 1;
         d.mSampleCount = SAMPLE_COUNT_1;
-        d.mFormat = TinyImageFormat_R32_SFLOAT; // RWTex2D(float) is r32f on Vulkan
+        d.mFormat = TinyImageFormat_R16G16_SFLOAT; // RWTex2D(half2) is rg16f on Vulkan: x visibility, y view depth
         d.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
         d.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
         d.pName = "renderer_ao";

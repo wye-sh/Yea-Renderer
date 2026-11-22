@@ -44,7 +44,24 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
     int2 p = int2(id.xy);
     if (p.x >= size.x || p.y >= size.y)
         RETURN();
+#if SAMPLE_COUNT > 1
     float d = DEPTH_AT(p);
+    int2  last = size - int2(1, 1);
+    float dL = DEPTH_AT(int2(max(p.x - 1, 0), p.y));
+    float dR = DEPTH_AT(int2(min(p.x + 1, last.x), p.y));
+    float dU = DEPTH_AT(int2(p.x, max(p.y - 1, 0)));
+    float dD = DEPTH_AT(int2(p.x, min(p.y + 1, last.y)));
+#else
+    // The pixel and its four neighbours from two gathers, at its top-left and bottom-right corners (the
+    // clamping sampler repeats the edge, as the loads did): w x y z are top-left, bottom-left, bottom-right, top-right.
+    float4 g0 = GatherRedTex2D(gDepth, gSamplerPointClamp, float2(p) / gContact.screen.xy);
+    float4 g1 = GatherRedTex2D(gDepth, gSamplerPointClamp, (float2(p) + 1.0) / gContact.screen.xy);
+    float  d = g0.y;
+    float  dL = g0.x;
+    float  dU = g0.z;
+    float  dR = g1.z;
+    float  dD = g1.x;
+#endif
     float3 P = viewPos(float2(p) + 0.5, d);
     float distanceFade = saturate((gContact.params.y - P.z) * gContact.params.z);
     if (d <= 0.0 || distanceFade <= 0.0)
@@ -58,11 +75,10 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
     // The surface's normal from the nearer neighbour on each axis (so an edge beside it is left out).
     // The march starts two pixels off the surface along it: from the surface itself, depth steps
     // between pixels on a curved or grazing surface read as occluders, a dark line along silhouettes.
-    int2   last = size - int2(1, 1);
-    float3 L0 = viewPos(float2(max(p.x - 1, 0), p.y) + 0.5, DEPTH_AT(int2(max(p.x - 1, 0), p.y)));
-    float3 R0 = viewPos(float2(min(p.x + 1, last.x), p.y) + 0.5, DEPTH_AT(int2(min(p.x + 1, last.x), p.y)));
-    float3 U0 = viewPos(float2(p.x, max(p.y - 1, 0)) + 0.5, DEPTH_AT(int2(p.x, max(p.y - 1, 0))));
-    float3 D0 = viewPos(float2(p.x, min(p.y + 1, last.y)) + 0.5, DEPTH_AT(int2(p.x, min(p.y + 1, last.y))));
+    float3 L0 = viewPos(float2(p.x - 1, p.y) + 0.5, dL);
+    float3 R0 = viewPos(float2(p.x + 1, p.y) + 0.5, dR);
+    float3 U0 = viewPos(float2(p.x, p.y - 1) + 0.5, dU);
+    float3 D0 = viewPos(float2(p.x, p.y + 1) + 0.5, dD);
     float3 dx = abs(R0.z - P.z) < abs(P.z - L0.z) ? R0 - P : P - L0;
     float3 dy = abs(D0.z - P.z) < abs(P.z - U0.z) ? D0 - P : P - U0;
     float3 N = normalize(cross(dy, dx));

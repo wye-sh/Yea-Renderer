@@ -2,6 +2,8 @@
 // with the nearest motion vector of the 3x3 neighbourhood, read with a Catmull-Rom filter, and clipped
 // to the neighbourhood's colour spread (mean +- width * deviation) in YCoCg. Everything is done on the
 // exposed colour compressed by c / (1 + max(c)), so bright pixels don't dominate the blend.
+// In compute, a group's 8 x 8 pixels and their one-pixel border are read once into shared memory
+// (colour already converted, with depth), and each pixel's 3 x 3 neighbourhood comes from there.
 STRUCT(TaaData)
 {
     DATA(float4, params, None); // x current frame's weight (1: no history), y clamp width
@@ -11,20 +13,18 @@ STRUCT(TaaData)
 
 #include "Taa.srt.h"
 
-STRUCT(VSOutput)
-{
-    DATA(float4, Position, SV_Position);
-    DATA(float2, UV, TEXCOORD0);
-};
+#define TILE 10 // 8 + a pixel each side
+GroupShared(float4, gsTile[TILE * TILE]); // xyz compressed YCoCg colour, w depth
 
 float3 compressColor(float3 c) { return c / (1.0 + max(c.r, max(c.g, c.b))); }
 float3 expandColor(float3 c) { return c / max(1.0 - max(c.r, max(c.g, c.b)), 1e-4); }
 float3 toYCoCg(float3 c) { return float3(dot(c, float3(0.25, 0.5, 0.25)), dot(c, float3(0.5, 0.0, -0.5)), dot(c, float3(-0.25, 0.5, -0.25))); }
 float3 fromYCoCg(float3 c) { return float3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z); }
 
-float3 historyTap(float x, float y) { return SampleLvlTex2D(gHistory, gSamplerBilinearClamp, float2(x, y), 0.0).rgb; }
+float3 historyTap(float2 uv) { return SampleLvlTex2D(gHistory, gSamplerBilinearClamp, uv, 0.0).rgb; }
 
-// Catmull-Rom from 9 bilinear taps: the two middle weights of each axis share one tap.
+// Catmull-Rom from 5 bilinear taps (the middle weights of each axis share one tap; the four corners, whose
+// weights are tiny, are left out and the rest renormalised).
 float3 sampleHistory(float2 uv)
 {
     float2 pos = uv * float2(gTaa.size.xy);
@@ -38,10 +38,10 @@ float3 sampleHistory(float2 uv)
     float2 t0 = (base - 1.0) * gTaa.texel.xy;
     float2 t12 = (base + w2 / w12) * gTaa.texel.xy;
     float2 t3 = (base + 2.0) * gTaa.texel.xy;
-    float3 c = historyTap(t0.x, t0.y) * (w0.x * w0.y) + historyTap(t12.x, t0.y) * (w12.x * w0.y) + historyTap(t3.x, t0.y) * (w3.x * w0.y);
-    c += historyTap(t0.x, t12.y) * (w0.x * w12.y) + historyTap(t12.x, t12.y) * (w12.x * w12.y) + historyTap(t3.x, t12.y) * (w3.x * w12.y);
-    c += historyTap(t0.x, t3.y) * (w0.x * w3.y) + historyTap(t12.x, t3.y) * (w12.x * w3.y) + historyTap(t3.x, t3.y) * (w3.x * w3.y);
-    return max(c, float3(0.0, 0.0, 0.0));
+    float  wc = w12.x * w12.y, wl = w0.x * w12.y, wr = w3.x * w12.y, wu = w12.x * w0.y, wd = w12.x * w3.y;
+    float3 c = historyTap(t12) * wc + historyTap(float2(t0.x, t12.y)) * wl + historyTap(float2(t3.x, t12.y)) * wr +
+               historyTap(float2(t12.x, t0.y)) * wu + historyTap(float2(t12.x, t3.y)) * wd;
+    return max(c / (wc + wl + wr + wu + wd), float3(0.0, 0.0, 0.0));
 }
 
 // Moves h along the line to the box's centre until it is inside the box.
@@ -55,37 +55,45 @@ float3 clipToBox(float3 h, float3 lo, float3 hi)
     return m > 1.0 ? centre + v / m : h;
 }
 
-ROOT_SIGNATURE(DefaultRootSignature)
-float4 PS_MAIN(VSOutput In)
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN(SV_GroupID(uint3) gid, SV_GroupThreadID(uint3) tid, SV_GroupIndex(uint) gi)
 {
     INIT_MAIN;
-    int2  p = int2(In.Position.xy);
-    int2  last = int2(gTaa.size.xy) - int2(1, 1);
+    int2  size = int2(gTaa.size.xy);
+    int2  last = size - int2(1, 1);
+    int2  origin = int2(gid.xy) * 8 - int2(1, 1);
     float exposure = max(gExposure[1], 1e-8);
+    for (uint i = gi; i < uint(TILE * TILE); i += 64u)
+    {
+        int2   q = clamp(origin + int2(int(i % uint(TILE)), int(i / uint(TILE))), int2(0, 0), last);
+        float3 c = toYCoCg(compressColor(max(LoadTex2D(gHdr, NO_SAMPLER, q, 0).rgb, float3(0.0, 0.0, 0.0)) * exposure));
+        gsTile[i] = float4(c, LoadTex2D(gDepth, NO_SAMPLER, q, 0).r);
+    }
+    GroupMemoryBarrier();
 
+    int2 p = int2(gid.xy) * 8 + int2(tid.xy);
+    if (p.x >= size.x || p.y >= size.y)
+        RETURN();
     float3 m1 = float3(0.0, 0.0, 0.0);
     float3 m2 = float3(0.0, 0.0, 0.0);
-    float3 centre = float3(0.0, 0.0, 0.0);
     float  nearest = -1.0;
     int2   nearestP = p;
     for (int dy = -1; dy <= 1; ++dy)
     {
         for (int dx = -1; dx <= 1; ++dx)
         {
-            int2   q = clamp(p + int2(dx, dy), int2(0, 0), last);
-            float3 c = toYCoCg(compressColor(max(LoadTex2D(gHdr, NO_SAMPLER, q, 0).rgb, float3(0.0, 0.0, 0.0)) * exposure));
-            if (dx == 0 && dy == 0)
-                centre = c;
-            m1 += c;
-            m2 += c * c;
-            float d = LoadTex2D(gDepth, NO_SAMPLER, q, 0).r; // reversed-Z: larger is nearer
-            if (d > nearest)
+            float4 s = gsTile[(int(tid.y) + 1 + dy) * TILE + int(tid.x) + 1 + dx];
+            m1 += s.xyz;
+            m2 += s.xyz * s.xyz;
+            if (s.w > nearest) // reversed-Z: larger is nearer
             {
-                nearest = d;
-                nearestP = q;
+                nearest = s.w;
+                nearestP = clamp(p + int2(dx, dy), int2(0, 0), last);
             }
         }
     }
+    float3 centre = gsTile[(int(tid.y) + 1) * TILE + int(tid.x) + 1].xyz;
 
     float2 uv = (float2(p) + 0.5) * gTaa.texel.xy;
     float2 prevUV = uv - LoadTex2D(gMotion, NO_SAMPLER, nearestP, 0).xy;
@@ -102,5 +110,6 @@ float4 PS_MAIN(VSOutput In)
         history = clipToBox(history, mean - width, mean + width);
         result = lerp(history, centre, alpha);
     }
-    RETURN(float4(max(expandColor(fromYCoCg(result)), float3(0.0, 0.0, 0.0)) / exposure, 1.0));
+    Write2D(gOut, p, float4(max(expandColor(fromYCoCg(result)), float3(0.0, 0.0, 0.0)) / exposure, 1.0));
+    RETURN();
 }

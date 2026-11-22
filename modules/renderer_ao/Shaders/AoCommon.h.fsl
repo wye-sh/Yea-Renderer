@@ -11,6 +11,10 @@ STRUCT(AoData)
 
 float viewDepth(float d) { return gAo.proj.z / max(d, 1e-7); } // reversed-Z, infinite far
 
+// Each pass writes the visibility with the view depth it stands for, so the next reads one texel, not the depth.
+#define SKY_DEPTH 65504.0
+void writeAo(int2 p, float visibility, float z) { Write2D(gOut, p, half2(visibility, min(z, SKY_DEPTH))); }
+
 // The occlusion's own size: the screen's, or half of it (each texel then stands for the full-size
 // pixel at texel * scale).
 int  aoScale() { return int(gAo.counts.w); }

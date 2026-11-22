@@ -1,6 +1,6 @@
 // Temporal antialiasing for the renderer core. taa_prepare picks this frame's sub-pixel jitter (a
 // Halton 2,3 sequence) and the history target to write; the core renders jittered at one sample with
-// motion vectors; taa_resolve blends the frame into the reprojected history (Shaders/Taa.frag.fsl).
+// motion vectors; taa_resolve blends the frame into the reprojected history (Shaders/Taa.comp.fsl).
 // The two history targets swap every frame; the resolved one is what the core composites.
 #include "yea_renderer_taa.h"
 #include "frame.h"
@@ -69,7 +69,7 @@ void createHistory(uint32_t w, uint32_t h)
     d.mSampleCount = SAMPLE_COUNT_1;
     d.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
     d.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
-    d.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+    d.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
     d.pName = "renderer_taa_history";
     addRenderTarget(gRenderer, &d, &gHistory[0]);
     addRenderTarget(gRenderer, &d, &gHistory[1]);
@@ -93,28 +93,15 @@ int load(int reloaded)
     gFrames = host->framesInFlight < kMaxFrames ? host->framesInFlight : kMaxFrames;
 
     ShaderLoadDesc sd = {};
-    sd.mVert.pFileName = "renderer_taa_fullscreen.vert";
-    sd.mFrag.pFileName = "renderer_taa.frag";
+    sd.mComp.pFileName = "renderer_taa.comp";
     addShader(gRenderer, &sd, &gShader);
     if (!gShader)
         return 1;
 
-    RasterizerStateDesc raster = {};
-    raster.mCullMode = CULL_MODE_NONE;
-    DepthStateDesc  depth = {};
-    TinyImageFormat format = TinyImageFormat_R16G16B16A16_SFLOAT;
-    PipelineDesc    desc = {};
-    desc.mType = PIPELINE_TYPE_GRAPHICS;
+    PipelineDesc desc = {};
+    desc.mType = PIPELINE_TYPE_COMPUTE;
     PIPELINE_LAYOUT_DESC(desc, NULL, SRT_LAYOUT_DESC(TaaSrt, PerFrame), NULL, NULL);
-    GraphicsPipelineDesc& g = desc.mGraphicsDesc;
-    g.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
-    g.mRenderTargetCount = 1;
-    g.pColorFormats = &format;
-    g.mSampleCount = SAMPLE_COUNT_1;
-    g.mDepthStencilFormat = TinyImageFormat_UNDEFINED;
-    g.pShaderProgram = gShader;
-    g.pRasterizerState = &raster;
-    g.pDepthState = &depth;
+    desc.mComputeDesc.pShaderProgram = gShader;
     desc.pName = "renderer_taa";
     addPipeline(gRenderer, &desc, &gPipe);
 
@@ -204,7 +191,7 @@ void taa_resolve(uint64_t address)
         return;
     Cmd*           cmd = F->cmd;
     RenderTarget*  out = gHistory[gCurrent];
-    DescriptorData p[6] = {};
+    DescriptorData p[7] = {};
     p[0].mIndex = SRT_RES_IDX(TaaSrt, PerFrame, gTaa);
     p[0].ppBuffers = &gCb[F->frameIndex];
     p[1].mIndex = SRT_RES_IDX(TaaSrt, PerFrame, gHdr);
@@ -217,21 +204,16 @@ void taa_resolve(uint64_t address)
     p[4].ppTextures = &gHistory[gCurrent ^ 1]->pTexture;
     p[5].mIndex = SRT_RES_IDX(TaaSrt, PerFrame, gExposure);
     p[5].ppBuffers = &F->exposure;
-    updateDescriptorSet(gRenderer, F->frameIndex, gSet, 6, p);
+    p[6].mIndex = SRT_RES_IDX(TaaSrt, PerFrame, gOut);
+    p[6].ppTextures = &out->pTexture;
+    updateDescriptorSet(gRenderer, F->frameIndex, gSet, 7, p);
 
     cmdBeginDebugMarker(cmd, 0.8f, 0.4f, 1.0f, "Renderer TAA");
-    barrier(cmd, out, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_RENDER_TARGET);
-    BindRenderTargetsDesc bind = {};
-    bind.mRenderTargetCount = 1;
-    bind.mRenderTargets[0] = { out, LOAD_ACTION_DONTCARE };
-    cmdBindRenderTargets(cmd, &bind);
-    cmdSetViewport(cmd, 0, 0, (float)F->width, (float)F->height, 0, 1);
-    cmdSetScissor(cmd, 0, 0, F->width, F->height);
+    barrier(cmd, out, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
     cmdBindPipeline(cmd, gPipe);
     cmdBindDescriptorSet(cmd, F->frameIndex, gSet);
-    cmdDraw(cmd, 3, 0);
-    cmdBindRenderTargets(cmd, nullptr);
-    barrier(cmd, out, RESOURCE_STATE_RENDER_TARGET, RESOURCE_STATE_SHADER_RESOURCE);
+    cmdDispatch(cmd, (F->width + 7) / 8, (F->height + 7) / 8, 1);
+    barrier(cmd, out, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE);
     cmdEndDebugMarker(cmd);
     gResolvedFrame = F->frameNumber;
 }

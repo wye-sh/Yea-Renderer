@@ -35,7 +35,7 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
     float d = DEPTH_AT(p);
     if (d <= 0.0)
     {
-        Write2D(gOut, op, 1.0); // sky
+        writeAo(op, 1.0, SKY_DEPTH); // sky
         RETURN();
     }
     int2   last = size - int2(1, 1);
@@ -54,7 +54,7 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
     float screenRadius = min(gAo.proj.w * gAo.proj.x * 0.5 * gAo.screen.x / P.z, gAo.params.w);
     if (screenRadius < 1.0)
     {
-        Write2D(gOut, op, 1.0);
+        writeAo(op, 1.0, P.z);
         RETURN();
     }
     // Interleaved gradient noise (Jimenez 2014), offset per frame when TAA averages it.
@@ -111,6 +111,6 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
         visibility += projLen * (arc0 + arc1);
     }
     visibility = saturate(visibility / float(slices));
-    Write2D(gOut, op, pow(visibility, gAo.params.z));
+    writeAo(op, pow(visibility, gAo.params.z), P.z);
     RETURN();
 }
