@@ -251,6 +251,8 @@ for screen reflections (a quarter of it at half resolution).
   (the camera once never reached the renderer this way). `renderer` binds its blocks in `bindState()`.
 - The same goes for `new`: memory allocated inside an export the core calls (`*_prepare`, `*_run`) goes on the core's
   heap and is freed when the core reloads. Allocate in your own `load()` (renderer_rt once crashed writing there).
+  So does `yea::assets()`: asked for inside the core's call it is the core's folder. Take it in your own `load()`
+  (renderer_upscale looked for FSR's DLLs in renderer's Assets/ this way, and FSR never ran before 3.1.2).
 - A stand-in for a depth texture (bound while its module draws none) is a render target (`addRenderTarget`, D32,
   2x2) as the core's `gDummyDepth`, never `addResource`: Direct3D 12 reads a depth format only through a render
   target's typeless resource. Samplers go in a set of their own (`Persistent`, written once), as the core's.

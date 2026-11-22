@@ -67,6 +67,8 @@ bool           gReady;
 // Lines said from upscale_prepare (the core's call, which would file them under renderer) wait here for this module's
 // own update(), and are said there under renderer_upscale. A few, fixed size: no allocation.
 char     gSay[4][1024];
+// This module's Assets/ folder, taken in load(): asked for inside the core's call, the host answers with the core's.
+char     gAssets[1024];
 int      gSayLevel[4]; // 0 news, 1 a warning
 uint32_t gSayCount;
 void say(const char* line, int level = 1)
@@ -175,7 +177,7 @@ void fsrUnload()
 }
 
 // One of AMD's DLLs from this module's assets, by its full path. A module's Assets folder isn't on Windows' DLL search
-// path, and yea::asset joins with '/', which Windows' loader doesn't take as a path: backslashes, and the DLL's own
+// path, and its path is joined with '/', which Windows' loader doesn't take as a path: backslashes, and the DLL's own
 // folder searched for its dependencies (never SetDllDirectory or the current directory: both are process-wide).
 HMODULE fsrLoadAsset(const char* name)
 {
@@ -187,7 +189,8 @@ HMODULE fsrLoadAsset(const char* name)
         char file[128], path[1024];
         snprintf(file, sizeof file, "%s%s", at ? "windows/" : "", name);
         wchar_t w[1024];
-        if (!yea::asset(file, path, sizeof path) || !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, w, 1024))
+        if (!gAssets[0] || snprintf(path, sizeof path, "%s/%s", gAssets, file) >= (int)sizeof path ||
+            !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, w, 1024))
             continue;
         for (wchar_t* c = w; *c; ++c)
             if (*c == L'/')
@@ -207,7 +210,7 @@ HMODULE fsrLoadAsset(const char* name)
         // Name what this version's Assets/ holds instead.
         char    found[512] = "";
         wchar_t pattern[1024];
-        if (MultiByteToWideChar(CP_UTF8, 0, yea::assets(), -1, pattern, 1000))
+        if (MultiByteToWideChar(CP_UTF8, 0, gAssets, -1, pattern, 1000))
         {
             wcscat(pattern, L"\\*");
             for (wchar_t* c = pattern; *c; ++c)
@@ -226,7 +229,7 @@ HMODULE fsrLoadAsset(const char* name)
             }
         }
         snprintf(line, sizeof line, "renderer_upscale: FSR's %s isn't in this module's assets (%s holds:%s); TAA instead", name,
-                 yea::assets(), found[0] ? found : " nothing");
+                 gAssets, found[0] ? found : " nothing");
         say(line);
         return nullptr;
     }
@@ -614,6 +617,7 @@ int load(int reloaded)
     gRenderer = (Renderer*)host->renderer;
     gQueue = (Queue*)host->queue;
     gFrames = host->framesInFlight < kMaxFrames ? host->framesInFlight : kMaxFrames;
+    snprintf(gAssets, sizeof gAssets, "%s", yea::assets());
 #if !defined(_WIN32)
     gDevice = yea::device();
 #endif
