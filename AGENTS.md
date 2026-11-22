@@ -151,7 +151,10 @@ Units: metres; sun intensity in lux, point and spot in candela. Colours linear R
 - Handles are `row | generation << 20`; stale handles are ignored.
 
 Minimal link module: `use renderer`, a `preset` for every knob, and in `update(SIMULATE)` add meshes,
-materials, instances and lights once (when `instance_count()` is 0), then move what moves and set the camera.
+materials, instances and lights once, then move what moves and set the camera. Build again whenever the
+renderer's `instance_count()`/`light_count()` differ from what you left last frame (a crash, revert or reload
+lost or replaced its scene: your handles are stale), and never while `mesh_sphere` etc. return 0xFFFFFFFF
+(the renderer is unloaded and its imports are stubs), as the example does.
 
 ## Knobs
 
@@ -171,7 +174,8 @@ intensity, max_distance, show_contact. `renderer_probes`: enabled, resolution (6
 `renderer_ssr`: enabled, half_resolution, max_roughness, thickness, max_distance, steps, edge_fade, intensity,
 show_hits (tints where reflections were found). `renderer_vrs`: enabled, aggressiveness, motion (0), keep_curved, glossy_below, allow_4x4,
 show_rates (green half rate, blue 2x2, magenta coarser). `renderer_rt`: enabled, max_roughness, half_resolution, full_below, screen_colors,
-reflected_shadows (Scene, Rays, Off), history_frames, brightest, max_distance, show_hits (green: hit seen on screen, blue: lit at the hit, grey: sky).
+reflected_shadows (Scene, Rays, Off), history_frames, brightest, max_distance, show_hits (green: hit seen on screen, blue: lit at the hit, grey: sky),
+pack_hits (off: each thread lights its own hit, bit-identical; to compare the packing's cost).
 
 ## Reset
 
@@ -251,7 +255,7 @@ for screen reflections (a quarter of it at half resolution).
 
 Floor, gold and red sphere rows sweeping roughness, pillars and assorted shapes, spinning tori, a sun,
 `light_count` moving coloured point lights (markers glow in their colour; the first `shadowed_points` cast
-shadows), `spot_count` sweeping shadowed spots, two reflection probes (the sphere rows, the whole yard), a free-look camera: holding its `look` action (left mouse button) after a press on the game
+shadows), `spot_count` sweeping shadowed spots (each with a small orb in its colour), two reflection probes (the sphere rows, the whole yard), a free-look camera: holding its `look` action (left mouse button) after a press on the game
 asks the host for the mouse each frame (`yea::captureMouse(true)`: hidden, kept in the window) and turns by
 `yea_mouse_dx`/`yea_mouse_dy` (`look_sensitivity`); the move keys fly (WASD, Q/E down/up, `move_speed`).
 The host lets go when the button is up (it is no longer asked), F1 opens, focus is lost, or on a view switch

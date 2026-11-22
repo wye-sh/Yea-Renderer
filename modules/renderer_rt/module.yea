@@ -29,3 +29,6 @@ setting float max_distance 100 1 inf
 # Tints traced reflections: green where the hit was seen on screen, blue where it was lit at the hit,
 # grey where the ray found the sky.
 setting bool show_hits false
+# Hits lit where they are are gathered per group of pixels and lit one per thread; off: each pixel lights its
+# own hit, as before. The picture is the same either way: to compare their cost.
+setting bool pack_hits true

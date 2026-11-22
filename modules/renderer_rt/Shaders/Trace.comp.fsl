@@ -54,6 +54,7 @@ STRUCT(ShadowView)
 #define RT_MISS 60000.0
 #define FLAG_SCREEN 1u
 #define FLAG_DEBUG 4u
+#define FLAG_PACK 8u // hits to light gathered per group (pack_hits); else each thread lights its own
 // How a hit's local lights are shadowed (shadowMode.y). The sun always takes a ray.
 #define SHADOWS_SCENE 0u // as the scene: from the light's shadow map where it has one, else a ray
 #define SHADOWS_RAYS 1u  // a ray for every light (the scene's ray-traced mode, or the comparison knob)
@@ -416,6 +417,8 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id, SV_GroupIndex(uint) gi)
         if (trace)
         {
             Hit h = traceRay(p, surface, LoadTex2D(gDepth, NO_SAMPLER, p, 0).r);
+            if (h.result.a < 0.0 && (gRt.counts.z & FLAG_PACK) == 0u)
+                h.result = lightHit(h.pos, h.normal, h.ray, h.screen.rgb, h.material, isHalf ? b : p); // as the list's
             if (h.result.a >= 0.0)
             {
                 if (isHalf)
