@@ -542,14 +542,15 @@ void barrierBuf(Cmd* cmd, Buffer* buf, ResourceState from, ResourceState to)
 // (that frame's fence has passed by then, so nothing waits), averaged and logged every 10 s.
 namespace
 {
-enum Timing : uint32_t { kTimeShadows, kTimeProbes, kTimePrepass, kTimeCompute, kTimeForward, kTimeExposure, kTimeTaa, kTimeTotal, kTimings };
-const char* const kTimingNames[kTimings] = { "shadows", "probes", "prepass", "culling+ao+contact", "forward", "exposure", "taa", "total" };
+enum Timing : uint32_t { kTimeShadows, kTimeProbes, kTimePrepass, kTimeCulling, kTimeAo, kTimeContact, kTimeForward, kTimeExposure, kTimeTaa, kTimeComposite, kTimeTotal, kTimings };
+const char* const kTimingNames[kTimings] = { "shadows", "probes", "prepass", "culling", "ao", "contact", "forward+sky", "exposure", "taa", "composite", "total" };
 QueryPool*        gTimePool[kMaxFrames];
 uint32_t          gTimeUsed[kMaxFrames]; // bits: what that frame recorded
 double            gTimeTicks;            // per second
 double            gTimeSum[kTimings], gTimeMax[kTimings];
 uint32_t          gTimeCount[kTimings];
 double            gTimeLogged;
+bool              gTimedFrame; // this frame's render was timed (the composite follows it)
 
 void timeBegin(Cmd* cmd, uint32_t fi, uint32_t t)
 {
@@ -814,9 +815,16 @@ void composite(const YeaFrame* yf)
     Cmd* cmd = (Cmd*)yf->cmd;
     cmdSetViewport(cmd, 0, 0, (float)yf->width, (float)yf->height, 0, 1);
     cmdSetScissor(cmd, 0, 0, yf->width, yf->height);
+    if (gTimedFrame)
+        timeBegin(cmd, gRenderedFi, kTimeComposite);
     cmdBindPipeline(cmd, gCompositePipe);
     cmdBindDescriptorSet(cmd, gRenderedFi, gCompositeSet);
     cmdDraw(cmd, 3, 0);
+    if (gTimedFrame)
+    {
+        timeEnd(cmd, gRenderedFi, kTimeComposite);
+        cmdResolveQuery(cmd, gTimePool[gRenderedFi], kTimeComposite, 1);
+    }
 }
 
 void draw(uint32_t pass, const YeaFrame* yf)
@@ -1414,17 +1422,24 @@ void draw(uint32_t pass, const YeaFrame* yf)
     timeEnd(cmd, fi, kTimePrepass);
     if (culled || ao || contact)
     {
-        if (timed)
-            timeBegin(cmd, fi, kTimeCompute);
         barrierRt(cmd, gDepth, RESOURCE_STATE_DEPTH_WRITE, RESOURCE_STATE_SHADER_RESOURCE);
-        if (culled)
-            renderer_culling::cull_run((uint64_t)(uintptr_t)&F);
-        if (ao)
-            renderer_ao::ao_run((uint64_t)(uintptr_t)&F);
-        if (contact)
-            renderer_contact::contact_run((uint64_t)(uintptr_t)&F);
+        const uint32_t which[3] = { kTimeCulling, kTimeAo, kTimeContact };
+        const bool     run[3] = { culled, ao, contact };
+        for (uint32_t k = 0; k < 3; ++k)
+        {
+            if (!run[k])
+                continue;
+            if (timed)
+                timeBegin(cmd, fi, which[k]);
+            if (k == 0)
+                renderer_culling::cull_run((uint64_t)(uintptr_t)&F);
+            else if (k == 1)
+                renderer_ao::ao_run((uint64_t)(uintptr_t)&F);
+            else
+                renderer_contact::contact_run((uint64_t)(uintptr_t)&F);
+            timeEnd(cmd, fi, which[k]);
+        }
         barrierRt(cmd, gDepth, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_DEPTH_WRITE);
-        timeEnd(cmd, fi, kTimeCompute);
     }
 
     if (timed)
@@ -1505,6 +1520,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     for (uint32_t t = 0; t < kTimings; ++t)
         if (gTimeUsed[fi] & (1u << t))
             cmdResolveQuery(cmd, gTimePool[fi], t, 1);
+    gTimedFrame = timed;
 
     // Nothing is left bound (every pass above unbinds); YEA_PASS_WORLD composites.
     gRenderedFrame = yea::host()->frame();
