@@ -7,6 +7,7 @@ STRUCT(CompositeData)
     DATA(uint4, mode, None);    // x tonemapper, y encode sRGB, z samples, w width | height << 16
     DATA(float4, params, None); // x sharpen 0..1, y light shadow atlas inset in pixels (0 off), z its size in texels,
                                 // w a fixed exposure without dither (F1's view modes), 0 off
+    DATA(uint4, rates, None);   // x Show Rates (renderer_vrs), y its tile in pixels
 };
 
 #include "Composite.srt.h"
@@ -108,6 +109,20 @@ float4 PS_MAIN(VSOutput In)
             float v = pow(saturate(1.0 - d), 0.25);
             c = float3(v, v, v);
         }
+    }
+    // Debug: renderer_vrs's shading rates. Full rate untinted, half rate (1x2, 2x1) green, quarter (2x2)
+    // blue, coarser magenta; tile edges darkened.
+    if (gComposite.rates.x != 0u)
+    {
+        uint   tile = max(gComposite.rates.y, 1u);
+        uint   r = LoadTex2D(gRates, NO_SAMPLER, int2(uint2(p) / tile), 0).r;
+        uint   shift = (r >> 2) + (r & 3u);
+        float3 tint = shift == 1u ? float3(0.1, 0.9, 0.2) : (shift == 2u ? float3(0.15, 0.35, 1.0) : float3(1.0, 0.1, 0.9));
+        if (shift != 0u)
+            c = lerp(c, tint, 0.5);
+        uint2 e = uint2(p) % tile;
+        if (e.x == 0u || e.y == 0u)
+            c *= 0.6;
     }
     // Dither by half a step of 8 bits, so smooth gradients don't band.
     float n = frac(52.9829189 * frac(dot(In.Position.xy, float2(0.06711056, 0.00583715))));

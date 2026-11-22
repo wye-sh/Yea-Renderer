@@ -39,8 +39,18 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   TAA-resolved image (`previous`), reprojected. Where nothing is found, off screen, near the screen's edges
   or above `max_roughness`, the probes show. Needs TAA: without it there is no previous image and it is off.
   Only on screen: what is behind the camera or hidden keeps the probes' (box-projected) reflection.
+- `renderer_vrs`: variable-rate shading of the forward pass, through Yea's shading-rate service
+  (`yea::shadingRate()`, nullptr on GPUs without it: then the module does nothing). After the prepass, one
+  compute group per rate tile (16 px on an RTX 2080) measures last frame's TAA-resolved image as seen
+  (exposed and compressed): the RMS luminance step between horizontal and between vertical neighbours.
+  Below `aggressiveness`' threshold, raised by motion, that axis goes coarse (2x1, 1x2, 2x2; 4x4 with
+  allow_4x4). A crease or edge in this frame's depth keeps the tile at 1x1. Writes Yea's R8_UINT rate image
+  and an R32_UINT copy (Show Rates); the core binds the forward pass with the service's `bindRenderTargets`.
+  Needs TAA and one sample; off in F1's view modes. Vulkan caveat: FSL declares `RWTex2D(uint)` as `r32ui`,
+  so the R8_UINT image is written through a mismatched format qualifier (fine on D3D12; unverified on Vulkan
+  VRS hardware).
 - The core calls the others through optional imports with a `RenderFrame*` (as `u64`): `frame.h`, copied
-  identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes` and `renderer_ssr` (`mathx.h` into the
+  identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes`, `renderer_ssr` and `renderer_vrs` (`mathx.h` into the
   first three). Change all copies together and raise `RENDER_FRAME_VERSION`. `taa_prepare` runs first,
   before the camera, so the jitter reaches the projection.
 
@@ -82,7 +92,8 @@ jitter_phases. `renderer_ao`: enabled, half_resolution (GTAO and its blur at hal
 multi_bounce, show_ao. `renderer_contact`: enabled, length, thickness, steps, intensity, max_distance,
 show_contact. `renderer_probes`: enabled, resolution (64-512), updates_per_frame, intensity, blend, parallax.
 `renderer_ssr`: enabled, half_resolution, max_roughness, thickness, max_distance, steps, edge_fade, intensity,
-show_hits (tints where reflections were found).
+show_hits (tints where reflections were found). `renderer_vrs`: enabled, aggressiveness, motion, allow_4x4,
+show_rates (green half rate, blue 2x2, magenta coarser).
 
 ## Reset
 
@@ -94,6 +105,7 @@ builds it again. GPU objects and shadow caches are rebuilt on load.
 Per frame: one depth prepass and one forward pass (draws grouped by mesh and sidedness, instanced; back
 faces culled except for double-sided materials; a leaner forward shader unless PCSS or a debug view is on), one culling
 dispatch per 16 px tile, a GTAO dispatch and `denoise` blur dispatches (at half size with half_resolution, plus a full-size upsample), one contact shadow dispatch (all full size; its march takes no more steps than the ray spans pixels), one
+rate dispatch per 16 px tile with variable-rate shading (the forward pass then shades smooth tiles at 2x2), one
 depth copy for screen reflections (their march, up to `steps` plus 4 depth reads, runs in the forward pass for
 glossy pixels with reflections on, and shows in its timing), per re-captured probe 6 scene draws at half its
 resolution plus 6 small passes per mip, sun cascades redrawn, at most `updates_per_frame` local lights redrawn (oldest shadow first), two

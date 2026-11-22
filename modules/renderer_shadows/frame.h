@@ -1,5 +1,5 @@
 // The frame contract between the renderer modules: renderer (the core) fills a RenderFrame each
-// frame and passes its address (as u64) to the other renderer modules (culling, shadows, taa, ao, contact, probes, ssr). The same
+// frame and passes its address (as u64) to the other renderer modules (culling, shadows, taa, ao, contact, probes, ssr, vrs). The same
 // file sits in each of them; keep the copies identical and raise RENDER_FRAME_VERSION on any change.
 #pragma once
 #include <stdint.h>
@@ -10,7 +10,7 @@ struct Buffer;
 struct RenderTarget;
 struct Texture;
 
-#define RENDER_FRAME_VERSION 7u
+#define RENDER_FRAME_VERSION 8u
 #define RENDER_MAX_CASCADES  4u
 #define RENDER_VIEW_SHIFT    20u // shadow instance stream entry: instance | view << 20
 
@@ -194,4 +194,13 @@ struct RenderFrame
     float    ssrEdgeFade;     // fraction of the screen
     float    ssrIntensity;
     float    ssrScale;        // 1 or 0.5
+
+    // Variable-rate shading (renderer_vrs), only on GPUs with it (yea::shadingRate()) and with TAA. vrs_prepare
+    // runs after ssr_prepare; vrs_run after the depth prepass, with depth in SHADER_RESOURCE, and leaves
+    // rateImage in SHADING_RATE_SOURCE for the forward pass (the core binds it with the service's
+    // bindRenderTargets).
+    Texture* rateImage;       // Yea's R8_UINT rate image, a YEA_RATE_* per rateTile px tile
+    Texture* rateCopy;        // the same rates, R32_UINT, SHADER_RESOURCE after vrs_run (Show Rates)
+    uint32_t rateTile;
+    uint32_t vrsDebug;        // tint the screen by rate
 };

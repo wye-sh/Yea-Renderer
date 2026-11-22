@@ -113,6 +113,8 @@ import renderer_probes bool probes_prepare(u64 frame) = false
 import renderer_probes void probes_render(u64 frame)
 import renderer_ssr bool ssr_prepare(u64 frame) = false
 import renderer_ssr void ssr_run(u64 frame)
+import renderer_vrs bool vrs_prepare(u64 frame) = false
+import renderer_vrs void vrs_run(u64 frame)
 
 category Exposure
 setting float exposure_ev 0 -6 6

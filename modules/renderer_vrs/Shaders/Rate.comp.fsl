@@ -1,0 +1,96 @@
+// One shading rate per tile (a thread group of 8 x 8, each thread tile/8 squared pixels). From last
+// frame's anti-aliased image, as seen (exposed, compressed, square-rooted): the RMS difference between
+// horizontal and between vertical neighbours, which halving the rate along that axis would lose
+// (Yang et al. 2019, content-adaptive shading). Below the threshold, scaled up by last frame's motion,
+// that axis goes coarse. A depth edge or crease in this frame's depth (the second difference of 1/z,
+// zero across any plane) keeps the tile at full rate, as do tiles with highlights or detail.
+STRUCT(VrsData)
+{
+    DATA(uint4, size, None);    // xy screen, zw rate image
+    DATA(uint4, info, None);    // x tile (px), y the GPU's rates (bits 1 << rate), z 4 x 4 allowed, w write the image
+    DATA(float4, params, None); // x contrast threshold, y motion scale (per px/frame), z edge threshold
+};
+
+#include "Rate.srt.h"
+
+#define RATE_1X1 0u
+#define RATE_1X2 1u
+#define RATE_2X1 4u
+#define RATE_2X2 5u
+#define RATE_4X4 10u
+
+GroupShared(float, gsH[64]);
+GroupShared(float, gsV[64]);
+GroupShared(float, gsEdge[64]);
+GroupShared(float, gsMotion[64]);
+
+float seen(int2 p)
+{
+    float3 c = max(LoadTex2D(gPrevious, NO_SAMPLER, p, 0).rgb, float3(0.0, 0.0, 0.0)) * gExposure[1];
+    float  l = dot(c, float3(0.2126, 0.7152, 0.0722));
+    return sqrt(l / (1.0 + l));
+}
+
+float depthAt(int2 p) { return LoadTex2D(gDepth, NO_SAMPLER, p, 0).r; } // reversed-Z, infinite far: near / z
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN(SV_GroupID(uint3) gid, SV_GroupThreadID(uint3) tid, SV_GroupIndex(uint) gi)
+{
+    INIT_MAIN;
+    uint tile = gVrs.info.x;
+    uint per = max(tile / 8u, 1u);
+    int2 last = int2(gVrs.size.xy) - int2(1, 1);
+    int2 base = int2(gid.xy) * int(tile) + int2(tid.xy) * int(per);
+    float h = 0.0;
+    float v = 0.0;
+    float edge = 0.0;
+    float motion = 0.0;
+    for (uint y = 0u; y < per; ++y)
+        for (uint x = 0u; x < per; ++x)
+        {
+            int2  p = min(base + int2(int(x), int(y)), last);
+            float l = seen(p);
+            float dh = seen(min(p + int2(1, 0), last)) - l;
+            float dv = seen(min(p + int2(0, 1), last)) - l;
+            h += dh * dh;
+            v += dv * dv;
+            float d = depthAt(p);
+            float ex = depthAt(max(p - int2(1, 0), int2(0, 0))) + depthAt(min(p + int2(1, 0), last)) - 2.0 * d;
+            float ey = depthAt(max(p - int2(0, 1), int2(0, 0))) + depthAt(min(p + int2(0, 1), last)) - 2.0 * d;
+            edge = max(edge, max(abs(ex), abs(ey)) / max(d, 1e-7));
+            motion = max(motion, length(LoadTex2D(gMotion, NO_SAMPLER, p, 0).rg * float2(gVrs.size.xy)));
+        }
+    gsH[gi] = h;
+    gsV[gi] = v;
+    gsEdge[gi] = edge;
+    gsMotion[gi] = motion;
+    GroupMemoryBarrier();
+    if (gi != 0u)
+        RETURN();
+    for (uint i = 1u; i < 64u; ++i)
+    {
+        h += gsH[i];
+        v += gsV[i];
+        edge = max(edge, gsEdge[i]);
+        motion = max(motion, gsMotion[i]);
+    }
+    float n = float(64u * per * per);
+    float eh = sqrt(h / n);
+    float ev = sqrt(v / n);
+    float t = gVrs.params.x * (1.0 + motion * gVrs.params.y);
+    uint  rate = RATE_1X1;
+    if (edge < gVrs.params.z)
+    {
+        if (eh < t && ev < t)
+            rate = gVrs.info.z != 0u && (gVrs.info.y & (1u << RATE_4X4)) != 0u && eh < t * 0.25 && ev < t * 0.25 ? RATE_4X4 : RATE_2X2;
+        else if (eh < t)
+            rate = RATE_2X1;
+        else if (ev < t)
+            rate = RATE_1X2;
+    }
+    if (gVrs.info.w != 0u)
+        Write2D(gRate, int2(gid.xy), rate);
+    Write2D(gRateCopy, int2(gid.xy), rate);
+    RETURN();
+}

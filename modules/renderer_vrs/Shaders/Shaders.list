@@ -1,0 +1,11 @@
+#include "Common_3/Graphics/FSL/defaults.h"
+
+#rootsig default.rootsig
+#end
+
+#rootsig compute.rootsig
+#end
+
+#comp renderer_vrs_rate.comp
+#include "Rate.comp.fsl"
+#end

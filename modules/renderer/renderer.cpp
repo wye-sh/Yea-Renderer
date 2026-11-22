@@ -4,6 +4,7 @@
 // YEA_PASS_WORLD, with the frame's target bound, it composites that image (tone mapped) onto it, so the
 // host's own world quads draw over it.
 #include "yea_renderer.h"
+#include <yea/shadingrate.h>
 #include "frame.h"
 #include "mathx.h"
 #include "scene.h"
@@ -63,6 +64,7 @@ struct CompositeData
 {
     uint32_t mode[4];
     float    params[4];
+    uint32_t rates[4]; // x Show Rates on, y tile px
 };
 struct ExposureData
 {
@@ -95,6 +97,8 @@ DescriptorSet *gScenePersistent, *gSceneFrame, *gCompositeSet, *gExposureSet;
 Pipeline *     gDepthPipe[2], *gForwardPipe[2], *gForwardFullPipe[2], *gForwardDepthPipe[2];
 Pipeline *     gSkyPipe, *gCompositePipe, *gHistogramPipe, *gAdaptPipe;
 RenderTarget * gHdr, *gDepth, *gDummyDepth, *gMotion, *gDummyArray, *gDummyColor;
+Texture*       gDummyRates;   // stands in for renderer_vrs's rate copy (R32_UINT)
+const YeaShadingRate* gShadingRate; // nullptr: no variable-rate shading on this GPU
 Buffer *       gFrameCb[kMaxFrames], *gInstanceBuf[kMaxFrames], *gMaterialBuf[kMaxFrames], *gLightBuf[kMaxFrames], *gStreamBuf[kMaxFrames];
 Buffer *       gCompositeCb[kMaxFrames], *gExposureCb[kMaxFrames];
 Buffer *       gDfg, *gExposure, *gHistogram, *gDummyU32, *gDummyViews, *gDummyProbes;
@@ -585,8 +589,8 @@ void barrierBuf(Cmd* cmd, Buffer* buf, ResourceState from, ResourceState to)
 // (that frame's fence has passed by then, so nothing waits), averaged and logged every 10 s.
 namespace
 {
-enum Timing : uint32_t { kTimeShadows, kTimeProbes, kTimePrepass, kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeForward, kTimeExposure, kTimeTaa, kTimeComposite, kTimeTotal, kTimings };
-const char* const kTimingNames[kTimings] = { "shadows", "probes", "prepass", "culling", "ao", "contact", "ssr", "forward+sky", "exposure", "taa", "composite", "total" };
+enum Timing : uint32_t { kTimeShadows, kTimeProbes, kTimePrepass, kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeVrs, kTimeForward, kTimeExposure, kTimeTaa, kTimeComposite, kTimeTotal, kTimings };
+const char* const kTimingNames[kTimings] = { "shadows", "probes", "prepass", "culling", "ao", "contact", "ssr", "vrs", "forward+sky", "exposure", "taa", "composite", "total" };
 QueryPool*        gTimePool[kMaxFrames];
 uint32_t          gTimeUsed[kMaxFrames]; // bits: what that frame recorded
 double            gTimeTicks;            // per second
@@ -656,6 +660,7 @@ int load(int reloaded)
 {
     const YeaHost* host = yea::host();
     bindState(); // first: the exports use these blocks even if the GPU side fails below
+    gShadingRate = yea::shadingRate();
     // A new material layout starts its table empty: instances would point at materials that are
     // gone, so the scene starts over and its owner builds it again (as on a clear()).
     if (Materials.size() == 0 && Instances.size() > 0)
@@ -768,6 +773,21 @@ int load(int reloaded)
     d.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
     d.pName = "renderer_dummy_color";
     addRenderTarget(gRenderer, &d, &gDummyColor);
+    {
+        TextureDesc t = {};
+        t.mWidth = t.mHeight = 2;
+        t.mDepth = t.mArraySize = t.mMipLevels = 1;
+        t.mSampleCount = SAMPLE_COUNT_1;
+        t.mFormat = TinyImageFormat_R32_UINT;
+        t.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+        t.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+        t.pName = "renderer_dummy_rates";
+        TextureLoadDesc tl = {};
+        tl.pDesc = &t;
+        tl.ppTexture = &gDummyRates;
+        addResource(&tl, nullptr);
+        waitForAllResourceLoads();
+    }
     // stands in for the probe array: two slices, so an array view
     d.mArraySize = 2;
     d.pName = "renderer_dummy_probes";
@@ -818,6 +838,9 @@ void unload()
     freeTarget(gDummyDepth);
     freeTarget(gDummyArray);
     freeTarget(gDummyColor);
+    if (gDummyRates)
+        removeResource(gDummyRates);
+    gDummyRates = nullptr;
     for (uint32_t i = 0; i < gFrames; ++i)
     {
         freeBuffer(gFrameCb[i]);
@@ -1202,6 +1225,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     F.ambient = settings.ambient;
     bool probes = renderer_probes::probes_prepare((uint64_t)(uintptr_t)&F) && F.probes && F.probeData && F.probeCount;
     bool ssr = taa && !viewMode && renderer_ssr::ssr_prepare((uint64_t)(uintptr_t)&F) && F.ssrOn && F.ssrDepth && F.previous;
+    bool vrs = taa && !viewMode && renderer_vrs::vrs_prepare((uint64_t)(uintptr_t)&F) && F.rateImage && F.rateCopy;
 
     // GPU lights in sorted order, with the shadow views renderer_shadows picked.
     RenderGpuLight* gl = gLightCpu;
@@ -1357,6 +1381,8 @@ void draw(uint32_t pass, const YeaFrame* yf)
         composite.params[3] = 1.0f; // exposure 1, no dither
     }
     // The light shadow atlas in the top right corner (renderer_shadows' show_atlas).
+    composite.rates[0] = vrs && F.vrsDebug ? 1u : 0u;
+    composite.rates[1] = F.rateTile ? F.rateTile : 16u;
     composite.params[1] = shadows && (F.showCascades & 2) ? floorf(mx::minf(h * 0.5f, w * 0.4f)) : 0.0f;
     composite.params[2] = shadows && F.localTexel > 0 ? 1.0f / F.localTexel : 0.0f;
     memcpy(gCompositeCb[fi]->pCpuMappedAddress, &composite, sizeof composite);
@@ -1426,7 +1452,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         p[16].ppTextures = &previous;
         updateDescriptorSet(gRenderer, fi, gSceneFrame, 17, p);
 
-        DescriptorData c[4] = {};
+        DescriptorData c[5] = {};
         c[0].mIndex = SRT_RES_IDX(CompositeSrt, PerFrame, gComposite);
         c[0].ppBuffers = &gCompositeCb[fi];
         c[1].mIndex = SRT_RES_IDX(CompositeSrt, PerFrame, gHdr);
@@ -1435,7 +1461,10 @@ void draw(uint32_t pass, const YeaFrame* yf)
         c[2].ppBuffers = &gExposure;
         c[3].mIndex = SRT_RES_IDX(CompositeSrt, PerFrame, gShadowAtlas);
         c[3].ppTextures = &local;
-        updateDescriptorSet(gRenderer, fi, gCompositeSet, 4, c);
+        Texture* rates = vrs ? F.rateCopy : gDummyRates;
+        c[4].mIndex = SRT_RES_IDX(CompositeSrt, PerFrame, gRates);
+        c[4].ppTextures = &rates;
+        updateDescriptorSet(gRenderer, fi, gCompositeSet, 5, c);
 
         DescriptorData e[4] = {};
         e[0].mIndex = SRT_RES_IDX(ExposureSrt, PerFrame, gExposureData);
@@ -1502,12 +1531,12 @@ void draw(uint32_t pass, const YeaFrame* yf)
     }
 
     timeEnd(cmd, fi, kTimePrepass);
-    if (culled || ao || contact || ssr)
+    if (culled || ao || contact || ssr || vrs)
     {
         barrierRt(cmd, gDepth, RESOURCE_STATE_DEPTH_WRITE, RESOURCE_STATE_SHADER_RESOURCE);
-        const uint32_t which[4] = { kTimeCulling, kTimeAo, kTimeContact, kTimeSsr };
-        const bool     run[4] = { culled, ao, contact, ssr };
-        for (uint32_t k = 0; k < 4; ++k)
+        const uint32_t which[5] = { kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeVrs };
+        const bool     run[5] = { culled, ao, contact, ssr, vrs };
+        for (uint32_t k = 0; k < 5; ++k)
         {
             if (!run[k])
                 continue;
@@ -1519,8 +1548,10 @@ void draw(uint32_t pass, const YeaFrame* yf)
                 renderer_ao::ao_run((uint64_t)(uintptr_t)&F);
             else if (k == 2)
                 renderer_contact::contact_run((uint64_t)(uintptr_t)&F);
-            else
+            else if (k == 3)
                 renderer_ssr::ssr_run((uint64_t)(uintptr_t)&F);
+            else
+                renderer_vrs::vrs_run((uint64_t)(uintptr_t)&F);
             timeEnd(cmd, fi, which[k]);
         }
         barrierRt(cmd, gDepth, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_DEPTH_WRITE);
@@ -1548,7 +1579,11 @@ void draw(uint32_t pass, const YeaFrame* yf)
         bind.mDepthStencil.mOverrideClearValue = 1;
         bind.mDepthStencil.mClearValue = {}; // reversed-Z: 0 is far
     }
-    cmdBindRenderTargets(cmd, &bind);
+    // With renderer_vrs: shaded at its rates (this pass only; the next bind ends them).
+    if (vrs && gShadingRate)
+        gShadingRate->bindRenderTargets(cmd, &bind, F.rateImage);
+    else
+        cmdBindRenderTargets(cmd, &bind);
     cmdSetViewport(cmd, 0, 0, (float)w, (float)h, 0, 1);
     cmdSetScissor(cmd, 0, 0, w, h);
     if (geometry)

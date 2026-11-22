@@ -1,0 +1,218 @@
+// Variable-rate shading for the renderer core: after the depth prepass, Shaders/Rate.comp.fsl picks a
+// shading rate per tile into Yea's rate image (yea::shadingRate()); the core binds the forward pass with
+// it. On a GPU without variable-rate shading there is no rate image and this module does nothing.
+#include "yea_renderer_vrs.h"
+#include "frame.h"
+#include <yea/shadingrate.h>
+
+#include <Common_3/Graphics/Interfaces/IGraphics.h>
+#include <Common_3/Resources/ResourceLoader/Interfaces/IResourceLoader.h>
+#include <Common_3/Graphics/FSL/defaults.h>
+#include "Shaders/Rate.srt.h"
+
+#include <string.h>
+
+namespace renderer_vrs
+{
+namespace
+{
+struct VrsData
+{
+    uint32_t size[4];
+    uint32_t info[4];
+    float    params[4];
+};
+
+const uint32_t kMaxFrames = 4;
+
+Renderer*             gRenderer;
+Queue*                gQueue;
+uint32_t              gFrames;
+const YeaShadingRate* gRate;   // nullptr: no variable-rate shading on this GPU
+Shader*               gShader;
+Pipeline*             gPipe;
+DescriptorSet*        gSet;
+Buffer*               gCb[kMaxFrames];
+Texture*              gImage;  // Yea's rate image: SHADING_RATE_SOURCE after vrs_run (made in UNORDERED_ACCESS)
+Texture*              gCopy;   // the same rates for Show Rates (R32_UINT), SHADER_RESOURCE between frames
+ResourceState         gImageState;
+uint32_t              gWidth, gHeight, gTile;
+bool                  gReady;
+
+float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+void freeImages()
+{
+    if (gImage)
+        removeResource(gImage);
+    if (gCopy)
+        removeResource(gCopy);
+    gImage = gCopy = nullptr;
+    gWidth = gHeight = 0;
+}
+
+void createImages(uint32_t w, uint32_t h)
+{
+    uint32_t tw = (w + gTile - 1) / gTile, th = (h + gTile - 1) / gTile;
+    gRate->addImage(gRenderer, w, h, (void**)&gImage);
+    gImageState = RESOURCE_STATE_UNORDERED_ACCESS;
+    TextureDesc d = {};
+    d.mWidth = tw;
+    d.mHeight = th;
+    d.mDepth = d.mArraySize = d.mMipLevels = 1;
+    d.mSampleCount = SAMPLE_COUNT_1;
+    d.mFormat = TinyImageFormat_R32_UINT; // RWTex2D(uint) is r32ui on Vulkan
+    d.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+    d.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+    d.pName = "renderer_vrs_rates";
+    TextureLoadDesc l = {};
+    l.pDesc = &d;
+    l.ppTexture = &gCopy;
+    addResource(&l, nullptr);
+    waitForAllResourceLoads();
+    gWidth = w;
+    gHeight = h;
+}
+
+void barrier(Cmd* cmd, Texture* t, ResourceState from, ResourceState to)
+{
+    TextureBarrier b = {};
+    b.pTexture = t;
+    b.mCurrentState = from;
+    b.mNewState = to;
+    cmdResourceBarrier(cmd, 0, nullptr, 1, &b, 0, nullptr);
+}
+} // namespace
+
+int load(int reloaded)
+{
+    const YeaHost* host = yea::host();
+    gRenderer = (Renderer*)host->renderer;
+    gQueue = (Queue*)host->queue;
+    gFrames = host->framesInFlight < kMaxFrames ? host->framesInFlight : kMaxFrames;
+    gRate = yea::shadingRate();
+    if (!gRate)
+        return 0; // nothing to do on this GPU: the core draws at full rate
+    gTile = gRate->tile ? gRate->tile : 16;
+    ShaderLoadDesc sd = {};
+    sd.mComp.pFileName = "renderer_vrs_rate.comp";
+    addShader(gRenderer, &sd, &gShader);
+    if (!gShader)
+        return 1;
+    PipelineDesc desc = {};
+    desc.mType = PIPELINE_TYPE_COMPUTE;
+    PIPELINE_LAYOUT_DESC(desc, NULL, SRT_LAYOUT_DESC(VrsSrt, PerFrame), NULL, NULL);
+    desc.mComputeDesc.pShaderProgram = gShader;
+    desc.pName = "renderer_vrs_rate";
+    addPipeline(gRenderer, &desc, &gPipe);
+    DescriptorSetDesc setDesc = SRT_SET_DESC(VrsSrt, PerFrame, gFrames, 0);
+    addDescriptorSet(gRenderer, &setDesc, &gSet);
+    for (uint32_t i = 0; i < gFrames; ++i)
+    {
+        BufferLoadDesc d = {};
+        d.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        d.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+        d.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+        d.mDesc.mSize = 256;
+        d.mDesc.mStartState = RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+        d.mDesc.pName = "renderer_vrs_cb";
+        d.ppBuffer = &gCb[i];
+        addResource(&d, nullptr);
+    }
+    waitForAllResourceLoads();
+    gReady = gPipe && gSet;
+    return gReady ? 0 : 1;
+}
+
+void unload()
+{
+    if (!gRenderer || !gRate)
+        return;
+    waitQueueIdle(gQueue);
+    freeImages();
+    for (uint32_t i = 0; i < gFrames; ++i)
+        if (gCb[i])
+            removeResource(gCb[i]);
+    if (gSet)
+        removeDescriptorSet(gRenderer, gSet);
+    if (gPipe)
+        removePipeline(gRenderer, gPipe);
+    if (gShader)
+        removeShader(gRenderer, gShader);
+}
+
+void update(uint32_t phase, float dt) {}
+void draw(uint32_t pass, const YeaFrame* frame) {}
+
+bool vrs_prepare(uint64_t address)
+{
+    RenderFrame* F = (RenderFrame*)(uintptr_t)address;
+    if (!gReady || !settings.enabled || !F || F->version != RENDER_FRAME_VERSION || !F->width || !F->height)
+        return false;
+    // Rates come from last frame's anti-aliased image: without TAA (or on its first frame) full rate.
+    if (!F->taaOn || !F->previous || !F->motion || F->sampleCount != 1 || yea::viewMode())
+        return false;
+    if (F->width != gWidth || F->height != gHeight)
+    {
+        waitQueueIdle(gQueue);
+        freeImages();
+        createImages(F->width, F->height);
+    }
+    if (!gImage || !gCopy)
+        return false;
+    VrsData d = {};
+    d.size[0] = F->width;
+    d.size[1] = F->height;
+    d.size[2] = (F->width + gTile - 1) / gTile;
+    d.size[3] = (F->height + gTile - 1) / gTile;
+    d.info[0] = gTile;
+    d.info[1] = gRate->rates;
+    d.info[2] = settings.allow_4x4;
+    d.info[3] = 1;
+    d.params[0] = 0.012f * clampf(settings.aggressiveness, 0.0f, 10.0f);
+    d.params[1] = 0.25f * clampf(settings.motion, 0.0f, 10.0f);
+    d.params[2] = 0.01f;
+    memcpy(gCb[F->frameIndex]->pCpuMappedAddress, &d, sizeof d);
+    F->rateImage = gImage;
+    F->rateCopy = gCopy;
+    F->rateTile = gTile;
+    F->vrsDebug = settings.show_rates;
+    return true;
+}
+
+void vrs_run(uint64_t address)
+{
+    RenderFrame* F = (RenderFrame*)(uintptr_t)address;
+    if (!gReady || !F || F->rateImage != gImage || !gImage || !F->depth || !F->previous || !F->motion || !F->exposure)
+        return;
+    Cmd*           cmd = F->cmd;
+    DescriptorData p[7] = {};
+    p[0].mIndex = SRT_RES_IDX(VrsSrt, PerFrame, gVrs);
+    p[0].ppBuffers = &gCb[F->frameIndex];
+    p[1].mIndex = SRT_RES_IDX(VrsSrt, PerFrame, gPrevious);
+    p[1].ppTextures = &F->previous->pTexture;
+    p[2].mIndex = SRT_RES_IDX(VrsSrt, PerFrame, gMotion);
+    p[2].ppTextures = &F->motion->pTexture;
+    p[3].mIndex = SRT_RES_IDX(VrsSrt, PerFrame, gDepth);
+    p[3].ppTextures = &F->depth->pTexture;
+    p[4].mIndex = SRT_RES_IDX(VrsSrt, PerFrame, gExposure);
+    p[4].ppBuffers = &F->exposure;
+    p[5].mIndex = SRT_RES_IDX(VrsSrt, PerFrame, gRate);
+    p[5].ppTextures = &gImage;
+    p[6].mIndex = SRT_RES_IDX(VrsSrt, PerFrame, gRateCopy);
+    p[6].ppTextures = &gCopy;
+    updateDescriptorSet(gRenderer, F->frameIndex, gSet, 7, p);
+
+    cmdBeginDebugMarker(cmd, 1.0f, 0.5f, 0.2f, "Renderer VRS rates");
+    if (gImageState != RESOURCE_STATE_UNORDERED_ACCESS)
+        barrier(cmd, gImage, gImageState, RESOURCE_STATE_UNORDERED_ACCESS);
+    barrier(cmd, gCopy, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
+    cmdBindPipeline(cmd, gPipe);
+    cmdBindDescriptorSet(cmd, F->frameIndex, gSet);
+    cmdDispatch(cmd, (F->width + gTile - 1) / gTile, (F->height + gTile - 1) / gTile, 1);
+    barrier(cmd, gImage, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADING_RATE_SOURCE);
+    barrier(cmd, gCopy, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE);
+    gImageState = RESOURCE_STATE_SHADING_RATE_SOURCE;
+    cmdEndDebugMarker(cmd);
+}
+} // namespace renderer_vrs

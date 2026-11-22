@@ -11,5 +11,6 @@ BEGIN_SRT(CompositeSrt)
 #endif
         DECL_BUFFER(PerFrame, Buffer(float), gExposure)
         DECL_TEXTURE(PerFrame, Tex2D(float), gShadowAtlas)
+        DECL_TEXTURE(PerFrame, Tex2D(uint), gRates)
     END_SRT_SET(PerFrame)
 END_SRT(CompositeSrt)
