@@ -147,7 +147,21 @@ void draw(uint32_t pass, const YeaFrame* frame) {}
 bool taa_prepare(uint64_t address)
 {
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
-    if (!gReady || !settings.enabled || !F || F->version != RENDER_FRAME_VERSION || !F->width || !F->height)
+    if (!gReady || !F || F->version != RENDER_FRAME_VERSION)
+        return false;
+    // renderer_upscale's frame: it resolves in TAA's place, so the history is let go; the sharpening is still this
+    // module's (the core's tonemap pass, after the upscale).
+    if (F->upscaleOn)
+    {
+        if (gHistory[0] || gHistory[1])
+        {
+            waitQueueIdle(gQueue);
+            freeHistory();
+        }
+        F->sharpen = settings.sharpen < 0 ? 0 : (settings.sharpen > 1 ? 1 : settings.sharpen);
+        return false;
+    }
+    if (!settings.enabled || !F->width || !F->height)
         return false;
     if (yea::viewMode()) // F1's Wireframe or Overdraw: stand aside so they read right
         return false;

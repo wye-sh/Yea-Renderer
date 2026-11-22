@@ -1,0 +1,6 @@
+module renderer_upscale
+
+# Called by renderer (the core) each frame with the address of its RenderFrame (frame.h): upscale_prepare first of all
+# (it may lower the frame's render size), upscale_run in TAA's resolve's place when it upscales.
+export bool upscale_prepare(u64 frame)
+export void upscale_run(u64 frame)

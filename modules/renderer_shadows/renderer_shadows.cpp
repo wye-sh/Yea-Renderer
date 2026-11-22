@@ -673,7 +673,7 @@ bool shadows_prepare(uint64_t address)
     uint32_t target[kGroups];
     {
         uint32_t maxCells = clampu((int32_t)(pow2Floor(clampu(settings.max_tile_resolution, kCell, 2048)) / kCell), 1, gSide);
-        float    focal = F->p11 * (float)F->height * 0.5f;
+        float    focal = F->p11 * (float)F->displayHeight * 0.5f; // the shown size, so tiles keep their size at any render scale
         uint32_t area = 0;
         for (uint32_t j = 0; j < pickedCount; ++j)
         {

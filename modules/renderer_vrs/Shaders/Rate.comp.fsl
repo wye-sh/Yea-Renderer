@@ -12,7 +12,8 @@ STRUCT(VrsData)
     DATA(uint4, info, None);    // x tile (px), y the GPU's rates (bits 1 << rate), z 4 x 4 allowed, w write the image
     DATA(float4, params, None); // x contrast threshold, y motion scale (per px/frame), z edge threshold,
                                 // w curvature threshold (0: curved surfaces may go coarse)
-    DATA(float4, params2, None); // x roughness below which a pixel's reflection keeps its tile at full rate (0: off)
+    DATA(float4, params2, None); // x roughness below which a pixel's reflection keeps its tile at full rate (0: off),
+                                 // yz 1 / size (the UPSCALED variants: last frame's image is the display's size)
 };
 
 #include "Rate.srt.h"
@@ -36,7 +37,12 @@ GroupShared(float3, gsMax[64]); // edge, motion, glossiness (1 - roughness)
 
 float seen(int2 p, float exposure)
 {
+#if defined(UPSCALED)
+    // renderer_upscale renders smaller than last frame's image (display size): read it at this pixel's centre.
+    float3 c = max(SampleLvlTex2D(gPrevious, gSamplerBilinearClamp, (float2(p) + 0.5) * gVrs.params2.yz, 0.0).rgb, float3(0.0, 0.0, 0.0)) * exposure;
+#else
     float3 c = max(LoadTex2D(gPrevious, NO_SAMPLER, p, 0).rgb, float3(0.0, 0.0, 0.0)) * exposure;
+#endif
     float  l = dot(c, float3(0.2126, 0.7152, 0.0722));
     return sqrt(l / (1.0 + l));
 }

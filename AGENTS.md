@@ -100,9 +100,17 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   `max_roughness` (`gTiles`, flag sets double-buffered so no thread reads a flag another rewrites); the resolve skips
   the rest and writes their zeros only when the history there isn't zero already. Every GPU object is freed
   in `unload()` (device-loss recovery unloads modules); nothing GPU-side is in tables.
+- `renderer_upscale`: render scale and upscaling. `upscale_prepare` runs first of all; when it upscales it lowers
+  `width`/`height` to the render size (every scene pass, the prepass, culling, AO, contact, SSR, VRS, RT, the forward
+  pass and exposure run at it; jitter is in its pixels), and `upscale_run` takes the TAA resolve's place, writing
+  `resolved` at `displayWidth`/`displayHeight`, the frame's size, where the tonemap pass and composite run. TAA then
+  frees its history and stands aside (its `sharpen` still applies, after the upscale). Not upscaling (native size, the
+  default), it returns false and the frame is exactly as without it: no pass, copy or target added. Shadow tiles size
+  by `displayHeight`. renderer_vrs reads last frame's image through `_up` shader variants only while upscaled.
+  (So far it never upscales: the FSR and DLSS upscalers come next.)
 - The core calls the others through optional imports with a `RenderFrame*` (as `u64`): `frame.h`, copied
-  identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes`, `renderer_ssr`, `renderer_vrs` and `renderer_rt` (`mathx.h` into the
-  first three). Change all copies together and raise `RENDER_FRAME_VERSION`. `taa_prepare` runs first,
+  identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes`, `renderer_ssr`, `renderer_vrs`, `renderer_rt` and `renderer_upscale` (`mathx.h` into the
+  first three). Change all copies together and raise `RENDER_FRAME_VERSION`. `upscale_prepare`, then `taa_prepare` run first,
   before the camera, so the jitter reaches the projection.
 
 ## Hook-up points (exports of `renderer`)
@@ -199,6 +207,9 @@ for screen reflections (a quarter of it at half resolution).
   when more lights move than `updates_per_frame`. Shading must use that drawn position (point lights pick
   their cube face from it, kept in the first face's `info.yzw`), never the light's current one, or points project off the tile's edge.
 - 2D world quads the host draws after this view are over the 3D image; there is no depth between them.
+- Sizes: `width`/`height` are the render size, `displayWidth`/`displayHeight` the frame's. Anything shown at the frame's
+  size or chosen by how big things look on screen (shadow resolution) uses the display size; anything reading this
+  frame's scene targets uses the render size. At native size they are equal, so a mix-up shows only when upscaled.
 - Instances draw with an instance-rate stream of indices, never `SV_InstanceID` (D3D12/Vulkan rule).
 - Shadows use standard Z (near 0); the camera uses reversed-Z with an infinite far plane.
 - With TAA on, the prepass uses the motion vertex shader too, so both passes compute the same depth.

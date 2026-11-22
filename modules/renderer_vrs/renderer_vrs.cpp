@@ -32,6 +32,9 @@ uint32_t              gFrames;
 const YeaShadingRate* gRate;   // nullptr: no variable-rate shading on this GPU
 Shader*               gShader;       // Rate.comp.fsl: a rate per tile into gPre
 Pipeline*             gPipe;
+Shader*               gUpShader;     // the same, reading last frame's image at display size (renderer_upscale renders smaller)
+Pipeline*             gUpPipe;
+bool                  gUpscaled;     // this frame renders smaller than last frame's image
 Shader*               gDilateShader; // Dilate.comp.fsl: gPre into the rate image and gCopy
 Pipeline*             gDilatePipe;
 Texture*              gPre;          // R32_UINT, UNORDERED_ACCESS always
@@ -109,7 +112,11 @@ int load(int reloaded)
     // Group memory sized for the GPU's tile: a variant per tile size.
     sd.mComp.pFileName = gTile <= 8 ? "renderer_vrs_rate_8.comp" : gTile <= 16 ? "renderer_vrs_rate_16.comp" : "renderer_vrs_rate_32.comp";
     addShader(gRenderer, &sd, &gShader);
-    if (!gShader)
+    ShaderLoadDesc ud = {};
+    ud.mComp.pFileName =
+        gTile <= 8 ? "renderer_vrs_rate_8_up.comp" : gTile <= 16 ? "renderer_vrs_rate_16_up.comp" : "renderer_vrs_rate_32_up.comp";
+    addShader(gRenderer, &ud, &gUpShader);
+    if (!gShader || !gUpShader)
         return 1;
     PipelineDesc desc = {};
     desc.mType = PIPELINE_TYPE_COMPUTE;
@@ -117,6 +124,9 @@ int load(int reloaded)
     desc.mComputeDesc.pShaderProgram = gShader;
     desc.pName = "renderer_vrs_rate";
     addPipeline(gRenderer, &desc, &gPipe);
+    desc.mComputeDesc.pShaderProgram = gUpShader;
+    desc.pName = "renderer_vrs_rate_up";
+    addPipeline(gRenderer, &desc, &gUpPipe);
     ShaderLoadDesc dd = {};
     dd.mComp.pFileName = "renderer_vrs_dilate.comp";
     addShader(gRenderer, &dd, &gDilateShader);
@@ -140,7 +150,7 @@ int load(int reloaded)
         addResource(&d, nullptr);
     }
     waitForAllResourceLoads();
-    gReady = gPipe && gDilatePipe && gSet;
+    gReady = gPipe && gUpPipe && gDilatePipe && gSet;
     return gReady ? 0 : 1;
 }
 
@@ -157,6 +167,10 @@ void unload()
         removeDescriptorSet(gRenderer, gSet);
     if (gPipe)
         removePipeline(gRenderer, gPipe);
+    if (gUpPipe)
+        removePipeline(gRenderer, gUpPipe);
+    if (gUpShader)
+        removeShader(gRenderer, gUpShader);
     if (gDilatePipe)
         removePipeline(gRenderer, gDilatePipe);
     if (gDilateShader)
@@ -198,6 +212,9 @@ bool vrs_prepare(uint64_t address)
     d.params[2] = 0.01f;
     d.params[3] = settings.keep_curved ? 2e-6f : 0.0f; // 1/z off a plane across a tile, relative
     d.params2[0] = clampf(settings.glossy_below, 0.0f, 1.0f);
+    gUpscaled = F->displayWidth != F->width || F->displayHeight != F->height;
+    d.params2[1] = 1.0f / (float)F->width;
+    d.params2[2] = 1.0f / (float)F->height;
     memcpy(gCb[F->frameIndex]->pCpuMappedAddress, &d, sizeof d);
     F->rateImage = gImage;
     F->rateCopy = gCopy;
@@ -237,7 +254,7 @@ void vrs_run(uint64_t address)
     if (gImageState != RESOURCE_STATE_UNORDERED_ACCESS)
         barrier(cmd, gImage, gImageState, RESOURCE_STATE_UNORDERED_ACCESS);
     barrier(cmd, gCopy, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
-    cmdBindPipeline(cmd, gPipe);
+    cmdBindPipeline(cmd, gUpscaled ? gUpPipe : gPipe);
     cmdBindDescriptorSet(cmd, F->frameIndex, gSet);
     uint32_t tw = (F->width + gTile - 1) / gTile, th = (F->height + gTile - 1) / gTile;
     cmdDispatch(cmd, tw, th, 1);

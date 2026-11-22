@@ -1,5 +1,5 @@
 // The frame contract between the renderer modules: renderer (the core) fills a RenderFrame each
-// frame and passes its address (as u64) to the other renderer modules (culling, shadows, taa, ao, contact, probes, ssr, vrs, rt). The same
+// frame and passes its address (as u64) to the other renderer modules (culling, shadows, taa, ao, contact, probes, ssr, vrs, rt, upscale). The same
 // file sits in each of them; keep the copies identical and raise RENDER_FRAME_VERSION on any change.
 #pragma once
 #include <stdint.h>
@@ -10,7 +10,7 @@ struct Buffer;
 struct RenderTarget;
 struct Texture;
 
-#define RENDER_FRAME_VERSION 12u
+#define RENDER_FRAME_VERSION 13u
 #define RENDER_MAX_CASCADES  4u
 #define RENDER_VIEW_SHIFT    20u // shadow instance stream entry: instance | view << 20
 
@@ -147,7 +147,7 @@ struct RenderFrame
     float         localLightSize; // point and spot lights' radius (m) for contact-hardening, 0: plain PCF
     uint32_t      receiverPlane;  // tilt each PCF tap's depth compare with the receiver's plane
 
-    // TAA (renderer_taa). taa_prepare runs first, with only the fields above the camera set: it sets
+    // TAA (renderer_taa). taa_prepare runs right after upscale_prepare, with only the fields above the camera set: it sets
     // jitter, taaOn, sharpen and resolved, and the core then renders at one sample with motion vectors.
     float         jitter[2];  // sub-pixel camera offset this frame, in pixels
     uint32_t      taaOn;
@@ -224,5 +224,16 @@ struct RenderFrame
                               // sees, a its distance (0: not traced, RENDER_RT_MISS: the sky)
     float    rtMaxRoughness;  // traced below it, fading out over its last third
     uint32_t rtDebug;         // show where rays were traced (green: hit seen on screen, blue: shaded at the hit)
+
+    // Upscaling (renderer_upscale). upscale_prepare runs first of all, before taa_prepare, with only the fields above the
+    // camera set and width, height = displayWidth, displayHeight = the frame's size. When it upscales, it lowers width and
+    // height to the render size (every pass above runs at it, and jitter is in its pixels), sets jitter, taaOn, sharpen,
+    // resolved (its output, display size) and previous (last frame's output) as taa_prepare would, and upscaleOn; TAA then
+    // steps aside and upscale_run takes taa_resolve's place, with hdr, depth, motion and exposure as there. At native size
+    // without an upscaler, width and height are the display's and nothing here changes the frame.
+    uint32_t displayWidth, displayHeight; // the frame's size: what the tonemap pass, the composite and screen-sized choices
+                                          // (such as shadow resolution) use
+    uint32_t upscaleOn;
+    float    mipBias;                     // texture LOD bias for the render scale (0 at native): log2(width / displayWidth)
 };
 #define RENDER_RT_MISS 60000.0f

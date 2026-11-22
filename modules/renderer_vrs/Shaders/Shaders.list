@@ -11,13 +11,31 @@
 #include "Rate.comp.fsl"
 #end
 
+#comp renderer_vrs_rate_8_up.comp
+#define TILE 8u
+#define UPSCALED 1
+#include "Rate.comp.fsl"
+#end
+
 #comp renderer_vrs_rate_16.comp
 #define TILE 16u
 #include "Rate.comp.fsl"
 #end
 
+#comp renderer_vrs_rate_16_up.comp
+#define TILE 16u
+#define UPSCALED 1
+#include "Rate.comp.fsl"
+#end
+
 #comp renderer_vrs_rate_32.comp
 #define TILE 32u
+#include "Rate.comp.fsl"
+#end
+
+#comp renderer_vrs_rate_32_up.comp
+#define TILE 32u
+#define UPSCALED 1
 #include "Rate.comp.fsl"
 #end
 

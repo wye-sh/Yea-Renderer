@@ -125,7 +125,8 @@ Buffer *       gDfg, *gExposure, *gHistogram, *gDummyU32, *gDummyViews, *gDummyP
 Buffer *       gVertexBuf, *gIndexBuf;
 Buffer *       gPrevBuf[kMaxFrames]; // last frame's instance rows, for motion vectors
 
-uint32_t        gWidth, gHeight, gSamples;       // the targets as made
+uint32_t        gWidth, gHeight, gSamples;       // the targets as made (render size)
+uint32_t        gDisplayWidth, gDisplayHeight;   // the frame's size the targets were made for (gLdr's)
 bool            gTargetMotion;
 uint32_t        gPipeSamples;                    // the pipelines as made
 bool            gPipeMotion;
@@ -463,9 +464,12 @@ void destroyTargets()
         removeResource(gLdr);
     gLdr = nullptr;
     gWidth = gHeight = gSamples = 0;
+    gDisplayWidth = gDisplayHeight = 0;
 }
 
-void createTargets(uint32_t w, uint32_t h, uint32_t samples, bool motion)
+// The scene's targets at the render size w x h; the tonemap pass's output at the frame's size dw x dh (the same unless
+// renderer_upscale renders smaller).
+void createTargets(uint32_t w, uint32_t h, uint32_t samples, bool motion, uint32_t dw, uint32_t dh)
 {
     RenderTargetDesc d = {};
     d.mWidth = w;
@@ -505,8 +509,8 @@ void createTargets(uint32_t w, uint32_t h, uint32_t samples, bool motion)
             addRenderTarget(gRenderer, &d, &gSurface);
         }
         TextureDesc t = {};
-        t.mWidth = w;
-        t.mHeight = h;
+        t.mWidth = dw;
+        t.mHeight = dh;
         t.mDepth = t.mArraySize = t.mMipLevels = 1;
         t.mSampleCount = SAMPLE_COUNT_1;
         t.mFormat = TinyImageFormat_R32_UINT;
@@ -521,6 +525,8 @@ void createTargets(uint32_t w, uint32_t h, uint32_t samples, bool motion)
     }
     gWidth = w;
     gHeight = h;
+    gDisplayWidth = dw;
+    gDisplayHeight = dh;
     gSamples = samples;
     gTargetMotion = motion;
 }
@@ -677,8 +683,8 @@ void barrierBuf(Cmd* cmd, Buffer* buf, ResourceState from, ResourceState to)
 // (that frame's fence has passed by then, so nothing waits), averaged and logged every 10 s.
 namespace
 {
-enum Timing : uint32_t { kTimeShadows, kTimeProbes, kTimePrepass, kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeVrs, kTimeRt, kTimeForward, kTimeExposure, kTimeTaa, kTimeTonemap, kTimeComposite, kTimeTotal, kTimings };
-const char* const kTimingNames[kTimings] = { "shadows", "probes", "prepass", "culling", "ao", "contact", "ssr", "vrs", "rt", "forward+sky", "exposure", "taa", "tonemap", "composite", "total" };
+enum Timing : uint32_t { kTimeShadows, kTimeProbes, kTimePrepass, kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeVrs, kTimeRt, kTimeForward, kTimeExposure, kTimeTaa, kTimeUpscale, kTimeTonemap, kTimeComposite, kTimeTotal, kTimings };
+const char* const kTimingNames[kTimings] = { "shadows", "probes", "prepass", "culling", "ao", "contact", "ssr", "vrs", "rt", "forward+sky", "exposure", "taa", "upscale", "tonemap", "composite", "total" };
 QueryPool*        gTimePool[kMaxFrames];
 uint32_t          gTimeUsed[kMaxFrames]; // bits: what that frame recorded
 double            gTimeTicks;            // per second
@@ -1095,7 +1101,7 @@ uint32_t gRenderedFi;
 // YEA_PASS_WORLD: the frame's target is bound; this frame's scene onto it.
 void composite(const YeaFrame* yf)
 {
-    if (gRenderedFrame != yea::host()->frame() || !gCompositePipe || yf->width != gWidth || yf->height != gHeight)
+    if (gRenderedFrame != yea::host()->frame() || !gCompositePipe || yf->width != gDisplayWidth || yf->height != gDisplayHeight)
         return;
     Cmd* cmd = (Cmd*)yf->cmd;
     cmdSetViewport(cmd, 0, 0, (float)yf->width, (float)yf->height, 0, 1);
@@ -1126,20 +1132,39 @@ void draw(uint32_t pass, const YeaFrame* yf)
     Cmd*          cmd = (Cmd*)yf->cmd;
     RenderTarget* target = (RenderTarget*)yf->renderTarget;
     uint32_t      fi = yf->frameIndex % gFrames;
-    uint32_t      w = yf->width, h = yf->height;
+    const uint32_t dw = yf->width, dh = yf->height; // the frame's (display) size
 
-    // --- The frame contract; TAA first: it picks the jitter, and replaces MSAA ------------------
+    // --- The frame contract; an upscaler or TAA first: they pick the jitter, and replace MSAA ---
     RenderFrame& F = gFrame;
     memset(&F, 0, sizeof F);
     F.version = RENDER_FRAME_VERSION;
     F.frameIndex = fi;
     F.framesInFlight = gFrames;
-    F.width = w;
-    F.height = h;
+    F.width = dw;
+    F.height = dh;
+    F.displayWidth = dw;
+    F.displayHeight = dh;
     F.frameNumber = yea::host()->frame();
     F.renderer = gRenderer;
     F.cmd = cmd;
-    bool taa = renderer_taa::taa_prepare((uint64_t)(uintptr_t)&F) && F.taaOn && F.resolved;
+    // renderer_upscale may render smaller (F.width x F.height) and upscale to the frame's size in TAA's place; without
+    // it everything runs at the frame's size, exactly as before it existed.
+    const bool upscaled = renderer_upscale::upscale_prepare((uint64_t)(uintptr_t)&F) && F.upscaleOn && F.resolved && F.width &&
+                          F.height && F.width <= dw && F.height <= dh;
+    if (!upscaled)
+    {
+        F.width = dw;
+        F.height = dh;
+        F.upscaleOn = 0;
+        F.mipBias = 0;
+        F.jitter[0] = F.jitter[1] = 0;
+        F.taaOn = 0;
+        F.sharpen = 0;
+        F.resolved = F.previous = nullptr;
+    }
+    // TAA also sees an upscaler's frame: it then frees its history and stands aside.
+    bool taa = (renderer_taa::taa_prepare((uint64_t)(uintptr_t)&F) && F.taaOn && F.resolved && !upscaled) || upscaled;
+    const uint32_t w = F.width, h = F.height; // the render size: every scene pass runs at it
     // F1's Wireframe or Overdraw (development only; 0 in a release): the scene drawn plainly so they read
     // right. No TAA, AO, contact shadows or light culling (their modules step aside), no prepass, no sky,
     // the HDR target cleared to black, exposure 1 and no tonemapping; shadow and probe caches stay frozen.
@@ -1147,11 +1172,11 @@ void draw(uint32_t pass, const YeaFrame* yf)
 
     // --- Targets, pipelines, meshes ----------------------------------------------------------
     uint32_t samples = taa || viewMode ? 1 : snapSamples(settings.msaa);
-    if (w != gWidth || h != gHeight || samples != gSamples || taa != gTargetMotion)
+    if (w != gWidth || h != gHeight || dw != gDisplayWidth || dh != gDisplayHeight || samples != gSamples || taa != gTargetMotion)
     {
         waitQueueIdle(gQueue);
         destroyTargets();
-        createTargets(w, h, samples, taa);
+        createTargets(w, h, samples, taa, dw, dh);
         if (!gHdr || !gDepth || (taa && (!gMotion || !gGloss || (gRaytracing && !gSurface))))
         {
             // Refused (out of memory, say): nothing drawn this frame, tried again next frame, said once.
@@ -1187,7 +1212,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     basis(fwd, &right, &up);
     float nearZ = maxf(settings.near_plane, 0.001f);
     float p11 = 1.0f / tanf(cam->fov * 0.5f * 3.14159265f / 180.0f);
-    float p00 = p11 * (float)h / (float)w;
+    float p00 = p11 * (float)dh / (float)dw;
     float view[4][4], proj[4][4] = { { p00, 0, 0, 0 }, { 0, p11, 0, 0 }, { 0, 0, 0, nearZ }, { 0, 0, 1, 0 } }, viewProj[4][4];
     lookRows(eye, fwd, right, up, view);
     float viewProjNoJitter[4][4];
@@ -1642,7 +1667,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     composite.mode[0] = (uint32_t)(settings.tonemapper < 0 || (tony && !gTonyLut) ? 0 : settings.tonemapper);
     composite.mode[1] = TinyImageFormat_IsSRGB(gFrameFormat) ? 0 : 1;
     composite.mode[2] = samples;
-    composite.mode[3] = w | (h << 16);
+    composite.mode[3] = dw | (dh << 16);
     composite.params[0] = taa ? F.sharpen : 0.0f;
     // Show AO and Show Contact write their values as they are: shown at exposure 1, untonemapped.
     const bool rawDebug = (ao && F.aoDebug) || (contact && F.contactDebug);
@@ -1665,7 +1690,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     // tonemapping every pixel five times (MSAA and no sharpening tonemap once per sample there anyway).
     const bool ldr = taa && composite.params[0] > 0.0f && gLdr && gTonemapPipe;
     composite.rates[2] = ldr ? 1u : 0u;
-    composite.params[1] = shadows && (F.showCascades & 2) ? floorf(mx::minf(h * 0.5f, w * 0.4f)) : 0.0f;
+    composite.params[1] = shadows && (F.showCascades & 2) ? floorf(mx::minf(dh * 0.5f, dw * 0.4f)) : 0.0f;
     composite.params[2] = shadows && F.localTexel > 0 ? 1.0f / F.localTexel : 0.0f;
     memcpy(gCompositeCb[fi]->pCpuMappedAddress, &composite, sizeof composite);
     ExposureData* ed = (ExposureData*)gExposureCb[fi]->pCpuMappedAddress;
@@ -1786,8 +1811,10 @@ void draw(uint32_t pass, const YeaFrame* yf)
 
     // --- Record -----------------------------------------------------------------------------
     {
-        char scene[160];
-        snprintf(scene, sizeof scene, "%ux%u x%u, %u lights, %u instances drawn, %u casters", w, h, samples, F.lightCount, count, casterTotal);
+        char scene[192];
+        int  n = snprintf(scene, sizeof scene, "%ux%u x%u, %u lights, %u instances drawn, %u casters", w, h, samples, F.lightCount, count, casterTotal);
+        if (upscaled && n > 0 && n < (int)sizeof scene)
+            snprintf(scene + n, sizeof scene - n, ", upscaled to %ux%u", dw, dh);
         timeFrame(cmd, fi, settings.gpu_timings, scene);
     }
     const bool timed = settings.gpu_timings;
@@ -1946,12 +1973,16 @@ void draw(uint32_t pass, const YeaFrame* yf)
 
     if (taa)
     {
+        const uint32_t slot = upscaled ? kTimeUpscale : kTimeTaa;
         if (timed)
-            timeBegin(cmd, fi, kTimeTaa);
+            timeBegin(cmd, fi, slot);
         barrierRt(cmd, gDepth, RESOURCE_STATE_DEPTH_WRITE, RESOURCE_STATE_SHADER_RESOURCE);
         gDepthState = RESOURCE_STATE_SHADER_RESOURCE;
-        renderer_taa::taa_resolve((uint64_t)(uintptr_t)&F);
-        timeEnd(cmd, fi, kTimeTaa);
+        if (upscaled)
+            renderer_upscale::upscale_run((uint64_t)(uintptr_t)&F);
+        else
+            renderer_taa::taa_resolve((uint64_t)(uintptr_t)&F);
+        timeEnd(cmd, fi, slot);
     }
     if (ldr)
     {
@@ -1961,7 +1992,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         cmdResourceBarrier(cmd, 0, nullptr, 1, &b, 0, nullptr);
         cmdBindPipeline(cmd, gTonemapPipe);
         cmdBindDescriptorSet(cmd, fi, gTonemapSet);
-        cmdDispatch(cmd, (w + 7) / 8, (h + 7) / 8, 1);
+        cmdDispatch(cmd, (dw + 7) / 8, (dh + 7) / 8, 1);
         b = { gLdr, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE };
         cmdResourceBarrier(cmd, 0, nullptr, 1, &b, 0, nullptr);
         timeEnd(cmd, fi, kTimeTonemap);
