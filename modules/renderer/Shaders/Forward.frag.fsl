@@ -158,7 +158,7 @@ float4 screenReflection(float3 P, float3 R, float rough, float noise)
             // passing behind it, and neighbouring pixels flip between hit and miss (rings, speckle).
             float lo = tPrev;
             float hi = t;
-            for (uint r = 0u; r < 6u; ++r)
+            for (uint r = 0u; r < 4u; ++r)
             {
                 float mid = 0.5 * (lo + hi);
                 float z = 1.0 / lerp(k0, k1, mid);
@@ -167,14 +167,17 @@ float4 screenReflection(float3 P, float3 R, float rough, float noise)
                 else
                     lo = mid;
             }
-            // A real crossing: what is seen is continuous across it. Where the depth jumps (a near
-            // object's outline), the ray only went behind that object towards a side the camera can't see:
-            // it marches on, and if nothing else is found the probes show.
+            // On a continuous surface the ray is a hit within `thickness`. Where what is seen jumps nearer
+            // at the crossing (an outline), the ray entered the object's outline already behind its front,
+            // and objects are thin at their outlines: only a ray barely behind it there hits it; one further
+            // behind passes it by (a sphere standing on a mirror, seen from above, smeared into a column).
             float zLo = 1.0 / lerp(k0, k1, lo);
             float zHit = 1.0 / lerp(k0, k1, hi);
             float bHit = behind(lerp(s0, s1, hi), zHit);
+            float step = abs(zHit - zLo);
             float jump = (zLo - behind(lerp(s0, s1, lo), zLo)) - (zHit - bHit);
-            if (bHit < gFrame.ssr.y && jump < gFrame.ssr.y)
+            float limit = jump > max(0.01 * zHit, 4.0 * step) ? min(gFrame.ssr.y, 0.01 * zHit + 2.0 * step) : gFrame.ssr.y;
+            if (bHit < limit)
             {
                 tHit = hi;
                 break;
@@ -344,7 +347,25 @@ float4 PS_MAIN(VSOutput In)
     float  ssrFound = 0.0;
     if ((gFrame.counts.z & FLAG_SSR) != 0u && m.params.z > 0.5)
     {
-        float4 sr = screenReflection(In.WorldPos, R, m.albedoRough.a, frac(phi * (0.5 / PI) + 0.37 + gFrame.ssr2.w));
+        // Glossy: the ray follows one microfacet normal drawn from the material's GGX lobe (Walter et al.
+        // 2007), a new one each frame; TAA averages them into the blur the roughness gives, as the probes'
+        // prefiltered mips do. A mirror stays a mirror.
+        float3 Rs = R;
+        if (a2 > 1e-6)
+        {
+            float  u1 = frac(phi * (0.5 / PI) + 0.61);
+            float  u2 = frac(phi * (0.5 / PI) * 7.0 + 0.13);
+            float  cosT = sqrt((1.0 - u1) / (1.0 + (a2 - 1.0) * u1));
+            float  sinT = sqrt(max(1.0 - cosT * cosT, 0.0));
+            float3 up = abs(N.y) < 0.9 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+            float3 tx = normalize(cross(up, N));
+            float3 ty = cross(N, tx);
+            float3 H = normalize(tx * (sinT * cos(u2 * 2.0 * PI)) + ty * (sinT * sin(u2 * 2.0 * PI)) + N * cosT);
+            float3 Rj = reflect(-V, H);
+            if (dot(Rj, N) > 0.0)
+                Rs = Rj;
+        }
+        float4 sr = screenReflection(In.WorldPos, Rs, m.albedoRough.a, frac(phi * (0.5 / PI) + 0.37 + gFrame.ssr2.w));
         radiance = lerp(radiance, sr.rgb, sr.a);
         ssrFound = sr.a;
     }

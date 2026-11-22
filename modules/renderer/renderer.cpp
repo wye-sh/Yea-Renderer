@@ -89,6 +89,9 @@ bool      gReady;
 
 Shader *gForwardDepthShader, *gForwardShader, *gSkyShader, *gCompositeShader[4], *gHistogramShader[4], *gAdaptShader;
 Shader *gMotionDepthShader, *gMotionShader, *gSkyMotionShader; // TAA on: with motion vectors
+Shader*        gGlossShader;   // the prepass with a reflection-roughness output, for renderer_vrs
+Pipeline*      gDepthGlossPipe[2];
+RenderTarget*  gGloss;
 // The full forward shaders add PCSS, the debug views and Wireframe's unlit lines; the lean ones, used
 // otherwise, leave them out and so need fewer registers.
 Shader *gForwardFullShader, *gMotionFullShader;
@@ -288,6 +291,7 @@ void destroyScenePipelines()
     for (uint32_t s = 0; s < 2; ++s)
     {
         freePipeline(gDepthPipe[s]);
+        freePipeline(gDepthGlossPipe[s]);
         freePipeline(gForwardPipe[s]);
         freePipeline(gForwardFullPipe[s]);
         freePipeline(gForwardDepthPipe[s]);
@@ -333,6 +337,21 @@ void createScenePipelines(uint32_t samples, bool motion)
     {
         raster.mCullMode = s ? CULL_MODE_NONE : CULL_MODE_BACK;
         addPipeline(gRenderer, &desc, &gDepthPipe[s]);
+    }
+    if (motion && gGlossShader)
+    {
+        TinyImageFormat glossFormat = TinyImageFormat_R8_UNORM;
+        g.mRenderTargetCount = 1;
+        g.pColorFormats = &glossFormat;
+        g.pShaderProgram = gGlossShader;
+        desc.pName = "renderer_depth_gloss";
+        for (uint32_t s = 0; s < 2; ++s)
+        {
+            raster.mCullMode = s ? CULL_MODE_NONE : CULL_MODE_BACK;
+            addPipeline(gRenderer, &desc, &gDepthGlossPipe[s]);
+        }
+        g.mRenderTargetCount = 0;
+        g.pColorFormats = nullptr;
     }
 
     DepthStateDesc depthTest = {};
@@ -403,6 +422,7 @@ void destroyTargets()
     freeTarget(gHdr);
     freeTarget(gDepth);
     freeTarget(gMotion);
+    freeTarget(gGloss);
     gWidth = gHeight = gSamples = 0;
 }
 
@@ -434,6 +454,10 @@ void createTargets(uint32_t w, uint32_t h, uint32_t samples, bool motion)
         d.mClearValue = { { 0, 0, 0, 0 } };
         d.pName = "renderer_motion";
         addRenderTarget(gRenderer, &d, &gMotion);
+        d.mFormat = TinyImageFormat_R8_UNORM;
+        d.mClearValue = { { 1, 1, 1, 1 } };
+        d.pName = "renderer_gloss";
+        addRenderTarget(gRenderer, &d, &gGloss);
     }
     gWidth = w;
     gHeight = h;
@@ -688,12 +712,13 @@ int load(int reloaded)
     gForwardFullShader = loadShader("renderer_forward.vert", "renderer_forward_full.frag", nullptr);
     gMotionFullShader = loadShader("renderer_forward_motion.vert", "renderer_forward_motion_full.frag", nullptr);
     gSkyMotionShader = loadShader("renderer_fullscreen.vert", "renderer_sky_motion.frag", nullptr);
+    gGlossShader = loadShader("renderer_forward_motion.vert", "renderer_gloss.frag", nullptr);
     const char* composite[4] = { "renderer_composite_1.frag", "renderer_composite_2.frag", "renderer_composite_4.frag",
                                  "renderer_composite_8.frag" };
     const char* histogram[4] = { "renderer_histogram_1.comp", "renderer_histogram_2.comp", "renderer_histogram_4.comp",
                                  "renderer_histogram_8.comp" };
     bool ok = gForwardDepthShader && gForwardShader && gSkyShader && gMotionDepthShader && gMotionShader && gSkyMotionShader &&
-              gForwardFullShader && gMotionFullShader;
+              gForwardFullShader && gMotionFullShader && gGlossShader;
     for (int i = 0; i < 4; ++i)
     {
         gCompositeShader[i] = loadShader("renderer_fullscreen.vert", composite[i], nullptr);
@@ -868,7 +893,7 @@ void unload()
     if (gShadowSampler)
         removeSampler(gRenderer, gShadowSampler);
     Shader* shaders[] = { gForwardDepthShader, gForwardShader, gSkyShader, gAdaptShader, gMotionDepthShader, gMotionShader, gSkyMotionShader,
-                          gForwardFullShader, gMotionFullShader };
+                          gForwardFullShader, gMotionFullShader, gGlossShader };
     for (Shader* s : shaders)
         if (s)
             removeShader(gRenderer, s);
@@ -1205,6 +1230,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     F.softness = 1.5f;
     F.hdr = gHdr;
     F.motion = gMotion;
+    F.gloss = gGloss;
     F.exposure = gExposure;
 
     bool culled = renderer_culling::cull_prepare((uint64_t)(uintptr_t)&F) && F.tileMasks && F.zbins && F.wordsPerTile;
@@ -1525,14 +1551,25 @@ void draw(uint32_t pass, const YeaFrame* yf)
     cmdBeginDebugMarker(cmd, 0.4f, 0.6f, 1.0f, "Renderer depth prepass");
     bind.mDepthStencil = { gDepth, LOAD_ACTION_CLEAR };
     bind.mDepthStencil.mStoreAction = STORE_ACTION_STORE;
+    // With renderer_vrs, also each pixel's reflection roughness, so glossy surfaces keep full rate.
+    bool gloss = vrs && gGloss && gDepthGlossPipe[0] && gDepthGlossPipe[1];
+    if (gloss)
+    {
+        barrierRt(cmd, gGloss, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_RENDER_TARGET);
+        bind.mRenderTargetCount = 1;
+        bind.mRenderTargets[0] = { gGloss, LOAD_ACTION_CLEAR };
+    }
     cmdBindRenderTargets(cmd, &bind);
     cmdSetViewport(cmd, 0, 0, (float)w, (float)h, 0, 1);
     cmdSetScissor(cmd, 0, 0, w, h);
     if (geometry)
     {
-        drawVisible(cmd, fi, gDepthPipe);
+        drawVisible(cmd, fi, gloss ? gDepthGlossPipe : gDepthPipe);
     }
     cmdBindRenderTargets(cmd, nullptr);
+    if (gloss)
+        barrierRt(cmd, gGloss, RESOURCE_STATE_RENDER_TARGET, RESOURCE_STATE_SHADER_RESOURCE);
+    F.gloss = gloss ? gGloss : nullptr;
     cmdEndDebugMarker(cmd);
     }
 

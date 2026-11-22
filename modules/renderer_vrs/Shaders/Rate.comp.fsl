@@ -1,9 +1,8 @@
 // One shading rate per tile (a thread group of 8 x 8, each thread tile/8 squared pixels), into gPre;
 // Dilate.comp.fsl then makes the final image. From last frame's anti-aliased image, as seen (exposed,
 // compressed, square-rooted): the RMS difference between horizontal and between vertical neighbours, which
-// halving the rate along that axis would lose (Yang et al. 2019, content-adaptive shading), both where the
-// pixel is and where it was a frame ago (last frame's motion), the larger counting: a moving object's
-// detail is caught where it is going. Below the threshold (raised by motion only if `motion` asks) that
+// halving the rate along that axis would lose (Yang et al. 2019, content-adaptive shading). Moving things
+// are covered by the depth tests below and Dilate's spreading. Below the threshold (raised by motion only if `motion` asks) that
 // axis goes coarse. From this frame's depth, the prepass's: a depth edge or crease (the second difference
 // of 1/z, zero across any plane) keeps the tile at full rate, and so does a curved surface (1/z off a plane
 // across the tile), whose reflections and highlights change from pixel to pixel.
@@ -13,6 +12,7 @@ STRUCT(VrsData)
     DATA(uint4, info, None);    // x tile (px), y the GPU's rates (bits 1 << rate), z 4 x 4 allowed, w write the image
     DATA(float4, params, None); // x contrast threshold, y motion scale (per px/frame), z edge threshold,
                                 // w curvature threshold (0: curved surfaces may go coarse)
+    DATA(float4, params2, None); // x roughness below which a pixel's reflection keeps its tile at full rate (0: off)
 };
 
 #include "Rate.srt.h"
@@ -28,10 +28,9 @@ STRUCT(VrsData)
 // The tile and a one-pixel border, loaded once: luminance as seen now and a frame ago, and depth.
 #define BORDER_MAX 34u
 GroupShared(float, gsL[BORDER_MAX * BORDER_MAX]);
-GroupShared(float, gsR[BORDER_MAX * BORDER_MAX]);
 GroupShared(float, gsZ[BORDER_MAX * BORDER_MAX]);
-GroupShared(float4, gsSum[64]); // h, v, h reprojected, v reprojected
-GroupShared(float2, gsMax[64]); // edge, motion
+GroupShared(float2, gsSum[64]); // h, v
+GroupShared(float3, gsMax[64]); // edge, motion, glossiness (1 - roughness)
 
 float seen(int2 p)
 {
@@ -52,38 +51,44 @@ void CS_MAIN(SV_GroupID(uint3) gid, SV_GroupThreadID(uint3) tid, SV_GroupIndex(u
     uint side = tile + 2u;
     int2 last = int2(gVrs.size.xy) - int2(1, 1);
     int2 origin = int2(gid.xy) * int(tile) - int2(1, 1);
-    float2 size = float2(gVrs.size.xy);
-    float motion = 0.0;
     for (uint i = gi; i < side * side; i += 64u)
     {
-        int2   q = clamp(origin + int2(int(i % side), int(i / side)), int2(0, 0), last);
-        float2 m = LoadTex2D(gMotion, NO_SAMPLER, q, 0).rg * size; // px moved over the last frame
+        int2 q = clamp(origin + int2(int(i % side), int(i / side)), int2(0, 0), last);
         gsL[i] = seen(q);
-        gsR[i] = seen(clamp(q - int2(floor(m + 0.5)), int2(0, 0), last));
         gsZ[i] = LoadTex2D(gDepth, NO_SAMPLER, q, 0).r; // reversed-Z, infinite far: near / z
-        motion = max(motion, length(m));
     }
     GroupMemoryBarrier();
 
-    float4 sum = float4(0.0, 0.0, 0.0, 0.0);
+    float2 sum = float2(0.0, 0.0);
     float  edge = 0.0;
     uint2  at = tid.xy * per; // within the tile
+    // Motion, only when it may coarsen: one read per thread (per x per pixels) is enough to judge it.
+    float  motion = 0.0;
+    if (gVrs.params.y > 0.0)
+        motion = length(LoadTex2D(gMotion, NO_SAMPLER, min(int2(gid.xy) * int(tile) + int2(at), last), 0).rg * float2(gVrs.size.xy));
     for (uint y = 0u; y < per; ++y)
         for (uint x = 0u; x < per; ++x)
         {
             uint  k = (at.y + y + 1u) * side + (at.x + x + 1u);
             float dh = gsL[k + 1u] - gsL[k];
             float dv = gsL[k + side] - gsL[k];
-            float rh = gsR[k + 1u] - gsR[k];
-            float rv = gsR[k + side] - gsR[k];
-            sum += float4(dh * dh, dv * dv, rh * rh, rv * rv);
+            sum += float2(dh * dh, dv * dv);
             float d = gsZ[k];
             float ex = gsZ[k - 1u] + gsZ[k + 1u] - 2.0 * d;
             float ey = gsZ[k - side] + gsZ[k + side] - 2.0 * d;
             edge = max(edge, max(abs(ex), abs(ey)) / max(d, 1e-7));
         }
+    // Glossy pixels, from the prepass: their reflections and highlights change from pixel to pixel.
+    float shine = 0.0;
+    if (gVrs.params2.x > 0.0)
+        for (uint gy = 0u; gy < per; ++gy)
+            for (uint gx = 0u; gx < per; ++gx)
+            {
+                int2 q = min(int2(gid.xy) * int(tile) + int2(at) + int2(int(gx), int(gy)), last);
+                shine = max(shine, 1.0 - LoadTex2D(gGloss, NO_SAMPLER, q, 0).r);
+            }
     gsSum[gi] = sum;
-    gsMax[gi] = float2(edge, motion);
+    gsMax[gi] = float3(edge, motion, shine);
     GroupMemoryBarrier();
     for (uint s = 32u; s > 0u; s >>= 1u)
     {
@@ -99,6 +104,7 @@ void CS_MAIN(SV_GroupID(uint3) gid, SV_GroupThreadID(uint3) tid, SV_GroupIndex(u
     sum = gsSum[0];
     edge = gsMax[0].x;
     motion = gsMax[0].y;
+    bool glossy = gsMax[0].z > 1.0 - gVrs.params2.x;
     // Curvature: 1/z on a 3 x 3 grid across the tile, against the plane through it.
     float curved = 0.0;
     if (gVrs.params.w > 0.0)
@@ -116,11 +122,13 @@ void CS_MAIN(SV_GroupID(uint3) gid, SV_GroupThreadID(uint3) tid, SV_GroupIndex(u
         curved = max(curved, curve(a * side + c, b * side + b, c * side + a));
     }
     float n = float(64u * per * per);
-    float eh = sqrt(max(sum.x, sum.z) / n);
-    float ev = sqrt(max(sum.y, sum.w) / n);
+    float eh = sqrt(sum.x / n);
+    float ev = sqrt(sum.y / n);
     float t = gVrs.params.x * (1.0 + motion * gVrs.params.y);
     uint  rate = RATE_1X1;
-    if (edge < gVrs.params.z && gVrs.params.w > 0.0 && curved >= gVrs.params.w)
+    if (glossy)
+        rate = RATE_1X1;
+    else if (edge < gVrs.params.z && gVrs.params.w > 0.0 && curved >= gVrs.params.w)
         rate = RATE_1X1 | CURVED;
     else if (edge < gVrs.params.z)
     {

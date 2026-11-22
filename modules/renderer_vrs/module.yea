@@ -16,6 +16,9 @@ setting float motion 0 0 4
 # Curved surfaces (spheres, rings, pillars) always at full rate: their reflections and highlights change
 # from pixel to pixel.
 setting bool keep_curved true
+# Surfaces smoother than this roughness (with reflections on) always at full rate: their reflections and
+# highlights are sharp. 0: off.
+setting float glossy_below 0.5 0 1
 # Very smooth areas once per 4 x 4 pixels, where the GPU has it.
 setting bool allow_4x4 false
 # Tints the screen by rate: green 2 x 1 or 1 x 2, blue 2 x 2, magenta coarser; full rate untinted.

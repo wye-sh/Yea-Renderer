@@ -10,7 +10,7 @@ struct Buffer;
 struct RenderTarget;
 struct Texture;
 
-#define RENDER_FRAME_VERSION 9u
+#define RENDER_FRAME_VERSION 10u
 #define RENDER_MAX_CASCADES  4u
 #define RENDER_VIEW_SHIFT    20u // shadow instance stream entry: instance | view << 20
 
@@ -203,6 +203,7 @@ struct RenderFrame
     // bindRenderTargets).
     Texture* rateImage;       // Yea's R8_UINT rate image, a YEA_RATE_* per rateTile px tile
     Texture* rateCopy;        // the same rates, R32_UINT, SHADER_RESOURCE after vrs_run (Show Rates)
+    RenderTarget* gloss;      // R8: each pixel's reflection roughness (1: none), from the prepass, SHADER_RESOURCE in vrs_run
     uint32_t rateTile;
     uint32_t vrsDebug;        // tint the screen by rate
 };

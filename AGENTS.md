@@ -41,8 +41,10 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
 - `renderer_ssr`: screen-space reflections over the probes. It copies the prepass depth (full or half size);
   the core's forward pass marches each glossy pixel's reflected ray across the screen against that copy
   (1/depth linear in screen space, the march's noise rotated per frame for TAA). Where the ray first goes
-  behind what is seen, 6 halvings find the crossing, and only there are thickness and continuity judged: a
-  crossing where the seen depth jumps (a near object's outline) is the ray passing behind it, and it marches on, and takes the colour from last frame's
+  behind what is seen, 4 halvings find the crossing, and only there is thickness judged: `thickness` on a
+  continuous surface, but where the seen depth jumps nearer (an object's outline, where objects are thin) only
+  a ray barely behind counts, else it marches on. Glossy rays follow a GGX microfacet normal drawn per pixel
+  and frame, so TAA averages them into the roughness's blur, and takes the colour from last frame's
   TAA-resolved image (`previous`), reprojected. Where nothing is found, off screen, near the screen's edges
   or above `max_roughness`, the probes show. Needs TAA: without it there is no previous image and it is off.
   Only on screen: what is behind the camera or hidden keeps the probes' (box-projected) reflection.
@@ -50,8 +52,9 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   (`yea::shadingRate()`, nullptr on GPUs without it: then the module does nothing). After the prepass, one
   compute group per rate tile (16 px on an RTX 2080) loads the tile once into group memory and measures
   last frame's TAA-resolved image as seen (exposed and compressed): the RMS luminance step between
-  horizontal and between vertical neighbours, where each pixel is and where it was a frame ago, the larger
-  counting. Below `aggressiveness`' threshold (raised by motion only when `motion` > 0) that axis goes
+  horizontal and between vertical neighbours. While it runs, the core's depth prepass also writes each
+  pixel's reflection roughness (R8, `gloss` in frame.h); a tile with a pixel smoother than glossy_below
+  stays at 1x1 at any distance. Below `aggressiveness`' threshold (raised by motion only when `motion` > 0) that axis goes
   coarse (2x1, 1x2, 2x2; 4x4 with allow_4x4). From this frame's depth, a crease or edge keeps the tile at
   1x1, and with keep_curved so does a curved surface (1/z off a plane across the tile; a tile mostly
   surrounded by curved ones too, as it lies on one flat facet of a curved mesh). A second small pass spreads
@@ -104,7 +107,7 @@ jitter_phases. `renderer_ao`: enabled, half_resolution (GTAO and its blur at hal
 multi_bounce, show_ao. `renderer_contact`: enabled, length, thickness, steps, intensity, max_distance,
 show_contact. `renderer_probes`: enabled, resolution (64-512), updates_per_frame, intensity, blend, parallax.
 `renderer_ssr`: enabled, half_resolution, max_roughness, thickness, max_distance, steps, edge_fade, intensity,
-show_hits (tints where reflections were found). `renderer_vrs`: enabled, aggressiveness, motion (0), keep_curved, allow_4x4,
+show_hits (tints where reflections were found). `renderer_vrs`: enabled, aggressiveness, motion (0), keep_curved, glossy_below, allow_4x4,
 show_rates (green half rate, blue 2x2, magenta coarser).
 
 ## Reset
@@ -118,7 +121,7 @@ Per frame: one depth prepass and one forward pass (draws grouped by mesh and sid
 faces culled except for double-sided materials; a leaner forward shader unless PCSS or a debug view is on), one culling
 dispatch per 16 px tile, a GTAO dispatch and `denoise` blur dispatches (at half size with half_resolution, plus a full-size upsample), one contact shadow dispatch (all full size; its march takes no more steps than the ray spans pixels), one
 rate dispatch per 16 px tile and a small dilation dispatch with variable-rate shading (the forward pass then shades smooth tiles at 2x2), one
-depth copy for screen reflections (their march, up to `steps` plus 6 depth reads per crossing, runs in the forward pass for
+depth copy for screen reflections (their march, up to `steps` plus 4 depth reads per crossing, runs in the forward pass for
 glossy pixels with reflections on, and shows in its timing), per re-captured probe 6 scene draws at half its
 resolution plus 6 small passes per mip, sun cascades redrawn, at most `updates_per_frame` local lights redrawn (oldest shadow first), two
 exposure dispatches, one full-screen TAA resolve (when on), one full-screen composite. No per-frame allocation. GPU memory at the defaults:

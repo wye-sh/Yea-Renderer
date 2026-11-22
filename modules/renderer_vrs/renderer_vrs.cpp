@@ -21,6 +21,7 @@ struct VrsData
     uint32_t size[4];
     uint32_t info[4];
     float    params[4];
+    float    params2[4];
 };
 
 const uint32_t kMaxFrames = 4;
@@ -195,6 +196,7 @@ bool vrs_prepare(uint64_t address)
     d.params[1] = 0.25f * clampf(settings.motion, 0.0f, 10.0f);
     d.params[2] = 0.01f;
     d.params[3] = settings.keep_curved ? 2e-6f : 0.0f; // 1/z off a plane across a tile, relative
+    d.params2[0] = clampf(settings.glossy_below, 0.0f, 1.0f);
     memcpy(gCb[F->frameIndex]->pCpuMappedAddress, &d, sizeof d);
     F->rateImage = gImage;
     F->rateCopy = gCopy;
@@ -206,10 +208,10 @@ bool vrs_prepare(uint64_t address)
 void vrs_run(uint64_t address)
 {
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
-    if (!gReady || !F || F->rateImage != gImage || !gImage || !F->depth || !F->previous || !F->motion || !F->exposure)
+    if (!gReady || !F || F->rateImage != gImage || !gImage || !F->depth || !F->previous || !F->motion || !F->exposure || !F->gloss)
         return;
     Cmd*           cmd = F->cmd;
-    DescriptorData p[8] = {};
+    DescriptorData p[9] = {};
     p[0].mIndex = SRT_RES_IDX(VrsSrt, PerFrame, gVrs);
     p[0].ppBuffers = &gCb[F->frameIndex];
     p[1].mIndex = SRT_RES_IDX(VrsSrt, PerFrame, gPrevious);
@@ -226,7 +228,9 @@ void vrs_run(uint64_t address)
     p[6].ppTextures = &gCopy;
     p[7].mIndex = SRT_RES_IDX(VrsSrt, PerFrame, gPre);
     p[7].ppTextures = &gPre;
-    updateDescriptorSet(gRenderer, F->frameIndex, gSet, 8, p);
+    p[8].mIndex = SRT_RES_IDX(VrsSrt, PerFrame, gGloss);
+    p[8].ppTextures = &F->gloss->pTexture;
+    updateDescriptorSet(gRenderer, F->frameIndex, gSet, 9, p);
 
     cmdBeginDebugMarker(cmd, 1.0f, 0.5f, 0.2f, "Renderer VRS rates");
     if (gImageState != RESOURCE_STATE_UNORDERED_ACCESS)

@@ -92,3 +92,7 @@
 #define SAMPLE_COUNT 1
 #include "Adapt.comp.fsl"
 #end
+
+#frag renderer_gloss.frag
+#include "Gloss.frag.fsl"
+#end
