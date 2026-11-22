@@ -8,6 +8,8 @@
 #include "mathx.h"
 #include "scene.h"
 
+#include <stdio.h>
+
 #include <Common_3/Graphics/Interfaces/IGraphics.h>
 #include <Common_3/Resources/ResourceLoader/Interfaces/IResourceLoader.h>
 #include <Common_3/Resources/ResourceLoader/ThirdParty/OpenSource/tinyimageformat/tinyimageformat_query.h>
@@ -536,6 +538,76 @@ void barrierBuf(Cmd* cmd, Buffer* buf, ResourceState from, ResourceState to)
 }
 } // namespace
 
+// GPU timings (the gpu_timings knob): a timestamp pair per pass, read back framesInFlight frames later
+// (that frame's fence has passed by then, so nothing waits), averaged and logged every 10 s.
+namespace
+{
+enum Timing : uint32_t { kTimeShadows, kTimeProbes, kTimePrepass, kTimeCompute, kTimeForward, kTimeExposure, kTimeTaa, kTimeTotal, kTimings };
+const char* const kTimingNames[kTimings] = { "shadows", "probes", "prepass", "culling+ao+contact", "forward", "exposure", "taa", "total" };
+QueryPool*        gTimePool[kMaxFrames];
+uint32_t          gTimeUsed[kMaxFrames]; // bits: what that frame recorded
+double            gTimeTicks;            // per second
+double            gTimeSum[kTimings], gTimeMax[kTimings];
+uint32_t          gTimeCount[kTimings];
+double            gTimeLogged;
+
+void timeBegin(Cmd* cmd, uint32_t fi, uint32_t t)
+{
+    if (!gTimePool[fi])
+        return;
+    QueryDesc d = { t };
+    cmdBeginQuery(cmd, gTimePool[fi], &d);
+    gTimeUsed[fi] |= 1u << t;
+}
+void timeEnd(Cmd* cmd, uint32_t fi, uint32_t t)
+{
+    if (!gTimePool[fi] || !(gTimeUsed[fi] & (1u << t)))
+        return;
+    QueryDesc d = { t };
+    cmdEndQuery(cmd, gTimePool[fi], &d);
+}
+// At the start of a frame's recording: what this slot measured last time, then a fresh start.
+void timeFrame(Cmd* cmd, uint32_t fi, bool on, const char* scene)
+{
+    if (!on || !gTimePool[fi])
+    {
+        gTimeUsed[fi] = 0;
+        return;
+    }
+    for (uint32_t t = 0; t < kTimings; ++t)
+    {
+        if (!(gTimeUsed[fi] & (1u << t)))
+            continue;
+        QueryData q = {};
+        getQueryData(gRenderer, gTimePool[fi], t, &q);
+        if (q.mEndTimestamp <= q.mBeginTimestamp)
+            continue;
+        double ms = (double)(q.mEndTimestamp - q.mBeginTimestamp) * 1000.0 / gTimeTicks;
+        gTimeSum[t] += ms;
+        gTimeMax[t] = ms > gTimeMax[t] ? ms : gTimeMax[t];
+        gTimeCount[t]++;
+    }
+    cmdResetQuery(cmd, gTimePool[fi], 0, kTimings);
+    gTimeUsed[fi] = 0;
+    double now = yea::host()->time();
+    if (now - gTimeLogged >= 10.0 && gTimeCount[kTimeTotal])
+    {
+        char line[512];
+        int  n = snprintf(line, sizeof line, "gpu ms avg/max over %u frames:", gTimeCount[kTimeTotal]);
+        for (uint32_t t = 0; t < kTimings && n < (int)sizeof line - 40; ++t)
+            if (gTimeCount[t])
+                n += snprintf(line + n, sizeof line - n, " %s %.3f/%.3f", kTimingNames[t], gTimeSum[t] / gTimeCount[t], gTimeMax[t]);
+        snprintf(line + n, sizeof line - n, " | %s", scene);
+        yea::log(line);
+        memset(gTimeSum, 0, sizeof gTimeSum);
+        memset(gTimeMax, 0, sizeof gTimeMax);
+        memset(gTimeCount, 0, sizeof gTimeCount);
+        gTimeLogged = now;
+    }
+}
+
+} // namespace
+
 int load(int reloaded)
 {
     const YeaHost* host = yea::host();
@@ -543,6 +615,16 @@ int load(int reloaded)
     gRenderer = (Renderer*)host->renderer;
     gQueue = (Queue*)host->queue;
     gFrames = host->framesInFlight < kMaxFrames ? host->framesInFlight : kMaxFrames;
+    getTimestampFrequency(gQueue, &gTimeTicks);
+    for (uint32_t i = 0; i < gFrames && gTimeTicks > 0; ++i)
+    {
+        QueryPoolDesc qd = {};
+        qd.pName = "renderer_timings";
+        qd.mType = QUERY_TYPE_TIMESTAMP;
+        qd.mQueryCount = kTimings;
+        initQueryPool(gRenderer, &qd, &gTimePool[i]);
+        gTimeUsed[i] = 0;
+    }
 
     gForwardDepthShader = loadShader("renderer_forward.vert", nullptr, nullptr);
     gForwardShader = loadShader("renderer_forward.vert", "renderer_forward.frag", nullptr);
@@ -672,6 +754,9 @@ void unload()
     if (!gRenderer)
         return;
     waitQueueIdle(gQueue);
+    for (uint32_t i = 0; i < gFrames; ++i)
+        if (gTimePool[i])
+            exitQueryPool(gRenderer, gTimePool[i]), gTimePool[i] = nullptr;
     destroyScenePipelines();
     freePipeline(gCompositePipe);
     freePipeline(gAdaptPipe);
@@ -1272,6 +1357,14 @@ void draw(uint32_t pass, const YeaFrame* yf)
     }
 
     // --- Record -----------------------------------------------------------------------------
+    {
+        char scene[160];
+        snprintf(scene, sizeof scene, "%ux%u x%u, %u lights, %u instances drawn, %u casters", w, h, samples, F.lightCount, count, casterTotal);
+        timeFrame(cmd, fi, settings.gpu_timings, scene);
+    }
+    const bool timed = settings.gpu_timings;
+    if (timed)
+        timeBegin(cmd, fi, kTimeTotal);
     if (gExposureState != RESOURCE_STATE_SHADER_RESOURCE)
     {
         barrierBuf(cmd, gExposure, gExposureState, RESOURCE_STATE_SHADER_RESOURCE);
@@ -1279,14 +1372,26 @@ void draw(uint32_t pass, const YeaFrame* yf)
     }
 
     if (shadows)
+    {
+        if (timed)
+            timeBegin(cmd, fi, kTimeShadows);
         renderer_shadows::shadows_render((uint64_t)(uintptr_t)&F);
+        timeEnd(cmd, fi, kTimeShadows);
+    }
     if (probes)
+    {
+        if (timed)
+            timeBegin(cmd, fi, kTimeProbes);
         renderer_probes::probes_render((uint64_t)(uintptr_t)&F);
+        timeEnd(cmd, fi, kTimeProbes);
+    }
 
     bool geometry = gVertexBuf && gIndexBuf && count > 0;
     if (gDepthState != RESOURCE_STATE_DEPTH_WRITE)
         barrierRt(cmd, gDepth, gDepthState, RESOURCE_STATE_DEPTH_WRITE);
     BindRenderTargetsDesc bind = {};
+    if (timed && !viewMode)
+        timeBegin(cmd, fi, kTimePrepass);
     if (!viewMode)
     {
     cmdBeginDebugMarker(cmd, 0.4f, 0.6f, 1.0f, "Renderer depth prepass");
@@ -1306,8 +1411,11 @@ void draw(uint32_t pass, const YeaFrame* yf)
     cmdEndDebugMarker(cmd);
     }
 
+    timeEnd(cmd, fi, kTimePrepass);
     if (culled || ao || contact)
     {
+        if (timed)
+            timeBegin(cmd, fi, kTimeCompute);
         barrierRt(cmd, gDepth, RESOURCE_STATE_DEPTH_WRITE, RESOURCE_STATE_SHADER_RESOURCE);
         if (culled)
             renderer_culling::cull_run((uint64_t)(uintptr_t)&F);
@@ -1316,7 +1424,11 @@ void draw(uint32_t pass, const YeaFrame* yf)
         if (contact)
             renderer_contact::contact_run((uint64_t)(uintptr_t)&F);
         barrierRt(cmd, gDepth, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_DEPTH_WRITE);
+        timeEnd(cmd, fi, kTimeCompute);
     }
+
+    if (timed)
+        timeBegin(cmd, fi, kTimeForward);
 
     cmdBeginDebugMarker(cmd, 1.0f, 0.8f, 0.3f, "Renderer forward");
     barrierRt(cmd, gHdr, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_RENDER_TARGET);
@@ -1360,11 +1472,14 @@ void draw(uint32_t pass, const YeaFrame* yf)
         barrierRt(cmd, gMotion, RESOURCE_STATE_RENDER_TARGET, RESOURCE_STATE_SHADER_RESOURCE);
     gDepthState = RESOURCE_STATE_DEPTH_WRITE;
     cmdEndDebugMarker(cmd);
+    timeEnd(cmd, fi, kTimeForward);
 
     // Auto exposure: histogram, then the adapted exposure. Held still in a view mode, so it doesn't
     // adapt to the wireframe or overdraw image and is where it was when the mode ends.
     if (!viewMode)
     {
+        if (timed)
+            timeBegin(cmd, fi, kTimeExposure);
         barrierBuf(cmd, gExposure, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
         cmdBindPipeline(cmd, gHistogramPipe);
         cmdBindDescriptorSet(cmd, fi, gExposureSet);
@@ -1374,14 +1489,22 @@ void draw(uint32_t pass, const YeaFrame* yf)
         cmdBindDescriptorSet(cmd, fi, gExposureSet);
         cmdDispatch(cmd, 1, 1, 1);
         barrierBuf(cmd, gExposure, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE);
+        timeEnd(cmd, fi, kTimeExposure);
     }
 
     if (taa)
     {
+        if (timed)
+            timeBegin(cmd, fi, kTimeTaa);
         barrierRt(cmd, gDepth, RESOURCE_STATE_DEPTH_WRITE, RESOURCE_STATE_SHADER_RESOURCE);
         gDepthState = RESOURCE_STATE_SHADER_RESOURCE;
         renderer_taa::taa_resolve((uint64_t)(uintptr_t)&F);
+        timeEnd(cmd, fi, kTimeTaa);
     }
+    timeEnd(cmd, fi, kTimeTotal);
+    for (uint32_t t = 0; t < kTimings; ++t)
+        if (gTimeUsed[fi] & (1u << t))
+            cmdResolveQuery(cmd, gTimePool[fi], t, 1);
 
     // Nothing is left bound (every pass above unbinds); YEA_PASS_WORLD composites.
     gRenderedFrame = yea::host()->frame();
