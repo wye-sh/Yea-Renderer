@@ -79,7 +79,11 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   (`screen_colors`), fully lit with every shadow; elsewhere it is shaded at the hit: emission, the sun and up to
   64 local lights (the core's light buffer now holds the lights outside the view after the visible ones,
   `allLightCount`), at most 8 shadow rays per hit (`shadow_rays`), sky ambient. A miss sees the sky. The forward
-  pass blends it over the probes, fading out over the roughness limit's last third. Every GPU object is freed
+  pass blends it over the probes, fading out over the roughness limit's last third. With `half_resolution` (on),
+  one pixel of each 2x2 block is traced (a different one each frame, for TAA to gather) into a half-size texture,
+  and a full-size upsample fills every pixel from the four nearest samples weighted by distance, depth and normal
+  match; pixels smoother than `full_below` (0.15: mirrors) and pixels no sample matches are traced in the upsample
+  itself, so mirrors are exactly as at full resolution. Every GPU object is freed
   in `unload()` (device-loss recovery unloads modules); nothing GPU-side is in tables.
 - The core calls the others through optional imports with a `RenderFrame*` (as `u64`): `frame.h`, copied
   identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes`, `renderer_ssr`, `renderer_vrs` and `renderer_rt` (`mathx.h` into the
@@ -125,7 +129,7 @@ multi_bounce, show_ao. `renderer_contact`: enabled, length, thickness, steps, in
 show_contact. `renderer_probes`: enabled, resolution (64-512), updates_per_frame, intensity, blend, parallax.
 `renderer_ssr`: enabled, half_resolution, max_roughness, thickness, max_distance, steps, edge_fade, intensity,
 show_hits (tints where reflections were found). `renderer_vrs`: enabled, aggressiveness, motion (0), keep_curved, glossy_below, allow_4x4,
-show_rates (green half rate, blue 2x2, magenta coarser). `renderer_rt`: enabled, max_roughness, screen_colors,
+show_rates (green half rate, blue 2x2, magenta coarser). `renderer_rt`: enabled, max_roughness, half_resolution, full_below, screen_colors,
 shadow_rays, max_distance, show_hits (green: hit seen on screen, blue: lit at the hit, grey: sky).
 
 ## Reset
@@ -143,7 +147,8 @@ depth copy for screen reflections (their march, up to `steps` plus 4 depth reads
 glossy pixels with reflections on, and shows in its timing), per re-captured probe 6 scene draws at half its
 resolution plus 6 small passes per mip, sun cascades redrawn, at most `updates_per_frame` local lights redrawn (oldest shadow first), two
 exposure dispatches, with ray-traced reflections (instead of the SSR depth copy and march) one top-level
-rebuild and one full-size trace dispatch (a closest-hit ray per glossy pixel, plus up to 9 shadow rays where
+rebuild and one trace dispatch (a closest-hit ray per glossy pixel; with half_resolution a quarter of them plus a
+full-size upsample that traces only mirror-like pixels, plus up to 9 shadow rays where
 the hit isn't on screen), one full-screen TAA resolve (when on), one full-screen composite. No per-frame allocation. GPU memory at the defaults:
 HDR + depth at 4x MSAA, sun atlas 4096² D32 (64 MB), local atlas 4096² (64 MB), a screen-size R32F depth copy
 for screen reflections (a quarter of it at half resolution).

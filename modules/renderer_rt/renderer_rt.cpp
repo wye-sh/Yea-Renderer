@@ -46,11 +46,13 @@ Queue*               gQueue;
 uint32_t             gFrames;
 const YeaRaytracing* gService;
 Raytracing*          gRay;
-Shader*              gShader;
-Pipeline*            gPipe;
-DescriptorSet*       gSet;
+enum { kTraceFull, kTraceHalf, kUpsample, kShaders };
+Shader*              gShader[kShaders];
+Pipeline*            gPipe[kShaders];
+DescriptorSet*       gSet; // two per frame in flight: the trace (full or half) and the upsample
 Buffer*              gCb[kMaxFrames];
-Texture*             gTex; // SHADER_RESOURCE between frames
+Texture*             gTex;  // SHADER_RESOURCE between frames
+Texture*             gHalf; // the half-resolution trace (a quarter of the pixels), SHADER_RESOURCE between frames
 uint32_t             gWidth, gHeight;
 bool                 gReady;
 
@@ -79,12 +81,15 @@ void freeTexture()
 {
     if (gTex)
         removeResource(gTex);
-    gTex = nullptr;
+    if (gHalf)
+        removeResource(gHalf);
+    gTex = gHalf = nullptr;
     gWidth = gHeight = 0;
 }
 
-void createTexture(uint32_t w, uint32_t h)
+Texture* makeTexture(uint32_t w, uint32_t h, const char* name)
 {
+    Texture*    t = nullptr;
     TextureDesc d = {};
     d.mWidth = w;
     d.mHeight = h;
@@ -93,12 +98,21 @@ void createTexture(uint32_t w, uint32_t h)
     d.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT; // RWTex2D(half4) is rgba16f on Vulkan
     d.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
     d.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
-    d.pName = "renderer_rt_reflection";
+    d.pName = name;
     TextureLoadDesc l = {};
     l.pDesc = &d;
-    l.ppTexture = &gTex;
+    l.ppTexture = &t;
     addResource(&l, nullptr);
     waitForAllResourceLoads();
+    return t;
+}
+
+void createTexture(uint32_t w, uint32_t h)
+{
+    gTex = makeTexture(w, h, "renderer_rt_reflection");
+    gHalf = makeTexture((w + 1) / 2, (h + 1) / 2, "renderer_rt_half");
+    if (!gTex || !gHalf)
+        freeTexture();
     gWidth = w;
     gHeight = h;
 }
@@ -235,22 +249,28 @@ int load(int reloaded)
         gRay = nullptr;
         return 0;
     }
-    ShaderLoadDesc sd = {};
-    sd.mComp.pFileName = "renderer_rt_trace.comp";
-    addShader(gRenderer, &sd, &gShader);
-    if (!gShader)
-        return 1;
-    PipelineDesc desc = {};
-    desc.mType = PIPELINE_TYPE_COMPUTE;
-    PIPELINE_LAYOUT_DESC(desc, NULL, SRT_LAYOUT_DESC(RtSrt, PerFrame), NULL, NULL);
-    desc.mComputeDesc.pShaderProgram = gShader;
-    desc.pName = "renderer_rt_trace";
-    addPipeline(gRenderer, &desc, &gPipe);
-    DescriptorSetDesc setDesc = SRT_SET_DESC(RtSrt, PerFrame, gFrames, 0);
+    const char* names[kShaders] = { "renderer_rt_trace.comp", "renderer_rt_trace_half.comp", "renderer_rt_upsample.comp" };
+    for (uint32_t k = 0; k < kShaders; ++k)
+    {
+        ShaderLoadDesc sd = {};
+        sd.mComp.pFileName = names[k];
+        addShader(gRenderer, &sd, &gShader[k]);
+        if (!gShader[k])
+            return 1;
+        PipelineDesc desc = {};
+        desc.mType = PIPELINE_TYPE_COMPUTE;
+        PIPELINE_LAYOUT_DESC(desc, NULL, SRT_LAYOUT_DESC(RtSrt, PerFrame), NULL, NULL);
+        desc.mComputeDesc.pShaderProgram = gShader[k];
+        desc.pName = "renderer_rt_trace";
+        addPipeline(gRenderer, &desc, &gPipe[k]);
+        if (!gPipe[k])
+            return 1;
+    }
+    DescriptorSetDesc setDesc = SRT_SET_DESC(RtSrt, PerFrame, gFrames * 2, 0);
     addDescriptorSet(gRenderer, &setDesc, &gSet);
     for (uint32_t i = 0; i < gFrames; ++i)
         gCb[i] = makeMapped(sizeof(RtData) < 256 ? 256 : (sizeof(RtData) + 255) / 256 * 256, 0, DESCRIPTOR_TYPE_UNIFORM_BUFFER, "renderer_rt_cb");
-    gReady = gPipe && gSet;
+    gReady = gSet != nullptr;
     yea::log(gReady ? "renderer_rt: ray-traced reflections on" : "renderer_rt: the trace pipeline failed");
     return gReady ? 0 : 1;
 }
@@ -278,10 +298,13 @@ void unload()
     }
     if (gSet)
         removeDescriptorSet(gRenderer, gSet);
-    if (gPipe)
-        removePipeline(gRenderer, gPipe);
-    if (gShader)
-        removeShader(gRenderer, gShader);
+    for (uint32_t k = 0; k < kShaders; ++k)
+    {
+        if (gPipe[k])
+            removePipeline(gRenderer, gPipe[k]);
+        if (gShader[k])
+            removeShader(gRenderer, gShader[k]);
+    }
     exitRaytracing(gRenderer, gRay);
     gRay = nullptr;
 }
@@ -347,6 +370,7 @@ bool rt_prepare(uint64_t address)
     d.counts[3] = F->drawableCount;
     d.params[0] = settings.max_distance < 1 ? 1 : settings.max_distance;
     d.params[1] = 0.05f;
+    d.params[2] = settings.half_resolution ? (settings.full_below < 0 ? 0 : settings.full_below) : 0.0f;
     memcpy(gCb[F->frameIndex]->pCpuMappedAddress, &d, sizeof d);
 
     F->rtReflection = gTex;
@@ -451,7 +475,9 @@ void rt_run(uint64_t address)
     Buffer*        indices = F->indices;
     Texture*       previous = F->previous->pTexture;
     Buffer*        exposure = F->exposure;
-    DescriptorData p[13] = {};
+    bool           half = settings.half_resolution && gHalf;
+    Texture*       halfTex = gHalf;
+    DescriptorData p[14] = {};
     p[0].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gScene);
     p[0].ppAccelerationStructures = &gTlas[fi];
     p[1].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gRt);
@@ -474,17 +500,39 @@ void rt_run(uint64_t address)
     p[9].ppBuffers = &vertices;
     p[10].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gIndices);
     p[10].ppBuffers = &indices;
-    p[11].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gOut);
-    p[11].ppTextures = &gTex;
     p[12].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gExposure);
     p[12].ppBuffers = &exposure;
-    updateDescriptorSet(gRenderer, fi, gSet, 13, p);
-
-    barrier(cmd, gTex, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
-    cmdBindPipeline(cmd, gPipe);
-    cmdBindDescriptorSet(cmd, fi, gSet);
-    cmdDispatch(cmd, (F->width + 7) / 8, (F->height + 7) / 8, 1);
-    barrier(cmd, gTex, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE);
+    p[11].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gOut);
+    p[13].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gHalfIn);
+    p[13].ppTextures = &halfTex; // read only by the upsample
+    if (half)
+    {
+        // A quarter of the pixels traced into gHalf, then every pixel filled from it (mirror-like ones traced).
+        p[11].ppTextures = &gHalf;
+        updateDescriptorSet(gRenderer, fi * 2, gSet, 14, p);
+        p[11].ppTextures = &gTex;
+        updateDescriptorSet(gRenderer, fi * 2 + 1, gSet, 14, p);
+        barrier(cmd, gHalf, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
+        cmdBindPipeline(cmd, gPipe[kTraceHalf]);
+        cmdBindDescriptorSet(cmd, fi * 2, gSet);
+        cmdDispatch(cmd, ((F->width + 1) / 2 + 7) / 8, ((F->height + 1) / 2 + 7) / 8, 1);
+        barrier(cmd, gHalf, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE);
+        barrier(cmd, gTex, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
+        cmdBindPipeline(cmd, gPipe[kUpsample]);
+        cmdBindDescriptorSet(cmd, fi * 2 + 1, gSet);
+        cmdDispatch(cmd, (F->width + 7) / 8, (F->height + 7) / 8, 1);
+        barrier(cmd, gTex, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE);
+    }
+    else
+    {
+        p[11].ppTextures = &gTex;
+        updateDescriptorSet(gRenderer, fi * 2, gSet, 14, p);
+        barrier(cmd, gTex, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
+        cmdBindPipeline(cmd, gPipe[kTraceFull]);
+        cmdBindDescriptorSet(cmd, fi * 2, gSet);
+        cmdDispatch(cmd, (F->width + 7) / 8, (F->height + 7) / 8, 1);
+        barrier(cmd, gTex, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE);
+    }
     cmdEndDebugMarker(cmd);
 }
 } // namespace renderer_rt

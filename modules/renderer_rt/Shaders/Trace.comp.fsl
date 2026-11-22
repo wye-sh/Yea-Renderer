@@ -21,7 +21,8 @@ STRUCT(RtData)
     DATA(float4, skyHorizon, None);
     DATA(float4, skyGround, None);
     DATA(uint4, counts, None);       // x lights, y frame (noise), z flags, w instances
-    DATA(float4, params, None);      // x max distance (m), y edge fade (fraction of the screen)
+    DATA(float4, params, None);      // x max distance (m), y edge fade (fraction of the screen), z roughness below
+                                     // which pixels are traced at full resolution with half_resolution on
 };
 
 STRUCT(InstanceData)
@@ -174,23 +175,16 @@ float4 clipOf(float4 rows[4], float3 W)
     return float4(dot(rows[0], w), dot(rows[1], w), dot(rows[2], w), dot(rows[3], w));
 }
 
-ROOT_SIGNATURE(ComputeRootSignature)
-NUM_THREADS(8, 8, 1)
-void CS_MAIN(SV_DispatchThreadID(uint3) id)
+// What pixel p's reflected ray sees: rgb, a its distance (0: not traced, RT_MISS: the sky). halfPass skips
+// pixels smoother than the full-resolution threshold: the upsample traces those itself.
+float4 tracePixel(int2 p, bool halfPass)
 {
-    INIT_MAIN;
-    int2 size = int2(gRt.screen.xy);
-    int2 p = int2(id.xy);
-    if (p.x >= size.x || p.y >= size.y)
-        RETURN();
+    int2   size = int2(gRt.screen.xy);
     float4 surface = LoadTex2D(gSurface, NO_SAMPLER, p, 0);
     float  d = LoadTex2D(gDepth, NO_SAMPLER, p, 0).r;
     float  rough = surface.x;
-    if (d <= 0.0 || rough >= gRt.camPos.w)
-    {
-        Write2D(gOut, p, float4(0.0, 0.0, 0.0, 0.0));
-        RETURN();
-    }
+    if (d <= 0.0 || rough >= gRt.camPos.w || (halfPass && rough < gRt.params.z))
+        return float4(0.0, 0.0, 0.0, 0.0);
 
     // The pixel's world position, from depth (reversed-Z, infinite far), undoing the TAA jitter it was drawn with.
     float  z = gRt.forward.w / d;
@@ -230,8 +224,7 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
     if (!RayQueryIsHit(hit))
     {
         float3 sky = skyRadiance(R) * gRt.sunColor.w;
-        Write2D(gOut, p, float4(debug ? float3(0.5, 0.5, 0.5) : sky, RT_MISS));
-        RETURN();
+        return float4(debug ? float3(0.5, 0.5, 0.5) : sky, RT_MISS);
     }
     float  t = RayQueryRayT(hit);
     uint   index = RayQueryInstanceID(hit);
@@ -285,6 +278,79 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
     }
     if (debug)
         color = float3(0.0, screenWeight, 1.0 - screenWeight);
-    Write2D(gOut, p, float4(color, max(t, 1e-3)));
+    return float4(color, max(t, 1e-3));
+}
+
+// Half resolution: each 2 x 2 block traces one pixel, a different one each frame (TAA gathers them).
+int2 blockOffset()
+{
+    uint k = gRt.counts.y % 4u;
+    return int2(k == 1u || k == 2u ? 1 : 0, k == 1u || k == 3u ? 1 : 0);
+}
+
+#if defined(TRACE_UPSAMPLE)
+// A full-resolution pixel from the four nearest half-resolution samples, each weighted by how close it lies
+// and by how well its depth and normal match this pixel's, so reflections don't bleed across edges or
+// creases. Mirror-like pixels (below the threshold), and pixels no sample matches, are traced here.
+float4 upsample(int2 p)
+{
+    int2   size = int2(gRt.screen.xy);
+    float4 surface = LoadTex2D(gSurface, NO_SAMPLER, p, 0);
+    float  d = LoadTex2D(gDepth, NO_SAMPLER, p, 0).r;
+    if (d <= 0.0 || surface.x >= gRt.camPos.w)
+        return float4(0.0, 0.0, 0.0, 0.0);
+    if (surface.x < gRt.params.z)
+        return tracePixel(p, false);
+    int2   o = blockOffset();
+    int2   halfSize = (size + int2(1, 1)) / 2;
+    int2   base = (p - o) >> 1;
+    float2 f = float2(p - o) * 0.5 - float2(base);
+    float  zp = gRt.forward.w / d;
+    float3 Np = normalize(surface.yzw);
+    float4 sum = float4(0.0, 0.0, 0.0, 0.0);
+    float  wsum = 0.0;
+    for (uint i = 0u; i < 4u; ++i)
+    {
+        int2   dq = int2(int(i & 1u), int(i >> 1u));
+        int2   q = clamp(base + dq, int2(0, 0), halfSize - int2(1, 1));
+        float4 v = LoadTex2D(gHalfIn, NO_SAMPLER, q, 0);
+        if (v.a <= 0.0)
+            continue;
+        int2   s = min(q * 2 + o, size - int2(1, 1));
+        float  zs = gRt.forward.w / max(LoadTex2D(gDepth, NO_SAMPLER, s, 0).r, 1e-7);
+        float3 Ns = normalize(LoadTex2D(gSurface, NO_SAMPLER, s, 0).yzw);
+        float  bx = dq.x == 1 ? f.x : 1.0 - f.x;
+        float  by = dq.y == 1 ? f.y : 1.0 - f.y;
+        float  w = (bx * by + 0.05) * saturate(1.0 - abs(zs - zp) / (0.02 * zp + 0.02)) * pow(saturate(dot(Ns, Np)), 32.0);
+        sum += v * w;
+        wsum += w;
+    }
+    if (wsum < 0.02)
+        return tracePixel(p, false);
+    return sum / wsum;
+}
+#endif
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) id)
+{
+    INIT_MAIN;
+    int2 size = int2(gRt.screen.xy);
+#if defined(TRACE_HALF)
+    int2 hp = int2(id.xy);
+    if (hp.x >= (size.x + 1) / 2 || hp.y >= (size.y + 1) / 2)
+        RETURN();
+    Write2D(gOut, hp, tracePixel(min(hp * 2 + blockOffset(), size - int2(1, 1)), true));
+#else
+    int2 p = int2(id.xy);
+    if (p.x >= size.x || p.y >= size.y)
+        RETURN();
+#if defined(TRACE_UPSAMPLE)
+    Write2D(gOut, p, upsample(p));
+#else
+    Write2D(gOut, p, tracePixel(p, false));
+#endif
+#endif
     RETURN();
 }

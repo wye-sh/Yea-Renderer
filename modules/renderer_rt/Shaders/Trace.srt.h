@@ -14,6 +14,7 @@ BEGIN_SRT(RtSrt)
         DECL_BUFFER(PerFrame, Buffer(uint), gVertices)
         DECL_BUFFER(PerFrame, Buffer(uint), gIndices)
         DECL_BUFFER(PerFrame, Buffer(float), gExposure)
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gHalfIn) // the half-resolution trace, for the upsample
         DECL_RWTEXTURE(PerFrame, RWTex2D(half4), gOut)
     END_SRT_SET(PerFrame)
 END_SRT(RtSrt)
