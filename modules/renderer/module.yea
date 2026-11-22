@@ -123,7 +123,10 @@ setting float exposure_ev 0
 setting bool auto_exposure true
 setting float manual_ev100 9
 setting float adapt_speed 1.5 0 inf
-setting int tonemapper 0 0 3
+# How the bright HDR image is fitted to the screen. Khronos PBR Neutral keeps material colours true; AgX rolls
+# bright, saturated light (coloured lamps, the sun) towards white as film does; Hable Filmic is the Uncharted 2
+# curve; Reinhard compresses brightness alone; None clips.
+setting choice tonemapper Khronos_PBR_Neutral Khronos_PBR_Neutral AgX Hable_Filmic Reinhard None
 category Anti-aliasing
 setting int msaa 4 1 8
 setting float specular_aa 1 0 2

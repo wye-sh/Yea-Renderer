@@ -124,8 +124,8 @@ materials, instances and lights once (when `instance_count()` is 0), then move w
 
 ## Knobs
 
-`renderer`: exposure_ev, auto_exposure, manual_ev100, adapt_speed, tonemapper (0 PBR Neutral, 1 filmic,
-2 Reinhard, 3 none), msaa (1/2/4/8), specular_aa, sky/horizon/ground colours, sky_luminance, ambient,
+`renderer`: exposure_ev, auto_exposure, manual_ev100, adapt_speed, tonemapper (a choice: Khronos_PBR_Neutral,
+AgX (our own constants, in Composite.frag.fsl), Hable_Filmic, Reinhard, None; the shader's mode is its index), msaa (1/2/4/8), specular_aa, sky/horizon/ground colours, sky_luminance, ambient,
 sun_disk (degrees), near_plane, gpu_timings (logs each pass's GPU time every 10 s: avg/max ms). `renderer_culling`: enabled, max_lights, tile_size (8/16/32), z_bins,
 heatmap. `renderer_shadows`: enabled (the sun's), cascades, shadow_distance, cascade_split, sun_resolution, softness,
 filter_taps, pcss, sun_size, normal_bias, slope_bias, receiver_plane, light_shadows, shadowed_lights, local_atlas_resolution,

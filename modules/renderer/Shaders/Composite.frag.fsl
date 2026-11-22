@@ -1,6 +1,6 @@
 // Exposure and tonemapping per MSAA sample, then the average: edges against bright lights stay
-// smooth. Tonemappers: Khronos PBR Neutral (from its specification), Hable's filmic curve,
-// Reinhard on luminance, or none. After TAA, an optional contrast-limited sharpen of the tonemapped
+// smooth. Tonemappers (renderer's tonemapper choice, in its order): Khronos PBR Neutral (from its
+// specification), AgX (our own: below), Hable's filmic curve, Reinhard on luminance, or none. After TAA, an optional contrast-limited sharpen of the tonemapped
 // image (never fed back into TAA's history).
 STRUCT(CompositeData)
 {
@@ -46,14 +46,47 @@ float3 hableCurve(float3 x)
     return ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F;
 }
 
+// AgX (Sobotka's method, our own constants): the colour is read as weights of primaries pulled in towards white
+// (Rec.709's, 15/10/15 % closer to D65 and turned 2/-1/-3 degrees about it, then the RGB-to-RGB matrix
+// from them), so bright saturated light desaturates as it brightens instead of clipping to a
+// pure hue; then log2 exposure from 10 stops under to 6.5 over middle grey into 0..1, an S-curve through middle
+// grey (slope 2.4, soft shoulder and toe), the inverse matrix back to Rec.709, and the curve's display gamma (2.2)
+// undone, since sRGB encoding follows.
+#define AGX_MIN_EV -12.47
+#define AGX_MAX_EV 4.03
+float agxCurve(float x)
+{
+    const float x0 = (-2.4739312 - AGX_MIN_EV) / (AGX_MAX_EV - AGX_MIN_EV); // log2(0.18)
+    const float y0 = 0.45865;                                                  // 0.18 ^ (1 / 2.2)
+    const float slope = 2.4;
+    float d = (x - x0) * slope;
+    float limit = d > 0.0 ? 1.0 - y0 : y0;
+    float r = abs(d) / limit;
+    return y0 + d / pow(1.0 + r * r * r, 1.0 / 3.0);
+}
+
+float3 agx(float3 c)
+{
+    float3 v = float3(dot(c, float3(0.949810, 0.053343, -0.003153)), dot(c, float3(0.047125, 0.859473, 0.093402)),
+                      dot(c, float3(0.026100, 0.031170, 0.942730)));
+    v = (log2(max(v, float3(1e-10, 1e-10, 1e-10))) - AGX_MIN_EV) / (AGX_MAX_EV - AGX_MIN_EV);
+    v = saturate(v);
+    v = float3(agxCurve(v.x), agxCurve(v.y), agxCurve(v.z));
+    v = float3(dot(v, float3(1.055835, -0.065894, 0.010060)), dot(v, float3(-0.054913, 1.171127, -0.116214)),
+               dot(v, float3(-0.027416, -0.036897, 1.064313)));
+    return pow(saturate(v), float3(2.2, 2.2, 2.2));
+}
+
 float3 tonemap(float3 c, uint mode)
 {
     c = max(c, float3(0.0, 0.0, 0.0));
     if (mode == 0u)
         return pbrNeutral(c);
     if (mode == 1u)
-        return hableCurve(c * 2.0) / hableCurve(float3(11.2, 11.2, 11.2));
+        return agx(c);
     if (mode == 2u)
+        return hableCurve(c * 2.0) / hableCurve(float3(11.2, 11.2, 11.2));
+    if (mode == 3u)
     {
         float l = dot(c, float3(0.2126, 0.7152, 0.0722));
         float w2 = 16.0;
