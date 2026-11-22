@@ -19,9 +19,10 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   Sampling (in the core's Lighting.h.fsl): every filter tap compares against the receiver's own depth
   there (receiver-plane bias: the surface's tangent plane carried into the view's ndc by the first three
   columns of its inverse, `inv` in the shadow view, three dot products; no screen derivatives, as lights are
-  shaded in loops), so the normal offset can stay small. Point and spot lights harden at contact (PCSS: 4 filtered
-  compares on the search disk's rim first decide fully lit or umbra; only penumbrae gather 32 depths (8 gathers) for
-  the blockers' distance, giving a penumbra from `light_size`; keep divides out of the rim, which every pixel runs). With TAA, cascade transitions
+  shaded in loops), so the normal offset can stay small. Point and spot lights harden at contact (PCSS: 4 gathers on
+  the search disk's rim first, 16 depths that decide fully lit or umbra; only penumbrae gather 4 more, the 32
+  depths averaged raw and turned into the blockers' distance with one divide, giving a penumbra from `light_size`;
+  keep divides out of the rim, which every pixel runs). With TAA, cascade transitions
   pick one cascade per pixel (dithered) and the filters' noise turns each frame.
 - `renderer_taa`: temporal antialiasing. Picks a Halton sub-pixel jitter each frame; the core then renders
   at one sample (TAA replaces `msaa`) with a motion vector target (RG16F, from last frame's instance rows and
