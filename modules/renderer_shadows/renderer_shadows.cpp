@@ -721,6 +721,8 @@ bool shadows_prepare(uint64_t address)
     F->showCascades = (settings.show_cascades ? 1u : 0u) | (settings.show_atlas ? 2u : 0u);
     F->sunTexel = 1.0f / (float)gSunSize;
     F->localTexel = 1.0f / (float)gLocalSize;
+    F->localLightSize = settings.contact_hardening ? settings.light_size : 0.0f;
+    F->receiverPlane = settings.receiver_plane;
     return true;
 }
 

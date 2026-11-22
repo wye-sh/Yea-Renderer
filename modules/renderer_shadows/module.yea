@@ -14,8 +14,11 @@ setting float softness 1.5 0 inf
 setting int filter_taps 16 4 32
 setting bool pcss false
 setting float sun_size 0.5 0.05 5
-setting float normal_bias 1.5 0 inf
+setting float normal_bias 0.5 0 inf
 setting float slope_bias 2 0 inf
+# Tilts each filter tap's depth test along the surface (sun and lights): fewer speckles and dark rings
+# on sloped and curved surfaces, with soft shadows most.
+setting bool receiver_plane true
 setting bool show_cascades false
 category Light Shadows
 setting bool light_shadows true
@@ -23,4 +26,8 @@ setting int shadowed_lights 24 0 32
 setting int local_atlas_resolution 4096 1024 8192
 setting int updates_per_frame 8 1 32
 setting int max_tile_resolution 1024 128 2048
+# Light shadows sharp where an object meets what it stands on, softer further away, as from a light
+# with this radius (metres).
+setting bool contact_hardening true
+setting float light_size 0.06 0 inf
 setting bool show_atlas false

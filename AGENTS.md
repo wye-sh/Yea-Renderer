@@ -15,6 +15,11 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   (6 tiles per point light), redrawn only when the light or a nearby caster moves. Tiles are squares of
   128 to max_tile_resolution px, sized to the light's reach on screen and halved, largest first, until
   all fit 90% of the atlas; a light changes size only when its wanted size doubles or halves.
+  Sampling (in the core's Lighting.h.fsl): every filter tap compares against the receiver's own depth
+  there (receiver-plane bias, from two points on the surface's tangent plane, as lights are shaded in
+  loops where screen derivatives are invalid), so the normal offset can stay small. Point and spot lights
+  harden at contact (PCSS: 8-tap blocker search, penumbra from `light_size`). With TAA, cascade transitions
+  pick one cascade per pixel (dithered) and the filters' noise turns each frame.
 - `renderer_taa`: temporal antialiasing. Picks a Halton sub-pixel jitter each frame; the core then renders
   at one sample (TAA replaces `msaa`) with a motion vector target (RG16F, from last frame's instance rows and
   camera); the resolve reprojects two ping-pong RGBA16F histories (Catmull-Rom), clips them to the 3x3
@@ -93,8 +98,8 @@ materials, instances and lights once (when `instance_count()` is 0), then move w
 2 Reinhard, 3 none), msaa (1/2/4/8), specular_aa, sky/horizon/ground colours, sky_luminance, ambient,
 sun_disk (degrees), near_plane, gpu_timings (logs each pass's GPU time every 10 s: avg/max ms). `renderer_culling`: enabled, max_lights, tile_size (8/16/32), z_bins,
 heatmap. `renderer_shadows`: enabled (the sun's), cascades, shadow_distance, cascade_split, sun_resolution, softness,
-filter_taps, pcss, sun_size, normal_bias, slope_bias, light_shadows, shadowed_lights, local_atlas_resolution,
-updates_per_frame, max_tile_resolution, show_cascades, show_atlas (the light shadow atlas, top right). `renderer_taa`: enabled, history_weight, clamp_width, sharpen, jitter,
+filter_taps, pcss, sun_size, normal_bias, slope_bias, receiver_plane, light_shadows, shadowed_lights, local_atlas_resolution,
+updates_per_frame, max_tile_resolution, contact_hardening, light_size (m), show_cascades, show_atlas (the light shadow atlas, top right). `renderer_taa`: enabled, history_weight, clamp_width, sharpen, jitter,
 jitter_phases. `renderer_ao`: enabled, half_resolution (GTAO and its blur at half size, then a depth-aware upsample), radius, intensity, falloff, slices, steps, denoise, specular_occlusion,
 multi_bounce, show_ao. `renderer_contact`: enabled, length, thickness, steps, intensity, max_distance,
 show_contact. `renderer_probes`: enabled, resolution (64-512), updates_per_frame, intensity, blend, parallax.

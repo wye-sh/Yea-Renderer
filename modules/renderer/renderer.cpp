@@ -74,7 +74,8 @@ struct ExposureData
 };
 
 const uint32_t kFlagCulled = 1, kFlagHeatmap = 2, kFlagCascades = 4, kFlagShadows = 8, kFlagAo = 16, kFlagAoDebug = 32, kFlagContact = 64,
-               kFlagContactDebug = 128, kFlagUnlit = 256, kFlagSsr = 512, kFlagSsrDebug = 1024;
+               kFlagContactDebug = 128, kFlagUnlit = 256, kFlagSsr = 512, kFlagSsrDebug = 1024,
+               kFlagReceiverPlane = 2048;
 const uint32_t kMaxFrames = 4;
 const uint32_t kMaxUnculledLights = 256;
 const uint32_t kHistogramBins = 128;
@@ -1301,7 +1302,8 @@ void draw(uint32_t pass, const YeaFrame* yf)
                     (shadows && (F.showCascades & 1) ? kFlagCascades : 0) | (shadows ? kFlagShadows : 0) | (ao ? kFlagAo : 0) |
                     (ao && F.aoDebug ? kFlagAoDebug : 0) | (contact ? kFlagContact : 0) |
                     (contact && F.contactDebug ? kFlagContactDebug : 0) |
-                    ((viewMode & YEA_VIEW_WIREFRAME) ? kFlagUnlit : 0) | (ssr ? kFlagSsr : 0) | (ssr && F.ssrDebug ? kFlagSsrDebug : 0);
+                    ((viewMode & YEA_VIEW_WIREFRAME) ? kFlagUnlit : 0) | (ssr ? kFlagSsr : 0) | (ssr && F.ssrDebug ? kFlagSsrDebug : 0) |
+                    (shadows && F.receiverPlane ? kFlagReceiverPlane : 0);
     if (ssr)
     {
         gf->ssr[0] = F.ssrMaxRoughness;
@@ -1347,7 +1349,10 @@ void draw(uint32_t pass, const YeaFrame* yf)
         gf->shadow[3] = F.normalBias;
         gf->shadow2[0] = F.sunTexel;
         gf->shadow2[1] = F.localTexel;
+        gf->shadow2[3] = F.localLightSize;
     }
+    // With TAA the shadow filters' noise turns each frame and cascade transitions are dithered: TAA averages both.
+    gf->shadow2[2] = taa && !viewMode ? (float)(F.frameNumber % 64u) : -1.0f;
 
     // One copy per buffer into the mapped memory.
     uint32_t visibleTotal = 0;

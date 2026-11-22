@@ -27,7 +27,8 @@ STRUCT(FrameData)
     DATA(float4, misc, None);         // x bin scale, y specular AA, z sun disk size (cos), w heatmap scale
     DATA(float4, cascadeEnd, None);   // view depth where each cascade ends
     DATA(float4, shadow, None);       // x cascades, y softness (texels), z sun size (PCSS, 0 off), w normal bias (texels)
-    DATA(float4, shadow2, None);      // x 1/sun atlas, y 1/local atlas
+    DATA(float4, shadow2, None);      // x 1/sun atlas, y 1/local atlas, z frame (0..63) with TAA else -1,
+                                      // w local lights' radius (m) for contact-hardening, 0 off
     DATA(float4, viewProjNoJitter[4], None); // rows, this frame without the TAA jitter
     DATA(float4, prevViewProj[4], None);     // rows, last frame without jitter
     DATA(float4, aoParams, None);            // x specular occlusion, y multi-bounce on
@@ -57,6 +58,7 @@ STRUCT(ProbeData)
 #define FLAG_UNLIT    256u // F1's Wireframe: each line in its material's own colour
 #define FLAG_SSR      512u
 #define FLAG_SSR_DEBUG 1024u
+#define FLAG_RECEIVER_PLANE 2048u
 
 STRUCT(InstanceData)
 {

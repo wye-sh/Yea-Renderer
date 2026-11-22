@@ -10,7 +10,7 @@ struct Buffer;
 struct RenderTarget;
 struct Texture;
 
-#define RENDER_FRAME_VERSION 8u
+#define RENDER_FRAME_VERSION 9u
 #define RENDER_MAX_CASCADES  4u
 #define RENDER_VIEW_SHIFT    20u // shadow instance stream entry: instance | view << 20
 
@@ -137,6 +137,8 @@ struct RenderFrame
     uint32_t      showCascades; // bit 0: tint the cascades; bit 1: show the light shadow atlas
     float         sunTexel;     // 1 / sun atlas size
     float         localTexel;   // 1 / local atlas size
+    float         localLightSize; // point and spot lights' radius (m) for contact-hardening, 0: plain PCF
+    uint32_t      receiverPlane;  // tilt each PCF tap's depth compare with the receiver's plane
 
     // TAA (renderer_taa). taa_prepare runs first, with only the fields above the camera set: it sets
     // jitter, taaOn, sharpen and resolved, and the core then renders at one sample with motion vectors.
