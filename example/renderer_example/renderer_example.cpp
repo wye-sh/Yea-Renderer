@@ -309,7 +309,8 @@ void update(uint32_t phase, float dt)
         build(s);
     else if (renderer_probes::probe_count() == 0)
         addProbes(); // renderer_probes came up after the scene was built: its import was a stub then
-    s->t += dt;
+    if (!settings.benchmark_view)
+        s->t += dt; // Benchmark View holds the lights and shapes still, so timings repeat
     syncLights(s);
     animate(s);
     moveCamera(s, dt);

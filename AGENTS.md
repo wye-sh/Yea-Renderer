@@ -202,4 +202,5 @@ asks the host for the mouse each frame (`yea::captureMouse(true)`: hidden, kept 
 The host lets go when the button is up (it is no longer asked), F1 opens, focus is lost, or on a view switch
 or Reset. Reset: lights and camera
 back to the start. `benchmark_view` holds the camera at its start view (field of view 55) without moving the
-user's own, so GPU Timings compare between versions. Exports `picture` (a fixed angle).
+user's own, and holds the lights and shapes still, so GPU Timings compare between versions; the project's
+`modules/test_renderer_bench` (a test on the user's machine) drives it. Exports `picture` (a fixed angle).
