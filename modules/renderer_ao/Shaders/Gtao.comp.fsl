@@ -27,13 +27,15 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
 {
     INIT_MAIN;
     int2 size = int2(gAo.screen.xy);
-    int2 p = int2(id.xy);
-    if (p.x >= size.x || p.y >= size.y)
+    int2 op = int2(id.xy); // the texel written
+    int2 outSize = aoSize();
+    if (op.x >= outSize.x || op.y >= outSize.y)
         RETURN();
+    int2  p = min(op * aoScale(), size - int2(1, 1)); // the full-size pixel it stands for
     float d = DEPTH_AT(p);
     if (d <= 0.0)
     {
-        Write2D(gOut, p, 1.0); // sky
+        Write2D(gOut, op, 1.0); // sky
         RETURN();
     }
     int2   last = size - int2(1, 1);
@@ -52,7 +54,7 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
     float screenRadius = min(gAo.proj.w * gAo.proj.x * 0.5 * gAo.screen.x / P.z, gAo.params.w);
     if (screenRadius < 1.0)
     {
-        Write2D(gOut, p, 1.0);
+        Write2D(gOut, op, 1.0);
         RETURN();
     }
     // Interleaved gradient noise (Jimenez 2014), offset per frame when TAA averages it.
@@ -109,6 +111,6 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
         visibility += projLen * (arc0 + arc1);
     }
     visibility = saturate(visibility / float(slices));
-    Write2D(gOut, p, pow(visibility, gAo.params.z));
+    Write2D(gOut, op, pow(visibility, gAo.params.z));
     RETURN();
 }

@@ -68,7 +68,7 @@ sun_disk (degrees), near_plane, gpu_timings (logs each pass's GPU time every 10 
 heatmap. `renderer_shadows`: enabled (the sun's), cascades, shadow_distance, cascade_split, sun_resolution, softness,
 filter_taps, pcss, sun_size, normal_bias, slope_bias, light_shadows, shadowed_lights, local_atlas_resolution,
 updates_per_frame, show_cascades, show_atlas (the light shadow atlas, top right). `renderer_taa`: enabled, history_weight, clamp_width, sharpen, jitter,
-jitter_phases. `renderer_ao`: enabled, radius, intensity, falloff, slices, steps, denoise, specular_occlusion,
+jitter_phases. `renderer_ao`: enabled, half_resolution (GTAO and its blur at half size, then a depth-aware upsample), radius, intensity, falloff, slices, steps, denoise, specular_occlusion,
 multi_bounce, show_ao. `renderer_contact`: enabled, length, thickness, steps, intensity, max_distance,
 show_contact. `renderer_probes`: enabled, resolution (64-512), updates_per_frame, intensity, blend, parallax.
 
@@ -80,7 +80,7 @@ builds it again. GPU objects and shadow caches are rebuilt on load.
 ## Cost
 
 Per frame: one depth prepass and one forward pass (draws grouped by mesh, instanced), one culling
-dispatch per 16 px tile, a GTAO dispatch and `denoise` blur dispatches, one contact shadow dispatch (all full size), per re-captured probe 6 scene draws at half its
+dispatch per 16 px tile, a GTAO dispatch and `denoise` blur dispatches (at half size with half_resolution, plus a full-size upsample), one contact shadow dispatch (all full size), per re-captured probe 6 scene draws at half its
 resolution plus 6 small passes per mip, sun cascades redrawn, at most `updates_per_frame` local lights redrawn (oldest shadow first), two
 exposure dispatches, one full-screen TAA resolve (when on), one full-screen composite. No per-frame allocation. GPU memory at the defaults:
 HDR + depth at 4x MSAA, sun atlas 4096² D32 (64 MB), local atlas 4096² (64 MB).

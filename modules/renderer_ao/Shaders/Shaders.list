@@ -53,3 +53,27 @@
 #define PI_AO 3.14159265
 #include "Denoise.comp.fsl"
 #end
+
+#comp renderer_ao_upsample_1.comp
+#define SAMPLE_COUNT 1
+#define PI_AO 3.14159265
+#include "Upsample.comp.fsl"
+#end
+
+#comp renderer_ao_upsample_2.comp
+#define SAMPLE_COUNT 2
+#define PI_AO 3.14159265
+#include "Upsample.comp.fsl"
+#end
+
+#comp renderer_ao_upsample_4.comp
+#define SAMPLE_COUNT 4
+#define PI_AO 3.14159265
+#include "Upsample.comp.fsl"
+#end
+
+#comp renderer_ao_upsample_8.comp
+#define SAMPLE_COUNT 8
+#define PI_AO 3.14159265
+#include "Upsample.comp.fsl"
+#end

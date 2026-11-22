@@ -1,0 +1,49 @@
+// Half-size occlusion to full size: per pixel, the four nearest half-size texels, bilinear weights
+// times how close each one's depth is to the pixel's (so occlusion never bleeds across an edge); when
+// none is close, the closest in depth.
+#include "AoCommon.h.fsl"
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) id)
+{
+    INIT_MAIN;
+    int2 size = int2(gAo.screen.xy);
+    int2 p = int2(id.xy);
+    if (p.x >= size.x || p.y >= size.y)
+        RETURN();
+    float d = DEPTH_AT(p);
+    if (d <= 0.0)
+    {
+        Write2D(gOut, p, 1.0); // sky
+        RETURN();
+    }
+    float  z = viewDepth(d);
+    int2   last = aoSize() - int2(1, 1);
+    int2   full = size - int2(1, 1);
+    int2   base = p / 2;
+    float2 f = float2(p - base * 2) * 0.5;
+    float  sum = 0.0;
+    float  total = 0.0;
+    float  best = 1e30;
+    float  nearest = 1.0;
+    for (int j = 0; j < 2; ++j)
+    {
+        for (int i = 0; i < 2; ++i)
+        {
+            int2  q = min(base + int2(i, j), last);
+            float a = LoadTex2D(gIn, NO_SAMPLER, q, 0).r;
+            float dz = abs(viewDepth(DEPTH_AT(min(q * 2, full))) - z);
+            float w = (i == 0 ? 1.0 - f.x : f.x) * (j == 0 ? 1.0 - f.y : f.y) * saturate(1.0 - dz / (z * 0.03));
+            sum += a * w;
+            total += w;
+            if (dz < best)
+            {
+                best = dz;
+                nearest = a;
+            }
+        }
+    }
+    Write2D(gOut, p, total > 1e-4 ? sum / total : nearest);
+    RETURN();
+}

@@ -1,6 +1,6 @@
 // Ambient occlusion for the renderer core: GTAO from the depth prepass (Shaders/Gtao.comp.fsl), then
-// `denoise` passes of a depth-aware 3x3 blur, into a full-size R32F visibility texture the forward pass
-// reads for its ambient light (diffuse with multi-bounce, specular with specular occlusion).
+// `denoise` passes of a depth-aware 3x3 blur, at full or half size (then a depth-aware upsample), into a
+// full-size R32F visibility texture the forward pass reads for its ambient light (diffuse with multi-bounce, specular with specular occlusion).
 #include "yea_renderer_ao.h"
 #include "frame.h"
 
@@ -26,19 +26,22 @@ struct AoData
 };
 
 const uint32_t kMaxFrames = 4;
-const uint32_t kSetsPerFrame = 2; // 0: read B, write A (GTAO, and blurs back into A); 1: read A, write B
+const uint32_t kSetsPerFrame = 3; // 0: read B, write A (GTAO, and blurs back into A); 1: read A, write B; 2: upsample
 
 Renderer*      gRenderer;
 Queue*         gQueue;
 uint32_t       gFrames;
 Shader*        gGtaoShader[4];
 Shader*        gBlurShader[4];
+Shader*        gUpShader[4];
 Pipeline*      gGtaoPipe[4];
 Pipeline*      gBlurPipe[4];
+Pipeline*      gUpPipe[4];
 DescriptorSet* gSet;
 Buffer*        gCb[kMaxFrames];
-Texture*       gTex[2]; // A, B: SHADER_RESOURCE between passes
-uint32_t       gWidth, gHeight;
+Texture*       gTex[2]; // A, B (at the occlusion's own size): SHADER_RESOURCE between passes
+Texture*       gFull;   // the upsampled result, at half size only
+uint32_t       gWidth, gHeight, gScale; // the screen's size; 1 full size, 2 half
 uint32_t       gPasses; // denoise passes this frame
 bool           gReady;
 
@@ -54,16 +57,23 @@ void freeTextures()
             removeResource(t);
             t = nullptr;
         }
-    gWidth = gHeight = 0;
+    if (gFull)
+        removeResource(gFull);
+    gFull = nullptr;
+    gWidth = gHeight = gScale = 0;
 }
 
-void createTextures(uint32_t w, uint32_t h)
+Texture* output() { return gScale == 2 ? gFull : gTex[gPasses & 1]; } // each denoise pass swaps A and B
+
+void createTextures(uint32_t w, uint32_t h, uint32_t scale)
 {
-    for (Texture*& t : gTex)
+    Texture** all[3] = { &gTex[0], &gTex[1], &gFull };
+    for (uint32_t i = 0; i < (scale == 2 ? 3u : 2u); ++i)
     {
+        Texture*&   t = *all[i];
         TextureDesc d = {};
-        d.mWidth = w;
-        d.mHeight = h;
+        d.mWidth = i < 2 ? (w + scale - 1) / scale : w;
+        d.mHeight = i < 2 ? (h + scale - 1) / scale : h;
         d.mDepth = d.mArraySize = d.mMipLevels = 1;
         d.mSampleCount = SAMPLE_COUNT_1;
         d.mFormat = TinyImageFormat_R32_SFLOAT; // RWTex2D(float) is r32f on Vulkan
@@ -78,6 +88,7 @@ void createTextures(uint32_t w, uint32_t h)
     waitForAllResourceLoads();
     gWidth = w;
     gHeight = h;
+    gScale = scale;
 }
 
 void barrier(Cmd* cmd, Texture* t, ResourceState from, ResourceState to)
@@ -120,14 +131,18 @@ int load(int reloaded)
     const char* gtao[4] = { "renderer_gtao_1.comp", "renderer_gtao_2.comp", "renderer_gtao_4.comp", "renderer_gtao_8.comp" };
     const char* blur[4] = { "renderer_ao_denoise_1.comp", "renderer_ao_denoise_2.comp", "renderer_ao_denoise_4.comp",
                             "renderer_ao_denoise_8.comp" };
+    const char* up[4] = { "renderer_ao_upsample_1.comp", "renderer_ao_upsample_2.comp", "renderer_ao_upsample_4.comp",
+                          "renderer_ao_upsample_8.comp" };
     for (int i = 0; i < 4; ++i)
     {
         gGtaoShader[i] = loadCompute(gtao[i]);
         gBlurShader[i] = loadCompute(blur[i]);
-        if (!gGtaoShader[i] || !gBlurShader[i])
+        gUpShader[i] = loadCompute(up[i]);
+        if (!gGtaoShader[i] || !gBlurShader[i] || !gUpShader[i])
             return 1;
         gGtaoPipe[i] = computePipeline(gGtaoShader[i], "renderer_gtao");
         gBlurPipe[i] = computePipeline(gBlurShader[i], "renderer_ao_denoise");
+        gUpPipe[i] = computePipeline(gUpShader[i], "renderer_ao_upsample");
     }
     DescriptorSetDesc setDesc = SRT_SET_DESC(GtaoSrt, PerFrame, gFrames * kSetsPerFrame, 0);
     addDescriptorSet(gRenderer, &setDesc, &gSet);
@@ -169,6 +184,10 @@ void unload()
             removeShader(gRenderer, gGtaoShader[i]);
         if (gBlurShader[i])
             removeShader(gRenderer, gBlurShader[i]);
+        if (gUpPipe[i])
+            removePipeline(gRenderer, gUpPipe[i]);
+        if (gUpShader[i])
+            removeShader(gRenderer, gUpShader[i]);
     }
 }
 
@@ -182,13 +201,14 @@ bool ao_prepare(uint64_t address)
         return false;
     if (yea::viewMode()) // F1's Wireframe or Overdraw: stand aside so they read right
         return false;
-    if (F->width != gWidth || F->height != gHeight)
+    uint32_t scale = settings.half_resolution ? 2 : 1;
+    if (F->width != gWidth || F->height != gHeight || scale != gScale)
     {
         waitQueueIdle(gQueue);
         freeTextures();
-        createTextures(F->width, F->height);
+        createTextures(F->width, F->height, scale);
     }
-    if (!gTex[0] || !gTex[1])
+    if (!gTex[0] || !gTex[1] || (gScale == 2 && !gFull))
         return false;
 
     gPasses = clampu(settings.denoise, 0, 3);
@@ -210,9 +230,10 @@ bool ao_prepare(uint64_t address)
     d.counts[0] = clampu(settings.slices, 1, 4);
     d.counts[1] = clampu(settings.steps, 2, 12);
     d.counts[2] = F->taaOn ? (uint32_t)(F->frameNumber % 64) : 0; // TAA averages the noise over frames
+    d.counts[3] = gScale;
     memcpy(gCb[F->frameIndex]->pCpuMappedAddress, &d, sizeof d);
 
-    F->ao = gTex[gPasses & 1]; // each pass swaps A and B
+    F->ao = output();
     F->aoOn = 1;
     F->aoSpecular = settings.specular_occlusion < 0 ? 0 : (settings.specular_occlusion > 1 ? 1 : settings.specular_occlusion);
     F->aoMultiBounce = settings.multi_bounce;
@@ -223,15 +244,16 @@ bool ao_prepare(uint64_t address)
 void ao_run(uint64_t address)
 {
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
-    if (!gReady || !F || F->ao != gTex[gPasses & 1] || !F->depth)
+    if (!gReady || !F || F->ao != output() || !F->depth)
         return;
     Cmd*     cmd = F->cmd;
     uint32_t fi = F->frameIndex, s = sampleIndex(F->sampleCount);
-    uint32_t gx = (F->width + 7) / 8, gy = (F->height + 7) / 8;
-    for (uint32_t k = 0; k < kSetsPerFrame; ++k)
+    uint32_t aw = (F->width + gScale - 1) / gScale, ah = (F->height + gScale - 1) / gScale;
+    uint32_t gx = (aw + 7) / 8, gy = (ah + 7) / 8;
+    for (uint32_t k = 0; k < (gScale == 2 ? 3u : 2u); ++k)
     {
-        Texture*       in = gTex[k ^ 1];
-        Texture*       out = gTex[k];
+        Texture*       in = k == 2 ? gTex[gPasses & 1] : gTex[k ^ 1];
+        Texture*       out = k == 2 ? gFull : gTex[k];
         DescriptorData p[4] = {};
         p[0].mIndex = SRT_RES_IDX(GtaoSrt, PerFrame, gAo);
         p[0].ppBuffers = &gCb[fi];
@@ -242,8 +264,6 @@ void ao_run(uint64_t address)
         p[3].mIndex = SRT_RES_IDX(GtaoSrt, PerFrame, gOut);
         p[3].ppTextures = &out;
         updateDescriptorSet(gRenderer, fi * kSetsPerFrame + k, gSet, 4, p);
-        if (k == 0 && !gPasses)
-            break;
     }
 
     cmdBeginDebugMarker(cmd, 0.6f, 0.6f, 0.6f, "Renderer ambient occlusion");
@@ -261,6 +281,14 @@ void ao_run(uint64_t address)
         cmdBindDescriptorSet(cmd, fi * kSetsPerFrame + k, gSet);
         cmdDispatch(cmd, gx, gy, 1);
         barrier(cmd, out, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE);
+    }
+    if (gScale == 2)
+    {
+        barrier(cmd, gFull, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
+        cmdBindPipeline(cmd, gUpPipe[s]);
+        cmdBindDescriptorSet(cmd, fi * kSetsPerFrame + 2, gSet);
+        cmdDispatch(cmd, (F->width + 7) / 8, (F->height + 7) / 8, 1);
+        barrier(cmd, gFull, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE);
     }
     cmdEndDebugMarker(cmd);
 }

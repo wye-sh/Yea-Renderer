@@ -4,12 +4,17 @@ STRUCT(AoData)
     DATA(float4, proj, None);   // x P00, y P11, z near, w radius (m)
     DATA(float4, params, None); // x falloff start (m), y 1 / falloff range, z intensity, w max radius (px)
     DATA(float4, screen, None); // xy size, zw jitter (px)
-    DATA(uint4, counts, None);  // x slices, y steps, z frame (noise), w 0
+    DATA(uint4, counts, None);  // x slices, y steps, z frame (noise), w scale: 1 full size, 2 half
 };
 
 #include "Gtao.srt.h"
 
 float viewDepth(float d) { return gAo.proj.z / max(d, 1e-7); } // reversed-Z, infinite far
+
+// The occlusion's own size: the screen's, or half of it (each texel then stands for the full-size
+// pixel at texel * scale).
+int  aoScale() { return int(gAo.counts.w); }
+int2 aoSize() { return (int2(gAo.screen.xy) + int2(aoScale() - 1, aoScale() - 1)) / aoScale(); }
 
 #if SAMPLE_COUNT > 1
 #define DEPTH_AT(q) LoadTex2DMS(gDepth, NO_SAMPLER, q, 0).r
