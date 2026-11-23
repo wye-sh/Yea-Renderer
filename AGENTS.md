@@ -143,6 +143,19 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   `max_roughness` (`gTiles`, flag sets double-buffered so no thread reads a flag another rewrites); the resolve skips
   the rest and writes their zeros only when the history there isn't zero already. Every GPU object is freed
   in `unload()` (device-loss recovery unloads modules); nothing GPU-side is in tables.
+  Ray-traced shadows (`shadows`, on; `traced_lights`, 4): `rt_pick` takes the sun and up to `traced_lights` visible
+  casting lights, area lights first (their PCSS costs most, and rays give their real shape), needing TAA and no debug
+  view. After the top-level build, `Shaders/Shadows.comp.fsl`'s three full-size passes, each over every traced shadow
+  (dispatch z, layers of 2D arrays matched to last frame's by light id): a trace (one any-hit ray a pixel, mask 2, to a
+  sample on the real shape: the sun's disc, a point or spot light's sphere of its own size or rtLightRadius, a rect's
+  or disc's surface, a sphere, a tube along its axis and across its radius; PCG hash per pixel plus R2 over frames;
+  from the pixel's unjittered position, as reflections, else grazing floors shadowed themselves), a temporal pass
+  (reprojected by motion, view-depth test, clamped to the 5x5 rays' mean ± 1.5σ, restarting at 4 when clamped; up to 32
+  frames, but 2 a pixel of penumbra width with at least 8, so sharp edges don't trail), and a filter (5x5 taps spread
+  over half the penumbra predicted from the averaged blocker distance, at most 8 px, plane and normal weighted) into
+  `rtShadows`. Checked on the tiny scene against a reference accumulated from one unclamped, unfiltered ray a frame for
+  hundreds of frames: mean error 0.2-0.4% (sun, point), 0.8-0.9% for a rect, disc, sphere or tube light; moving, against
+  32 rays a frame, about a third of the trailing that 32 frames everywhere left.
 - `renderer_sky`: the physical sky (Hillaire 2020, UE's sky atmosphere), on by default (physical_sky; off: the core's
   Sky gradient knobs). Earth's Rayleigh, Mie (haze) and ozone (Hillaire's table 1, each scaled by a knob) over a 6360 km
   planet to 6460 km; the scene's ground is y = 0, metres. `sky_prepare` (core, right after the sun is set, before
@@ -356,8 +369,8 @@ intensity, max_distance, show_contact. `renderer_probes`: enabled, resolution (6
 show_hits (tints where reflections were found). `renderer_vrs`: enabled, aggressiveness, motion (0), keep_curved, glossy_below, allow_4x4,
 show_rates (green half rate, blue 2x2, magenta coarser). `renderer_rt`: enabled, max_roughness, half_resolution, full_below, screen_colors,
 reflected_shadows (Scene, Rays, Off), history_frames, brightest, max_distance, show_hits (green: hit seen on screen, blue: lit at the hit, grey: sky),
-probe_rays (temporary: 0 off; traces 1 sun ray plus k-1 local-light rays per pixel and discards them, to measure ray-traced
-shadows' cost on the user's GPU; remove once measured).
+probe_rays (temporary: 0 off; traces 1 sun ray plus k-1 local-light rays per pixel and discards them; retire it with a major
+version), shadows (ray-traced shadows), traced_lights (0-8, besides the sun).
 `renderer_fog`: fog, density, height_falloff, base_height, albedo, anisotropy, quality (Low, Medium, High), range,
 temporal. Its exports: `fog_volume_add(shape, center, half_size)` (0 box, 1 ellipsoid; density 0.1, white, softness
 0.25), `fog_volume_place`, `fog_volume_medium(v, density, albedo, softness)`, `fog_volume_remove`, `fog_volume_clear`.
@@ -365,7 +378,7 @@ temporal. Its exports: `fog_volume_add(shape, center, half_size)` (0 box, 1 elli
 lod_quality, cast_shadows, double_sided.
 Players of a released game tune (`player` lines): upscaler, quality_mode, dlss_model, exposure_ev (brightness), lod_error,
 TAA's sharpen, shadows' sun_resolution, shadow_distance, pcss and light_shadows, and enabled for AO, contact shadows, SSR,
-ray-traced reflections and VRS, with half_resolution for AO, SSR and ray-traced reflections, probes' resolution, and
+ray-traced reflections, ray-traced shadows and VRS, with half_resolution for AO, SSR and ray-traced reflections, probes' resolution, and
 fog with its quality.
 Debug views and show_ knobs never. renderer_rt's `enabled` needs `raytracing` and renderer_vrs' `shadingrate` (hidden and
 false without them); each still returns from `load()` before touching its service when that is nullptr, as `load()` runs
@@ -406,7 +419,11 @@ resolution plus 6 small passes per mip, sun cascades whose view or casters chang
 exposure dispatches, with ray-traced reflections (instead of the SSR depth copy and march) one top-level
 rebuild, a trace dispatch (a closest-hit ray per glossy pixel, a quarter of them with half_resolution except
 mirror-like ones; where the hit isn't on screen a shadow map lookup per lit light with a map, a ray for the sun and for mapless casters), with half_resolution a
-full-size reconstruction (nine rays reused per glossy pixel) a full-size resolve (temporal accumulation; tiles with no glossy pixel cost a read or two) and a full-size filter (up to 25 taps per glossy pixel, a write elsewhere), one full-screen TAA resolve (when on; with an upscaler, its dispatch at the display size and a one-thread
+full-size reconstruction (nine rays reused per glossy pixel) a full-size resolve (temporal accumulation; tiles with no glossy pixel cost a read or two) and a full-size filter (up to 25 taps per glossy pixel, a write elsewhere), with ray-traced shadows (the top-level rebuild
+too, if reflections are off) three full-size dispatches per traced shadow (one any-hit ray a pixel, a 25-read temporal
+pass, a filter of up to 25 taps in penumbrae only), and screen-size arrays of 1 + traced_lights layers (RG16F, 2x RGBA16F,
+R16F: 22 bytes a pixel a layer, plus 8 for two R32F depths: about 410 MB at 2560x1356 with the default 4, remade when
+traced_lights or the size changes), one full-screen TAA resolve (when on; with an upscaler, its dispatch at the display size and a one-thread
 exposure copy instead, every scene pass then at the render size), one full-screen composite. With fog on, two
 dispatches: one thread per froxel (240 x 135 x 128 at 1080p on High: 4.1 M, each a cascade compare and its z-bin's lights
 with a compare each) and one per column, plus 3 RGBA16F froxel volumes (about 33 MB at 1080p on High, 17 MB on Medium),

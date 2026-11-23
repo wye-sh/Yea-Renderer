@@ -30,3 +30,18 @@
 #define PROBE_PASS
 #include "Trace.comp.fsl"
 #end
+
+#comp FT_RAYTRACING renderer_rt_shadow_trace.comp
+#define SHADOW_TRACE
+#include "Shadows.comp.fsl"
+#end
+
+#comp FT_RAYTRACING renderer_rt_shadow_temporal.comp
+#define SHADOW_TEMPORAL
+#include "Shadows.comp.fsl"
+#end
+
+#comp FT_RAYTRACING renderer_rt_shadow_filter.comp
+#define SHADOW_FILTER
+#include "Shadows.comp.fsl"
+#end

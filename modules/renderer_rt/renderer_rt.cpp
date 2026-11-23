@@ -16,6 +16,7 @@
 #include <Common_3/Resources/ResourceLoader/Interfaces/IResourceLoader.h>
 #include <Common_3/Graphics/FSL/defaults.h>
 #include "Shaders/Trace.srt.h"
+#include "Shaders/Shadows.srt.h"
 
 #include <math.h>
 #include <string.h>
@@ -41,6 +42,14 @@ struct RtData
     float    sky[4]; // x 1: renderer_sky's physical sky, y its image's mips
     uint32_t probe[4]; // TEMPORARY (probe_rays)
     float    fogMedium[4], fogAlbedo[4]; // frame.h's height fog
+};
+
+// Shaders/ShadowData.h.fsl
+struct ShadowData
+{
+    float    right[4], up[4], forward[4], camPos[4], screen[4], sunDir[4], params[4];
+    uint32_t misc[4];
+    uint32_t slots[9][4];
 };
 
 struct Blas
@@ -97,6 +106,30 @@ Buffer*              gNoSkySh; // and its SH
 RenderTarget*        gDummyAtlas;  // as the core's gDummyDepth: a depth render target, 2 x 2
 DescriptorSet*       gPersistent;  // the sampler's set
 Buffer*              gDummyViews;
+
+// Ray-traced shadows (Shaders/Shadows.comp.fsl): the sun's and up to RENDER_RT_MAX_TRACED lights', each a layer of
+// the arrays below (in this frame's pick order), and of rtShadows (0 the sun, 1 + n traced light n).
+const uint32_t kShadowLayers = 1 + RENDER_RT_MAX_TRACED;
+const uint32_t kNoLight = 0xFFFFFFFFu, kSunId = 0xFFFFFFFEu;
+enum { kShadowTrace, kShadowTemporal, kShadowFilter, kShadowShaders };
+Shader*        gShShader[kShadowShaders];
+Pipeline*      gShPipe[kShadowShaders];
+DescriptorSet* gShSet; // three per frame in flight, a pass each
+Buffer*        gShCb[kMaxFrames];
+Buffer*        gNoShapes; // bound while the core has no shape buffer (every light kind 0)
+// All SHADER_RESOURCE between frames.
+Texture*       gShRaw;      // RG16F array: this frame's rays (lit, blocker distance)
+Texture*       gShHist[2];  // RGBA16F arrays: accumulated (visibility, blocker distance, samples); alternating
+Texture*       gShZ[2];     // R32F: the view depth they were for
+Texture*       gRtShadows;  // R16F array: rtShadows
+uint32_t       gShWidth, gShHeight, gShLayers; // the arrays' size: layers the sun and traced_lights
+uint32_t       gShIndex;    // the history written last
+uint64_t       gShFrame;    // the frame it was written (0: none)
+uint32_t       gShIds[kShadowLayers];  // the light (id; kSunId the sun) whose history each layer of it holds
+uint32_t       gShIdCount;
+// This frame's pick (rt_pick): per shadow, its light in the GPU light buffer (kNoLight the sun) and its id.
+uint32_t       gPickLight[kShadowLayers], gPickId[kShadowLayers], gPickCount;
+uint64_t       gPickFrame;
 
 Blas gBlas[kMaxMeshes];
 // Bottom-level structures replaced while frames in flight may still trace them: freed once those are done.
@@ -156,6 +189,60 @@ Texture* makeTexture(uint32_t w, uint32_t h, const char* name, TinyImageFormat f
     addResource(&l, nullptr);
     waitForAllResourceLoads();
     return t;
+}
+
+Texture* makeArray(uint32_t w, uint32_t h, uint32_t layers, TinyImageFormat format, const char* name)
+{
+    Texture*    t = nullptr;
+    TextureDesc d = {};
+    d.mWidth = w;
+    d.mHeight = h;
+    d.mDepth = d.mMipLevels = 1;
+    d.mArraySize = layers;
+    d.mSampleCount = SAMPLE_COUNT_1;
+    d.mFormat = format;
+    d.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+    d.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+    d.pName = name;
+    TextureLoadDesc l = {};
+    l.pDesc = &d;
+    l.ppTexture = &t;
+    addResource(&l, nullptr);
+    waitForAllResourceLoads();
+    return t;
+}
+
+void freeShadowTextures()
+{
+    Texture** all[6] = { &gShRaw, &gShHist[0], &gShHist[1], &gShZ[0], &gShZ[1], &gRtShadows };
+    for (Texture** t : all)
+    {
+        if (*t)
+            removeResource(*t);
+        *t = nullptr;
+    }
+    gShWidth = gShHeight = gShLayers = 0;
+    gShFrame = 0;
+    gShIdCount = 0;
+}
+
+// Formats as the shaders' views: RWTex2DArray(half2) is rg16f on Vulkan, half4 rgba16f, half r16f; RWTex2D(float) r32f.
+void createShadowTextures(uint32_t w, uint32_t h, uint32_t layers)
+{
+    gShRaw = makeArray(w, h, layers, TinyImageFormat_R16G16_SFLOAT, "renderer_rt_shadow_rays");
+    gShHist[0] = makeArray(w, h, layers, TinyImageFormat_R16G16B16A16_SFLOAT, "renderer_rt_shadow_history");
+    gShHist[1] = makeArray(w, h, layers, TinyImageFormat_R16G16B16A16_SFLOAT, "renderer_rt_shadow_history");
+    gShZ[0] = makeTexture(w, h, "renderer_rt_shadow_z", TinyImageFormat_R32_SFLOAT);
+    gShZ[1] = makeTexture(w, h, "renderer_rt_shadow_z", TinyImageFormat_R32_SFLOAT);
+    gRtShadows = makeArray(w, h, layers, TinyImageFormat_R16_SFLOAT, "renderer_rt_shadows");
+    if (!gShRaw || !gShHist[0] || !gShHist[1] || !gShZ[0] || !gShZ[1] || !gRtShadows)
+    {
+        freeShadowTextures();
+        return;
+    }
+    gShWidth = w;
+    gShHeight = h;
+    gShLayers = layers;
 }
 
 void createTexture(uint32_t w, uint32_t h)
@@ -338,6 +425,24 @@ int load(int reloaded)
         if (!gPipe[k])
             return 1;
     }
+    const char* shadowNames[kShadowShaders] = { "renderer_rt_shadow_trace.comp", "renderer_rt_shadow_temporal.comp",
+                                                "renderer_rt_shadow_filter.comp" };
+    for (uint32_t k = 0; k < kShadowShaders; ++k)
+    {
+        ShaderLoadDesc sd = {};
+        sd.mComp.pFileName = shadowNames[k];
+        addShader(gRenderer, &sd, &gShShader[k]);
+        if (!gShShader[k])
+            return 1;
+        PipelineDesc desc = {};
+        desc.mType = PIPELINE_TYPE_COMPUTE;
+        desc.mComputeDesc.pShaderProgram = gShShader[k];
+        desc.pName = "renderer_rt_shadows";
+        PIPELINE_LAYOUT_DESC(desc, NULL, SRT_LAYOUT_DESC(ShadowSrt, PerFrame), NULL, NULL);
+        addPipeline(gRenderer, &desc, &gShPipe[k]);
+        if (!gShPipe[k])
+            return 1;
+    }
     SamplerDesc sd = {};
     sd.mMinFilter = FILTER_LINEAR;
     sd.mMagFilter = FILTER_LINEAR;
@@ -397,7 +502,15 @@ int load(int reloaded)
     addDescriptorSet(gRenderer, &setDesc, &gSet);
     for (uint32_t i = 0; i < gFrames; ++i)
         gCb[i] = makeMapped(sizeof(RtData) < 256 ? 256 : (sizeof(RtData) + 255) / 256 * 256, 0, DESCRIPTOR_TYPE_UNIFORM_BUFFER, "renderer_rt_cb");
-    gReady = gSet != nullptr;
+    DescriptorSetDesc shadowSet = SRT_SET_DESC(ShadowSrt, PerFrame, gFrames * 3, 0);
+    addDescriptorSet(gRenderer, &shadowSet, &gShSet);
+    for (uint32_t i = 0; i < gFrames; ++i)
+        gShCb[i] = makeMapped(sizeof(ShadowData) < 256 ? 256 : (sizeof(ShadowData) + 255) / 256 * 256, 0, DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                              "renderer_rt_shadow_cb");
+    gNoShapes = makeMapped(sizeof(RenderGpuLightShape) * 4, sizeof(RenderGpuLightShape), DESCRIPTOR_TYPE_BUFFER, "renderer_rt_no_shapes");
+    if (gNoShapes)
+        memset(gNoShapes->pCpuMappedAddress, 0, sizeof(RenderGpuLightShape) * 4);
+    gReady = gSet != nullptr && gShSet != nullptr && gNoShapes != nullptr;
     yea::log(gReady ? "renderer_rt: ray-traced reflections on" : "renderer_rt: the trace pipeline failed");
     return gReady ? 0 : 1;
 }
@@ -408,6 +521,7 @@ void unload()
         return;
     waitQueueIdle(gQueue);
     freeTexture();
+    freeShadowTextures();
     for (uint32_t i = 0; i < gRetiredCount; ++i)
         removeAccelerationStructure(gRay, gRetired[i].as);
     gRetiredCount = 0;
@@ -422,6 +536,24 @@ void unload()
             removeResource(gInstBuf[i]);
         if (gCb[i])
             removeResource(gCb[i]);
+        if (gShCb[i])
+            removeResource(gShCb[i]);
+        gCb[i] = gShCb[i] = nullptr;
+    }
+    if (gShSet)
+        removeDescriptorSet(gRenderer, gShSet);
+    if (gNoShapes)
+        removeResource(gNoShapes);
+    gShSet = nullptr;
+    gNoShapes = nullptr;
+    for (uint32_t k = 0; k < kShadowShaders; ++k)
+    {
+        if (gShPipe[k])
+            removePipeline(gRenderer, gShPipe[k]);
+        if (gShShader[k])
+            removeShader(gRenderer, gShShader[k]);
+        gShPipe[k] = nullptr;
+        gShShader[k] = nullptr;
     }
     if (gSet)
         removeDescriptorSet(gRenderer, gSet);
@@ -460,10 +592,58 @@ void unload()
 void update(uint32_t phase, float dt) {}
 void draw(uint32_t pass, const YeaFrame* frame) {}
 
+// Which shadows rays trace this frame: the sun's, then up to traced_lights visible local lights that cast, area lights
+// first (their soft shadows cost the shadow maps most, and rays give their real shape), then in the core's order.
+// renderer_shadows then draws no cascades for a traced sun and no tiles for a traced light.
+bool rt_pick(uint64_t address)
+{
+    RenderFrame* F = (RenderFrame*)(uintptr_t)address;
+    gPickCount = 0;
+    if (!gReady || !settings.shadows || !F || F->version != RENDER_FRAME_VERSION || !F->width || !F->height || !F->taaOn ||
+        yea::viewMode())
+        return false;
+    uint32_t most = settings.traced_lights < 0 ? 0 : (uint32_t)settings.traced_lights;
+    most = most > RENDER_RT_MAX_TRACED ? RENDER_RT_MAX_TRACED : most;
+    if (F->width != gShWidth || F->height != gShHeight || 1 + most != gShLayers)
+    {
+        waitQueueIdle(gQueue);
+        freeShadowTextures();
+        createShadowTextures(F->width, F->height, 1 + most);
+    }
+    if (!gRtShadows)
+        return false;
+    F->rtSunShadows = 0;
+    F->rtLightCount = 0;
+    for (uint32_t i = 0; i < F->lightCount; ++i)
+        F->lights[i].traced = -1;
+    if (F->sunOn && F->sunShadow)
+    {
+        F->rtSunShadows = 1;
+        gPickLight[0] = kNoLight;
+        gPickId[0] = kSunId;
+        gPickCount = 1;
+    }
+    for (uint32_t pass = 0; pass < 2; ++pass)
+        for (uint32_t i = 0; i < F->lightCount && F->rtLightCount < most; ++i)
+        {
+            RenderLight& l = F->lights[i];
+            if (!l.castShadow || l.traced >= 0 || (pass == 0) != (l.kind >= 3))
+                continue;
+            l.traced = (int32_t)F->rtLightCount;
+            F->rtLightSlots[F->rtLightCount++] = i;
+            gPickLight[gPickCount] = i; // the visible lights lead the GPU buffer in this order
+            gPickId[gPickCount++] = l.id;
+        }
+    gPickFrame = F->frameNumber;
+    F->rtShadows = gRtShadows;
+    return gPickCount > 0;
+}
+
 bool rt_prepare(uint64_t address)
 {
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
-    if (!gReady || !settings.enabled || !F || F->version != RENDER_FRAME_VERSION || !F->width || !F->height || !F->taaOn)
+    bool shadows = gPickCount && F && gPickFrame == F->frameNumber;
+    if (!gReady || (!settings.enabled && !shadows) || !F || F->version != RENDER_FRAME_VERSION || !F->width || !F->height || !F->taaOn)
         return false;
     if (yea::viewMode() || !F->surface || !F->previous || !F->drawableCount || !F->positions || !F->attributes || !F->indices || !F->instances ||
         !F->materials || !F->lightBuffer || !F->exposure || !F->motion || F->frameIndex >= kMaxFrames)
@@ -563,17 +743,129 @@ bool rt_prepare(uint64_t address)
     d.denoise[2] = settings.full_below < 0 ? 0.0f : settings.full_below;
     memcpy(gCb[F->frameIndex]->pCpuMappedAddress, &d, sizeof d);
 
-    F->rtReflection = gTex; // the filter writes it after the resolve
+    F->rtReflection = settings.enabled ? gTex : nullptr; // the filter writes it after the resolve; none: shadows only
     F->rtMaxRoughness = maxRough;
     F->rtDebug = settings.show_hits;
     return true;
+}
+
+// The traced shadows into rtShadows (rt_run, after the top-level structure's build): rays, accumulation, filter.
+void traceShadows(RenderFrame* F, Cmd* cmd, uint32_t fi)
+{
+    uint32_t   w = gShIndex ^ 1;
+    ShadowData d = {};
+    const float(*v)[4] = F->view;
+    for (int k = 0; k < 3; ++k)
+    {
+        d.right[k] = v[0][k];
+        d.up[k] = v[1][k];
+        d.forward[k] = v[2][k];
+        d.camPos[k] = F->camPos[k];
+        d.sunDir[k] = F->sunDir[k];
+    }
+    d.right[3] = F->p00;
+    d.up[3] = F->p11;
+    d.forward[3] = F->nearZ;
+    d.camPos[3] = F->rtLightRadius > 0 ? F->rtLightRadius : 0.1f;
+    d.screen[0] = (float)F->width;
+    d.screen[1] = (float)F->height;
+    d.screen[2] = F->jitter[0];
+    d.screen[3] = F->jitter[1];
+    d.sunDir[3] = tanf(0.5f * (F->rtSunAngle > 0 ? F->rtSunAngle : 0.0093f)); // 0.53 degrees: the real sun
+    d.params[0] = 32.0f; // frames of history at most
+    d.params[1] = 0.5f;  // filter radius: half the penumbra
+    d.params[2] = 8.0f;  // at most (px)
+    d.misc[0] = (uint32_t)F->frameNumber;
+    d.misc[1] = gPickCount;
+    d.misc[2] = gShFrame && gShFrame + 1 == F->frameNumber ? 0 : 1;
+    // Each shadow's history: the layer that held the same light last frame, if any.
+    for (uint32_t s = 0; s < gPickCount; ++s)
+    {
+        d.slots[s][0] = gPickLight[s] == kNoLight ? 0 : 1 + (s - (F->rtSunShadows ? 1 : 0));
+        d.slots[s][1] = 0;
+        d.slots[s][2] = gPickLight[s];
+        d.slots[s][3] = 1;
+        for (uint32_t j = 0; j < gShIdCount; ++j)
+            if (gShIds[j] == gPickId[s])
+                d.slots[s][1] = j, d.slots[s][3] = 0;
+    }
+    memcpy(gShCb[fi]->pCpuMappedAddress, &d, sizeof d);
+
+    Buffer*  lights = F->lightBuffer;
+    Buffer*  shapes = F->lightShapes ? F->lightShapes : gNoShapes;
+    Texture* depth = F->depth->pTexture;
+    Texture* surface = F->surface->pTexture;
+    Texture* motion = F->motion->pTexture;
+    DescriptorData p[14] = {};
+    p[0].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gScene);
+    p[0].ppAccelerationStructures = &gTlas[fi];
+    p[1].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gSd);
+    p[1].ppBuffers = &gShCb[fi];
+    p[2].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gDepth);
+    p[2].ppTextures = &depth;
+    p[3].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gSurface);
+    p[3].ppTextures = &surface;
+    p[4].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gMotion);
+    p[4].ppTextures = &motion;
+    p[5].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gLights);
+    p[5].ppBuffers = &lights;
+    p[6].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gShapes);
+    p[6].ppBuffers = &shapes;
+    p[7].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gRawOut);
+    p[7].ppTextures = &gShRaw;
+    p[8].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gRaw);
+    p[8].ppTextures = &gShRaw;
+    p[9].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gHistory);
+    p[9].ppTextures = &gShHist[w ^ 1];
+    p[10].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gHistoryOut);
+    p[10].ppTextures = &gShHist[w];
+    p[11].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gPrevZ);
+    p[11].ppTextures = &gShZ[w ^ 1];
+    p[12].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gZOut);
+    p[12].ppTextures = &gShZ[w];
+    p[13].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gFinal);
+    p[13].ppTextures = &gRtShadows;
+    updateDescriptorSet(gRenderer, fi * 3, gShSet, 14, p);
+    updateDescriptorSet(gRenderer, fi * 3 + 1, gShSet, 14, p);
+    p[9].ppTextures = &gShHist[w]; // the filter reads this frame's accumulation
+    updateDescriptorSet(gRenderer, fi * 3 + 2, gShSet, 14, p);
+
+    uint32_t gx = (F->width + 7) / 8, gy = (F->height + 7) / 8;
+    cmdBeginDebugMarker(cmd, 0.5f, 0.8f, 1.0f, "Renderer ray-traced shadows");
+    TextureBarrier in[4] = { { gShRaw, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS },
+                             { gShHist[w], RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS },
+                             { gShZ[w], RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS },
+                             { gRtShadows, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS } };
+    cmdResourceBarrier(cmd, 0, nullptr, 4, in, 0, nullptr);
+    cmdBindPipeline(cmd, gShPipe[kShadowTrace]);
+    cmdBindDescriptorSet(cmd, fi * 3, gShSet);
+    cmdDispatch(cmd, gx, gy, gPickCount);
+    TextureBarrier rays[1] = { { gShRaw, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE } };
+    cmdResourceBarrier(cmd, 0, nullptr, 1, rays, 0, nullptr);
+    cmdBindPipeline(cmd, gShPipe[kShadowTemporal]);
+    cmdBindDescriptorSet(cmd, fi * 3 + 1, gShSet);
+    cmdDispatch(cmd, gx, gy, gPickCount);
+    TextureBarrier hist[2] = { { gShHist[w], RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE },
+                               { gShZ[w], RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE } };
+    cmdResourceBarrier(cmd, 0, nullptr, 2, hist, 0, nullptr);
+    cmdBindPipeline(cmd, gShPipe[kShadowFilter]);
+    cmdBindDescriptorSet(cmd, fi * 3 + 2, gShSet);
+    cmdDispatch(cmd, gx, gy, gPickCount);
+    TextureBarrier out[1] = { { gRtShadows, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE } };
+    cmdResourceBarrier(cmd, 0, nullptr, 1, out, 0, nullptr);
+    cmdEndDebugMarker(cmd);
+    gShIndex = w;
+    gShFrame = F->frameNumber;
+    for (uint32_t s = 0; s < gPickCount; ++s)
+        gShIds[s] = gPickId[s];
+    gShIdCount = gPickCount;
 }
 
 void rt_run(uint64_t address)
 {
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
     uint32_t w = gAccumIndex ^ 1; // written this frame; gAccumIndex holds last frame's
-    if (!gReady || !F || !gTex || F->rtReflection != gTex || !F->depth || !F->depth->pTexture || !F->surface ||
+    if (!gReady || !F || !gTex || (F->rtReflection && F->rtReflection != gTex) || !F->depth || !F->depth->pTexture || !F->surface ||
         !F->surface->pTexture || !F->motion || !F->motion->pTexture || !F->previous || !F->previous->pTexture || !F->instances ||
         !F->materials || !F->lightBuffer || !F->positions || !F->attributes || !F->indices || !F->exposure)
         return;
@@ -651,6 +943,13 @@ void rt_run(uint64_t address)
     cmdBuildAccelerationStructure(cmd, gRay, &build);
     // The core fills its light buffer after rt_prepare: the count goes in now.
     ((RtData*)gCb[fi]->pCpuMappedAddress)->counts[0] = F->allLightCount;
+    if (gPickCount && gPickFrame == F->frameNumber && F->rtShadows == gRtShadows)
+        traceShadows(F, cmd, fi);
+    if (!F->rtReflection)
+    {
+        cmdEndDebugMarker(cmd);
+        return;
+    }
 
     Buffer*        instances = F->instances;
     Buffer*        materials = F->materials;

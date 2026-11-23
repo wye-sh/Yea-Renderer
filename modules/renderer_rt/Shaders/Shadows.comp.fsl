@@ -1,0 +1,328 @@
+// Ray-traced shadows, three full-size passes per frame, each over every traced shadow at once (the dispatch's z):
+// SHADOW_TRACE casts one ray a pixel towards a random point on the light's real shape (the sun's disc; a point or
+// spot light's sphere; a rect, disc, sphere or tube light's own surface), so a shadow is sharp where it touches
+// its caster and as soft further away as the light's size makes it. SHADOW_TEMPORAL accumulates those rays over
+// frames (reprojected by the motion vectors, dropped where the depth doesn't match, held to the spread of this
+// frame's rays around, so a moving caster leaves no trail), with the blocker's distance averaged alongside; a
+// pixel keeps about 2 frames per pixel of penumbra width (8 to 32), so a sharp edge doesn't trail when it moves.
+// SHADOW_FILTER averages each pixel over the penumbra that distance predicts (none in full light or full shadow),
+// across neighbours on its own surface, into rtShadows' slice (0 the sun, 1 + n traced light n).
+#include "fsl_ext.h"
+
+STRUCT(LightData) // as Trace.comp.fsl's (the core's RenderGpuLight)
+{
+    DATA(float4, pos, None);    // xyz, w range
+    DATA(float4, color, None);  // rgb candela, w type (1 point, 2 spot; area lights 1)
+    DATA(float4, dir, None);    // xyz spot direction or an area light's facing (a tube's axis), w spot scale
+    DATA(float4, params, None); // x spot offset
+    DATA(float4, sphere, None);
+};
+
+STRUCT(LightShape) // the core's RenderGpuLightShape
+{
+    DATA(float4, ex, None); // rect, disc: half the width (a vector); tube: half its length along dir. w: kind
+    DATA(float4, ey, None); // rect, disc: half the height (a vector); tube: x its radius. w: kinds 3 to 6 1 / area,
+                            // kind 0 its own radius (0: none)
+};
+
+#include "ShadowData.h.fsl"
+#include "Shadows.srt.h"
+
+#define PI 3.14159265
+#define NO_LIGHT 0xFFFFFFFFu
+
+int2 screenSize() { return int2(gSd.screen.xy); }
+
+float viewDepth(float d) { return gSd.forward.w / max(d, 1e-7); }
+
+// Pixel p's world position from its depth d (reversed-Z, infinite far), where it was drawn: undoing the TAA jitter
+// (as the reflections), else a grazing surface's point lands under it and its rays hit it from below.
+float3 worldAt(int2 p, float d)
+{
+    float  z = viewDepth(d);
+    float2 u = float2(p) + 0.5 - gSd.screen.zw;
+    float2 ndc = float2(u.x / gSd.screen.x * 2.0 - 1.0, 1.0 - u.y / gSd.screen.y * 2.0);
+    return gSd.camPos.xyz + gSd.right.xyz * (ndc.x * z / gSd.right.w) + gSd.up.xyz * (ndc.y * z / gSd.up.w) + gSd.forward.xyz * z;
+}
+
+// A light's radius for its penumbra: its own (kind 0), that of a disc of its area (kinds 3 to 6), else rtLightRadius.
+float shapeRadius(LightShape s)
+{
+    if (s.ex.w > 2.5)
+        return sqrt(1.0 / (PI * max(s.ey.w, 1e-6)));
+    return s.ey.w > 0.0 ? s.ey.w : gSd.camPos.w;
+}
+
+// The penumbra's width at P in pixels: the light's size seen from a blocker `blocker` metres off, carried to P.
+float penumbraPx(float3 P, uint4 slot, float blocker)
+{
+    float width;
+    if (slot.z == NO_LIGHT)
+        width = 2.0 * gSd.sunDir.w * blocker;
+    else
+    {
+        float dist = length(gLights[slot.z].pos.xyz - P);
+        width = 2.0 * shapeRadius(gShapes[slot.z]) * blocker / max(dist - blocker, 0.05);
+    }
+    float pixelAngle = 2.0 / (gSd.up.w * gSd.screen.y);
+    return width / (length(P - gSd.camPos.xyz) * pixelAngle);
+}
+
+#if defined(SHADOW_TRACE)
+// Every instance is opaque triangles (as Trace.comp.fsl).
+#if defined(RAY_FLAG_SKIP_AABB)
+#define RT_RAY_FLAGS (RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_AABB)
+#else
+#define RT_RAY_FLAGS RAY_FLAG_FORCE_OPAQUE
+#endif
+
+uint pcgHash(uint v)
+{
+    uint s = v * 747796405u + 2891336453u;
+    uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+
+// Pixel p's n-th sample for shadow s: a hash of its position and the shadow (neighbours' and lights' samples
+// unrelated) plus R2's n-th point (as the reflections'), so a pixel's samples cover the light evenly over frames.
+float2 sampleOf(int2 p, uint s, uint n)
+{
+    uint   h = pcgHash(uint(p.x) + pcgHash(uint(p.y) + pcgHash(s)));
+    float2 offset = float2(float(h & 0xFFFFu), float(h >> 16u)) * (1.0 / 65536.0);
+    uint2  f = uint2(n * 3242174889u, n * 2447445414u);
+    return frac(offset + float2(f >> uint2(8u, 8u)) * (1.0 / 16777216.0));
+}
+
+// A point on a disc of radius r around c, square to direction C (the pixel's view of a sphere), for sample xi.
+float3 onDisc(float3 c, float3 C, float r, float2 xi)
+{
+    float3 axis = abs(C.y) < 0.9 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+    float3 tx = normalize(cross(axis, C));
+    float3 ty = cross(C, tx);
+    float  phi = xi.y * 2.0 * PI;
+    return c + (tx * cos(phi) + ty * sin(phi)) * (sqrt(xi.x) * r);
+}
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) id)
+{
+    INIT_MAIN;
+    uint  s = id.z;
+    uint4 slot = gSd.slots[s];
+    int2  p = int2(id.xy);
+    if (p.x >= screenSize().x || p.y >= screenSize().y)
+        RETURN();
+    float  d = LoadTex2D(gDepth, NO_SAMPLER, p, 0).r;
+    float2 result = float2(1.0, 0.0); // where the light can't reach, nothing to shadow: lit (the light adds nothing)
+    if (d > 0.0)
+    {
+        float3 P = worldAt(p, d);
+        float3 N = normalize(LoadTex2D(gSurface, NO_SAMPLER, p, 0).yzw);
+        float3 origin = P + N * (0.001 * viewDepth(d) + 0.004); // off the surface, more further away (as reflections)
+        float2 xi = sampleOf(p, s, gSd.misc.x);
+        float3 L = float3(0.0, 0.0, 1.0);
+        float  tMax = 0.0;
+        if (slot.z == NO_LIGHT)
+        {
+            // The sun: a direction within its disc.
+            float3 S = gSd.sunDir.xyz;
+            if (dot(N, S) > 0.0)
+            {
+                L = normalize(onDisc(S, S, gSd.sunDir.w, xi));
+                tMax = 10000.0;
+            }
+        }
+        else
+        {
+            LightData  l = gLights[slot.z];
+            LightShape sh = gShapes[slot.z];
+            float3     toLight = l.pos.xyz - P;
+            float      d2 = dot(toLight, toLight);
+            float3     C = toLight * rsqrt(max(d2, 1e-8));
+            uint       kind = uint(sh.ex.w + 0.5);
+            // Where the light reaches (as the forward pass): in range, inside a spot's cone, in front of a rect or disc.
+            bool reaches = d2 < l.pos.w * l.pos.w && dot(N, C) > -0.2; // an area light can light a surface its centre is behind
+            if (reaches && kind == 0u && l.color.w > 1.5)
+                reaches = dot(-C, l.dir.xyz) * l.dir.w + l.params.x > 0.0;
+            if (reaches && (kind == 3u || kind == 4u))
+                reaches = dot(-toLight, l.dir.xyz) > 0.0;
+            if (reaches)
+            {
+                float3 target;
+                float  inset = 0.0; // stop short of a sphere's surface (the light's own marker is no caster anyway)
+                if (kind == 3u)
+                    target = l.pos.xyz + sh.ex.xyz * (xi.x * 2.0 - 1.0) + sh.ey.xyz * (xi.y * 2.0 - 1.0);
+                else if (kind == 4u)
+                {
+                    float r = sqrt(xi.x), phi = xi.y * 2.0 * PI;
+                    target = l.pos.xyz + (sh.ex.xyz * cos(phi) + sh.ey.xyz * sin(phi)) * r;
+                }
+                else if (kind == 6u)
+                {
+                    // A tube: a point along its axis, then across its radius as the pixel sees it.
+                    float3 a = l.pos.xyz + sh.ex.xyz * (xi.x * 2.0 - 1.0);
+                    float3 side = normalize(cross(normalize(sh.ex.xyz), a - P));
+                    target = a + side * ((xi.y * 2.0 - 1.0) * sh.ey.x);
+                }
+                else
+                {
+                    float r = shapeRadius(sh);
+                    target = onDisc(l.pos.xyz, C, r, xi);
+                    inset = r;
+                }
+                float3 toTarget = target - origin;
+                float  dist = length(toTarget);
+                L = toTarget / max(dist, 1e-4);
+                tMax = max(dist - inset - 0.01, 0.0);
+            }
+        }
+        if (tMax > 0.0)
+        {
+            RayDesc ray;
+            ray.Origin = origin;
+            ray.Direction = L;
+            ray.TMin = 0.0;
+            ray.TMax = tMax;
+            RayQueryAnyHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RT_RAY_FLAGS, ray, 2u, occluder) // casters only
+            if (RayQueryIsHit(occluder))
+                result = float2(0.0, max(RayQueryRayT(occluder), 1e-3));
+        }
+    }
+    Write3D(gRawOut, int3(p, int(s)), result);
+    RETURN();
+}
+#endif
+
+#if defined(SHADOW_TEMPORAL)
+// The history's frames per pixel of penumbra, and its fewest (measured on the tiny scene against many-ray truths:
+// trails a third of what 32 frames everywhere left, for a little more shimmer at sharp edges, which TAA takes).
+#define HISTORY_PER_PX 2.0
+#define HISTORY_MIN    8.0
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) id)
+{
+    INIT_MAIN;
+    uint  s = id.z;
+    uint4 slot = gSd.slots[s];
+    int2  size = screenSize();
+    int2  p = int2(id.xy);
+    if (p.x >= size.x || p.y >= size.y)
+        RETURN();
+    float d = LoadTex2D(gDepth, NO_SAMPLER, p, 0).r;
+    float z = d > 0.0 ? viewDepth(d) : 0.0;
+    if (s == 0u)
+        Write2D(gZOut, p, z);
+    float2 raw = LoadTex3D(gRaw, NO_SAMPLER, int3(p, int(s)), 0).xy;
+    if (d <= 0.0)
+    {
+        Write3D(gHistoryOut, int3(p, int(s)), float4(1.0, 0.0, 0.0, 0.0));
+        RETURN();
+    }
+    // This frame's rays around: their mean and spread, which the history must lie near.
+    float m1 = 0.0, m2 = 0.0, n = 0.0;
+    for (int y = -2; y <= 2; ++y)
+    {
+        for (int x = -2; x <= 2; ++x)
+        {
+            float v = LoadTex3D(gRaw, NO_SAMPLER, int3(clamp(p + int2(x, y), int2(0, 0), size - int2(1, 1)), int(s)), 0).x;
+            m1 += v;
+            m2 += v * v;
+            n += 1.0;
+        }
+    }
+    float mean = m1 / n;
+    float spread = sqrt(max(m2 / n - mean * mean, 0.0));
+
+    float4 result = float4(raw.x, raw.y, 1.0, 0.0);
+    if (gSd.misc.z == 0u && slot.w == 0u)
+    {
+        float2 uv = (float2(p) + 0.5) / gSd.screen.xy;
+        float2 prev = uv - LoadTex2D(gMotion, NO_SAMPLER, p, 0).xy;
+        int2   q = int2(floor(prev * gSd.screen.xy));
+        if (prev.x > 0.0 && prev.y > 0.0 && prev.x < 1.0 && prev.y < 1.0)
+        {
+            float zPrev = LoadTex2D(gPrevZ, NO_SAMPLER, q, 0).r;
+            // A surface was there last frame (as the reflections' test, by view depth).
+            if (zPrev > 0.0 && abs(zPrev - z) < 0.04 * z + 0.02)
+            {
+                float4 h = LoadTex3D(gHistory, NO_SAMPLER, int3(q, int(slot.y)), 0);
+                float  samples = min(h.z + 1.0, gSd.params.x);
+                // Held to this frame's spread: a light or caster that moved shows at once; there the count restarts.
+                float lo = mean - 1.5 * spread - 0.1, hi = mean + 1.5 * spread + 0.1;
+                float kept = clamp(h.x, lo, hi);
+                if (abs(kept - h.x) > 0.05)
+                    samples = min(samples, 4.0);
+                // As many frames as the penumbra is wide: a narrow one has little noise (its rays agree) but its
+                // edge moves across it in a pixel, which a long history would trail; a wide one is the reverse.
+                float blocker = raw.y > 0.0 ? raw.y : h.y;
+                if (blocker > 0.0)
+                    samples = min(samples, clamp(HISTORY_PER_PX * penumbraPx(worldAt(p, d), slot, blocker), HISTORY_MIN, gSd.params.x));
+                result.x = lerp(kept, raw.x, 1.0 / samples);
+                // The blocker distance averages over the rays that hit something.
+                result.y = raw.y > 0.0 ? (h.y > 0.0 ? lerp(h.y, raw.y, 1.0 / samples) : raw.y) : h.y;
+                result.z = samples;
+            }
+        }
+    }
+    Write3D(gHistoryOut, int3(p, int(s)), result);
+    RETURN();
+}
+#endif
+
+#if defined(SHADOW_FILTER)
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) id)
+{
+    INIT_MAIN;
+    uint  s = id.z;
+    uint4 slot = gSd.slots[s];
+    int2  size = screenSize();
+    int2  p = int2(id.xy);
+    if (p.x >= size.x || p.y >= size.y)
+        RETURN();
+    float4 c = LoadTex3D(gHistory, NO_SAMPLER, int3(p, int(s)), 0);
+    float  d = LoadTex2D(gDepth, NO_SAMPLER, p, 0).r;
+    if (d <= 0.0 || c.y <= 0.0)
+    {
+        Write3D(gFinal, int3(p, int(slot.x)), c.x); // nothing in the way of any ray: no penumbra to smooth
+        RETURN();
+    }
+    // The penumbra's width here: the light's size seen from the blocker, carried to the surface.
+    float3 P = worldAt(p, d);
+    float  eye = length(P - gSd.camPos.xyz);
+    // Wider while the history is short (a fresh or moving pixel holds few rays).
+    float radius = min(gSd.params.y * penumbraPx(P, slot, c.y) * (1.0 + 2.0 / c.z), gSd.params.z);
+    if (radius < 0.5)
+    {
+        Write3D(gFinal, int3(p, int(slot.x)), c.x);
+        RETURN();
+    }
+    float3 N = normalize(LoadTex2D(gSurface, NO_SAMPLER, p, 0).yzw);
+    float  stride = radius / 2.0;
+    float  sigma2 = 0.5 * radius * radius;
+    float  planeTol = 0.01 * eye + 0.01;
+    float2 sum = float2(c.x, 1.0);
+    for (int y = -2; y <= 2; ++y)
+    {
+        for (int x = -2; x <= 2; ++x)
+        {
+            if (x == 0 && y == 0)
+                continue;
+            float2 o = float2(float(x), float(y)) * stride;
+            int2   q = clamp(p + int2(round(o)), int2(0, 0), size - int2(1, 1));
+            float  dq = LoadTex2D(gDepth, NO_SAMPLER, q, 0).r;
+            if (dq <= 0.0)
+                continue;
+            float3 Nq = normalize(LoadTex2D(gSurface, NO_SAMPLER, q, 0).yzw);
+            float  plane = abs(dot(N, worldAt(q, dq) - P));
+            float  w = exp(-dot(o, o) / sigma2 - plane / planeTol) * pow(saturate(dot(N, Nq)), 32.0);
+            sum += float2(LoadTex3D(gHistory, NO_SAMPLER, int3(q, int(s)), 0).x, 1.0) * w;
+        }
+    }
+    Write3D(gFinal, int3(p, int(slot.x)), sum.x / sum.y);
+    RETURN();
+}
+#endif
