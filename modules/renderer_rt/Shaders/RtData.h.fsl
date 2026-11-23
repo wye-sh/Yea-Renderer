@@ -13,7 +13,7 @@ STRUCT(RtData)
     DATA(float4, skyZenith, None);
     DATA(float4, skyHorizon, None);
     DATA(float4, skyGround, None);
-    DATA(uint4, counts, None);       // x lights, y frame (noise), z flags, w instances
+    DATA(uint4, counts, None);       // x lights, y frame number (noise; never wraps short), z flags, w instances
     DATA(float4, params, None);      // x max distance (m), y edge fade (fraction of the screen), z roughness below
                                      // which pixels are traced at full resolution (above 1 with half_resolution off)
     DATA(float4, temporal, None);    // x frames of history for rough reflections, y 1 when last frame's history is

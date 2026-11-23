@@ -69,9 +69,12 @@ STRUCT(ShadowView)
 
 float noise2(float2 p) { return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715)))); }
 
-// Pixel p's sample for this frame: a hash of its position (so neighbours' samples are unrelated: interleaved
-// gradient noise lined them up, and what the history hadn't averaged out showed as diagonal streaks), stepped
-// through the R2 sequence over frames (so a pixel's samples cover the lobe evenly, not at random).
+// Pixel p's n-th sample: a hash of its position (so neighbours' samples are unrelated: interleaved gradient noise
+// lined them up, and what the history hadn't averaged out showed as diagonal streaks) plus the R2 sequence's n-th
+// point, n counting the frames the pixel is traced (so its samples, consecutive points, cover the lobe evenly and
+// never repeat). Every fourth point of R2 steps by only 0.02 in x: a half-resolution pixel, traced every fourth
+// frame, once took those and saw a third of its lobe, repeating every 64 frames, and its history settled into a
+// fixed grain.
 uint pcgHash(uint v)
 {
     uint s = v * 747796405u + 2891336453u;
@@ -79,11 +82,18 @@ uint pcgHash(uint v)
     return (w >> 22u) ^ w;
 }
 
-float2 sample2(int2 p)
+// R2's n-th point, exact for any n: the fractions in 32-bit fixed point, where the products' wrap is the fraction.
+float2 r2(uint n)
+{
+    uint2 f = uint2(n * 3242174889u, n * 2447445414u);
+    return float2(f >> uint2(8u, 8u)) * (1.0 / 16777216.0);
+}
+
+float2 sample2(int2 p, uint n)
 {
     uint   h = pcgHash(uint(p.x) + pcgHash(uint(p.y)));
     float2 offset = float2(float(h & 0xFFFFu), float(h >> 16u)) * (1.0 / 65536.0);
-    return frac(offset + float(gRt.counts.y) * float2(0.7548776662, 0.5698402910));
+    return frac(offset + r2(n));
 }
 
 // A GGX visible normal (tangent space, z the normal) for view direction v and roughness alpha: spherical caps.
@@ -253,7 +263,7 @@ STRUCT(Hit)
 
 // Traces pixel p's reflected ray (surface and d: its surface and depth). What the screen shows, the sky and
 // untraced pixels come back finished; a hit to light where it is comes back with result.a < 0 (lightHit).
-Hit traceRay(int2 p, float4 surface, float d)
+Hit traceRay(int2 p, float4 surface, float d, uint seq)
 {
     Hit o;
     o.result = float4(0.0, 0.0, 0.0, 0.0);
@@ -285,7 +295,7 @@ Hit traceRay(int2 p, float4 surface, float d)
         float3 tx = normalize(cross(axis, N));
         float3 ty = cross(N, tx);
         float3 v = float3(dot(V, tx), dot(V, ty), max(dot(V, N), 1e-4));
-        float3 h = sampleVndf(v, alpha, sample2(p));
+        float3 h = sampleVndf(v, alpha, sample2(p, seq));
         float3 Rj = reflect(-V, tx * h.x + ty * h.y + N * h.z);
         if (dot(Rj, N) > 0.0)
             R = Rj;
@@ -370,7 +380,7 @@ Hit traceRay(int2 p, float4 surface, float d)
 float4 lightHit(float4 pos, float4 normal, float4 ray, float3 screen, uint material, int2 p)
 {
     // The maps' filter turned per pixel and frame, as the core's (TAA averages it).
-    float  phi = noise2(float2(p) + float(gRt.counts.y) * 5.588238) * 2.0 * PI;
+    float  phi = noise2(float2(p) + float(gRt.counts.y % 64u) * 5.588238) * 2.0 * PI;
     float3 lit = shadeHit(pos.xyz, normal.xyz, -ray.xyz, gMaterials[material], float2(cos(phi), sin(phi)));
     float3 color = lerp(lit, screen, ray.w);
     if ((gRt.counts.z & FLAG_DEBUG) != 0u)
@@ -381,7 +391,7 @@ float4 lightHit(float4 pos, float4 normal, float4 ray, float3 screen, uint mater
 // What pixel p's reflected ray sees: rgb, a its distance (0: not traced, RT_MISS: the sky).
 float4 tracePixel(int2 p, float4 surface, float d)
 {
-    Hit h = traceRay(p, surface, d);
+    Hit h = traceRay(p, surface, d, gRt.counts.y);
     if (h.result.a >= 0.0)
         return h.result;
     return lightHit(h.pos, h.normal, h.ray, h.screen.rgb, h.material, p);
@@ -425,7 +435,8 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
         bool trace = glossy && (isHalf ? gRt.temporal.w > 0.5 && surface.x >= gRt.params.z : surface.x < gRt.params.z);
         if (trace)
         {
-            Hit h = traceRay(p, surface, LoadTex2D(gDepth, NO_SAMPLER, p, 0).r);
+            // A half-resolution pixel is traced every fourth frame: its own samples are consecutive.
+            Hit h = traceRay(p, surface, LoadTex2D(gDepth, NO_SAMPLER, p, 0).r, isHalf ? gRt.counts.y >> 2u : gRt.counts.y);
             // The maps' filter is turned by where the sample is written (the half-size texel at half resolution).
             if (h.result.a < 0.0)
                 h.result = lightHit(h.pos, h.normal, h.ray, h.screen.rgb, h.material, isHalf ? b : p);
@@ -573,6 +584,10 @@ float4 currentAt(int2 q, float4 surface, float d)
 // How far outside the clip box (in its half-widths) a still pixel's history must lie to count as changed: noise
 // alone pokes just past the box now and then, and dropping the history for it showed as flicker.
 #define STILL_SNAP 1.5
+// A still glossy pixel's history counts as changed only when it lies out that far on STILL_STRIKES frames running,
+// or past STILL_SNAP_NOW on one (see resolve).
+#define STILL_SNAP_NOW 4.0
+#define STILL_STRIKES 3.0
 
 float3 compressColor(float3 c) { return c / (1.0 + max(c.r, max(c.g, c.b))); }
 float3 expandColor(float3 c) { return c / max(1.0 - max(c.r, max(c.g, c.b)), 1e-4); }
@@ -644,9 +659,6 @@ void resolve(int2 p)
             brightest = max(brightest, s.x);
         }
     }
-    // A jittered sample brighter than all its neighbours is a stray: held to the brightest of them.
-    if (rough > 0.1 && n > 4.0 && c.x > brightest)
-        c *= brightest / max(c.x, 1e-6);
     float3 mean = m1 / n;
     float3 width = sqrt(max(m2 / n - mean * mean, float3(0.0, 0.0, 0.0))) * CLIP_WIDTH;
 
@@ -675,6 +687,11 @@ void resolve(int2 p)
     bool   still = dot(moved, moved) < 1e-4 && dot(shift, shift) < 1e-4;
     if (dot(moved, moved) > 0.25)
         frames = min(frames, 4.0);
+    // A jittered sample brighter than all its neighbours is a stray: held to the brightest of them where the pixel
+    // moves, so it doesn't sparkle. Not where it is still: its long history averages strays out, and holding every
+    // bright sample down settled it darker than the true reflection.
+    if (!still && rough > 0.1 && n > 4.0 && c.x > brightest)
+        c *= brightest / max(c.x, 1e-6);
 
     float3 result = c;
     float  samples = 1.0;
@@ -689,6 +706,10 @@ void resolve(int2 p)
         valid = abs(zn.x - pcS.w) < 0.04 * pcS.w + 0.02;
         samplesPrev = zn.y;
     }
+    // A still glossy pixel whose history lay out of the box keeps its strikes in quarters of its sample count.
+    float strikesPrev = round(frac(samplesPrev) * 4.0);
+    samplesPrev = floor(samplesPrev);
+    float strikes = 0.0;
     if (valid && max(frames, still ? stillFrames : 1.0) > 1.0)
     {
         // Bilinear, over the history texels that hold reflections only.
@@ -709,7 +730,17 @@ void resolve(int2 p)
         {
             float  outside;
             float3 history = clipToBox(toYCoCg(sum.rgb / sum.w), mean - width, mean + width, outside);
-            bool   clipped = outside > STILL_SNAP;
+            // A still glossy pixel's history is changed only when it lies out of the box on STILL_STRIKES frames
+            // running, or far out on one: noise alone puts it out of one frame's box now and then, and each time it
+            // fell back to a short history, left with a fresh error that stayed (grain). Until then it is kept whole:
+            // clipped to each frame's noisy box, it was pulled towards that frame's noise, and the pulls settled
+            // into a fixed error per pixel too. A switched-off light is far out at once: it clears in a frame.
+            // Mirrors and anything that moves are clipped and reset as before.
+            bool   patient = still && rough > 0.1;
+            bool   clipped = outside > STILL_SNAP && (!patient || strikesPrev + 1.0 >= STILL_STRIKES || outside > STILL_SNAP_NOW);
+            strikes = patient && outside > STILL_SNAP && !clipped ? strikesPrev + 1.0 : 0.0;
+            if (patient && !clipped)
+                history = toYCoCg(sum.rgb / sum.w);
             // As many samples as the history holds plus this one, up to the cap: after a disocclusion the
             // history fills in evenly (1/2, 1/3, ...) instead of leaning on its first sample. A history the clip
             // found changed (a light moved) goes back to history_frames at once, so nothing trails.
@@ -719,7 +750,7 @@ void resolve(int2 p)
         }
     }
     Write2D(gOut, p, float4(max(expandColor(fromYCoCg(result)), float3(0.0, 0.0, 0.0)) / exposure, cur.a));
-    Write2D(gOutZ, p, float2(z, samples));
+    Write2D(gOutZ, p, float2(z, samples + strikes * 0.25));
 }
 
 // The resolve, one full-size pass: this frame's reflection per pixel (the full-resolution trace, or the one
@@ -775,7 +806,7 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
     float3 P = gRt.camPos.xyz + gRt.right.xyz * (ndc.x * z / gRt.right.w) + gRt.up.xyz * (ndc.y * z / gRt.up.w) + gRt.forward.xyz * z;
     float3 N = normalize(surface.yzw);
     float3 origin = P + N * (0.001 * z + 0.004);
-    float2 xi = sample2(p);
+    float2 xi = sample2(p, gRt.counts.y);
     float  phi = xi.x * 2.0 * PI;
     float2 disc = sqrt(xi.y) * float2(cos(phi), sin(phi));
     uint   budget = gRt.probe.x;

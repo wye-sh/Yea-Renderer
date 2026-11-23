@@ -122,8 +122,14 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   history lay less than 1.5 box half-widths outside the clip box (`STILL_SNAP`; past it the history is changed and
   drops back to the cap at once), so a still view settles (3.6.3: before it, half-resolution reflections crawled in
   a still view with a diagonal stipple; a box widened by each pixel's own spread over time held them stiller but
-  let a switched-off light linger). Each pixel's rays start from a hash of its position (interleaved gradient noise
-  lined up into diagonal streaks).
+  let a switched-off light linger). A still glossy pixel (roughness over 0.1) keeps its history unclipped and skips
+  the stray clamp, and its history is changed only when out of the box on 3 frames running (`STILL_STRIKES`, kept in
+  quarters of its samples count) or past 4 half-widths on one (`STILL_SNAP_NOW`); mirrors and moving pixels clip and
+  reset as before (3.8.1: clipped to each frame's noisy box and reset by noise, a still glossy history settled into a
+  fixed error per pixel, a frozen grain like battered metal, and the clamp settled it darker; a light switched off
+  leaves about 1% that fades over its 128 frames). Each pixel's n-th sample is a hash of its position (interleaved
+  gradient noise lined up into diagonal streaks) plus R2's exact n-th point, n the frames it is traced (a
+  half-resolution pixel's frame number / 4: the frame number % 64 gave it every fourth R2 point, a third of its lobe).
   Without the accumulation, 1 spp reflections flickered (fireflies). The trace marks each 8x8 tile holding a pixel below
   `max_roughness` (`gTiles`, flag sets double-buffered so no thread reads a flag another rewrites); the resolve skips
   the rest and writes their zeros only when the history there isn't zero already. Every GPU object is freed

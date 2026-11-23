@@ -473,7 +473,7 @@ bool rt_prepare(uint64_t address)
     d.sunDir[3] = F->sunOn ? 1.0f : 0.0f;
     d.sunColor[3] = F->ambient;
     d.counts[0] = F->allLightCount;
-    d.counts[1] = (uint32_t)(F->frameNumber % 64u);
+    d.counts[1] = (uint32_t)F->frameNumber;
     d.counts[2] = (settings.screen_colors ? kFlagScreen : 0) | (settings.show_hits ? kFlagDebug : 0);
     // Hits are shadowed as the scene is: from the local lights' maps (the same filter, normal bias and
     // contact-hardening as the forward pass), a ray where a light casts but has no map, a ray for the sun. When the
