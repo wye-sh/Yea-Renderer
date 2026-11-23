@@ -213,24 +213,35 @@ uint32_t mesh_plane()
 
 namespace
 {
-// A surface of revolution around y: rings of (radius, y, normal radial, normal y), plus caps.
+// A surface of revolution around y: rings of (radius, y, normal radial, normal y), plus caps. A ring of radius 0 (a
+// cone's tip) is one vertex per segment, at the segment's middle angle, with one triangle per segment: a ring of
+// coincident vertices at the segment edges would pair each panel's base with the next panel's tip normal, twisting the
+// shading across every panel (a faceted cone).
 uint32_t revolve(uint32_t segments, const float (*profile)[4], uint32_t count, bool capBottom, bool capTop)
 {
     uint32_t seg = clampSegments(segments, 3, 256);
     if (!begin())
         return kNoMesh;
     for (uint32_t k = 0; k < count; ++k)
+    {
+        float half = profile[k][0] == 0.0f ? 0.5f : 0.0f; // tips: the segment's middle
         for (uint32_t s = 0; s <= seg; ++s)
         {
-            float p = 6.28318531f * (float)s / (float)seg;
+            float p = 6.28318531f * ((float)s + half) / (float)seg;
             float c = cosf(p), sn = sinf(p);
             vertex(profile[k][0] * c, profile[k][1], profile[k][0] * sn, profile[k][2] * c, profile[k][3], profile[k][2] * sn);
         }
+    }
     for (uint32_t k = 0; k + 1 < count; ++k)
         for (uint32_t s = 0; s < seg; ++s)
         {
             uint32_t a = k * (seg + 1) + s, b = a + seg + 1;
-            quad(a, b, b + 1, a + 1);
+            if (profile[k + 1][0] == 0.0f)
+                tri(a, b, a + 1); // up to a tip
+            else if (profile[k][0] == 0.0f)
+                tri(a, b, b + 1); // down from a tip
+            else
+                quad(a, b, b + 1, a + 1);
         }
     for (int capIndex = 0; capIndex < 2; ++capIndex)
     {

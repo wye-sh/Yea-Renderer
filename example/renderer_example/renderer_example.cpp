@@ -39,6 +39,7 @@ struct State
     uint32_t   instances, lightsAlive; // the renderer's live counts once this frame's scene was in place
 };
 State* gState;
+bool   gFreshVersion; // this version of the module hasn't built its scene yet: build it once (new meshes reach a running game)
 
 // Mouse look: the host holds the mouse (hidden, kept in the window) while the left button stays down
 // after a press on the game; it lets go itself when F1 opens, focus is lost, the view switches or resets.
@@ -117,12 +118,14 @@ void build(State* s)
     renderer::clear();
     renderer_probes::probe_clear();
     s->lightCount = s->spotCount = s->spinCount = 0;
-    uint32_t sphere = renderer::mesh_sphere(48);
+    // Segments so the silhouettes stay round in the close-ups (a sphere filling the screen at 2560x1356 is under a
+    // third of a pixel off a true circle at 128); the light orbs are small, so 32 keeps their triangles a useful size.
+    uint32_t sphere = renderer::mesh_sphere(128);
     if (sphere == 0xFFFFFFFFu)
         return; // the renderer isn't loaded: try again next frame
     uint32_t box = renderer::mesh_box(), plane = renderer::mesh_plane();
-    uint32_t cylinder = renderer::mesh_cylinder(40), cone = renderer::mesh_cone(40), torus = renderer::mesh_torus(0.15f, 64);
-    s->sphereMesh = sphere;
+    uint32_t cylinder = renderer::mesh_cylinder(96), cone = renderer::mesh_cone(96), torus = renderer::mesh_torus(0.15f, 128);
+    s->sphereMesh = renderer::mesh_sphere(32); // the light orbs
 
     yea_handle floor = renderer::material_add({ 0.42f, 0.42f, 0.42f }, 0.65f, 0);
     place(plane, floor, { 0, 0, 0 }, { 60, 1, 60 });
@@ -320,6 +323,7 @@ bool picture(bool on)
 int load(int reloaded)
 {
     gState = nullptr;
+    gFreshVersion = true;
     gLooking = false;
     gPicture = false;
     return 0;
@@ -335,14 +339,17 @@ void update(uint32_t phase, float dt)
     // The renderer's scene must be the one this module built: after a renderer crash, revert or reload that lost or
     // replaced it (or one that came back while this module had built against stubs), every handle held here is stale
     // and nothing would move, so build it all again.
-    if (!s->built || renderer::instance_count() != s->instances || renderer::light_count() != s->lightsAlive)
+    if (!s->built || gFreshVersion || renderer::instance_count() != s->instances || renderer::light_count() != s->lightsAlive)
     {
         char line[160];
         snprintf(line, sizeof line, "renderer_example: building the scene (built %u; renderer has %u instances, %u lights; expected %u, %u)",
                  s->built, renderer::instance_count(), renderer::light_count(), s->instances, s->lightsAlive);
         build(s);
         if (s->built)
+        {
+            gFreshVersion = false;
             yea::log(line);
+        }
     }
     if (!s->built)
         return; // the renderer isn't loaded
