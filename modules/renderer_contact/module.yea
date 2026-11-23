@@ -5,7 +5,7 @@ export bool contact_prepare(u64 frame)
 export void contact_run(u64 frame)
 
 category Contact Shadows
-setting bool enabled true
+setting bool enabled false
 player enabled
 # How thick each surface is taken to be, as a part of its distance from the camera (0.005: 5 cm at 10 m).
 setting float surface_thickness 0.005 0.0005 0.05
@@ -20,3 +20,8 @@ setting float intensity 1 0 1
 # Beyond this distance (metres) there are none; they fade out over the last fifth.
 setting float max_distance 60 5 inf
 setting bool show_contact false
+
+# Frame versions (6.1.0): the core calls this module only while frame_version() is its own; it refuses a core of
+# another version (frame_version 0 from an older core's stub).
+export u32 frame_version()
+import renderer u32 frame_version() = 0

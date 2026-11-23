@@ -51,8 +51,13 @@ setting bool show_atlas false
 category Glass
 # Glass that casts shadows (instance_shadow on a see-through instance) colours the shadow maps' light by what it lets
 # through, in layers out from the light (as many as its panes need), for the sun's cascades and every shadowed light.
-setting bool glass_shadows true
+setting bool glass_shadows false
 player glass_shadows
 # The side of the maps the glass's layers share (two squares of them, 4 bytes a texel each, plus a scratch of three):
 # a view's glass gets coarser squares when they don't all fit.
 setting int glass_resolution 2048 1024 4096
+
+# Frame versions (6.1.0): the core calls this module only while frame_version() is its own; it refuses a core of
+# another version (frame_version 0 from an older core's stub).
+export u32 frame_version()
+import renderer u32 frame_version() = 0

@@ -29,3 +29,8 @@ needs dlss_model Transformer fp8
 player dlss_model
 # NVIDIA's DLSS files ship with the game only while DLSS is picked.
 service dlss when upscaler DLSS
+
+# Frame versions (6.1.0): the core calls this module only while frame_version() is its own; it refuses a core of
+# another version (frame_version 0 from an older core's stub).
+export u32 frame_version()
+import renderer u32 frame_version() = 0

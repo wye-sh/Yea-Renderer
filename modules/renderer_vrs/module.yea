@@ -8,7 +8,7 @@ category Variable Rate Shading
 # Smooth areas of the screen are lit once per 2 x 2 (or 2 x 1, 1 x 2) pixels instead of every pixel;
 # edges, highlights and fine detail stay at full rate. Only on GPUs with variable-rate shading, with
 # Anti-aliasing (TAA) on. Hidden on GPUs without it.
-setting bool enabled true
+setting bool enabled false
 needs enabled shadingrate
 player enabled
 # Higher: more of the screen at coarser rates (from last frame's contrast).
@@ -25,3 +25,8 @@ setting float glossy_below 0.5 0 1
 setting bool allow_4x4 false
 # Tints the screen by rate: green 2 x 1 or 1 x 2, blue 2 x 2, magenta coarser; full rate untinted.
 setting bool show_rates false
+
+# Frame versions (6.1.0): the core calls this module only while frame_version() is its own; it refuses a core of
+# another version (frame_version 0 from an older core's stub).
+export u32 frame_version()
+import renderer u32 frame_version() = 0

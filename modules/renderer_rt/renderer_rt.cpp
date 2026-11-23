@@ -938,8 +938,32 @@ void draw(uint32_t pass, const YeaFrame* frame) {}
 // Which shadows rays trace this frame: the sun's, then up to traced_lights visible local lights that cast, area lights
 // first (their soft shadows cost the shadow maps most, and rays give their real shape), then in the core's order.
 // renderer_shadows then draws no cascades for a traced sun and no tiles for a traced light.
+// Frame versions (6.1.0): this module's frame layout, for the core; and whether the core's is the same (an older or newer
+// core, cached or reverted, is left alone: no frame read, no GPU work), logged once a change.
+uint32_t frame_version() { return RENDER_FRAME_VERSION; }
+bool coreMatches()
+{
+    static uint32_t logged; // the core's version last logged as different (0: none)
+    const uint32_t  core = renderer::frame_version();
+    if (core == RENDER_FRAME_VERSION)
+    {
+        logged = 0;
+        return true;
+    }
+    if (logged != core + 1)
+    {
+        char line[160];
+        snprintf(line, sizeof line, "renderer_rt: the core's frame is v%u, this module's v%u: standing aside", core, RENDER_FRAME_VERSION);
+        yea::log(line);
+        logged = core + 1;
+    }
+    return false;
+}
+
 bool rt_pick(uint64_t address)
 {
+    if (!coreMatches())
+        return false;
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
     gPickCount = 0;
     if (gReady && !settings.shadows && gShLayers)
@@ -1004,6 +1028,8 @@ bool glassInRays(const RenderFrame* F)
 
 bool rt_prepare(uint64_t address)
 {
+    if (!coreMatches())
+        return false;
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
     bool shadows = gPickCount && F && gPickFrame == F->frameNumber;
     gTintNow = gGlassNow = false;
@@ -1338,6 +1364,8 @@ void traceShadows(RenderFrame* F, Cmd* cmd, uint32_t fi)
 
 void rt_run(uint64_t address)
 {
+    if (!coreMatches())
+        return;
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
     uint32_t w = gAccumIndex ^ 1; // written this frame; gAccumIndex holds last frame's
     if (!gReady || !F || !gTex || (F->rtReflection && F->rtReflection != gTex) || !F->depth || !F->depth->pTexture || !F->surface ||

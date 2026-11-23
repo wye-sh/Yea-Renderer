@@ -407,6 +407,9 @@ int load(int reloaded)
     s.ppSamplers = &gShadowCmp;
     updateDescriptorSet(gRenderer, 0, gPersistent, 1, &s);
     gPipes = yea::pipelines();
+#if defined(_WIN32)
+    gPipes = nullptr; // 6.1.0, until Yea 149: Direct3D 12 compiles on the main thread (a crash on Yea's threads freezes 148)
+#endif
     gDrawPending = 0;
     gDrawPipe = nullptr;
     if (!gPipes)
@@ -611,8 +614,32 @@ void particle_emitter_clear()
 // --- The core's hooks ----------------------------------------------------------------------------------------------
 bool particles_on() { return gReady && settings.particles && (gLiveBound > 0 || anyEmitter()); }
 
+// Frame versions (6.1.0): this module's frame layout, for the core; and whether the core's is the same (an older or newer
+// core, cached or reverted, is left alone: no frame read, no GPU work), logged once a change.
+uint32_t frame_version() { return RENDER_FRAME_VERSION; }
+bool coreMatches()
+{
+    static uint32_t logged; // the core's version last logged as different (0: none)
+    const uint32_t  core = renderer::frame_version();
+    if (core == RENDER_FRAME_VERSION)
+    {
+        logged = 0;
+        return true;
+    }
+    if (logged != core + 1)
+    {
+        char line[160];
+        snprintf(line, sizeof line, "renderer_particles: the core's frame is v%u, this module's v%u: standing aside", core, RENDER_FRAME_VERSION);
+        yea::log(line);
+        logged = core + 1;
+    }
+    return false;
+}
+
 bool particles_prepare(uint64_t address)
 {
+    if (!coreMatches())
+        return false;
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
     gOn = gDrawn = false;
     float dt = gPendingDt;
@@ -754,8 +781,11 @@ bool particles_prepare(uint64_t address)
     return true;
 }
 
+
 void particles_run(uint64_t address)
 {
+    if (!coreMatches())
+        return;
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
     if (!gOn || !F)
         return;
@@ -895,6 +925,8 @@ void runBarrier(Cmd* cmd, bool toDraw)
 // particles this frame (particles_draw and particles_draw_end then do nothing).
 bool particles_draw_begin(uint64_t address)
 {
+    if (!coreMatches())
+        return false;
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
     gDrawn = false;
     if (!gOn || !F || !F->hdr || !F->depth)
@@ -932,6 +964,8 @@ bool particles_draw_begin(uint64_t address)
 // pass's counts, first vertex 0.
 void particles_draw(uint64_t address, uint32_t run)
 {
+    if (!coreMatches())
+        return;
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
     if (!gDrawn || !F || run >= gRunCount)
         return;
@@ -947,6 +981,8 @@ void particles_draw(uint64_t address, uint32_t run)
 // After the core unbinds its pass.
 void particles_draw_end(uint64_t address)
 {
+    if (!coreMatches())
+        return;
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
     if (!gDrawn || !F)
         return;

@@ -1678,8 +1678,32 @@ void unload()
 void update(uint32_t phase, float dt) {}
 void draw(uint32_t pass, const YeaFrame* frame) {}
 
+// Frame versions (6.1.0): this module's frame layout, for the core; and whether the core's is the same (an older or newer
+// core, cached or reverted, is left alone: no frame read, no GPU work), logged once a change.
+uint32_t frame_version() { return RENDER_FRAME_VERSION; }
+bool coreMatches()
+{
+    static uint32_t logged; // the core's version last logged as different (0: none)
+    const uint32_t  core = renderer::frame_version();
+    if (core == RENDER_FRAME_VERSION)
+    {
+        logged = 0;
+        return true;
+    }
+    if (logged != core + 1)
+    {
+        char line[160];
+        snprintf(line, sizeof line, "renderer_shadows: the core's frame is v%u, this module's v%u: standing aside", core, RENDER_FRAME_VERSION);
+        yea::log(line);
+        logged = core + 1;
+    }
+    return false;
+}
+
 bool shadows_prepare(uint64_t address)
 {
+    if (!coreMatches())
+        return false;
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
     gLightShadowsOn = false;
     if (!gReady || !F || F->version != RENDER_FRAME_VERSION)
@@ -2175,6 +2199,8 @@ bool light_shadows_on() { return gLightShadowsOn; }
 
 void shadows_render(uint64_t address)
 {
+    if (!coreMatches())
+        return;
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
     if (!gReady || !F || F->sunAtlas != gSunAtlas)
         return;

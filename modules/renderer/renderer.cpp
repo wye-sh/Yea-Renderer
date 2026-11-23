@@ -547,6 +547,36 @@ VertexLayout sceneLayout(bool motion = false)
     return l;
 }
 
+// Each module's frame version, asked every frame (its frame_version export; 0 from the stub of a module that isn't
+// loaded, or is an older version without it, cached or reverted). A module whose version isn't the core's is never
+// called, whatever its own checks, so the core survives any mix of versions. A module of another version (not 0: absent
+// is normal) is logged when it is left out and when it comes back.
+struct ModulesOk
+{
+    bool ao, contact, culling, fog, gi, particles, post, probes, rt, shadows, sky, ssr, taa, upscale, vrs;
+} gOk;
+uint32_t gOkLogged[15]; // the other version logged for each (0: none)
+void checkModules()
+{
+    const uint32_t versions[15] = { renderer_ao::frame_version(), renderer_contact::frame_version(), renderer_culling::frame_version(), renderer_fog::frame_version(), renderer_gi::frame_version(), renderer_particles::frame_version(), renderer_post::frame_version(), renderer_probes::frame_version(), renderer_rt::frame_version(), renderer_shadows::frame_version(), renderer_sky::frame_version(), renderer_ssr::frame_version(), renderer_taa::frame_version(), renderer_upscale::frame_version(), renderer_vrs::frame_version() };
+    const char*    names[15] = { "ao", "contact", "culling", "fog", "gi", "particles", "post", "probes", "rt", "shadows", "sky", "ssr", "taa", "upscale", "vrs" };
+    bool*          ok[15] = { &gOk.ao, &gOk.contact, &gOk.culling, &gOk.fog, &gOk.gi, &gOk.particles, &gOk.post, &gOk.probes, &gOk.rt, &gOk.shadows, &gOk.sky, &gOk.ssr, &gOk.taa, &gOk.upscale, &gOk.vrs };
+    for (uint32_t k = 0; k < 15; ++k)
+    {
+        *ok[k] = versions[k] == RENDER_FRAME_VERSION;
+        const uint32_t other = *ok[k] ? 0u : versions[k];
+        if (other == gOkLogged[k] || (!other && *ok[k] == false))
+            continue;
+        char line[160];
+        if (other)
+            snprintf(line, sizeof line, "renderer: renderer_%s left out: its frame is v%u, the core's v%u", names[k], other, RENDER_FRAME_VERSION);
+        else
+            snprintf(line, sizeof line, "renderer: renderer_%s back in (frame v%u)", names[k], RENDER_FRAME_VERSION);
+        yea::log(line);
+        gOkLogged[k] = other;
+    }
+}
+
 void cancelPipelines();
 
 void destroyScenePipelines()
@@ -1761,7 +1791,7 @@ void drawSeeThrough(Cmd* cmd, uint32_t fi, uint32_t count, bool refract, Rebind 
 } // namespace
 
 // GPU timings (the gpu_timings knob): a timestamp pair per pass, read back framesInFlight frames later
-// (that frame's fence has passed by then, so nothing waits), averaged and logged every 10 s.
+// (that frame's fence has passed by then, so nothing waits), averaged and logged every 30 s.
 namespace
 {
 enum Timing : uint32_t { kTimeSkin, kTimeSky, kTimeShadows, kTimeProbes, kTimePrepass, kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeVrs, kTimeRt, kTimeGi, kTimeFog, kTimeParticles, kTimeForward, kTimeBlend, kTimeExposure, kTimeTaa, kTimeUpscale, kTimePost, kTimeTonemap, kTimeComposite, kTimeTotal, kTimings };
@@ -1774,6 +1804,53 @@ uint32_t          gTimeCount[kTimings];
 double            gTimeLogged;
 bool              gTimedFrame; // this frame's render was timed (the composite follows it)
 
+// Breadcrumbs (6.1.0, for lost devices): the end of every pass above (timeEnd, timed or not) is noted with its frame.
+// At unload, which follows a lost device (Yea unloads the view's modules then), one line names the last passes
+// recorded: with Yea's DRED report (every list the GPU ran finished), the last frame's are where to look. On the GPU
+// itself nothing is written: The Forge's markers break Vulkan's rules inside a render pass.
+struct Crumb
+{
+    uint32_t frame, pass;
+};
+Crumb    gCrumbs[32];
+uint32_t gCrumbCount;
+// The passes this frame recorded (bits by Timing; kCrumbRates: the forward pass bound renderer_vrs's rates), and every
+// one seen since load: a frame with one not seen before logs one line saying so (the first frame with VRS, say).
+const uint32_t kCrumbRates = 31;
+uint32_t       gCrumbMask, gCrumbSeen;
+
+void crumb(uint32_t pass)
+{
+    const uint32_t frame = (uint32_t)yea::host()->frame();
+    gCrumbs[gCrumbCount++ & 31u] = { frame, pass };
+    gCrumbMask |= 1u << pass;
+    if (pass != kTimeTotal)
+        return;
+    const uint32_t fresh = gCrumbMask & ~gCrumbSeen;
+    gCrumbSeen |= gCrumbMask;
+    gCrumbMask = 0;
+    if (!fresh)
+        return;
+    char line[320];
+    int  n = snprintf(line, sizeof line, "renderer: frame %u is the first with", frame);
+    for (uint32_t t = 0; t < 32 && n > 0 && n < (int)sizeof line - 24; ++t)
+        if (fresh & (1u << t))
+            n += snprintf(line + n, sizeof line - n, " %s", t == kCrumbRates ? "vrs-rates-bound" : t < kTimings ? kTimingNames[t] : "?");
+    yea::log(line);
+}
+
+void crumbsAtUnload()
+{
+    if (!gCrumbCount)
+        return;
+    char line[480];
+    int  n = snprintf(line, sizeof line, "renderer: unloaded; the last passes recorded (frame, pass):");
+    for (uint32_t i = gCrumbCount > 14 ? gCrumbCount - 14 : 0; i < gCrumbCount && n > 0 && n < (int)sizeof line - 32; ++i)
+        n += snprintf(line + n, sizeof line - n, " %u %s", gCrumbs[i & 31u].frame, kTimingNames[gCrumbs[i & 31u].pass]);
+    yea::log(line);
+    gCrumbCount = 0;
+}
+
 void timeBegin(Cmd* cmd, uint32_t fi, uint32_t t)
 {
     if (!gTimePool[fi])
@@ -1784,6 +1861,7 @@ void timeBegin(Cmd* cmd, uint32_t fi, uint32_t t)
 }
 void timeEnd(Cmd* cmd, uint32_t fi, uint32_t t)
 {
+    crumb(t);
     if (!gTimePool[fi] || !(gTimeUsed[fi] & (1u << t)))
         return;
     QueryDesc d = { t };
@@ -1813,7 +1891,7 @@ void timeFrame(Cmd* cmd, uint32_t fi, bool on, const char* scene)
     cmdResetQuery(cmd, gTimePool[fi], 0, kTimings);
     gTimeUsed[fi] = 0;
     double now = yea::host()->time();
-    if (now - gTimeLogged >= 10.0 && gTimeCount[kTimeTotal])
+    if (now - gTimeLogged >= 30.0 && gTimeCount[kTimeTotal]) // 30 s in 6.1.0: Yea takes 10 lines a minute
     {
         char line[512];
         int  n = snprintf(line, sizeof line, "gpu ms avg/max over %u frames:", gTimeCount[kTimeTotal]);
@@ -1936,11 +2014,17 @@ int load(int reloaded)
     gFrames = host->framesInFlight < kMaxFrames ? host->framesInFlight : kMaxFrames;
     pipeCacheOpen();
     gPipes = yea::pipelines();
+#if defined(_WIN32)
+    // 6.1.0, until Yea 149: Direct3D 12 compiles on the main thread alone (warming a few a frame), as a crash on Yea's
+    // compile threads freezes Yea 148.
+    gPipes = nullptr;
+#endif
     gPipesFailed = false;
     gTaintedCount = gCancelledNow = gTaintedMade = 0;
     gCancelled = false;
     gPendingCount = 0;
     getTimestampFrequency(gQueue, &gTimeTicks);
+    gCrumbCount = gCrumbMask = gCrumbSeen = 0;
     for (uint32_t i = 0; i < gFrames && gTimeTicks > 0; ++i)
     {
         QueryPoolDesc qd = {};
@@ -2262,6 +2346,7 @@ void unload()
     if (!gRenderer)
         return;
     waitQueueIdle(gQueue);
+    crumbsAtUnload();
     previewUnload();
     texturesFree();
     skinUnload();
@@ -2413,7 +2498,8 @@ void draw(uint32_t pass, const YeaFrame* yf)
     F.cmd = cmd;
     // renderer_upscale may render smaller (F.width x F.height) and upscale to the frame's size in TAA's place; without
     // it everything runs at the frame's size, exactly as before it existed.
-    const bool upscaled = renderer_upscale::upscale_prepare((uint64_t)(uintptr_t)&F) && F.upscaleOn && F.resolved && F.width &&
+    checkModules();
+    const bool upscaled = (gOk.upscale ? renderer_upscale::upscale_prepare((uint64_t)(uintptr_t)&F) : false) && F.upscaleOn && F.resolved && F.width &&
                           F.height && F.width <= dw && F.height <= dh;
     if (!upscaled)
     {
@@ -2427,7 +2513,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         F.resolved = F.previous = nullptr;
     }
     // TAA also sees an upscaler's frame: it then frees its history and stands aside.
-    bool taa = (renderer_taa::taa_prepare((uint64_t)(uintptr_t)&F) && F.taaOn && F.resolved && !upscaled) || upscaled;
+    bool taa = ((gOk.taa ? renderer_taa::taa_prepare((uint64_t)(uintptr_t)&F) : false) && F.taaOn && F.resolved && !upscaled) || upscaled;
     const uint32_t w = F.width, h = F.height; // the render size: every scene pass runs at it
     // F1's Wireframe or Overdraw (development only; 0 in a release): the scene drawn plainly so they read
     // right. No TAA, AO, contact shadows or light culling (their modules step aside), no prepass, no sky,
@@ -2887,7 +2973,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     // The sun's light above the atmosphere; with the physical sky (renderer_sky), what of it reaches the camera, so
     // every module (shadows' tints, probes, ray tracing, the forward pass) sees the sun as it arrives.
     memcpy(F.sunColor, gf->sunColor[0], sizeof F.sunColor);
-    const bool sky = renderer_sky::sky_prepare((uint64_t)(uintptr_t)&F) && F.skyView && F.skyEnv && F.skySh && F.skyAerial;
+    const bool sky = (gOk.sky ? renderer_sky::sky_prepare((uint64_t)(uintptr_t)&F) : false) && F.skyView && F.skyEnv && F.skySh && F.skyAerial;
     if (sky)
         for (int k = 0; k < 3; ++k)
         {
@@ -2969,7 +3055,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     F.decalItems = gWorldCount ? gDecalItemBuf[fi] : nullptr;
     memcpy(F.decalGrid, gDecalGrid, sizeof F.decalGrid);
     F.decalsChanged = gDecalsChanged;
-    bool culled = renderer_culling::cull_prepare((uint64_t)(uintptr_t)&F) && F.tileMasks && F.zbins && F.wordsPerTile;
+    bool culled = (gOk.culling ? renderer_culling::cull_prepare((uint64_t)(uintptr_t)&F) : false) && F.tileMasks && F.zbins && F.wordsPerTile;
     // Decals need culling's bins with it; without culling the forward pass tries every one.
     const bool decals = decalCount && (!culled || (F.decalMasks && F.decalBins));
     if (!culled && F.lightCount > kMaxUnculledLights)
@@ -2977,11 +3063,11 @@ void draw(uint32_t pass, const YeaFrame* yf)
     // Ray-traced shadows (renderer_rt): its pick comes first, so renderer_shadows draws nothing for what it traces.
     const bool rtGate = taa && !viewMode && gRaytracing && gSurface && gDepthSurfacePipe[0] && gDepthSurfacePipe[1] && F.previous;
     // While fog or particles run they read the shadow maps: renderer_shadows keeps them even for what renderer_rt traces.
-    const bool fogMaps = !viewMode && renderer_fog::fog_on();
-    const bool particlesOn = !viewMode && renderer_particles::particles_on();
+    const bool fogMaps = !viewMode && (gOk.fog ? renderer_fog::fog_on() : false);
+    const bool particlesOn = !viewMode && (gOk.particles ? renderer_particles::particles_on() : false);
     // See-through surfaces read them too (traced shadows are the opaque scene's pixels).
     F.keepShadowMaps = fogMaps || particlesOn || blendCount ? 1u : 0u;
-    const bool rtPicked = rtGate && renderer_rt::rt_pick((uint64_t)(uintptr_t)&F);
+    const bool rtPicked = rtGate && (gOk.rt ? renderer_rt::rt_pick((uint64_t)(uintptr_t)&F) : false);
     if (!rtPicked)
     {
         for (uint32_t i = 0; i < F.lightCount; ++i)
@@ -3000,11 +3086,11 @@ void draw(uint32_t pass, const YeaFrame* yf)
     F.materials = gMaterialBuf[fi];
     F.tintDepth = F.tintColor = nullptr;
     F.shadowTints = nullptr;
-    bool shadows = renderer_shadows::shadows_prepare((uint64_t)(uintptr_t)&F) && F.shadowViews && F.sunAtlas && F.localAtlas;
+    bool shadows = (gOk.shadows ? renderer_shadows::shadows_prepare((uint64_t)(uintptr_t)&F) : false) && F.shadowViews && F.sunAtlas && F.localAtlas;
     const bool glassShadows = shadows && F.tintDepth && F.tintColor && F.shadowTints;
-    bool ao = renderer_ao::ao_prepare((uint64_t)(uintptr_t)&F) && F.aoOn && F.ao;
+    bool ao = (gOk.ao ? renderer_ao::ao_prepare((uint64_t)(uintptr_t)&F) : false) && F.aoOn && F.ao;
     // Contact shadows refine the sun's: off with them.
-    bool contact = shadows && F.cascadeCount && renderer_contact::contact_prepare((uint64_t)(uintptr_t)&F) && F.contactOn && F.contact;
+    bool contact = shadows && F.cascadeCount && (gOk.contact ? renderer_contact::contact_prepare((uint64_t)(uintptr_t)&F) : false) && F.contactOn && F.contact;
     const yea_float3 zen = settings.sky_color, hor = settings.horizon_color, gnd = settings.ground_color;
     float            L = settings.sky_luminance;
     F.drawables = gDrawables;
@@ -3016,27 +3102,27 @@ void draw(uint32_t pass, const YeaFrame* yf)
     F.ambient = settings.ambient;
     // Volumetric fog (renderer_fog): it reads the lights, their bins and shadow views, and the sky, all set by now; probes
     // and ray-traced reflections then read its height fog (fogMedium).
-    const bool fog = fogMaps && renderer_fog::fog_prepare((uint64_t)(uintptr_t)&F) && F.fogVolume;
+    const bool fog = fogMaps && (gOk.fog ? renderer_fog::fog_prepare((uint64_t)(uintptr_t)&F) : false) && F.fogVolume;
     // Particles (renderer_particles): lit from the same lights, shadows, sky and fog.
-    const bool particles = particlesOn && renderer_particles::particles_prepare((uint64_t)(uintptr_t)&F);
-    bool probes = renderer_probes::probes_prepare((uint64_t)(uintptr_t)&F) && F.probes && F.probeData && F.probeCount;
+    const bool particles = particlesOn && (gOk.particles ? renderer_particles::particles_prepare((uint64_t)(uintptr_t)&F) : false);
+    bool probes = (gOk.probes ? renderer_probes::probes_prepare((uint64_t)(uintptr_t)&F) : false) && F.probes && F.probeData && F.probeCount;
     // Ray-traced reflections where the GPU has ray queries; screen-space ones otherwise.
     F.surface = gSurface;
     // Dynamic diffuse GI (renderer_gi): its probes and this frame's rays, before rt_prepare (renderer_rt traces them).
-    const bool giOn = !viewMode && renderer_gi::gi_prepare((uint64_t)(uintptr_t)&F);
+    const bool giOn = !viewMode && (gOk.gi ? renderer_gi::gi_prepare((uint64_t)(uintptr_t)&F) : false);
     // The forward pass reads the probes once they have light (the same images gi_run blends into later this frame).
     const bool gi = giOn && F.giIrradiance && F.giDistance && F.giProbeData;
     // renderer_rt runs (its prepass target, rt_run) for its reflections, its traced shadows or both.
-    const bool rtRun = rtGate && renderer_rt::rt_prepare((uint64_t)(uintptr_t)&F);
+    const bool rtRun = rtGate && (gOk.rt ? renderer_rt::rt_prepare((uint64_t)(uintptr_t)&F) : false);
     bool       rt = rtRun && F.rtReflection;
     const bool rtShadows = rtRun && rtPicked && F.rtShadows;
-    bool ssr = !rt && taa && !viewMode && renderer_ssr::ssr_prepare((uint64_t)(uintptr_t)&F) && F.ssrOn && F.ssrDepth && F.previous;
-    bool vrs = taa && !viewMode && renderer_vrs::vrs_prepare((uint64_t)(uintptr_t)&F) && F.rateImage && F.rateCopy;
+    bool ssr = !rt && taa && !viewMode && (gOk.ssr ? renderer_ssr::ssr_prepare((uint64_t)(uintptr_t)&F) : false) && F.ssrOn && F.ssrDepth && F.previous;
+    bool vrs = taa && !viewMode && (gOk.vrs ? renderer_vrs::vrs_prepare((uint64_t)(uintptr_t)&F) : false) && F.rateImage && F.rateCopy;
 
     // GPU lights in sorted order, with the shadow views renderer_shadows picked; then, for reflections
     // (renderer_rt), the lights outside the view, without shadows.
     RenderGpuLight* gl = gLightCpu;
-    const bool      lightShadows = shadows && renderer_shadows::light_shadows_on();
+    const bool      lightShadows = shadows && (gOk.shadows ? renderer_shadows::light_shadows_on() : false);
     bool            anyShape = false;
     for (uint32_t i = 0; i < F.lightCount + outsideCount; ++i)
     {
@@ -3320,7 +3406,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     // Post-processing (renderer_post) on the resolved HDR image, before the tonemapper: the image it returns is what
     // the tonemap pass and the composite read. Not under the debug views, which show their values as they are.
     Texture* post = !rawDebug && !(culled && F.heatmap) && (taa || samples == 1)
-                        ? (Texture*)(uintptr_t)renderer_post::post_prepare((uint64_t)(uintptr_t)&F)
+                        ? (Texture*)(uintptr_t)(gOk.post ? renderer_post::post_prepare((uint64_t)(uintptr_t)&F) : 0)
                         : nullptr;
     ExposureData* ed = (ExposureData*)gExposureCb[fi]->pCpuMappedAddress;
     float         minLog = -8.0f, range = 26.0f;
@@ -3543,35 +3629,35 @@ void draw(uint32_t pass, const YeaFrame* yf)
     {
         if (timed)
             timeBegin(cmd, fi, kTimeSky);
-        renderer_sky::sky_run((uint64_t)(uintptr_t)&F);
+        (gOk.sky ? renderer_sky::sky_run((uint64_t)(uintptr_t)&F) : (void)0);
         timeEnd(cmd, fi, kTimeSky);
     }
     if (shadows)
     {
         if (timed)
             timeBegin(cmd, fi, kTimeShadows);
-        renderer_shadows::shadows_render((uint64_t)(uintptr_t)&F);
+        (gOk.shadows ? renderer_shadows::shadows_render((uint64_t)(uintptr_t)&F) : (void)0);
         timeEnd(cmd, fi, kTimeShadows);
     }
     if (probes)
     {
         if (timed)
             timeBegin(cmd, fi, kTimeProbes);
-        renderer_probes::probes_render((uint64_t)(uintptr_t)&F);
+        (gOk.probes ? renderer_probes::probes_render((uint64_t)(uintptr_t)&F) : (void)0);
         timeEnd(cmd, fi, kTimeProbes);
     }
     if (fog)
     {
         if (timed)
             timeBegin(cmd, fi, kTimeFog);
-        renderer_fog::fog_run((uint64_t)(uintptr_t)&F);
+        (gOk.fog ? renderer_fog::fog_run((uint64_t)(uintptr_t)&F) : (void)0);
         timeEnd(cmd, fi, kTimeFog);
     }
     if (particles)
     {
         if (timed)
             timeBegin(cmd, fi, kTimeParticles);
-        renderer_particles::particles_run((uint64_t)(uintptr_t)&F);
+        (gOk.particles ? renderer_particles::particles_run((uint64_t)(uintptr_t)&F) : (void)0);
         timeEnd(cmd, fi, kTimeParticles);
     }
 
@@ -3650,6 +3736,11 @@ void draw(uint32_t pass, const YeaFrame* yf)
     if (rtRun)
         barrierRt(cmd, gMotion, RESOURCE_STATE_RENDER_TARGET, RESOURCE_STATE_SHADER_RESOURCE);
     F.gloss = second;
+    // renderer_vrs writes its rate image only with all of these (vrs_run's guard). Without them (the gloss prepass's
+    // pipelines still warming after TAA arrives, say) the image is unwritten and, just made, in UNORDERED_ACCESS, where
+    // Direct3D 12 can't shade by it (the service needs SHADING_RATE_SOURCE): full rate this frame instead.
+    if (vrs && (!F.gloss || !F.previous || !F.motion || !F.exposure || !F.depth))
+        vrs = false;
     cmdEndDebugMarker(cmd);
     }
 
@@ -3666,17 +3757,17 @@ void draw(uint32_t pass, const YeaFrame* yf)
             if (timed)
                 timeBegin(cmd, fi, which[k]);
             if (k == 0)
-                renderer_culling::cull_run((uint64_t)(uintptr_t)&F);
+                (gOk.culling ? renderer_culling::cull_run((uint64_t)(uintptr_t)&F) : (void)0);
             else if (k == 1)
-                renderer_ao::ao_run((uint64_t)(uintptr_t)&F);
+                (gOk.ao ? renderer_ao::ao_run((uint64_t)(uintptr_t)&F) : (void)0);
             else if (k == 2)
-                renderer_contact::contact_run((uint64_t)(uintptr_t)&F);
+                (gOk.contact ? renderer_contact::contact_run((uint64_t)(uintptr_t)&F) : (void)0);
             else if (k == 3)
-                renderer_ssr::ssr_run((uint64_t)(uintptr_t)&F);
+                (gOk.ssr ? renderer_ssr::ssr_run((uint64_t)(uintptr_t)&F) : (void)0);
             else if (k == 4)
-                renderer_vrs::vrs_run((uint64_t)(uintptr_t)&F);
+                (gOk.vrs ? renderer_vrs::vrs_run((uint64_t)(uintptr_t)&F) : (void)0);
             else
-                renderer_rt::rt_run((uint64_t)(uintptr_t)&F);
+                (gOk.rt ? renderer_rt::rt_run((uint64_t)(uintptr_t)&F) : (void)0);
             timeEnd(cmd, fi, which[k]);
         }
         barrierRt(cmd, gDepth, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_DEPTH_WRITE);
@@ -3687,7 +3778,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     {
         if (timed)
             timeBegin(cmd, fi, kTimeGi);
-        renderer_gi::gi_run((uint64_t)(uintptr_t)&F);
+        (gOk.gi ? renderer_gi::gi_run((uint64_t)(uintptr_t)&F) : (void)0);
         timeEnd(cmd, fi, kTimeGi);
     }
 
@@ -3715,7 +3806,10 @@ void draw(uint32_t pass, const YeaFrame* yf)
     }
     // With renderer_vrs: shaded at its rates (this pass only; the next bind ends them).
     if (vrs && gShadingRate)
+    {
         gShadingRate->bindRenderTargets(cmd, &bind, F.rateImage);
+        gCrumbMask |= 1u << kCrumbRates;
+    }
     else
         cmdBindRenderTargets(cmd, &bind);
     cmdSetViewport(cmd, 0, 0, (float)w, (float)h, 0, 1);
@@ -3767,7 +3861,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
             timeBegin(cmd, fi, kTimeBlend);
         barrierRt(cmd, gDepth, RESOURCE_STATE_DEPTH_WRITE, RESOURCE_STATE_SHADER_RESOURCE);
         gDepthState = RESOURCE_STATE_SHADER_RESOURCE;
-        const bool runs = particles && renderer_particles::particles_draw_begin((uint64_t)(uintptr_t)&F);
+        const bool runs = particles && (gOk.particles ? renderer_particles::particles_draw_begin((uint64_t)(uintptr_t)&F) : false);
         cmdBeginDebugMarker(cmd, 0.6f, 0.9f, 1.0f, "Renderer see-through");
         RenderTargetBarrier rb[3] = { { gHdr, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_RENDER_TARGET },
                                       { gReactive, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_RENDER_TARGET },
@@ -3790,12 +3884,12 @@ void draw(uint32_t pass, const YeaFrame* yf)
         drawSeeThrough(cmd, fi, surfaces, blendDraw && (gFrameCpu.counts[2] & kFlagRefraction), bindPass, [&](uint32_t j) {
             if (!runs || j < split)
                 return false;
-            renderer_particles::particles_draw((uint64_t)(uintptr_t)&F, j - split);
+            (gOk.particles ? renderer_particles::particles_draw((uint64_t)(uintptr_t)&F, j - split) : (void)0);
             return true;
         });
         // The runs nearer than every surface drawn (all of them while the see-through pipelines are still being made).
         for (uint32_t r = surfaces ? F.blendRuns : 0; runs && r <= F.blendRuns; ++r)
-            renderer_particles::particles_draw((uint64_t)(uintptr_t)&F, r);
+            (gOk.particles ? renderer_particles::particles_draw((uint64_t)(uintptr_t)&F, r) : (void)0);
         cmdBindRenderTargets(cmd, nullptr);
         RenderTargetBarrier back[3] = { { gHdr, RESOURCE_STATE_RENDER_TARGET, RESOURCE_STATE_SHADER_RESOURCE },
                                         { gReactive, RESOURCE_STATE_RENDER_TARGET, RESOURCE_STATE_SHADER_RESOURCE },
@@ -3803,7 +3897,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         cmdResourceBarrier(cmd, 0, nullptr, 0, nullptr, 3, back);
         cmdEndDebugMarker(cmd);
         if (runs)
-            renderer_particles::particles_draw_end((uint64_t)(uintptr_t)&F);
+            (gOk.particles ? renderer_particles::particles_draw_end((uint64_t)(uintptr_t)&F) : (void)0);
         F.reactive = gReactive->pTexture;
         F.transparency = blendDraw ? gTransparency->pTexture : nullptr;
         timeEnd(cmd, fi, kTimeBlend);
@@ -3836,16 +3930,16 @@ void draw(uint32_t pass, const YeaFrame* yf)
             barrierRt(cmd, gDepth, gDepthState, RESOURCE_STATE_SHADER_RESOURCE);
         gDepthState = RESOURCE_STATE_SHADER_RESOURCE;
         if (upscaled)
-            renderer_upscale::upscale_run((uint64_t)(uintptr_t)&F);
+            (gOk.upscale ? renderer_upscale::upscale_run((uint64_t)(uintptr_t)&F) : (void)0);
         else
-            renderer_taa::taa_resolve((uint64_t)(uintptr_t)&F);
+            (gOk.taa ? renderer_taa::taa_resolve((uint64_t)(uintptr_t)&F) : (void)0);
         timeEnd(cmd, fi, slot);
     }
     if (post)
     {
         if (timed)
             timeBegin(cmd, fi, kTimePost);
-        renderer_post::post_run((uint64_t)(uintptr_t)&F);
+        (gOk.post ? renderer_post::post_run((uint64_t)(uintptr_t)&F) : (void)0);
         timeEnd(cmd, fi, kTimePost);
     }
     if (ldr)

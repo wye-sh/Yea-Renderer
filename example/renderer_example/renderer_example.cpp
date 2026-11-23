@@ -217,6 +217,14 @@ void addProbes()
 // front, its file's +Z, faces -Z as cooked; each is turned towards the start view.
 void placeModels()
 {
+    if (!settings.models)
+    {
+        uint32_t* all[4] = { &models->lantern, &models->flightHelmet, &models->waterBottle, &models->boomBox };
+        for (uint32_t* p : all)
+            if (mdl::placed(*p))
+                mdl::remove(*p);
+        return;
+    }
     const yea_float4 toView = axisAngle({ 0, 1, 0 }, -2.17f);
     if (!mdl::placed(models->lantern)) // a 3 m street lamp by the white boxes, its arm over the path
         models->lantern = mdl::place(lantern, { -7.6f, -0.02f, 4.2f }, axisAngle({ 0, 1, 0 }, -0.5f));

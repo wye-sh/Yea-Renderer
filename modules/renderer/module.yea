@@ -368,7 +368,7 @@ setting float dark_adaptation 0.6 0 1
 # industry's ACES look (contrasty, warm highlights); Tony McMapface is Tomasz Stachowiak's neutral 3D table.
 setting choice tonemapper Khronos_PBR_Neutral Khronos_PBR_Neutral AgX Hable_Filmic Reinhard None ACES_Fitted Tony_McMapface
 category Anti-aliasing
-setting int msaa 4 1 8
+setting int msaa 1 1 8
 setting float specular_aa 1 0 2
 category Sky
 setting color sky_color 0.22 0.38 0.85
@@ -382,10 +382,10 @@ setting float near_plane 0.05 0.01 inf
 category Performance
 setting bool gpu_timings true
 # Decals (decal_add) painted on the scene; off saves their cost.
-setting bool decals true
+setting bool decals false
 # Glass bends and blurs what is behind it (material_refraction, rough see-through surfaces); off: seen straight through,
 # unblurred (saves a copy of the scene and its blurred levels while glass is in view).
-setting bool refraction true
+setting bool refraction false
 # How far a mesh's outline may be off on screen (display pixels) before a simpler version of it is drawn; 0 always
 # draws the finest. Built-in shapes only: meshes made vertex by vertex have one version.
 setting float lod_error 0.5 0 inf
@@ -394,3 +394,22 @@ player lod_error
 # leaves out more by itself when the GPU's free memory can't hold a texture).
 setting choice texture_detail Full Full Half Quarter
 player texture_detail
+
+# Frame versions (6.1.0): the core calls a module only while its frame_version() is the core's RENDER_FRAME_VERSION
+# (0 from the stub of an older module without it); modules call the core's to refuse a core of another version.
+export u32 frame_version()
+import renderer_ao u32 frame_version() = 0
+import renderer_contact u32 frame_version() = 0
+import renderer_culling u32 frame_version() = 0
+import renderer_fog u32 frame_version() = 0
+import renderer_gi u32 frame_version() = 0
+import renderer_particles u32 frame_version() = 0
+import renderer_post u32 frame_version() = 0
+import renderer_probes u32 frame_version() = 0
+import renderer_rt u32 frame_version() = 0
+import renderer_shadows u32 frame_version() = 0
+import renderer_sky u32 frame_version() = 0
+import renderer_ssr u32 frame_version() = 0
+import renderer_taa u32 frame_version() = 0
+import renderer_upscale u32 frame_version() = 0
+import renderer_vrs u32 frame_version() = 0

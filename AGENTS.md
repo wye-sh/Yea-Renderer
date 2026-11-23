@@ -477,7 +477,13 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   preview pipelines and buffers are made in its own `load()` (`preview_core.h`); a failure turns only the preview off.
 - The core calls the others through optional imports with a `RenderFrame*` (as `u64`): `frame.h`, copied
   identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes`, `renderer_ssr`, `renderer_vrs`, `renderer_rt`, `renderer_upscale`, `renderer_post`, `renderer_sky`, `renderer_fog`, `renderer_particles` and `renderer_gi` (`mathx.h` into the
-  first three). Change all copies together and raise `RENDER_FRAME_VERSION`. Geometry (frame v16): two vertex streams, `positions`
+  first three). Change all copies together and raise `RENDER_FRAME_VERSION`. Mixed versions (6.1.0; Yea 148 swapped
+  each module as its download finished, so a 3.10.3 module ran against a v26 core): every module exports
+  `frame_version()` (its RENDER_FRAME_VERSION) and so does the core. The core asks each module's every frame
+  (`checkModules`; the stub's 0 for one absent or older) and calls nothing in one whose answer differs (every call
+  site is `gOk.<module> ? call : default`), logging a module of another version once when it leaves and comes back;
+  each module checks the core's (`coreMatches`) at the top of every export that takes a frame, and on a difference
+  reads nothing and does nothing, logged once. A new export calling into another module needs the same gate. Geometry (frame v16): two vertex streams, `positions`
   (float3, `RENDER_POSITION_STRIDE`) and `attributes` (`RENDER_ATTRIBUTE_STRIDE`: octahedral normal and tangent snorm16x2,
   uv0, rgba8 colour; frame.h says how to decode), and u32 `indices`. They are GPU-only, made with half again as much room
   and appended to with the queue idle when meshes are added (remade only when full or the scene starts over), always in
@@ -729,6 +735,16 @@ for the decals in its tile and z-bin (a box test, then up to three map reads or 
 
 ## Pitfalls
 
+- 6.1.0 is a diagnostic release for a lost Direct3D 12 device (DXGI_ERROR_INVALID_CALL on an RTX 2080, after the core
+  remade its scene for TAA). Its defaults are safe ones, and the next release puts the real ones back: msaa 1;
+  renderer_rt enabled, renderer_gi gi, renderer_particles particles, renderer_shadows glass_shadows, renderer_sky
+  physical_sky, renderer_vrs, renderer_ao, renderer_contact and renderer_ssr enabled all off; the core's refraction and
+  decals off; the example's dust, steam, glass, decals and models off. `modules/test_renderer_bisect` turns them on one
+  at a time. On Windows the core and renderer_particles compile on the main thread (no `yea::pipelines()`) until
+  Yea 149. The core keeps its last passes (`crumb`, at each timeEnd), logs them at unload, and logs the first frame with
+  each pass and with VRS's rates bound. Fixed in it: the forward pass bound renderer_vrs's rate image on frames
+  vrs_run hadn't written it (no gloss target while its prepass pipelines warmed). The image was unwritten and, when
+  just made, in UNORDERED_ACCESS. The core now binds rates only when vrs_run's own guard holds.
 - Third-party material: every addition or removal updates both `licenses.json` and `LICENSES.txt` (its name,
   what uses it, source, verbatim licence text with its copyright line) in the same commit.
 - Code run per light per pixel (`brdfLight`, the shadow filters) stays free of sin, cos, pow and per-tap sqrt: the

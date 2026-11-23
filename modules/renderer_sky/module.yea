@@ -9,7 +9,7 @@ export void sky_run(u64 frame)
 category Atmosphere
 # The sky as Earth's atmosphere makes it: blue overhead, paler at the horizon, red and gold at sunset, its light
 # following the sun. Off: the Sky settings' plain gradient.
-setting bool physical_sky true
+setting bool physical_sky false
 # Haze: dust and droplets in the air (1: a clear day; higher is hazier, with a brighter halo round the sun).
 setting float haze 1 0 inf
 # How strongly the air scatters blue (1: Earth's).
@@ -20,3 +20,8 @@ setting float ozone 1 0 inf
 setting float ground_albedo 0.3 0 1
 # Distant things fade into the sky's colour (1: as far as real air does it; higher fades nearer).
 setting float aerial_perspective 1 0 inf
+
+# Frame versions (6.1.0): the core calls this module only while frame_version() is its own; it refuses a core of
+# another version (frame_version 0 from an older core's stub).
+export u32 frame_version()
+import renderer u32 frame_version() = 0

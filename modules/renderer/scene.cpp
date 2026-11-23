@@ -2,6 +2,7 @@
 // Exports only touch tables and state; the GPU side picks the changes up when it draws.
 #include "yea_renderer.h"
 #include "scene.h"
+#include "frame.h"
 
 #include <math.h>
 #include <string.h>
@@ -887,6 +888,9 @@ void decal_clear()
 // --- Camera -----------------------------------------------------------------------------------
 
 CameraState* cameraState() { return gCamera; }
+
+// The frame layout this core fills (frame.h): modules compare it with their own and refuse a core of another version.
+uint32_t frame_version() { return RENDER_FRAME_VERSION; }
 
 void camera(yea_float3 eye, yea_float3 target, float fov_deg)
 {

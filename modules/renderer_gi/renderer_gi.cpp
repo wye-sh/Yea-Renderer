@@ -1040,8 +1040,32 @@ void gi_volume(yea_float3 center, yea_float3 size)
     volume->set = size.x != 0 && size.y != 0 && size.z != 0;
 }
 
+// Frame versions (6.1.0): this module's frame layout, for the core; and whether the core's is the same (an older or newer
+// core, cached or reverted, is left alone: no frame read, no GPU work), logged once a change.
+uint32_t frame_version() { return RENDER_FRAME_VERSION; }
+bool coreMatches()
+{
+    static uint32_t logged; // the core's version last logged as different (0: none)
+    const uint32_t  core = renderer::frame_version();
+    if (core == RENDER_FRAME_VERSION)
+    {
+        logged = 0;
+        return true;
+    }
+    if (logged != core + 1)
+    {
+        char line[160];
+        snprintf(line, sizeof line, "renderer_gi: the core's frame is v%u, this module's v%u: standing aside", core, RENDER_FRAME_VERSION);
+        yea::log(line);
+        logged = core + 1;
+    }
+    return false;
+}
+
 bool gi_prepare(uint64_t address)
 {
+    if (!coreMatches())
+        return false;
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
     gOn = gInitNow = false;
     if (!F || F->version != RENDER_FRAME_VERSION)
@@ -1118,6 +1142,8 @@ bool gi_prepare(uint64_t address)
 
 void gi_run(uint64_t address)
 {
+    if (!coreMatches())
+        return;
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
     if (!gOn || !gReady || !F)
         return;

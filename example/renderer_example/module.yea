@@ -100,15 +100,17 @@ setting float sun_elevation 22 -10 90
 setting float sun_azimuth 35 0 360
 category Particles
 # Dust motes drifting over the floor, glinting where the sun reaches them.
-setting bool dust true
+setting bool dust false
 # Steam rising off the steel drum.
-setting bool steam true
-category Glass and Decals
+setting bool steam false
+category Glass, Decals and Models
 # Glass panes either side of the steam (clear in front, teal behind), a frosted one and a solid glass ball, bending and
 # blurring what is behind them.
-setting bool glass true
+setting bool glass false
 # A scorch, a puddle, worn painted lines, patina on the copper block and a glowing strip on the stone ledge.
-setting bool decals true
+setting bool decals false
+# The four sample models (lantern, flight helmet, water bottle, boom box).
+setting bool models false
 category Camera
 setting float fov 55 20 100
 setting float look_sensitivity 1 0.1 inf

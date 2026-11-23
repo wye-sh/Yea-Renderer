@@ -76,7 +76,7 @@ export void particles_draw_end(u64 frame)
 
 category Particles
 # Dust, steam, smoke and sparks from the game's emitters.
-setting bool particles true
+setting bool particles false
 player particles
 # The most particles alive at once (memory: 48 bytes each, plus 24 to draw and light them).
 setting int max_particles 32768 1024 65536
@@ -84,3 +84,8 @@ setting int max_particles 32768 1024 65536
 setting float soft_distance 0.3 0 inf
 # How close to the camera they fade out (m).
 setting float near_fade 0.3 0 inf
+
+# Frame versions (6.1.0): the core calls this module only while frame_version() is its own; it refuses a core of
+# another version (frame_version 0 from an older core's stub).
+export u32 frame_version()
+import renderer u32 frame_version() = 0

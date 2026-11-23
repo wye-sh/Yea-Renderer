@@ -7,7 +7,7 @@ export void ssr_run(u64 frame)
 category Screen Reflections
 # Glossy surfaces reflect what is on screen exactly (from last frame's image), over the reflection
 # probes; where the reflected thing is off screen, the probes show. Needs Anti-aliasing (TAA) on.
-setting bool enabled true
+setting bool enabled false
 player enabled
 # Traces against half-size depth: faster, thin things may be missed.
 setting bool half_resolution false
@@ -23,3 +23,8 @@ setting int steps 32 8 96
 setting float edge_fade 0.1 0 0.5
 setting float intensity 1 0 1
 setting bool show_hits false
+
+# Frame versions (6.1.0): the core calls this module only while frame_version() is its own; it refuses a core of
+# another version (frame_version 0 from an older core's stub).
+export u32 frame_version()
+import renderer u32 frame_version() = 0

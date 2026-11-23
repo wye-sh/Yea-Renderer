@@ -10,3 +10,8 @@ setting int max_lights 1024 16 4096
 setting int tile_size 16 8 32
 setting int z_bins 1024 64 8192
 setting bool heatmap false
+
+# Frame versions (6.1.0): the core calls this module only while frame_version() is its own; it refuses a core of
+# another version (frame_version 0 from an older core's stub).
+export u32 frame_version()
+import renderer u32 frame_version() = 0

@@ -19,7 +19,7 @@ category Global Illumination
 # Light bouncing off everything onto everything else: a sunlit red wall tints the floor beside it, a lamp lights the
 # room round its pool, shade under a table is darker than the open sky alone makes it. Ray-traced where the GPU can;
 # elsewhere a few probes are captured each frame instead, following changes more slowly.
-setting bool gi true
+setting bool gi false
 player gi
 # Rays each probe casts a frame (Low 64, Medium 128, High 256): smoother, quicker to follow changing light. Without
 # ray tracing, probes captured a frame (Low 4, Medium 8, High 16).
@@ -29,3 +29,8 @@ player quality
 setting float hysteresis 0.97 0 0.995
 # Show only the bounced light (diffuse, white surfaces).
 setting bool show_gi false
+
+# Frame versions (6.1.0): the core calls this module only while frame_version() is its own; it refuses a core of
+# another version (frame_version 0 from an older core's stub).
+export u32 frame_version()
+import renderer u32 frame_version() = 0

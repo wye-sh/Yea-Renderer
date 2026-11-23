@@ -9,7 +9,7 @@ export bool rt_pick(u64 frame)
 category Ray-Traced Reflections
 # Reflections found by tracing rays through the scene, also of what is off screen or hidden. Only on GPUs
 # with ray tracing (hidden elsewhere), with Anti-aliasing (TAA) on; elsewhere Screen Reflections and the probes show.
-setting bool enabled true
+setting bool enabled false
 needs enabled raytracing
 player enabled
 # Surfaces rougher than this keep the probes' blurred reflections; traced ones fade out towards it.
@@ -48,3 +48,8 @@ needs shadows raytracing
 player shadows
 # How many lights besides the sun get traced shadows (area lights first); the rest keep shadow maps.
 setting int traced_lights 4 0 8
+
+# Frame versions (6.1.0): the core calls this module only while frame_version() is its own; it refuses a core of
+# another version (frame_version 0 from an older core's stub).
+export u32 frame_version()
+import renderer u32 frame_version() = 0
