@@ -5,6 +5,7 @@
 #include "yea_renderer_models.h"
 #include "models.h"
 #include "rmodel.h"
+#include "anim.h"
 
 #include <Common_3/Graphics/Interfaces/IGraphics.h>
 #include <yea/ui.h>
@@ -29,6 +30,20 @@ RenderTarget * gHdr, *gDepth, *gShadow, *gOut;
 uint32_t       gTargetW, gTargetH;
 RenderPreview* gDraw; // the core's preview request, kept (made in load())
 const uint32_t kShadowSize = 1024;
+// Skinned models: a skeleton's nodes and palette at most (the cooker allows more; the loader refuses them).
+constexpr uint32_t kMaxNodes = 1024, kMaxBones = 1024;
+anim::Pose*        gPoses;   // scratch for one placement's evaluation (made in load()): its clip's poses,
+anim::Pose*        gFrom;    // the clip it fades from,
+float*             gWorld;   // each node's model-space matrix (12 floats),
+float*             gPalette; // and each bone's (12 floats)
+constexpr uint32_t kNoClip = 0xFFFFFFFFu;
+
+void freeAnim(Entry& e)
+{
+    free(e.anim);
+    e.anim = nullptr;
+    e.skel = nullptr, e.nodes = nullptr, e.bones = nullptr, e.clips = nullptr;
+}
 
 uint32_t fnv(const char* a, const char* b)
 {
@@ -97,6 +112,7 @@ uint32_t apiDefine(const mdl::Spec* s, char* error, uint32_t bytes)
     if (e->source[0] && strcmp(e->source, s->source)) // a new file: its parts made again
     {
         e->state = 0;
+        freeAnim(*e);
         for (uint32_t i = ModelParts.size(); i-- > 0;)
             if (ModelParts[i].key == key)
                 ModelParts.remove(i);
@@ -120,6 +136,7 @@ void apiEnd(const char* owner)
             for (uint32_t r = 0; r < Placements.size(); ++r)
                 if (Placements[r].alive && Placements[r].key == gEntries[i].key)
                     Placements[r].alive = 0, Placements[r].dirty = 1; // its instances go in update()
+            freeAnim(gEntries[i]);
             memmove(&gEntries[i], &gEntries[i + 1], sizeof(Entry) * (gEntryCount - i - 1));
             --gEntryCount;
         }
@@ -162,6 +179,15 @@ uint32_t apiPlace(uint32_t model, const float* pos, const float* rot, float scal
     p.rot = { rot[0], rot[1], rot[2], rot[3] };
     p.scale = scale;
     p.dirty = 1;
+    while (PlacementAnims.size() <= row && PlacementAnims.add())
+        ;
+    if (row < PlacementAnims.size())
+    {
+        PlacementAnim& a = PlacementAnims[row];
+        a = PlacementAnim{};
+        a.clip = 0; // its first clip, looping (a model without clips stands in its rest pose)
+        a.speed = 1, a.loop = 1, a.from = kNoClip;
+    }
     return row | gen << 20;
 }
 void apiMove(uint32_t h, const float* pos, const float* rot, float scale)
@@ -193,7 +219,7 @@ int      apiInfo(uint32_t index, mdl::Info* out)
     out->name = e.name;
     out->source = e.source;
     out->id = e.id;
-    out->kind = e.kind;
+    out->kind = e.kind == 1 && e.anim ? 2 : e.kind;
     out->state = e.state;
     out->parts = e.parts;
     out->lods = lodCount(e);
@@ -205,8 +231,133 @@ int      apiInfo(uint32_t index, mdl::Info* out)
     out->error = e.error;
     return 1;
 }
-mdl::Api gApi = { mdl::kApi, sizeof(mdl::Api), 0, apiBegin, apiDefine, apiEnd, apiKnobs, apiPlace, apiMove, apiRemove, apiPlaced,
-                  apiCount, apiInfo };
+// A placement's skinned model and its animation row, or nullptr.
+Entry* animOf(uint32_t h, PlacementAnim** out)
+{
+    const uint32_t row = placementRow(h);
+    Entry*         e = row != 0xFFFFFFFFu ? byKey(Placements[row].key) : nullptr;
+    if (!e || !e->anim || row >= PlacementAnims.size())
+        return nullptr;
+    *out = &PlacementAnims[row];
+    return e;
+}
+uint32_t clipHash(const char* name, size_t max)
+{
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < max && name[i]; ++i)
+        h = (h ^ (uint8_t)name[i]) * 16777619u;
+    return h ? h : 1;
+}
+uint32_t clipNamed(const Entry& e, const char* name)
+{
+    for (uint32_t c = 0; name && name[0] && c < e.skel->clipCount; ++c)
+        if (!strncmp(e.clips[c].name, name, sizeof e.clips[c].name))
+            return c;
+    return kNoClip;
+}
+uint32_t clipHashed(const Entry& e, uint32_t hash)
+{
+    for (uint32_t c = 0; c < e.skel->clipCount; ++c)
+        if (clipHash(e.clips[c].name, sizeof e.clips[c].name) == hash)
+            return c;
+    return kNoClip;
+}
+int apiPlay(uint32_t h, const char* clip, float speed, int loop, float fade)
+{
+    PlacementAnim* a;
+    Entry*         e = animOf(h, &a);
+    if (!e)
+    {
+        // Its model still loading: the clip is taken by name once it has (a placement of a static model ignores it).
+        const uint32_t row = placementRow(h);
+        Entry*         m = row != 0xFFFFFFFFu ? byKey(Placements[row].key) : nullptr;
+        if (!m || m->state != 0 || row >= PlacementAnims.size())
+            return 0;
+        PlacementAnim& p = PlacementAnims[row];
+        p.want = clip && clip[0] ? clipHash(clip, 48) : 0;
+        p.clip = clip && clip[0] ? 0 : kNoClip;
+        p.speed = speed, p.loop = loop ? 1 : 0, p.time = 0, p.from = kNoClip;
+        return 1;
+    }
+    a->want = 0;
+    const uint32_t c = clipNamed(*e, clip);
+    if (c == kNoClip && clip && clip[0])
+        return 0;
+    if (c != a->clip && fade > 0)
+        a->from = a->clip, a->fromTime = a->time, a->fromSpeed = a->speed, a->fromLoop = a->loop, a->fade = fade, a->faded = 0;
+    else if (c != a->clip)
+        a->from = kNoClip;
+    if (c != a->clip)
+        a->time = 0;
+    a->clip = c, a->speed = speed, a->loop = loop ? 1 : 0;
+    return 1;
+}
+float apiTime(uint32_t h)
+{
+    PlacementAnim* a;
+    return animOf(h, &a) ? a->time : 0.0f;
+}
+// One placement's pose now into gPoses (its clip, faded from the one before): false when it isn't skinned.
+bool evaluate(const Entry& e, const PlacementAnim& a)
+{
+    const uint32_t n = e.skel->nodeCount;
+    auto           sample = [&](uint32_t clip, float time, bool loop, anim::Pose* out) {
+        if (clip >= e.skel->clipCount ||
+            !anim::sampleClip(e.anim + (e.clips[clip].offset - e.animBase), e.clips[clip], n, time, loop, out))
+            anim::restPoses(e.nodes, n, out);
+    };
+    sample(a.clip, a.time, a.loop, gPoses);
+    if (a.from != kNoClip && a.fade > 0 && a.faded < a.fade)
+    {
+        sample(a.from, a.fromTime, a.fromLoop, gFrom);
+        float f = a.faded / a.fade;
+        f = f * f * (3 - 2 * f); // eased
+        anim::blendPoses(gFrom, gPoses, n, f);
+        memcpy(gPoses, gFrom, sizeof(anim::Pose) * n);
+    }
+    anim::palette(e.nodes, n, e.bones, e.skel->boneCount, gPoses, gWorld, gPalette);
+    return true;
+}
+yea_float4 upTurn(const Entry& e);
+yea_float4 qmul(yea_float4 a, yea_float4 b);
+int        apiJoint(uint32_t h, const char* name, float* out)
+{
+    PlacementAnim* a;
+    Entry*         e = animOf(h, &a);
+    if (!e || !name || !out)
+        return 0;
+    uint32_t node = kNoClip;
+    for (uint32_t i = 0; i < e->skel->nodeCount && node == kNoClip; ++i)
+        if (!strncmp(e->nodes[i].name, name, sizeof e->nodes[i].name))
+            node = i;
+    if (node == kNoClip)
+        return 0;
+    evaluate(*e, *a);
+    const Placement& p = Placements[placementRow(h)];
+    const float      s = p.scale * e->knobs[mdl::KnobScale];
+    const yea_float4 r = qmul(p.rot, upTurn(*e));
+    const anim::Pose placed = { { p.pos.x, p.pos.y, p.pos.z }, { r.x, r.y, r.z, r.w }, { s, s, s } };
+    float            m[12];
+    anim::poseMatrix(placed, m);
+    anim::mul34(m, &gWorld[node * 12], out);
+    return 1;
+}
+uint32_t apiClips(uint32_t model)
+{
+    const Entry* e = byId(model);
+    return e && e->anim ? e->skel->clipCount : 0;
+}
+const char* apiClip(uint32_t model, uint32_t index, float* duration)
+{
+    const Entry* e = byId(model);
+    if (!e || !e->anim || index >= e->skel->clipCount)
+        return nullptr;
+    if (duration)
+        *duration = e->clips[index].duration;
+    return e->clips[index].name;
+}
+mdl::Api gApi = { mdl::kApi, sizeof(mdl::Api), 0,       apiBegin, apiDefine, apiEnd,   apiKnobs, apiPlace, apiMove,
+                  apiRemove, apiPlaced,        apiCount, apiInfo,  apiPlay,   apiTime,  apiJoint, apiClips, apiClip };
 
 // --- Building models in the renderer's scene (this module's own update) ------------------------------------------
 
@@ -268,6 +419,7 @@ void fail(Entry& e, const char* why)
 // first, and a material per part. Read here, in this module's own update; the renderer copies the data into its tables.
 void loadCooked(Entry& e)
 {
+    freeAnim(e);
     char path[1300];
     snprintf(path, sizeof path, "%s/%s", e.assets, e.source);
     FILE* f = e.assets[0] ? fopen(path, "rb") : nullptr;
@@ -285,7 +437,7 @@ void loadCooked(Entry& e)
     auto inside = [&](uint64_t at, uint64_t bytes) { return at + bytes <= (uint64_t)size; };
     const char* bad = !read                                   ? "its file couldn't be read"
                       : h.magic != kRmodelMagic               ? "its file isn't a cooked model"
-                      : h.version != kRmodelVersion           ? "it was cooked for another version: cook it again"
+                      : h.version < kRmodelOldest || h.version > kRmodelVersion ? "it was cooked for another version: cook it again"
                       : !h.partCount || h.partCount > kMaxParts ? "it has no parts, or more than 64"
                       : !inside(h.materials, (uint64_t)h.materialCount * sizeof(RmodelMaterial)) ||
                               !inside(h.parts, (uint64_t)h.partCount * sizeof(RmodelPart)) ||
@@ -306,6 +458,63 @@ void loadCooked(Entry& e)
         for (int32_t t : mats[m].textures)
             if (t >= (int32_t)h.textureCount)
                 bad = "its file is damaged";
+    // Skinned (v3): its skeleton and clips, kept (the span from the skeleton to the textures).
+    const bool skinned = !bad && h.version >= 3 && (h.flags & RmodelSkinned);
+    if (skinned)
+    {
+        const RmodelSkeleton* sk = inside(h.skeleton, sizeof(RmodelSkeleton)) && h.skeleton < h.textures ? (const RmodelSkeleton*)(data + h.skeleton) : nullptr;
+        bad = !sk || !inside(h.skin, (uint64_t)h.vertexCount * sizeof(RmodelSkinVertex)) ? "its file is cut short"
+              : !sk->nodeCount || sk->nodeCount > kMaxNodes || !sk->boneCount || sk->boneCount > kMaxBones
+                  ? "its skeleton has no bones, or more than 1024 nodes or bones"
+              : sk->nodes < h.skeleton || sk->bones < h.skeleton || sk->clips < h.skeleton ||
+                      sk->nodes + (uint64_t)sk->nodeCount * sizeof(RmodelNode) > h.textures ||
+                      sk->bones + (uint64_t)sk->boneCount * sizeof(RmodelBone) > h.textures ||
+                      sk->clips + (uint64_t)sk->clipCount * sizeof(RmodelClip) > h.textures
+                  ? "its file is damaged"
+                  : nullptr;
+        const RmodelNode* nodes = bad ? nullptr : (const RmodelNode*)(data + sk->nodes);
+        const RmodelBone* bones = bad ? nullptr : (const RmodelBone*)(data + sk->bones);
+        const RmodelClip* clips = bad ? nullptr : (const RmodelClip*)(data + sk->clips);
+        for (uint32_t i = 0; !bad && i < sk->nodeCount; ++i)
+            if (nodes[i].parent >= (int32_t)i)
+                bad = "its file is damaged";
+        for (uint32_t i = 0; !bad && i < sk->boneCount; ++i)
+            if (bones[i].node >= sk->nodeCount)
+                bad = "its file is damaged";
+        for (uint32_t i = 0; !bad && i < sk->clipCount; ++i)
+            if (clips[i].offset < h.skeleton || clips[i].offset + clips[i].bytes > h.textures || !clips[i].frames ||
+                clips[i].bytes < (uint64_t)sk->nodeCount * 3 * sizeof(RmodelTrack))
+                bad = "its file is damaged";
+        // Every track's samples inside its clip, and every bone a vertex names in the skeleton.
+        for (uint32_t i = 0; !bad && i < sk->clipCount; ++i)
+            for (uint32_t t = 0; !bad && t < sk->nodeCount * 3; ++t)
+            {
+                const RmodelTrack& tr = ((const RmodelTrack*)(data + clips[i].offset))[t];
+                if (tr.data != 0xFFFFFFFFu && tr.data + (uint64_t)clips[i].frames * 6 > clips[i].bytes)
+                    bad = "its file is damaged";
+            }
+        const RmodelSkinVertex* sv = bad ? nullptr : (const RmodelSkinVertex*)(data + h.skin);
+        for (uint32_t v = 0; !bad && v < h.vertexCount; ++v)
+            for (int k = 0; k < 4; ++k)
+                if (sv[v].weights[k] && sv[v].bones[k] >= sk->boneCount)
+                    bad = "its file is damaged";
+        if (!bad)
+        {
+            freeAnim(e);
+            e.animBase = h.skeleton;
+            e.anim = (uint8_t*)malloc(h.textures - h.skeleton);
+            if (!e.anim)
+                bad = "out of memory for its animation";
+            else
+            {
+                memcpy(e.anim, data + h.skeleton, h.textures - h.skeleton);
+                e.skel = (const RmodelSkeleton*)e.anim;
+                e.nodes = (const RmodelNode*)(e.anim + (e.skel->nodes - h.skeleton));
+                e.bones = (const RmodelBone*)(e.anim + (e.skel->bones - h.skeleton));
+                e.clips = (const RmodelClip*)(e.anim + (e.skel->clips - h.skeleton));
+            }
+        }
+    }
     for (uint32_t k = 0; !bad && k < h.partCount; ++k)
     {
         const RmodelPart& p = parts[k];
@@ -347,6 +556,9 @@ void loadCooked(Entry& e)
                                                        (uint64_t)(uintptr_t)(data + h.indices + (size_t)lod.firstIndex * 4), lod.indexCount);
             if (m == 0xFFFFFFFFu)
                 break; // the renderer's tables are full: the versions made so far still chain
+            if (skinned) // its bones, and the bounds every clip reaches (the part's, as cooked)
+                renderer::mesh_skin(m, (uint64_t)(uintptr_t)(data + h.skin + (size_t)lod.firstVertex * sizeof(RmodelSkinVertex)),
+                                    { p.lo[0], p.lo[1], p.lo[2] }, { p.hi[0], p.hi[1], p.hi[2] });
             chain[n++] = m;
         }
         if (!n)
@@ -384,6 +596,7 @@ void loadCooked(Entry& e)
     free(data);
     if (made < h.partCount)
     {
+        freeAnim(e);
         // Partly made: what was made stays in the renderer's tables until its scene starts over; nothing of it is drawn.
         for (uint32_t i = ModelParts.size(); i-- > 0;)
             if (ModelParts[i].key == e.key)
@@ -398,6 +611,38 @@ void loadCooked(Entry& e)
     snprintf(line, sizeof line, "renderer_models: model %s (%s): %u parts, %u triangles, %u versions in all", e.name, e.owner, e.parts,
              triangles, h.lodCount);
     yea::log(line);
+}
+
+// A skinned model's skeleton and clips alone, from its file (its parts are in the renderer already).
+void loadAnim(Entry& e)
+{
+    char path[1300];
+    snprintf(path, sizeof path, "%s/%s", e.assets, e.source);
+    FILE* f = e.assets[0] ? fopen(path, "rb") : nullptr;
+    if (!f)
+        return;
+    RmodelHeader h = {};
+    fseek(f, 0, SEEK_END);
+    const long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    const bool ok = fread(&h, sizeof h, 1, f) == 1 && h.magic == kRmodelMagic && h.version >= 3 && h.version <= kRmodelVersion &&
+                    (h.flags & RmodelSkinned) && h.skeleton < h.textures && h.textures <= (uint64_t)size;
+    if (ok && (e.anim = (uint8_t*)malloc(h.textures - h.skeleton)) != nullptr)
+    {
+        fseek(f, (long)h.skeleton, SEEK_SET);
+        const RmodelSkeleton* sk = (const RmodelSkeleton*)e.anim;
+        if (fread(e.anim, 1, h.textures - h.skeleton, f) != h.textures - h.skeleton || sk->nodeCount > kMaxNodes || sk->boneCount > kMaxBones)
+            freeAnim(e);
+        else
+        {
+            e.animBase = h.skeleton;
+            e.skel = sk;
+            e.nodes = (const RmodelNode*)(e.anim + (sk->nodes - h.skeleton));
+            e.bones = (const RmodelBone*)(e.anim + (sk->bones - h.skeleton));
+            e.clips = (const RmodelClip*)(e.anim + (sk->clips - h.skeleton));
+        }
+    }
+    fclose(f);
 }
 
 // Its parts in the renderer: found again (made in this scene before this module restarted) or made now.
@@ -418,6 +663,9 @@ void build(Entry& e)
         }
     if (e.parts)
     {
+        // Made before this module restarted: a skinned model's skeleton and clips are read again from its file.
+        if (e.kind == 1 && !e.anim)
+            loadAnim(e);
         e.state = 1;
         return;
     }
@@ -505,6 +753,54 @@ void syncPlacements()
                 renderer::instance_lod_quality(h, e->knobs[mdl::KnobLodQuality]);
             }
         p.dirty = 0;
+    }
+}
+
+// Every skinned placement's clip moved on by dt, then its palette handed to the renderer for each of its instances.
+void animate(float dt)
+{
+    const uint32_t rows = Placements.size() < PlacementAnims.size() ? Placements.size() : PlacementAnims.size();
+    for (uint32_t row = 0; row < rows; ++row)
+    {
+        const Entry* e = Placements[row].alive ? byKey(Placements[row].key) : nullptr;
+        if (!e || !e->anim || e->state != 1)
+            continue;
+        PlacementAnim& a = PlacementAnims[row];
+        if (a.want) // asked for by name while it loaded
+        {
+            const uint32_t c = clipHashed(*e, a.want);
+            a.clip = c != kNoClip ? c : 0, a.want = 0;
+        }
+        auto advance = [&](uint32_t clip, float& time, float speed, uint32_t loop) {
+            if (clip >= e->skel->clipCount)
+                return;
+            const float d = e->clips[clip].duration;
+            time += dt * speed;
+            if (d > 0)
+                time = loop ? (fmodf(time, d) + (time < 0 ? d : 0)) : (time < 0 ? 0 : (time > d ? d : time));
+        };
+        advance(a.clip, a.time, a.speed, a.loop);
+        if (a.from != kNoClip)
+        {
+            advance(a.from, a.fromTime, a.fromSpeed, a.fromLoop);
+            a.faded += dt;
+            if (a.faded >= a.fade)
+                a.from = kNoClip;
+        }
+    }
+    uint32_t last = 0xFFFFFFFFu, bones = 0; // a placement's parts come together: posed once for all of them
+    for (uint32_t i = 0; i < PartInstances.size(); ++i)
+    {
+        const uint32_t row = PartInstances[i].placement;
+        if (row != last)
+        {
+            last = row, bones = 0;
+            const Entry* e = row < rows && Placements[row].alive ? byKey(Placements[row].key) : nullptr;
+            if (e && e->anim && e->state == 1 && evaluate(*e, PlacementAnims[row]))
+                bones = e->skel->boneCount;
+        }
+        if (bones)
+            renderer::instance_pose(PartInstances[i].instance, (uint64_t)(uintptr_t)gPalette, bones);
     }
 }
 
@@ -596,6 +892,10 @@ int load(int reloaded)
     gEntries = new Entry[kMaxModels];
     gEntryCount = 0;
     gDraw = new RenderPreview;
+    gPoses = new anim::Pose[kMaxNodes];
+    gFrom = new anim::Pose[kMaxNodes];
+    gWorld = new float[kMaxNodes * 12];
+    gPalette = new float[kMaxBones * 12];
     gPreview = Preview{};
     gPreview.yaw = 35.0f;
     gPreview.pitch = 20.0f;
@@ -610,7 +910,15 @@ int load(int reloaded)
 void unload()
 {
     freeTargets();
+    for (uint32_t i = 0; i < gEntryCount; ++i)
+        freeAnim(gEntries[i]);
     delete[] gEntries;
+    delete[] gPoses;
+    delete[] gFrom;
+    delete[] gWorld;
+    delete[] gPalette;
+    gPoses = gFrom = nullptr;
+    gWorld = gPalette = nullptr;
     gEntries = nullptr;
     gEntryCount = 0;
     delete gDraw;
@@ -657,6 +965,7 @@ void update(uint32_t phase, float dt)
         if (gEntries[i].state == 0)
             build(gEntries[i]);
     syncPlacements();
+    animate(dt);
     // emissive_nits, live: every cooked part's glow again when it changes (and once after this module restarts).
     if (settings.emissive_nits != gGlow)
     {

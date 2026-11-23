@@ -177,3 +177,7 @@
 #comp renderer_chain.comp
 #include "Chain.comp.fsl"
 #end
+
+#comp renderer_skin.comp
+#include "Skin.comp.fsl"
+#end

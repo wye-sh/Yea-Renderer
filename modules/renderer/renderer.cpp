@@ -11,6 +11,7 @@
 #include "preview.h"
 #include "mathx.h"
 #include "scene.h"
+#include "skin.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -255,13 +256,18 @@ struct InstanceInfo
 {
     uint32_t mesh; // the version drawn
     uint32_t row;  // in the Instance table
-    uint32_t flags; // 1 visible, 2 casts shadow, 4 double-sided, 8 alpha-tested, 16 see-through (drawn sorted, alone)
+    uint32_t flags; // 1 visible, 2 casts shadow, 4 double-sided, 8 alpha-tested, 16 see-through (drawn sorted, alone),
+                    // 32 skinned (gSkinDraw)
     float    sphere[4];
     uint64_t moved;
 };
 // Everything the GPU reads is built here and copied into the mapped buffers once: those are
 // write-combined on many drivers, so reading them back (or scattered small writes) is very slow.
 InstanceInfo*        gInfo;     // per GPU instance
+SkinDraw*            gSkinDraw; // per GPU instance, where a skinned one draws from (flags 16)
+uint32_t*            gSkinVisible; // the visible skinned instances (GPU indices), drawn one by one after their pipeline's
+uint32_t             gSkinVisibleCount, gSkinStreamAt; // ... their entries in the stream from gSkinStreamAt
+bool                 gSkinOn;   // the skinning pass loaded
 RenderGpuInstance* gInstCpu;  // instance rows
 uint32_t             gTapsMade; // the taps count gFrameCpu.taps holds
 uint32_t*            gStream;   // visible instances by mesh
@@ -408,7 +414,9 @@ void buildDfg(float* out)
         }
 }
 
-VertexLayout sceneLayout()
+// motion: the MOTION vertex shaders' layout, with last frame's positions as a fourth stream (bindGeometry binds the
+// positions buffer again: at the instance's other copy when skinned, else as the first).
+VertexLayout sceneLayout(bool motion = false)
 {
     VertexLayout l = {};
     // Positions, attributes (only the normal read so far) and the instance-rate stream: bindGeometry's three buffers.
@@ -450,6 +458,18 @@ VertexLayout sceneLayout()
     l.mAttribs[5].mBinding = 1;
     l.mAttribs[5].mLocation = 5;
     l.mAttribs[5].mOffset = 16;
+    if (motion)
+    {
+        l.mBindingCount = 4;
+        l.mBindings[3].mStride = RENDER_POSITION_STRIDE;
+        l.mAttribCount = 7;
+        l.mAttribs[6] = {};
+        l.mAttribs[6].mSemantic = SEMANTIC_TEXCOORD2;
+        l.mAttribs[6].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
+        l.mAttribs[6].mBinding = 3;
+        l.mAttribs[6].mLocation = 6;
+        l.mAttribs[6].mOffset = 0;
+    }
     return l;
 }
 
@@ -668,7 +688,7 @@ bool createScenePipelines(uint32_t samples, bool motion, bool masked, uint32_t f
         !((forward & kForwardDepth) && missing(gForwardDepthPipe)) && !((forward & kForwardBlend) && (!gBlendPipe[0] || !gBlendPipe[1] || !gBlendPipe[2] || !gBlendPipe[3])) &&
         gSkyPipe && gHistogramPipe)
         return false; // every frame after the first: nothing to make
-    VertexLayout        layout = sceneLayout();
+    VertexLayout        layout = sceneLayout(motion);
     // Triangles wind counter-clockwise around their outward normal (cross(b - a, c - a) points out);
     // seen through the left-handed camera that is clockwise on screen. The Forge flips Vulkan's
     // viewport, so D3D12 and Vulkan agree.
@@ -1087,19 +1107,20 @@ void writeGeometry(uint32_t firstVertex, uint32_t vertexCount, uint32_t firstInd
 
 // Uploads the vertex and index tables when meshes were added (rare: a short stall is fine). Meshes only ever append
 // until the scene starts over, so new rows go into the buffers' spare room; the buffers are made again, with room to
-// grow, only when they are full or the scene started over.
-void uploadMeshes()
+// grow, only when they are full or the scene started over. `skinned` more vertices stay free after them: the dynamic
+// region posed instances are skinned into each frame (skin.cpp).
+void uploadMeshes(uint32_t skinned)
 {
     uint32_t meshes = Meshes.size(), epoch = scene_epoch();
     if (Vertexes.size() == gUploadedVertices && Indexes.size() == gUploadedIndices && meshes == gUploadedMeshes &&
-        epoch == gUploadedEpoch && meshHash(meshes) == gUploadedMeshHash)
+        epoch == gUploadedEpoch && meshHash(meshes) == gUploadedMeshHash && (!skinned || (uint64_t)Vertexes.size() + skinned <= gVertexCap))
         return;
     if (meshBuilding())
         return;
     uint32_t vertices = Vertexes.size(), indices = Indexes.size();
     bool     append = gPosBuf && epoch == gUploadedEpoch && vertices >= gUploadedVertices && indices >= gUploadedIndices &&
-                  meshes >= gUploadedMeshes && meshHash(gUploadedMeshes) == gUploadedMeshHash && vertices <= gVertexCap &&
-                  indices <= gIndexCap;
+                  meshes >= gUploadedMeshes && meshHash(gUploadedMeshes) == gUploadedMeshHash &&
+                  (uint64_t)vertices + skinned <= gVertexCap && indices <= gIndexCap;
     waitQueueIdle(gQueue); // frames in flight may read the buffers (a copy into them must not overlap a draw)
     uint32_t gen = (uint32_t)yea::host()->frame();
     gen = gen ? gen : 1;
@@ -1114,12 +1135,13 @@ void uploadMeshes()
         {
             // GPU-only (fast to read every pass), with half again as much room, so the next model appends without a remake.
             // With ray queries also acceleration-structure build inputs, read as uint arrays by renderer_rt.
-            uint32_t vcap = vertices + vertices / 2 < 65536 ? 65536 : vertices + vertices / 2;
+            const uint32_t total = vertices + skinned;
+            uint32_t       vcap = total + total / 2 < 65536 ? 65536 : total + total / 2;
             uint32_t icap = indices + indices / 2 < 196608 ? 196608 : indices + indices / 2;
             uint32_t rtFlags = gRaytracing ? (uint32_t)(BUFFER_CREATION_FLAG_SHADER_DEVICE_ADDRESS | BUFFER_CREATION_FLAG_ACCELERATION_STRUCTURE_BUILD_INPUT) : 0;
-            gPosBuf = makeBuffer((uint64_t)vcap * RENDER_POSITION_STRIDE, 4, DESCRIPTOR_TYPE_VERTEX_BUFFER | DESCRIPTOR_TYPE_BUFFER,
+            gPosBuf = makeBuffer((uint64_t)vcap * RENDER_POSITION_STRIDE, 4, DESCRIPTOR_TYPE_VERTEX_BUFFER | DESCRIPTOR_TYPE_BUFFER | DESCRIPTOR_TYPE_RW_BUFFER,
                                  RESOURCE_MEMORY_USAGE_GPU_ONLY, gGeometryState, "renderer_positions", nullptr, false, rtFlags);
-            gAttrBuf = makeBuffer((uint64_t)vcap * RENDER_ATTRIBUTE_STRIDE, 4, DESCRIPTOR_TYPE_VERTEX_BUFFER | DESCRIPTOR_TYPE_BUFFER,
+            gAttrBuf = makeBuffer((uint64_t)vcap * RENDER_ATTRIBUTE_STRIDE, 4, DESCRIPTOR_TYPE_VERTEX_BUFFER | DESCRIPTOR_TYPE_BUFFER | DESCRIPTOR_TYPE_RW_BUFFER,
                                   RESOURCE_MEMORY_USAGE_GPU_ONLY, gGeometryState, "renderer_attributes", nullptr, false, rtFlags);
             gIndexBuf = makeBuffer((uint64_t)icap * 4, 4, DESCRIPTOR_TYPE_INDEX_BUFFER | DESCRIPTOR_TYPE_BUFFER, RESOURCE_MEMORY_USAGE_GPU_ONLY,
                                    gIndexState, "renderer_indices", nullptr, false, rtFlags);
@@ -1203,12 +1225,20 @@ void sortLights(RenderLight* a, uint32_t n)
     }
 }
 
-void bindGeometry(Cmd* cmd, Buffer* stream, uint32_t first)
+// The streams for the scene pipelines: with motion also last frame's positions. A skinned instance's streams start at its
+// region (drawn with vertex offset 0, so last frame's copy may lie before this frame's).
+void bindGeometry(Cmd* cmd, Buffer* stream, uint32_t first, bool motion = false, const SkinDraw* skin = nullptr)
 {
-    Buffer*  bufs[3] = { gPosBuf, gAttrBuf, stream };
-    uint32_t strides[3] = { RENDER_POSITION_STRIDE, RENDER_ATTRIBUTE_STRIDE, 4 };
-    uint64_t offsets[3] = { 0, 0, (uint64_t)first * 4 };
-    cmdBindVertexBuffer(cmd, 3, bufs, strides, offsets);
+    Buffer*  bufs[4] = { gPosBuf, gAttrBuf, stream, gPosBuf };
+    uint32_t strides[4] = { RENDER_POSITION_STRIDE, RENDER_ATTRIBUTE_STRIDE, 4, RENDER_POSITION_STRIDE };
+    uint64_t offsets[4] = { 0, 0, (uint64_t)first * 4, 0 };
+    if (skin)
+    {
+        offsets[0] = (uint64_t)skin->current * RENDER_POSITION_STRIDE;
+        offsets[1] = (uint64_t)skin->current * RENDER_ATTRIBUTE_STRIDE;
+        offsets[3] = (uint64_t)skin->previous * RENDER_POSITION_STRIDE;
+    }
+    cmdBindVertexBuffer(cmd, motion ? 4 : 3, bufs, strides, offsets);
 }
 
 // Single-sided instances with pipes[0] (back faces culled), then double-sided ones with pipes[1], then alpha-tested ones
@@ -1233,8 +1263,26 @@ void drawVisible(Cmd* cmd, uint32_t fi, Pipeline* const pipes[4], uint32_t sides
                 bound = true;
             }
             const Mesh& mesh = Meshes[m];
-            bindGeometry(cmd, gStreamBuf[fi], gMeshStart[key]);
+            bindGeometry(cmd, gStreamBuf[fi], gMeshStart[key], gPipeMotion);
             cmdDrawIndexedInstanced(cmd, mesh.indexCount, mesh.firstIndex, gMeshCount[key], mesh.firstVertex, 0);
+        }
+        // Skinned instances, one draw each from their own regions.
+        for (uint32_t j = 0; j < gSkinVisibleCount; ++j)
+        {
+            const InstanceInfo& info = gInfo[gSkinVisible[j]];
+            if (((info.flags >> 2) & 3) != s || !pipes[s] || !((sides >> s) & 1))
+                continue;
+            if (!bound)
+            {
+                cmdBindPipeline(cmd, pipes[s]);
+                cmdBindDescriptorSet(cmd, 0, gScenePersistent);
+                cmdBindDescriptorSet(cmd, fi, gSceneFrame);
+                cmdBindIndexBuffer(cmd, gIndexBuf, INDEX_TYPE_UINT32, 0);
+                bound = true;
+            }
+            const Mesh& mesh = Meshes[info.mesh];
+            bindGeometry(cmd, gStreamBuf[fi], gSkinStreamAt + j, gPipeMotion, &gSkinDraw[gSkinVisible[j]]);
+            cmdDrawIndexedInstanced(cmd, mesh.indexCount, mesh.firstIndex, 1, 0, 0);
         }
     }
 }
@@ -1246,7 +1294,8 @@ void drawBlended(Cmd* cmd, uint32_t fi, uint32_t j, uint32_t sides = 3)
 {
     const BlendEntry& e = gBlendList[j];
     const Mesh&       mesh = Meshes[e.mesh];
-    bindGeometry(cmd, gStreamBuf[fi], gBlendStream + j);
+    const bool        skinned = (gInfo[e.instance].flags & 32) != 0; // from its own region (its streams start there)
+    bindGeometry(cmd, gStreamBuf[fi], gBlendStream + j, false, skinned ? &gSkinDraw[e.instance] : nullptr);
     cmdBindIndexBuffer(cmd, gIndexBuf, INDEX_TYPE_UINT32, 0);
     const uint32_t order[4] = { 1, 3, 0, 2 };
     for (uint32_t k = e.twoSided && (sides & 1) ? 0 : 2; k < ((sides & 2) ? 4u : 2u); ++k)
@@ -1254,7 +1303,7 @@ void drawBlended(Cmd* cmd, uint32_t fi, uint32_t j, uint32_t sides = 3)
         cmdBindPipeline(cmd, gBlendPipe[order[k]]);
         cmdBindDescriptorSet(cmd, 0, gScenePersistent);
         cmdBindDescriptorSet(cmd, fi, gSceneFrame);
-        cmdDrawIndexedInstanced(cmd, mesh.indexCount, mesh.firstIndex, 1, mesh.firstVertex, 0);
+        cmdDrawIndexedInstanced(cmd, mesh.indexCount, mesh.firstIndex, 1, skinned ? 0 : mesh.firstVertex, 0);
     }
 }
 
@@ -1337,8 +1386,8 @@ void chainUpdate(Cmd* cmd, uint32_t fi, uint32_t copy, const int32_t r[4])
 // (that frame's fence has passed by then, so nothing waits), averaged and logged every 10 s.
 namespace
 {
-enum Timing : uint32_t { kTimeSky, kTimeShadows, kTimeProbes, kTimePrepass, kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeVrs, kTimeRt, kTimeGi, kTimeFog, kTimeParticles, kTimeForward, kTimeBlend, kTimeExposure, kTimeTaa, kTimeUpscale, kTimePost, kTimeTonemap, kTimeComposite, kTimeTotal, kTimings };
-const char* const kTimingNames[kTimings] = { "sky", "shadows", "probes", "prepass", "culling", "ao", "contact", "ssr", "vrs", "rt", "gi", "fog", "particles", "forward+sky", "see-through", "exposure", "taa", "upscale", "post", "tonemap", "composite", "total" };
+enum Timing : uint32_t { kTimeSkin, kTimeSky, kTimeShadows, kTimeProbes, kTimePrepass, kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeVrs, kTimeRt, kTimeGi, kTimeFog, kTimeParticles, kTimeForward, kTimeBlend, kTimeExposure, kTimeTaa, kTimeUpscale, kTimePost, kTimeTonemap, kTimeComposite, kTimeTotal, kTimings };
+const char* const kTimingNames[kTimings] = { "skin", "sky", "shadows", "probes", "prepass", "culling", "ao", "contact", "ssr", "vrs", "rt", "gi", "fog", "particles", "forward+sky", "see-through", "exposure", "taa", "upscale", "post", "tonemap", "composite", "total" };
 QueryPool*        gTimePool[kMaxFrames];
 uint32_t          gTimeUsed[kMaxFrames]; // bits: what that frame recorded
 double            gTimeTicks;            // per second
@@ -1743,6 +1792,12 @@ int load(int reloaded)
     addPipeline(gRenderer, &chdesc, &gChainPipe);
 
     gInfo = new InstanceInfo[Instances.capacity()];
+    gSkinDraw = new SkinDraw[Instances.capacity()];
+    gSkinVisible = new uint32_t[Instances.capacity()];
+    gSkinVisibleCount = 0;
+    gSkinOn = skinLoad(gRenderer, gFrames);
+    if (!gSkinOn)
+        yea::host()->log(1, "renderer: the skinning pass didn't load: animated models stand in their bind pose");
     gInstCpu = new RenderGpuInstance[Instances.capacity()];
     gStream = new uint32_t[Instances.capacity()];
     gLightCpu = new RenderGpuLight[Lights.capacity()];
@@ -1781,6 +1836,7 @@ void unload()
     waitQueueIdle(gQueue);
     previewUnload();
     texturesFree();
+    skinUnload();
     for (uint32_t i = 0; i < gFrames; ++i)
         if (gTimePool[i])
             exitQueryPool(gRenderer, gTimePool[i]), gTimePool[i] = nullptr;
@@ -1993,7 +2049,8 @@ void draw(uint32_t pass, const YeaFrame* yf)
         gFrameSamples = target->mSampleCount;
         createCompositePipeline(gFrameFormat, gFrameSamples, samples);
     }
-    uploadMeshes();
+    uploadMeshes(gSkinOn ? skinNeed() : 0);
+    skinBegin(gUploadedVertices, gVertexCap > gUploadedVertices ? gVertexCap - gUploadedVertices : 0);
     lightImagesUpload(gLightImages);
     texturesUpdate(gQueue);
     F.materialMaps = gMaterialMapBuf[fi];
@@ -2042,6 +2099,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     uint32_t             count = 0, casterTotal = 0;
     float                lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
     memset(gMeshCount, 0, sizeof gMeshCount);
+    gSkinVisibleCount = 0;
     uint32_t keyCount = meshCount * 4;
     uint32_t casterCount[1024], drawCount[4096], blendCount = 0, blendAll = 0;
     // Refraction (material_refraction) needs the see-through pass's one sample a pixel and its scene colour chain.
@@ -2115,6 +2173,12 @@ void draw(uint32_t pass, const YeaFrame* yf)
         }
         info.mesh = lod;
         info.row = row;
+        // Posed this frame (renderer_models' instance_pose): skinned into its own region, drawn on its own, and moving.
+        if (gSkinOn && skinInstance(row, lod, gSkinDraw[count]))
+        {
+            info.flags |= 32;
+            info.moved = F.frameNumber;
+        }
         if (blended)
         {
             blendAll++;
@@ -2150,7 +2214,9 @@ void draw(uint32_t pass, const YeaFrame* yf)
         }
         uint32_t key = lod * 4 + (masked ? 2 : 0) + (twoSided ? 1 : 0);
         drawCount[key]++;
-        if (info.flags & 1)
+        if ((info.flags & 33) == 33)
+            gSkinVisible[gSkinVisibleCount++] = count;
+        else if (info.flags & 1)
             gMeshCount[key]++;
         if (info.flags & 2)
         {
@@ -2190,7 +2256,8 @@ void draw(uint32_t pass, const YeaFrame* yf)
         if (info.flags & 16)
             continue; // see-through: listed apart
         uint32_t            key = info.mesh * 4 + ((info.flags >> 2) & 3);
-        if (info.flags & 1)
+        const bool          skinned = (info.flags & 32) != 0;
+        if ((info.flags & 1) && !skinned)
             stream[gMeshCursor[key]++] = i;
         {
             const Mesh&     mesh = Meshes[info.mesh];
@@ -2198,10 +2265,11 @@ void draw(uint32_t pass, const YeaFrame* yf)
             c.instance = i;
             c.firstIndex = mesh.firstIndex;
             c.indexCount = mesh.indexCount;
-            c.vertexOffset = (int32_t)mesh.firstVertex;
+            c.vertexOffset = skinned ? gSkinDraw[i].current : (int32_t)mesh.firstVertex;
             memcpy(c.sphere, info.sphere, sizeof c.sphere);
             c.moved = info.moved;
             c.twoSided = (info.flags >> 2) & 1;
+            c.dynamic = skinned;
             c.mesh = info.mesh;
             c.vertexCount = mesh.vertexCount;
             c.castShadow = (info.flags >> 1) & 1;
@@ -2215,9 +2283,10 @@ void draw(uint32_t pass, const YeaFrame* yf)
             c.instance = i;
             c.firstIndex = mesh.firstIndex;
             c.indexCount = mesh.indexCount;
-            c.vertexOffset = (int32_t)mesh.firstVertex;
+            c.vertexOffset = skinned ? gSkinDraw[i].current : (int32_t)mesh.firstVertex;
             memcpy(c.sphere, info.sphere, sizeof c.sphere);
             c.moved = info.moved > gLodChanged[info.row] ? info.moved : gLodChanged[info.row]; // a new version redraws cached maps
+            c.dynamic = skinned;
             c.mesh = info.mesh;
             c.vertexCount = mesh.vertexCount;
             c.castShadow = 1;
@@ -2226,6 +2295,12 @@ void draw(uint32_t pass, const YeaFrame* yf)
         }
     }
     (void)casterStart;
+    // The visible skinned instances' stream entries, after every mesh's.
+    gSkinStreamAt = 0;
+    for (uint32_t k = 0; k < keyCount; ++k)
+        gSkinStreamAt += gMeshCount[k];
+    for (uint32_t j = 0; j < gSkinVisibleCount; ++j)
+        stream[gSkinStreamAt + j] = gSkinVisible[j];
     // See-through instances back to front, their stream entries after the opaque ones'; the depths particles split at
     // (frame.h blendRuns): the nearest RENDER_MAX_BLEND_RUNS surfaces' (past that many, farther ones share a run).
     qsort(gBlendList, blendCount, sizeof(BlendEntry), [](const void* a, const void* b) {
@@ -2233,9 +2308,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         return za > zb ? -1 : za < zb ? 1 : 0;
     });
     gBlendCount = blendCount;
-    gBlendStream = 0;
-    for (uint32_t k = 0; k < keyCount; ++k)
-        gBlendStream += gMeshCount[k];
+    gBlendStream = gSkinStreamAt + gSkinVisibleCount;
     for (uint32_t j = 0; j < blendCount; ++j)
         stream[gBlendStream + j] = gBlendList[j].instance;
     F.blendRuns = blendCount < RENDER_MAX_BLEND_RUNS ? blendCount : RENDER_MAX_BLEND_RUNS;
@@ -2988,6 +3061,14 @@ void draw(uint32_t pass, const YeaFrame* yf)
         gExposureState = RESOURCE_STATE_SHADER_RESOURCE;
     }
 
+    // Skinning first of all: every pass after it reads the posed vertices.
+    if (skinJobs())
+    {
+        if (timed)
+            timeBegin(cmd, fi, kTimeSkin);
+        skinRecord(cmd, fi, gPosBuf, gAttrBuf, (uint32_t)gGeometryState);
+        timeEnd(cmd, fi, kTimeSkin);
+    }
     if (sky)
     {
         if (timed)

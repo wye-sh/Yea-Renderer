@@ -13,6 +13,9 @@ STRUCT(VSInput)
     DATA(int2, Tangent, TANGENT); // octahedral snorm16 as integers: y's lowest bit the bitangent's sign (odd: -1)
     DATA(float2, Uv, TEXCOORD0);
     DATA(float4, Color, COLOR);
+#ifdef MOTION
+    DATA(float3, PrevPosition, TEXCOORD2); // last frame's: the same as Position unless skinned (renderer's skin.cpp)
+#endif
 };
 
 STRUCT(VSOutput)
@@ -60,7 +63,8 @@ VSOutput VS_MAIN(VSInput In)
     Out.Color = In.Color;
 #ifdef MOTION
     PrevInstanceData prev = gPrevInstances[In.Instance];
-    float4 pw = float4(dot(prev.row0, p), dot(prev.row1, p), dot(prev.row2, p), 1.0);
+    float4 pp = float4(In.PrevPosition, 1.0);
+    float4 pw = float4(dot(prev.row0, pp), dot(prev.row1, pp), dot(prev.row2, pp), 1.0);
     Out.CurrClip = float4(dot(gFrame.viewProjNoJitter[0], w), dot(gFrame.viewProjNoJitter[1], w), dot(gFrame.viewProjNoJitter[2], w), dot(gFrame.viewProjNoJitter[3], w));
     Out.PrevClip = float4(dot(gFrame.prevViewProj[0], pw), dot(gFrame.prevViewProj[1], pw), dot(gFrame.prevViewProj[2], pw), dot(gFrame.prevViewProj[3], pw));
 #endif

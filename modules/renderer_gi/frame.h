@@ -10,7 +10,7 @@ struct Buffer;
 struct RenderTarget;
 struct Texture;
 
-#define RENDER_FRAME_VERSION 23u
+#define RENDER_FRAME_VERSION 24u
 #define RENDER_RT_MAX_TRACED 8u
 #define RENDER_MAX_CASCADES  4u
 #define RENDER_MAX_TEXTURES  1024u // texture maps the shaders' array holds (the core's Texture table)
@@ -89,6 +89,9 @@ struct RenderCaster
                           // the same generation, buffers and ranges mean the same data
     uint32_t masked;      // its material is alpha-tested (cut out where its base colour's alpha is under its cutoff): draw it
                           // with uv0 and the material maps (textures, materialMaps)
+    uint32_t dynamic;     // frame v24: the core skins it into vertices of its own every frame (vertexOffset, new each frame,
+                          // with mesh the version it skinned): draw it on its own at exactly that version, never a coarser
+                          // one; ray tracing refits rather than rebuilds. moved is this frame while it animates
 };
 
 // A visible local light, sorted by view depth (nearest first).

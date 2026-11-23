@@ -26,6 +26,10 @@ import renderer void instance_place(handle i, float3 pos, float4 rotation, float
 import renderer void instance_shadow(handle i, bool cast)
 import renderer void instance_lod_quality(handle i, float quality)
 import renderer void instance_remove(handle i)
+# Skinning (renderer frame v24): a mesh's bones and weights (rmodel.h RmodelSkinVertex[its vertex count]) and the
+# bounds its animation reaches; and an instance's palette this frame (3x4 rows a bone, model space).
+import renderer void mesh_skin(u32 mesh, u64 skin, float3 lo, float3 hi)
+import renderer void instance_pose(handle i, u64 palette, u32 bones)
 import renderer u32 scene_epoch() = 0
 import renderer bool preview_draw(u64 preview) = false
 import table renderer Mesh
@@ -42,6 +46,22 @@ table Placement none 4096
   u32 dirty
   u32 gen
   u32 alive
+end
+# What a placement of a skinned model plays (rows as Placement's): its clip (4294967295: none, the rest pose), time
+# (seconds), speed and loop, and the clip it fades from over `fade` seconds (`faded` of them gone). `want`: a clip asked
+# for by name (its hash) before the model had loaded, taken once it has (0 none).
+table PlacementAnim none 4096
+  u32 clip
+  u32 want
+  float time
+  float speed
+  u32 loop
+  u32 from
+  float fromTime
+  float fromSpeed
+  u32 fromLoop
+  float fade
+  float faded
 end
 # The renderer's instances a placement draws with, one per part of its model.
 table PartInstance none 65536

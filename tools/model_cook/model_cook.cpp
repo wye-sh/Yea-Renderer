@@ -23,8 +23,15 @@
 //   aims at half the triangles of the one before and records its error in metres, which only grows down the chain;
 //   the chain stops when the simplifier can't take a tenth off, the error passes a quarter of the part's size, or a
 //   level has under 64 triangles.
-// - Writes the file and prints the report: units and axes, parts, triangles and error per LOD, what it generated or
-//   ignored. Skins and animations come with a later stage and are listed as ignored.
+// - Skins and animations (rmodel v3): a model with a skin, or with a clip that moves a node holding a mesh, is cooked
+//   skinned. Its vertices stay in their bind space (a glTF skinned mesh's own, an FBX mesh's geometry space) with up to
+//   4 bones each (the strongest, renormalised); a mesh with no skin is bound whole to its own node, so it follows its
+//   node's animation. Every node of the file goes in the skeleton with its rest pose; every clip (glTF animations, FBX
+//   takes) is evaluated exactly from the file and encoded with the Renderer's own codec (cook_anim.h), at the lowest
+//   rate that keeps every vertex within a millimetre. Parts' bounds hold every frame of every clip. Morph targets are
+//   ignored.
+// - Writes the file and prints the report: units and axes, parts, triangles and error per LOD, the skeleton and clips,
+//   what it generated or ignored.
 // - Texture maps (rmodel v2): each image used as base colour, ORM, normal or emissive is decoded (stb_image) and written
 //   with its full mip chain, BC7 (sRGB for colour) or BC5 for normals (bc7e, Apache-2.0).
 #define CGLTF_IMPLEMENTATION
@@ -38,6 +45,7 @@
 #include "vendor/stb/stb_image.h"
 
 #include "../../modules/renderer_models/rmodel.h"
+#include "cook_anim.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -45,6 +53,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <algorithm>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -59,6 +69,8 @@ struct Vertex // a corner with everything that tells two apart (welded by bytes)
     float    t[4];
     float    uv[2];
     uint32_t color;
+    uint16_t bones[4]; // skinned models only (all zero otherwise)
+    uint16_t weights[4];
 };
 
 struct Part
@@ -72,6 +84,7 @@ struct Part
     {
         std::vector<float>    positions;  // float3
         std::vector<uint32_t> attributes; // 5 each
+        std::vector<RmodelSkinVertex> skin; // skinned models
         std::vector<uint32_t> indices;
         float                 error;
     };
@@ -194,8 +207,193 @@ struct SrcMesh
     uint32_t              material; // index into the source's materials (their count: the default material)
     std::vector<float>    pos, nor, tan, uv; // per vertex: 3, 3, 4 (w the bitangent's sign), 2; nor, tan, uv may be empty
     std::vector<uint32_t> col;      // rgba8 per vertex; empty: white
+    std::vector<uint16_t> bones, weights; // 4 each per vertex (skeleton bones, unorm16), skinned models only
+    std::vector<float>    dracoJoints, dracoWeights; // a Draco primitive's JOINTS_n/WEIGHTS_n, set after set (4 a vertex)
     std::vector<uint32_t> idx;      // a triangle list
 };
+
+// The skeleton and clips of a skinned model (rmodel v3), in the renderer's space.
+struct Clip
+{
+    std::string                                   name;
+    float                                         duration;
+    std::function<void(float, anim::Pose*)>       source; // every node's exact local pose at a time
+    bool                                          stepped = false; // it has step keys (jumps)
+    float                                         keyRate = 0;     // the file's keys are evenly spaced at it (0: they aren't)
+};
+struct Skeleton
+{
+    bool                            on = false;
+    std::vector<RmodelNode>         nodes;
+    std::vector<RmodelBone>         bones;
+    std::vector<Clip>               clips;
+    std::vector<bool>               meshNode; // per node: it holds a mesh
+    std::map<std::string, uint32_t> boneKeys;
+    uint32_t bone(uint32_t node, const float* invBind)
+    {
+        RmodelBone b = {};
+        memcpy(b.invBind, invBind, sizeof b.invBind);
+        b.node = node;
+        std::string key((const char*)&b, sizeof b);
+        auto it = boneKeys.find(key);
+        if (it != boneKeys.end())
+            return it->second;
+        bones.push_back(b);
+        return boneKeys[key] = (uint32_t)bones.size() - 1;
+    }
+};
+Skeleton gSkel;
+const float kIdentity34[12] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0 };
+
+// Up to n influences to the strongest 4, renormalised to unorm16 that sum to exactly 65535 (false: they weigh nothing).
+bool packInfluences(const uint32_t* bone, const float* weight, int n, uint16_t* ob, uint16_t* ow)
+{
+    uint32_t b[16];
+    float    w[16];
+    int      m = 0;
+    for (int i = 0; i < n && i < 16; ++i)
+    {
+        if (!(weight[i] > 0))
+            continue;
+        int j = 0;
+        while (j < m && b[j] != bone[i])
+            ++j;
+        if (j == m)
+            b[m] = bone[i], w[m++] = 0;
+        w[j] += weight[i];
+    }
+    for (int i = 1; i < m; ++i) // strongest first
+        for (int j = i; j > 0 && w[j] > w[j - 1]; --j)
+            std::swap(w[j], w[j - 1]), std::swap(b[j], b[j - 1]);
+    m = m < 4 ? m : 4;
+    float sum = 0;
+    for (int i = 0; i < m; ++i)
+        sum += w[i];
+    if (!(sum > 0))
+        return false;
+    int total = 0;
+    for (int i = 0; i < 4; ++i)
+    {
+        ob[i] = i < m ? (uint16_t)b[i] : 0;
+        ow[i] = i < m ? (uint16_t)(w[i] / sum * 65535.0f + 0.5f) : 0;
+        total += ow[i];
+    }
+    ow[0] = (uint16_t)(ow[0] + 65535 - total);
+    return true;
+}
+
+// glTF's space to the renderer's (Z negated): a pose, and a column-major 4x4 to 3x4 rows.
+void toRenderer(anim::Pose& p)
+{
+    p.t[2] = -p.t[2];
+    p.r[0] = -p.r[0], p.r[1] = -p.r[1];
+}
+void rowsToRenderer(const float* colMajor, float* rows)
+{
+    static const float sgn[4] = { 1, 1, -1, 1 };
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 4; ++c)
+            rows[r * 4 + c] = colMajor[c * 4 + r] * sgn[r] * sgn[c];
+}
+
+// A column-major affine 4x4 as scale, rotation and translation (a negative determinant flips the x scale).
+void decompose(const float* m, anim::Pose& p)
+{
+    p.t[0] = m[12], p.t[1] = m[13], p.t[2] = m[14];
+    float c[3][3];
+    for (int k = 0; k < 3; ++k)
+    {
+        p.s[k] = sqrtf(m[k * 4] * m[k * 4] + m[k * 4 + 1] * m[k * 4 + 1] + m[k * 4 + 2] * m[k * 4 + 2]);
+        for (int r = 0; r < 3; ++r)
+            c[k][r] = p.s[k] > 0 ? m[k * 4 + r] / p.s[k] : (r == k ? 1.0f : 0.0f);
+    }
+    const float det = c[0][0] * (c[1][1] * c[2][2] - c[2][1] * c[1][2]) - c[1][0] * (c[0][1] * c[2][2] - c[2][1] * c[0][2]) +
+                      c[2][0] * (c[0][1] * c[1][2] - c[1][1] * c[0][2]);
+    if (det < 0)
+    {
+        p.s[0] = -p.s[0];
+        for (int r = 0; r < 3; ++r)
+            c[0][r] = -c[0][r];
+    }
+    // R[row][col] = c[col][row]
+    const float tr = c[0][0] + c[1][1] + c[2][2];
+    float*      q = p.r;
+    if (tr > 0)
+    {
+        float s = sqrtf(tr + 1.0f) * 2;
+        q[3] = 0.25f * s, q[0] = (c[1][2] - c[2][1]) / s, q[1] = (c[2][0] - c[0][2]) / s, q[2] = (c[0][1] - c[1][0]) / s;
+    }
+    else if (c[0][0] > c[1][1] && c[0][0] > c[2][2])
+    {
+        float s = sqrtf(1.0f + c[0][0] - c[1][1] - c[2][2]) * 2;
+        q[3] = (c[1][2] - c[2][1]) / s, q[0] = 0.25f * s, q[1] = (c[1][0] + c[0][1]) / s, q[2] = (c[2][0] + c[0][2]) / s;
+    }
+    else if (c[1][1] > c[2][2])
+    {
+        float s = sqrtf(1.0f + c[1][1] - c[0][0] - c[2][2]) * 2;
+        q[3] = (c[2][0] - c[0][2]) / s, q[0] = (c[1][0] + c[0][1]) / s, q[1] = 0.25f * s, q[2] = (c[2][1] + c[1][2]) / s;
+    }
+    else
+    {
+        float s = sqrtf(1.0f + c[2][2] - c[0][0] - c[1][1]) * 2;
+        q[3] = (c[0][1] - c[1][0]) / s, q[0] = (c[2][0] + c[0][2]) / s, q[1] = (c[2][1] + c[1][2]) / s, q[2] = 0.25f * s;
+    }
+}
+
+void setNode(RmodelNode& n, int32_t parent, const anim::Pose& p, const char* name, uint32_t index)
+{
+    n = {};
+    n.parent = parent;
+    memcpy(n.t, p.t, 12), memcpy(n.r, p.r, 16), memcpy(n.s, p.s, 12);
+    if (name && name[0])
+        snprintf(n.name, sizeof n.name, "%s", name);
+    else
+        snprintf(n.name, sizeof n.name, "node%u", index);
+}
+
+// The rest pose composed through the hierarchy against the file's own world matrices (rows, renderer space): the
+// worst difference, so a node whose transform the cooker read wrongly shows up in the report.
+float checkHierarchy(const std::vector<float>& fileWorld)
+{
+    const uint32_t          n = (uint32_t)gSkel.nodes.size();
+    std::vector<anim::Pose> rest(n);
+    std::vector<float>      world(n * 12), pal;
+    anim::restPoses(gSkel.nodes.data(), n, rest.data());
+    anim::palette(gSkel.nodes.data(), n, nullptr, 0, rest.data(), world.data(), pal.data());
+    float worst = 0;
+    for (size_t i = 0; i < world.size(); ++i)
+        worst = fmaxf(worst, fabsf(world[i] - fileWorld[i]) / (1.0f + fabsf(fileWorld[i])));
+    return worst;
+}
+
+// Does any clip move a node that holds a mesh, or one above it? (A model without a skin is only cooked skinned then.)
+bool clipsMoveMeshes()
+{
+    const uint32_t    n = (uint32_t)gSkel.nodes.size();
+    std::vector<bool> relevant(n, false);
+    for (uint32_t i = n; i-- > 0;) // children after parents: walk back, marking parents of relevant nodes
+    {
+        relevant[i] = relevant[i] || gSkel.meshNode[i];
+        if (relevant[i] && gSkel.nodes[i].parent >= 0)
+            relevant[gSkel.nodes[i].parent] = true;
+    }
+    std::vector<anim::Pose> a(n), b(n);
+    for (const Clip& c : gSkel.clips)
+    {
+        c.source(0, a.data());
+        for (float t = 1.0f / 30; t <= c.duration + 1e-4f; t += 1.0f / 30)
+        {
+            c.source(t, b.data());
+            for (uint32_t i = 0; i < n; ++i)
+                if (relevant[i] && memcmp(&a[i], &b[i], sizeof a[i]))
+                    for (int k = 0; k < 3; ++k)
+                        if (fabsf(a[i].t[k] - b[i].t[k]) > 1e-6f || fabsf(a[i].s[k] - b[i].s[k]) > 1e-6f ||
+                            fabsf(a[i].r[0] * b[i].r[0] + a[i].r[1] * b[i].r[1] + a[i].r[2] * b[i].r[2] + a[i].r[3] * b[i].r[3]) < 1.0f - 1e-7f)
+                            return true;
+        }
+    }
+    return false;
+}
 
 // One mesh's triangles, in the renderer's space, appended to its material's part.
 void addMesh(const SrcMesh& src, std::vector<Part>& parts, bool& flatNormals, bool& madeTangents)
@@ -204,6 +402,7 @@ void addMesh(const SrcMesh& src, std::vector<Part>& parts, bool& flatNormals, bo
     const size_t vcount = src.pos.size() / 3;
     const bool   nor = src.nor.size() == vcount * 3 && vcount, tan = src.tan.size() == vcount * 4 && vcount;
     const bool   uv0 = src.uv.size() == vcount * 2 && vcount, col = src.col.size() == vcount && vcount;
+    const bool   skinned = src.bones.size() == vcount * 4 && src.weights.size() == vcount * 4 && vcount;
 
     // The world transform (column-major), its normal matrix (inverse transpose, by cofactors over the determinant).
     const float a00 = m[0], a10 = m[1], a20 = m[2], a01 = m[4], a11 = m[5], a21 = m[6], a02 = m[8], a12 = m[9], a22 = m[10];
@@ -262,6 +461,8 @@ void addMesh(const SrcMesh& src, std::vector<Part>& parts, bool& flatNormals, bo
             if (uv0)
                 o.uv[0] = src.uv[v * 2], o.uv[1] = src.uv[v * 2 + 1];
             o.color = col ? src.col[v] : 0xFFFFFFFFu;
+            if (skinned)
+                memcpy(o.bones, &src.bones[v * 4], 8), memcpy(o.weights, &src.weights[v * 4], 8);
             part->corners.push_back(o);
         }
     }
@@ -371,6 +572,15 @@ bool decodeDraco(const cgltf_data* data, const cgltf_primitive& prim, SrcMesh& o
     if (read(cgltf_attribute_type_color, 0, 4, col))
         for (uint32_t v = 0; v < points; ++v)
             out.col.push_back(packColor(&col[(size_t)v * 4]));
+    for (int set = 0; set < 2; ++set)
+    {
+        std::vector<float> j, w;
+        if (read(cgltf_attribute_type_joints, set, 4, j) && read(cgltf_attribute_type_weights, set, 4, w))
+        {
+            out.dracoJoints.insert(out.dracoJoints.end(), j.begin(), j.end());
+            out.dracoWeights.insert(out.dracoWeights.end(), w.begin(), w.end());
+        }
+    }
     std::vector<uint32_t> raw;
     raw.reserve((size_t)mesh->num_faces() * 3);
     for (draco::FaceIndex f(0); f < mesh->num_faces(); ++f)
@@ -389,7 +599,79 @@ const cgltf_accessor* attribute(const cgltf_primitive& p, cgltf_attribute_type t
 }
 
 // One glTF primitive as a SrcMesh (false: nothing to draw).
-bool gltfPrimitive(const cgltf_data* data, const cgltf_primitive& prim, const float* world, SrcMesh& out)
+// Skinned models: `palette` maps the skin's joints to skeleton bones (null: bound whole to `rigidBone`).
+bool gltfPrimitive(const cgltf_data* data, const cgltf_primitive& prim, const float* world, SrcMesh& out,
+                   const std::vector<uint32_t>* palette = nullptr, uint32_t rigidBone = 0xFFFFFFFFu);
+void gltfSkin(const cgltf_primitive& prim, SrcMesh& out, const std::vector<uint32_t>* palette, uint32_t rigidBone)
+{
+    if (rigidBone == 0xFFFFFFFFu && !palette)
+        return;
+    const size_t vcount = out.pos.size() / 3;
+    std::vector<float> joints, weights; // 4 a vertex, per set
+    int                sets = 0;
+    if (palette && !out.dracoJoints.empty())
+    {
+        sets = (int)(out.dracoJoints.size() / (vcount * 4));
+        joints = out.dracoJoints, weights = out.dracoWeights;
+    }
+    else if (palette)
+        for (int set = 0; set < 2; ++set)
+        {
+            const cgltf_accessor* j = attribute(prim, cgltf_attribute_type_joints, set);
+            const cgltf_accessor* w = attribute(prim, cgltf_attribute_type_weights, set);
+            if (!j || !w || j->count != vcount || w->count != vcount)
+                break;
+            joints.resize((size_t)(sets + 1) * vcount * 4), weights.resize(joints.size());
+            for (size_t v = 0; v < vcount; ++v)
+            {
+                cgltf_uint ji[4] = {};
+                cgltf_accessor_read_uint(j, v, ji, 4);
+                for (int k = 0; k < 4; ++k)
+                    joints[(sets * vcount + v) * 4 + k] = (float)ji[k];
+                cgltf_accessor_read_float(w, v, &weights[(sets * vcount + v) * 4], 4);
+            }
+            ++sets;
+        }
+    if (sets > 1)
+        note("skin: up to %d influences a vertex in the file, the strongest 4 kept", sets * 4);
+    out.bones.assign(vcount * 4, 0);
+    out.weights.assign(vcount * 4, 0);
+    bool unweighted = false, badJoint = false;
+    for (size_t v = 0; v < vcount; ++v)
+    {
+        uint32_t b[8];
+        float    w[8];
+        int      n = 0;
+        for (int set = 0; set < sets; ++set)
+            for (int k = 0; k < 4; ++k)
+            {
+                const uint32_t j = (uint32_t)joints[(set * vcount + v) * 4 + k];
+                const float    wt = weights[(set * vcount + v) * 4 + k];
+                if (!(wt > 0))
+                    continue;
+                if (j >= palette->size())
+                {
+                    badJoint = true;
+                    continue;
+                }
+                b[n] = (*palette)[j], w[n++] = wt;
+            }
+        if (!packInfluences(b, w, n, &out.bones[v * 4], &out.weights[v * 4]))
+        {
+            unweighted = unweighted || palette;
+            const uint32_t rb = rigidBone != 0xFFFFFFFFu ? rigidBone : 0;
+            const float    one = 1;
+            packInfluences(&rb, &one, 1, &out.bones[v * 4], &out.weights[v * 4]);
+        }
+    }
+    if (unweighted)
+        warn("some skinned vertices weigh nothing: they follow their mesh's node");
+    if (badJoint)
+        warn("some skin influences name joints the skin doesn't have: left out");
+}
+
+bool gltfPrimitive(const cgltf_data* data, const cgltf_primitive& prim, const float* world, SrcMesh& out,
+                   const std::vector<uint32_t>* palette, uint32_t rigidBone)
 {
     if (prim.type != cgltf_primitive_type_triangles && prim.type != cgltf_primitive_type_triangle_strip &&
         prim.type != cgltf_primitive_type_triangle_fan)
@@ -399,8 +681,6 @@ bool gltfPrimitive(const cgltf_data* data, const cgltf_primitive& prim, const fl
     }
     memcpy(out.m, world, sizeof out.m);
     out.material = prim.material ? (uint32_t)(prim.material - data->materials) : (uint32_t)data->materials_count;
-    if (attribute(prim, cgltf_attribute_type_joints, 0))
-        warn("skinning is ignored: the model is cooked in its bind pose (skinned models come with animation)");
     if (prim.targets_count)
         warn("morph targets are ignored");
     if (attribute(prim, cgltf_attribute_type_texcoord, 1))
@@ -413,6 +693,7 @@ bool gltfPrimitive(const cgltf_data* data, const cgltf_primitive& prim, const fl
             return false;
         }
         gDraco++;
+        gltfSkin(prim, out, palette, rigidBone);
         return true;
     }
     const cgltf_accessor* pos = attribute(prim, cgltf_attribute_type_position, 0);
@@ -449,7 +730,175 @@ bool gltfPrimitive(const cgltf_data* data, const cgltf_primitive& prim, const fl
     for (cgltf_size i = 0; i < n; ++i)
         raw[i] = prim.indices ? (uint32_t)cgltf_accessor_read_index(prim.indices, i) : (uint32_t)i;
     triangleList(prim.type, raw, out.idx);
+    gltfSkin(prim, out, palette, rigidBone);
     return true;
+}
+
+// Skinned glTF models: every node into the skeleton (parents first), with the map from cgltf's nodes to its.
+std::vector<uint32_t> gNodeOf; // cgltf node index -> skeleton node
+void gltfSkeleton(const cgltf_data* data)
+{
+    gNodeOf.assign(data->nodes_count, 0xFFFFFFFFu);
+    std::vector<const cgltf_node*> order;
+    std::vector<float>             fileWorld;
+    std::function<void(const cgltf_node*)> add = [&](const cgltf_node* node) {
+        const uint32_t index = (uint32_t)order.size();
+        gNodeOf[node - data->nodes] = index;
+        order.push_back(node);
+        anim::Pose p;
+        float      m[16];
+        if (node->has_matrix)
+            decompose(node->matrix, p);
+        else
+        {
+            const float t0[3] = { 0, 0, 0 }, r0[4] = { 0, 0, 0, 1 }, s0[3] = { 1, 1, 1 };
+            memcpy(p.t, node->has_translation ? node->translation : t0, 12);
+            memcpy(p.r, node->has_rotation ? node->rotation : r0, 16);
+            memcpy(p.s, node->has_scale ? node->scale : s0, 12);
+        }
+        toRenderer(p);
+        gSkel.nodes.emplace_back();
+        setNode(gSkel.nodes.back(), node->parent ? (int32_t)gNodeOf[node->parent - data->nodes] : -1, p, node->name, index);
+        gSkel.meshNode.push_back(node->mesh != nullptr);
+        cgltf_node_transform_world(node, m);
+        fileWorld.resize(fileWorld.size() + 12);
+        rowsToRenderer(m, &fileWorld[fileWorld.size() - 12]);
+        for (cgltf_size i = 0; i < node->children_count; ++i)
+            add(node->children[i]);
+    };
+    for (cgltf_size i = 0; i < data->nodes_count; ++i)
+        if (!data->nodes[i].parent)
+            add(&data->nodes[i]);
+    const float worst = checkHierarchy(fileWorld);
+    if (worst > 1e-3f)
+        warn("the skeleton's rest pose strays %.3g from the file's node transforms: tell the Renderer's agents", worst);
+
+    // Clips: each animation's translation, rotation and scale channels, evaluated as glTF says (step, linear with
+    // spherical interpolation for rotations, cubic spline), held at their first and last keys outside them.
+    struct Track
+    {
+        uint32_t           node;
+        int                path, interp; // 0 t, 1 r, 2 s; 0 step, 1 linear, 2 cubic
+        std::vector<float> in, out;
+    };
+    bool morphs = false;
+    for (cgltf_size a = 0; a < data->animations_count; ++a)
+    {
+        const cgltf_animation& an = data->animations[a];
+        auto                   tracks = std::make_shared<std::vector<Track>>();
+        float                  duration = 0;
+        for (cgltf_size c = 0; c < an.channels_count; ++c)
+        {
+            const cgltf_animation_channel& ch = an.channels[c];
+            if (!ch.target_node || !ch.sampler)
+                continue;
+            if (ch.target_path == cgltf_animation_path_type_weights)
+            {
+                morphs = true;
+                continue;
+            }
+            Track tr;
+            tr.node = gNodeOf[ch.target_node - data->nodes];
+            tr.path = ch.target_path == cgltf_animation_path_type_translation ? 0 : (ch.target_path == cgltf_animation_path_type_rotation ? 1 : 2);
+            if (ch.target_path != cgltf_animation_path_type_translation && ch.target_path != cgltf_animation_path_type_rotation &&
+                ch.target_path != cgltf_animation_path_type_scale)
+                continue;
+            tr.interp = ch.sampler->interpolation == cgltf_interpolation_type_step ? 0 : (ch.sampler->interpolation == cgltf_interpolation_type_linear ? 1 : 2);
+            const int comps = tr.path == 1 ? 4 : 3;
+            tr.in.resize(ch.sampler->input->count);
+            for (cgltf_size k = 0; k < tr.in.size(); ++k)
+                cgltf_accessor_read_float(ch.sampler->input, k, &tr.in[k], 1);
+            tr.out.resize(ch.sampler->output->count * comps);
+            for (cgltf_size k = 0; k < ch.sampler->output->count; ++k)
+                cgltf_accessor_read_float(ch.sampler->output, k, &tr.out[k * comps], comps);
+            if (tr.in.empty() || tr.out.size() < tr.in.size() * comps * (tr.interp == 2 ? 3 : 1))
+                continue;
+            duration = fmaxf(duration, tr.in.back());
+            tracks->push_back(std::move(tr));
+        }
+        if (tracks->empty())
+            continue;
+        Clip clip;
+        clip.name = an.name && an.name[0] ? an.name : "clip" + std::to_string(a);
+        clip.duration = duration;
+        float step = 0; // the smallest gap between keys, then whether every key falls on it
+        for (const Track& tr : *tracks)
+        {
+            clip.stepped = clip.stepped || (tr.interp == 0 && tr.in.size() > 1);
+            for (size_t k = 1; k < tr.in.size(); ++k)
+                if (tr.in[k] - tr.in[k - 1] > 1e-4f && (step == 0 || tr.in[k] - tr.in[k - 1] < step))
+                    step = tr.in[k] - tr.in[k - 1];
+        }
+        bool even = step > 0;
+        for (const Track& tr : *tracks)
+            for (size_t k = 0; k < tr.in.size() && even; ++k)
+            {
+                const float x = (tr.in[k] - tr.in[0]) / step;
+                even = fabsf(x - roundf(x)) < 0.01f && fabsf(tr.in[0] - (*tracks)[0].in[0]) < 1e-4f;
+            }
+        clip.keyRate = even ? 1.0f / step : 0;
+        clip.source = [tracks](float t, anim::Pose* poses) {
+            anim::restPoses(gSkel.nodes.data(), (uint32_t)gSkel.nodes.size(), poses);
+            for (const Track& tr : *tracks)
+            {
+                const int    comps = tr.path == 1 ? 4 : 3, stride = tr.interp == 2 ? comps * 3 : comps, at = tr.interp == 2 ? comps : 0;
+                const size_t n = tr.in.size();
+                float        v[4];
+                auto         value = [&](size_t k) { return &tr.out[k * stride + at]; };
+                if (t <= tr.in[0] || n == 1)
+                    memcpy(v, value(0), comps * 4);
+                else if (t >= tr.in[n - 1])
+                    memcpy(v, value(n - 1), comps * 4);
+                else
+                {
+                    const size_t k = (size_t)(std::upper_bound(tr.in.begin(), tr.in.end(), t) - tr.in.begin()) - 1;
+                    const float  td = tr.in[k + 1] - tr.in[k], f = td > 0 ? (t - tr.in[k]) / td : 0;
+                    const float *a = value(k), *b = value(k + 1);
+                    if (tr.interp == 0)
+                        memcpy(v, a, comps * 4);
+                    else if (tr.interp == 2)
+                    {
+                        const float* bo = &tr.out[k * stride + 2 * comps]; // a's out-tangent
+                        const float* ai = &tr.out[(k + 1) * stride];       // b's in-tangent
+                        const float  f2 = f * f, f3 = f2 * f;
+                        for (int i = 0; i < comps; ++i)
+                            v[i] = (2 * f3 - 3 * f2 + 1) * a[i] + td * (f3 - 2 * f2 + f) * bo[i] + (-2 * f3 + 3 * f2) * b[i] + td * (f3 - f2) * ai[i];
+                    }
+                    else if (tr.path == 1) // slerp
+                    {
+                        float d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3], s = 1;
+                        if (d < 0)
+                            d = -d, s = -1;
+                        float wa = 1 - f, wb = f;
+                        if (d < 0.9995f)
+                        {
+                            const float th = acosf(d), sn = sinf(th);
+                            wa = sinf((1 - f) * th) / sn, wb = sinf(f * th) / sn;
+                        }
+                        for (int i = 0; i < 4; ++i)
+                            v[i] = a[i] * wa + b[i] * wb * s;
+                    }
+                    else
+                        for (int i = 0; i < comps; ++i)
+                            v[i] = a[i] + (b[i] - a[i]) * f;
+                }
+                anim::Pose& p = poses[tr.node];
+                if (tr.path == 0)
+                    p.t[0] = v[0], p.t[1] = v[1], p.t[2] = -v[2];
+                else if (tr.path == 2)
+                    memcpy(p.s, v, 12);
+                else
+                {
+                    float len = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3]);
+                    len = len > 0 ? len : 1;
+                    p.r[0] = -v[0] / len, p.r[1] = -v[1] / len, p.r[2] = v[2] / len, p.r[3] = v[3] / len;
+                }
+            }
+        };
+        gSkel.clips.push_back(std::move(clip));
+    }
+    if (morphs)
+        warn("morph target animation is ignored");
 }
 
 void visit(const cgltf_data* data, const cgltf_node* node, std::vector<SrcMesh>& meshes, uint32_t& meshNodes)
@@ -459,15 +908,33 @@ void visit(const cgltf_data* data, const cgltf_node* node, std::vector<SrcMesh>&
         float m[16];
         cgltf_node_transform_world(node, m);
         ++meshNodes;
+        // Skinned models keep each mesh in its own space: a skinned mesh's bind space (glTF ignores its node's
+        // transform), or its node's, bound whole to that node.
+        std::vector<uint32_t> palette;
+        uint32_t              rigid = 0xFFFFFFFFu;
+        if (gSkel.on)
+        {
+            static const float id[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+            memcpy(m, id, sizeof m);
+            rigid = gSkel.bone(gNodeOf[node - data->nodes], kIdentity34);
+            if (node->skin)
+                for (cgltf_size j = 0; j < node->skin->joints_count; ++j)
+                {
+                    float ibm[16], rows[12];
+                    memcpy(ibm, id, sizeof ibm);
+                    if (node->skin->inverse_bind_matrices)
+                        cgltf_accessor_read_float(node->skin->inverse_bind_matrices, j, ibm, 16);
+                    rowsToRenderer(ibm, rows);
+                    palette.push_back(gSkel.bone(gNodeOf[node->skin->joints[j] - data->nodes], rows));
+                }
+        }
         for (cgltf_size i = 0; i < node->mesh->primitives_count; ++i)
         {
             meshes.emplace_back();
-            if (!gltfPrimitive(data, node->mesh->primitives[i], m, meshes.back()))
+            if (!gltfPrimitive(data, node->mesh->primitives[i], m, meshes.back(), node->skin && gSkel.on ? &palette : nullptr, rigid))
                 meshes.pop_back();
         }
     }
-    if (node->skin)
-        warn("skinning is ignored: the model is cooked in its bind pose (skinned models come with animation)");
     for (cgltf_size i = 0; i < node->children_count; ++i)
         visit(data, node->children[i], meshes, meshNodes);
 }
@@ -476,6 +943,69 @@ void visit(const cgltf_data* data, const cgltf_node* node, std::vector<SrcMesh>&
 // the file into glTF's space (right-handed, +Y up, metres, geometry scaled). Their UVs start at the image's bottom left,
 // glTF's at its top left: v flipped. Tangents are always generated (MikkTSpace-compatible, as the renderer's normal maps
 // expect); vertex colours are left out (FBX files often keep other data in them).
+std::vector<uint32_t> gUfbxNodeOf; // ufbx node typed_id -> skeleton node
+
+void ufbxRows(const ufbx_matrix& m, float* rows) // ufbx's matrix (glTF's space) as 3x4 rows in the renderer's
+{
+    float c[16] = {};
+    for (int col = 0; col < 4; ++col)
+        c[col * 4] = (float)m.cols[col].x, c[col * 4 + 1] = (float)m.cols[col].y, c[col * 4 + 2] = (float)m.cols[col].z;
+    c[15] = 1;
+    rowsToRenderer(c, rows);
+}
+
+anim::Pose ufbxPose(const ufbx_transform& t)
+{
+    anim::Pose p = { { (float)t.translation.x, (float)t.translation.y, (float)t.translation.z },
+                     { (float)t.rotation.x, (float)t.rotation.y, (float)t.rotation.z, (float)t.rotation.w },
+                     { (float)t.scale.x, (float)t.scale.y, (float)t.scale.z } };
+    toRenderer(p);
+    return p;
+}
+
+// Skinned FBX models: every node into the skeleton (parents first), and each take as a clip, evaluated by ufbx.
+void ufbxSkeleton(const ufbx_scene* scene)
+{
+    gUfbxNodeOf.assign(scene->nodes.count, 0xFFFFFFFFu);
+    std::vector<const ufbx_node*> order;
+    std::vector<float>            fileWorld;
+    std::function<void(const ufbx_node*)> add = [&](const ufbx_node* node) {
+        const uint32_t index = (uint32_t)order.size();
+        gUfbxNodeOf[node->typed_id] = index;
+        order.push_back(node);
+        gSkel.nodes.emplace_back();
+        setNode(gSkel.nodes.back(), node->parent ? (int32_t)gUfbxNodeOf[node->parent->typed_id] : -1, ufbxPose(node->local_transform),
+                node->name.data, index);
+        gSkel.meshNode.push_back(node->mesh != nullptr);
+        fileWorld.resize(fileWorld.size() + 12);
+        ufbxRows(node->node_to_world, &fileWorld[fileWorld.size() - 12]);
+        for (size_t i = 0; i < node->children.count; ++i)
+            add(node->children.data[i]);
+    };
+    add(scene->root_node);
+    const float worst = checkHierarchy(fileWorld);
+    if (worst > 1e-3f)
+        warn("the skeleton's rest pose strays %.3g from the file's node transforms: tell the Renderer's agents", worst);
+    auto nodes = std::make_shared<std::vector<const ufbx_node*>>(order);
+    for (size_t i = 0; i < scene->anim_stacks.count; ++i)
+    {
+        const ufbx_anim_stack* st = scene->anim_stacks.data[i];
+        if (!(st->time_end - st->time_begin > 1e-6))
+            continue; // an empty take (3ds Max's "(internal)")
+        Clip                   clip;
+        clip.keyRate = (float)scene->settings.frames_per_second; // FBX curves are mostly keyed on the file's frames
+        clip.name = st->name.length ? st->name.data : "clip" + std::to_string(i);
+        clip.duration = (float)fmax(0.0, st->time_end - st->time_begin);
+        const ufbx_anim* an = st->anim;
+        const double     begin = st->time_begin;
+        clip.source = [nodes, an, begin](float t, anim::Pose* poses) {
+            for (size_t n = 0; n < nodes->size(); ++n)
+                poses[n] = ufbxPose(ufbx_evaluate_transform(an, (*nodes)[n], begin + t));
+        };
+        gSkel.clips.push_back(std::move(clip));
+    }
+}
+
 void ufbxMeshes(const ufbx_scene* scene, std::vector<SrcMesh>& meshes, uint32_t& meshNodes, bool& droppedColors)
 {
     for (size_t ni = 0; ni < scene->nodes.count; ++ni)
@@ -485,8 +1015,24 @@ void ufbxMeshes(const ufbx_scene* scene, std::vector<SrcMesh>& meshes, uint32_t&
         if (!mesh || !mesh->num_triangles)
             continue;
         ++meshNodes;
-        if (mesh->skin_deformers.count)
-            warn("skinning is ignored: the model is cooked in its bind pose (skinned models come with animation)");
+        if (mesh->skin_deformers.count > 1)
+            warn("a mesh has more than one skin: only its first is used");
+        const ufbx_skin_deformer* skin = gSkel.on && mesh->skin_deformers.count ? mesh->skin_deformers.data[0] : nullptr;
+        std::vector<uint32_t>     palette;
+        uint32_t                  rigid = 0;
+        if (gSkel.on)
+        {
+            float rows[12];
+            ufbxRows(node->geometry_to_node, rows);
+            rigid = gSkel.bone(gUfbxNodeOf[node->typed_id], rows);
+            if (skin)
+                for (size_t c = 0; c < skin->clusters.count; ++c)
+                {
+                    const ufbx_skin_cluster* cl = skin->clusters.data[c];
+                    ufbxRows(cl->geometry_to_bone, rows);
+                    palette.push_back(cl->bone_node ? gSkel.bone(gUfbxNodeOf[cl->bone_node->typed_id], rows) : rigid);
+                }
+        }
         if (mesh->blend_deformers.count)
             warn("blend shapes (morph targets) are ignored");
         if (mesh->num_point_faces || mesh->num_line_faces)
@@ -494,7 +1040,9 @@ void ufbxMeshes(const ufbx_scene* scene, std::vector<SrcMesh>& meshes, uint32_t&
         if (mesh->uv_sets.count > 1)
             warn("a second UV set is ignored");
         droppedColors = droppedColors || mesh->vertex_color.exists;
-        const ufbx_matrix& g = node->geometry_to_world;
+        ufbx_matrix identity = {};
+        identity.m00 = identity.m11 = identity.m22 = 1;
+        const ufbx_matrix& g = gSkel.on ? identity : node->geometry_to_world; // skinned: geometry space
         const float        world[16] = { (float)g.cols[0].x, (float)g.cols[0].y, (float)g.cols[0].z, 0, (float)g.cols[1].x, (float)g.cols[1].y,
                                          (float)g.cols[1].z, 0, (float)g.cols[2].x, (float)g.cols[2].y, (float)g.cols[2].z, 0,
                                          (float)g.cols[3].x, (float)g.cols[3].y, (float)g.cols[3].z, 1 };
@@ -525,6 +1073,29 @@ void ufbxMeshes(const ufbx_scene* scene, std::vector<SrcMesh>& meshes, uint32_t&
                     {
                         const ufbx_vec2 t = ufbx_get_vertex_vec2(&mesh->vertex_uv, ix);
                         out.uv.push_back((float)t.x), out.uv.push_back(1.0f - (float)t.y);
+                    }
+                    if (gSkel.on)
+                    {
+                        uint32_t b[16];
+                        float    w[16];
+                        int      n = 0;
+                        if (skin)
+                        {
+                            const ufbx_skin_vertex& sv = skin->vertices.data[mesh->vertex_indices.data[ix]];
+                            for (uint32_t i = 0; i < sv.num_weights && n < 16; ++i)
+                            {
+                                const ufbx_skin_weight& sw = skin->weights.data[sv.weight_begin + i];
+                                b[n] = palette[sw.cluster_index], w[n++] = (float)sw.weight;
+                            }
+                        }
+                        uint16_t ob[4], ow[4];
+                        if (!packInfluences(b, w, n, ob, ow))
+                        {
+                            const float one = 1;
+                            packInfluences(&rigid, &one, 1, ob, ow);
+                        }
+                        out.bones.insert(out.bones.end(), ob, ob + 4);
+                        out.weights.insert(out.weights.end(), ow, ow + 4);
                     }
                     out.idx.push_back((uint32_t)out.idx.size());
                 }
@@ -586,6 +1157,12 @@ Part::Level compact(const Part& p, const uint32_t* indices, size_t count, float 
         l.attributes.push_back(uv[0]);
         l.attributes.push_back(uv[1]);
         l.attributes.push_back(v.color);
+        if (gSkel.on)
+        {
+            RmodelSkinVertex sv;
+            memcpy(sv.bones, v.bones, 8), memcpy(sv.weights, v.weights, 8);
+            l.skin.push_back(sv);
+        }
     }
     return l;
 }
@@ -601,14 +1178,28 @@ void buildLods(Part& p, const std::unordered_map<uint64_t, uint32_t>& owners)
         if (it != owners.end() && it->second == 0xFFFFFFFFu)
             lock[i] = meshopt_SimplifyVertex_Lock;
     }
+    // Skinned: where a triangle spans two strongest bones (an influence border), its vertices stay, so coarser levels
+    // bend at the same joints as the finest; and the strongest bone's weight weighs in, so blended vertices don't
+    // collapse onto rigid ones.
+    if (gSkel.on)
+        for (size_t t = 0; t + 2 < p.indices.size(); t += 3)
+        {
+            const uint32_t a = p.indices[t], b = p.indices[t + 1], c = p.indices[t + 2];
+            const uint16_t ba = p.vertices[a].bones[0], bb = p.vertices[b].bones[0], bc = p.vertices[c].bones[0];
+            if (ba != bb || bb != bc)
+                lock[a] = lock[b] = lock[c] = meshopt_SimplifyVertex_Lock;
+        }
     // Normals and UVs weigh in the error, so shading and texturing hold.
-    std::vector<float> attrs(n * 5);
+    const size_t       stride = gSkel.on ? 6 : 5;
+    std::vector<float> attrs(n * stride);
     for (size_t i = 0; i < n; ++i)
     {
-        memcpy(&attrs[i * 5], p.vertices[i].n, 12);
-        memcpy(&attrs[i * 5 + 3], p.vertices[i].uv, 8);
+        memcpy(&attrs[i * stride], p.vertices[i].n, 12);
+        memcpy(&attrs[i * stride + 3], p.vertices[i].uv, 8);
+        if (gSkel.on)
+            attrs[i * stride + 5] = p.vertices[i].weights[0] / 65535.0f;
     }
-    const float weights[5] = { 0.5f, 0.5f, 0.5f, 0.5f, 0.5f };
+    const float weights[6] = { 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 1.0f };
     const float scale = meshopt_simplifyScale(p.vertices[0].p, n, sizeof(Vertex)); // relative error to metres
 
     p.levels.push_back(compact(p, p.indices.data(), p.indices.size(), 0));
@@ -620,7 +1211,7 @@ void buildLods(Part& p, const std::unordered_map<uint64_t, uint32_t>& owners)
         float  relative = 0;
         size_t target = (prev / 6) * 3;
         size_t got = meshopt_simplifyWithAttributes(out.data(), p.indices.data(), p.indices.size(), p.vertices[0].p, n, sizeof(Vertex),
-                                                    attrs.data(), 5 * sizeof(float), weights, 5, lock.data(), target, 0.25f, 0,
+                                                    attrs.data(), stride * sizeof(float), weights, stride, lock.data(), target, 0.25f, 0,
                                                     &relative);
         if (got == 0 || got > prev * 9 / 10)
             break;
@@ -857,10 +1448,17 @@ int main(int argc, char** argv)
             fprintf(stderr, "error: %s isn't an FBX or OBJ file ufbx can read: %s\n", argv[1], error.description.data);
             return 1;
         }
+        if (scene->skin_deformers.count || scene->anim_curves.count)
+        {
+            ufbxSkeleton(scene);
+            gSkel.on = scene->skin_deformers.count || clipsMoveMeshes();
+        }
         ufbxMeshes(scene, meshes, meshNodes, droppedColors);
         srcMats = ufbxMaterials(scene);
-        if (scene->anim_curves.count)
-            warn("its animation is ignored (animation is a later stage)");
+        if (gSkel.on && !scene->anim_stacks.count)
+            note("skinned, with no takes: it stands in its rest pose");
+        if (gSkel.on && scene->anim_stacks.count)
+            note("takes: the file's frame rate is %g a second; clips start at each take's start", scene->settings.frames_per_second);
         const double unit = scene->settings.original_unit_meters;
         if (ext == "fbx" && unit > 0 && fabs(unit - 1.0) > 1e-6)
             note("units: the file's %g m a unit scaled to metres", unit);
@@ -891,6 +1489,11 @@ int main(int argc, char** argv)
             fprintf(stderr, "error: its EXT_meshopt_compression data didn't decode\n");
             return done(1);
         }
+        if (data->skins_count || data->animations_count)
+        {
+            gltfSkeleton(data);
+            gSkel.on = data->skins_count || clipsMoveMeshes();
+        }
         const cgltf_scene* sc = data->scene ? data->scene : (data->scenes_count ? &data->scenes[0] : nullptr);
         if (sc)
             for (cgltf_size i = 0; i < sc->nodes_count; ++i)
@@ -900,8 +1503,6 @@ int main(int argc, char** argv)
                 if (!data->nodes[i].parent)
                     visit(data, &data->nodes[i], meshes, meshNodes);
         srcMats = gltfMaterials(data);
-        if (data->animations_count)
-            warn("%zu animation%s ignored (animation is a later stage)", (size_t)data->animations_count, data->animations_count == 1 ? " is" : "s are");
         note("units: metres, as glTF is; node scales applied");
         note("axes: +Y up kept; Z negated into the renderer's left-handed space (its front, glTF's +Z, now faces -Z), triangle order flipped to match");
         if (gDraco)
@@ -943,6 +1544,65 @@ int main(int argc, char** argv)
         }
     for (Part& p : parts)
         buildLods(p, owners);
+    if (!gSkel.on && !gSkel.clips.empty())
+        note("its %zu clip%s move%s no mesh: cooked static", gSkel.clips.size(), gSkel.clips.size() == 1 ? "" : "s",
+             gSkel.clips.size() == 1 ? "s" : "");
+    if (gSkel.on && gSkel.bones.size() > 65535)
+    {
+        fprintf(stderr, "error: %zu bones; a model may have 65535\n", gSkel.bones.size());
+        return done(1);
+    }
+
+    // Skinned: each part's bounds hold the rest pose and every frame of every clip (padded for the frames between),
+    // and every clip encoded within a millimetre at the skin.
+    std::vector<cook_anim::Encoded> clips;
+    if (gSkel.on)
+    {
+        std::vector<cook_anim::SkinnedVertex> verts;
+        std::vector<uint32_t>                 vpart;
+        for (uint32_t k = 0; k < parts.size(); ++k)
+        {
+            const Part::Level& l = parts[k].levels[0];
+            for (size_t i = 0; i < l.skin.size(); ++i)
+            {
+                cook_anim::SkinnedVertex v;
+                memcpy(v.p, &l.positions[i * 3], 12);
+                memcpy(v.bones, l.skin[i].bones, 8), memcpy(v.weights, l.skin[i].weights, 8);
+                verts.push_back(v);
+                vpart.push_back(k);
+            }
+        }
+        const uint32_t          nn = (uint32_t)gSkel.nodes.size(), nb = (uint32_t)gSkel.bones.size();
+        std::vector<float>      lo(parts.size() * 3, 1e30f), hi(parts.size() * 3, -1e30f), world(nn * 12), pal(nb * 12), posed;
+        std::vector<anim::Pose> rest(nn);
+        anim::restPoses(gSkel.nodes.data(), nn, rest.data());
+        anim::palette(gSkel.nodes.data(), nn, gSkel.bones.data(), nb, rest.data(), world.data(), pal.data());
+        cook_anim::skin(verts, pal.data(), posed);
+        for (size_t i = 0; i < verts.size(); ++i)
+            for (int k = 0; k < 3; ++k)
+                lo[vpart[i] * 3 + k] = fminf(lo[vpart[i] * 3 + k], posed[i * 3 + k]), hi[vpart[i] * 3 + k] = fmaxf(hi[vpart[i] * 3 + k], posed[i * 3 + k]);
+        float size = 0, mlo[3] = { 1e30f, 1e30f, 1e30f }, mhi[3] = { -1e30f, -1e30f, -1e30f };
+        for (uint32_t k = 0; k < parts.size(); ++k)
+            for (int a = 0; a < 3; ++a)
+                mlo[a] = fminf(mlo[a], lo[k * 3 + a]), mhi[a] = fmaxf(mhi[a], hi[k * 3 + a]);
+        for (int a = 0; a < 3; ++a)
+            size = fmaxf(size, mhi[a] - mlo[a]);
+        const float tolerance = fmaxf(cook_anim::kMaxError, size * cook_anim::kRelativeError);
+        for (const Clip& c : gSkel.clips)
+            clips.push_back(cook_anim::encode(c.name.c_str(), c.duration, gSkel.nodes.data(), nn, gSkel.bones.data(), nb, verts, vpart, lo, hi,
+                                              c.source, tolerance, c.stepped, c.keyRate));
+        for (size_t i = 0; i < clips.size(); ++i)
+            if (gSkel.clips[i].stepped)
+                note("clip %s has step keys: each jump blends over one frame (%.1f ms)", clips[i].clip.name, 1000.0f / clips[i].clip.rate);
+        for (uint32_t k = 0; k < parts.size(); ++k)
+        {
+            float big = 0;
+            for (int a = 0; a < 3; ++a)
+                big = fmaxf(big, hi[k * 3 + a] - lo[k * 3 + a]);
+            for (int a = 0; a < 3; ++a)
+                parts[k].lo[a] = lo[k * 3 + a] - big * 0.01f - cook_anim::kMaxError, parts[k].hi[a] = hi[k * 3 + a] + big * 0.01f + cook_anim::kMaxError;
+        }
+    }
 
     // Materials, in the parts' order.
     std::vector<RmodelMaterial> mats;
@@ -1028,6 +1688,19 @@ int main(int argc, char** argv)
     h.positions = (uint32_t)at, at = align16(at + (size_t)h.vertexCount * 12);
     h.attributes = (uint32_t)at, at = align16(at + (size_t)h.vertexCount * 20);
     h.indices = (uint32_t)at, at = align16(at + (size_t)h.indexCount * 4);
+    RmodelSkeleton sk = {};
+    if (gSkel.on)
+    {
+        h.flags |= RmodelSkinned;
+        h.skin = (uint32_t)at, at = align16(at + (size_t)h.vertexCount * sizeof(RmodelSkinVertex));
+        h.skeleton = (uint32_t)at, at = align16(at + sizeof sk);
+        sk.nodeCount = (uint32_t)gSkel.nodes.size(), sk.boneCount = (uint32_t)gSkel.bones.size(), sk.clipCount = (uint32_t)clips.size();
+        sk.nodes = (uint32_t)at, at = align16(at + gSkel.nodes.size() * sizeof(RmodelNode));
+        sk.bones = (uint32_t)at, at = align16(at + gSkel.bones.size() * sizeof(RmodelBone));
+        sk.clips = (uint32_t)at, at = align16(at + clips.size() * sizeof(RmodelClip));
+        for (cook_anim::Encoded& c : clips)
+            c.clip.offset = at, at = align16(at + c.data.size());
+    }
     h.textureCount = (uint32_t)cook::gTextures.size();
     h.textures = (uint32_t)at, at = align16(at + cook::gTextures.size() * sizeof(RmodelTexture));
     for (cook::Cooked& c : cook::gTextures)
@@ -1051,7 +1724,20 @@ int main(int argc, char** argv)
             memcpy(&file[h.positions + (size_t)fl.firstVertex * 12], l.positions.data(), l.positions.size() * 4);
             memcpy(&file[h.attributes + (size_t)fl.firstVertex * 20], l.attributes.data(), l.attributes.size() * 4);
             memcpy(&file[h.indices + (size_t)fl.firstIndex * 4], l.indices.data(), l.indices.size() * 4);
+            if (gSkel.on)
+                memcpy(&file[h.skin + (size_t)fl.firstVertex * sizeof(RmodelSkinVertex)], l.skin.data(), l.skin.size() * sizeof(RmodelSkinVertex));
         }
+    if (gSkel.on)
+    {
+        memcpy(&file[h.skeleton], &sk, sizeof sk);
+        memcpy(&file[sk.nodes], gSkel.nodes.data(), gSkel.nodes.size() * sizeof(RmodelNode));
+        memcpy(&file[sk.bones], gSkel.bones.data(), gSkel.bones.size() * sizeof(RmodelBone));
+        for (size_t i = 0; i < clips.size(); ++i)
+        {
+            memcpy(&file[sk.clips + i * sizeof(RmodelClip)], &clips[i].clip, sizeof(RmodelClip));
+            memcpy(&file[clips[i].clip.offset], clips[i].data.data(), clips[i].data.size());
+        }
+    }
     for (size_t i = 0; i < cook::gTextures.size(); ++i)
     {
         memcpy(&file[h.textures + i * sizeof(RmodelTexture)], &cook::gTextures[i].t, sizeof(RmodelTexture));
@@ -1107,6 +1793,21 @@ int main(int argc, char** argv)
         if (cook::gSkipped)
             note("--max-size %u: %u top mip level%s left out over all textures (the source images are unchanged)", cook::gMaxSize, cook::gSkipped,
                  cook::gSkipped == 1 ? "" : "s");
+    }
+    if (gSkel.on)
+    {
+        size_t bytes = 0, raw = 0;
+        float  worst = 0, over = 0;
+        for (const cook_anim::Encoded& c : clips)
+            bytes += c.data.size(), raw += c.rawBytes, worst = fmaxf(worst, c.error), over = fmaxf(over, c.error / c.tolerance);
+        printf("skinned: %zu nodes, %zu bones, %zu clip%s (%.1f KB, %.1fx smaller than floats; the skin within %.2f mm of the file)%s\n",
+               gSkel.nodes.size(), gSkel.bones.size(), clips.size(), clips.size() == 1 ? "" : "s", bytes / 1024.0, bytes ? (double)raw / bytes : 0.0,
+               worst * 1000.0f, clips.empty() ? "" : ":");
+        for (const cook_anim::Encoded& c : clips)
+            printf("  %s: %.2f s, %u frames at %.0f a second, %.1f KB, within %.2f mm\n", c.clip.name, c.clip.duration, c.clip.frames,
+                   c.clip.frames > 1 ? c.clip.rate : 0.0f, c.data.size() / 1024.0, c.error * 1000.0f);
+        if (over > 1.0f)
+            warn("a clip strays %.1fx its tolerance (%.2g mm) at its best rate: very fast motion", over, clips.empty() ? 0.0 : clips[0].tolerance * 1000.0);
     }
     for (const std::string& s : gNotes)
         printf("%s\n", s.c_str());

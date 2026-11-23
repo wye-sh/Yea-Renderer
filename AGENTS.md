@@ -131,7 +131,14 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   off). Owns the acceleration structures: one bottom-level structure per mesh (built on the frame's command list
   from the positions stream when the mesh is new, its geometry moved or its caster's `generation` changed, as the
   buffers are rewritten in place; replaced ones freed once no frame in flight uses them; hits read the normal from
-  the attributes stream, octahedral) and one
+  the attributes stream, octahedral). Skinned casters (`RenderCaster.dynamic`) get their own, keyed by instance: with
+  the ray-tracing service's `updateBottom` (v2), one per frame in flight (ALLOW_UPDATE, fast build), refitted each
+  frame to this frame's posed copy and built afresh every `kRebuildFrames` (60, staggered by instance; on the Bend rig
+  a refitted tree reaches its worst within 15 frames, 4% dearer to trace on average, 26% at worst, so the interval
+  only caps drift that keeps growing, such as root motion); on older hosts, or once a refit is refused, one per posed
+  copy (keyed by `vertexOffset` too), built afresh each frame. Never refitted or built over while a frame in flight may
+  trace it; dropped 8 frames after their last use. While any are traced, the module logs their refit and rebuild GPU
+  time every 10 s (`skinned ray structures`). One
   top-level structure per frame in flight, its instances rewritten with `setInstances` and rebuilt every frame
   (mask 1 every drawable, 2 shadow casters). Instances are forced opaque except alpha-tested ones
   (`RenderCaster.masked`, with the frame's material maps): those are non-opaque, and every ray query (reflections,
@@ -370,8 +377,16 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   (a mask cuts out at the file's cutoff, 0.5 by default; a BLEND material is blended through `material_blend(m, 1)`, its
   factors' alpha times its map's); emissive is the file's factor times strength times `emissive_nits`. A file that is
   missing, damaged or of another version fails that model only, logged and shown in the Viewer; state `Format` rebuilds
-  every model when `rmodel.h`'s kRmodelVersion changes. Its tables: `Placement` (a row per
-  placement, keyed by the model's owner and name), `PartInstance` (the core's instances, one per part), `ModelPart` (each
+  every model when `rmodel.h`'s kRmodelVersion changes (the loader reads kRmodelOldest up). Skinned models (rmodel v3,
+  `Info.kind` 2) play their first clip, looping, once placed: `mdl::play(h, "Run", speed, loop, fade)` switches clip
+  (crossfaded, 0.2 s by default; nullptr or "" the rest pose; a name asked for while loading is taken once loaded),
+  `mdl::clipTime(h)`, `mdl::joint(h, "hand_r", m)` a joint's world 3x4 this frame (attach things to it); clips and joints
+  are named as in the source. `ModelLink.h`'s `hasAnim(a)` says the module has them (Api's size). Clips are sampled with
+  `anim.h` (shared with the cooker: smallest-three rotations, quantised tracks, `sampleClip`, `blendPoses`, `palette`)
+  in `YEA_PHASE_LATE` into scratch made in load(), and each part instance gets the palette through `instance_pose`.
+  Its tables: `Placement` (a row per
+  placement, keyed by the model's owner and name), `PlacementAnim` (beside it: clip, time, speed, loop and the clip
+  it fades from), `PartInstance` (the core's instances, one per part), `ModelPart` (each
   model's meshes and materials in the core, found again after a reload), state `Scene` (the core's scene_epoch they belong
   to: when it changes, every part and instance is made again). It builds and syncs in `YEA_PHASE_LATE`, after the game's
   modules moved things. Each MODEL line gets the knobs of its each block (scale, up_axis, lod_quality, cast_shadows,
@@ -396,6 +411,15 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   vertex/index plus shader-resource state (never barriered), with RT build-input flags and 4-byte `Buffer(uint)` views
   while ray queries are on. `RenderCaster.generation` changes whenever that mesh's data was written. Shadow maps bind
   positions only (masked casters also attributes, for uv0); the scene, probes and preview bind positions and attributes.
+  Skinning (frame v24): a skinned mesh is a pool mesh in its bind pose plus `SkinVertex` rows (`mesh_skin`); each
+  frame `skin.cpp` gives every posed instance a region after the meshes (two copies of its finest version's vertex
+  count: this frame's at frameNumber & 1, last frame's the other) and one compute dispatch (`Skin.comp.fsl`, the
+  "skin" timing, first in the frame) writes them, pool buffers barriered to unordered access and back. Its
+  `RenderCaster` has `dynamic` set and `vertexOffset` at this frame's copy: every module draws or traces a dynamic
+  caster at its own vertexOffset, one at a time (renderer_shadows, renderer_gi's sun map, renderer_rt's per-instance
+  refitted structures), never shared or cached by mesh. MOTION variants bind a fourth stream, `PrevPosition` (binding 3,
+  last frame's copy; the static pool for still meshes), so moving limbs leave true motion vectors; the see-through
+  pipelines keep the three-stream layout. Instance flag 32 is skinned (16 see-through).
   Texture maps (frame v21): `materialMaps` (a material's maps, Common.h.fsl MaterialMapData) and `textures`
   (RENDER_MAX_TEXTURES, a stand-in where empty or loading, all SHADER_RESOURCE), rebound only when `textureVersion`
   changes; FrameData.textures.x is the mip bias. Probes clip cut-outs and read base colour and emissive maps; masked
@@ -424,6 +448,10 @@ surface's luminance is that over its area). Colours linear RGB.
   than the screen's (a finer caster would shadow the screen's surface). A version change counts as a move for the
   cached shadow maps. Custom meshes have one version. Request finer segments for close-ups freely: far away it costs
   nothing.
+- Skins (renderer_models calls these): `mesh_skin(mesh, skin, lo, hi)` (per vertex u16x4 bones and unorm16x4 weights
+  summing to 65535; lo and hi the bounds its clips reach, so culling never loses a limb), `instance_pose(i, palette,
+  bones)` each frame it is posed (3 rows of 4 floats a bone, model space; an instance not posed this frame draws its
+  bind pose).
 - Materials: `material_add(albedo, roughness, metallic)`, `material_set`, `material_emissive(m, color, nits)`,
   `material_reflections(m, on)`: off, the material shows no reflected image (probes or sky), only the sky's
   soft light, however shiny or metallic it is. `material_double_sided(m, on)` (off by default): drawn from
@@ -542,6 +570,10 @@ library keeps its licence file beside its source, since the component's reposito
   base colour's image cuts out. Each ORM channel comes from its own map; one without is white (glTF's lone
   metallic-roughness image leaves red unused). A BLEND material's colour map keeps its painted alpha. Texture maps (rmodel v2) go in with full mips: BC7 for colour and
   ORM, BC5 for normals.
+  Skins and clips (rmodel v3, `cook_anim.h`): up to 4 bones a vertex; meshes under animated nodes without a skin are
+  bound whole to their node; every node's pose resampled at the file's key rate, else the lowest of 30 to 240 a second
+  whose decoded skin stays within 1 mm of the source (or 2.5e-4 of the model's size); LODs keep influence borders.
+  glTF through cgltf, FBX through ufbx's evaluator; empty takes skipped.
   It normalises units (node scales applied; warns past 500 m or under 1 cm) and axes (+Y up kept, Z negated into the
   renderer's left-handed space, triangle order flipped), generates flat normals and MikkTSpace-compatible tangents where
   missing, merges primitives by material into parts (64 at most), and builds each part's LOD chain with meshoptimizer's
@@ -556,10 +588,14 @@ All scene data is in `renderer`'s tables and state: Reset empties the scene; the
 builds it again (decals included). renderer_fog's volumes and renderer_particles' emitters are in their tables: Reset removes them too (and starts the
 particle pool empty). renderer_gi's volume (state) goes back to fitted, and its probes start again from dark: they fill
 within a second or two traced, a few seconds rasterized. renderer_models' placements go with it: a game places its models again whenever `mdl::placed(h)` is
-false. GPU objects and shadow caches are rebuilt on load.
+false, and their clips start again from the first (PlacementAnim goes with them). GPU objects and shadow caches are
+rebuilt on load.
 
 ## Cost
 
+Per frame, with animated models: one skin dispatch (a thread a posed vertex), 32 bytes a vertex twice per posed
+instance in the pool, palettes uploaded (48 bytes a bone), each posed instance drawn on its own (not instanced), its
+shadow casters redrawn every frame it moves, and with ray tracing its own structure refitted (renderer_rt).
 Per frame: one depth prepass and one forward pass (draws grouped by mesh, sidedness and cut-out, instanced; cut-outs
 clip in a prepass of their own and the forward pass draws them depth-equal; back
 faces culled except for double-sided materials; a leaner forward shader unless PCSS or a debug view is on), one culling

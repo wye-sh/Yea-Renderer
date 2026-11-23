@@ -29,6 +29,17 @@ end
 table Index none 4194304
   u32 v
 end
+# Skinned meshes (skin.cpp): a Mesh row's first SkinVertex row + 1 (0: not skinned; rows match Mesh's, and may be fewer),
+# and each vertex's 4 bones (u16 pairs, the first low) and weights (unorm16 pairs, summing to 65535).
+table MeshSkin none 1024
+  u32 firstSkin
+end
+table SkinVertex none 1048576
+  u32 bones01
+  u32 bones23
+  u32 weights01
+  u32 weights23
+end
 table Material none 4096
   float3 albedo
   float roughness
@@ -168,6 +179,9 @@ export u32 mesh_packed(u64 positions, u64 attributes, u32 vertex_count, u64 indi
 # Makes `simpler` the next version of `mesh` (its LOD chain, the finest first) and sets how far `mesh` strays from the
 # true shape (object units); `simpler` 4294967295 ends the chain there.
 export void mesh_lod(u32 mesh, float error, u32 simpler)
+# A skinned mesh, right after it is made: its vertices' bones and weights (renderer_models' rmodel.h
+# RmodelSkinVertex[its vertex count]) and the bounds its animation reaches (object units).
+export void mesh_skin(u32 mesh, u64 skin, float3 lo, float3 hi)
 
 export handle material_add(float3 albedo, float roughness, float metallic)
 export void material_set(handle m, float3 albedo, float roughness, float metallic)
@@ -216,6 +230,9 @@ export void instance_shadow(handle i, bool cast)
 # Detail kept with distance for this instance: its lod_error divided by quality (2: finer versions twice as far; 1 as
 # every other instance).
 export void instance_lod_quality(handle i, float quality)
+# An instance of a skinned mesh, posed this frame: its palette (3x4 rows a bone, model space; the mesh's bones index it),
+# called every frame it moves (renderer_models does). Without one this frame it stands in its bind pose.
+export void instance_pose(handle i, u64 palette, u32 bones)
 export void instance_remove(handle i)
 export u32 instance_count()
 

@@ -3,6 +3,7 @@
 
 #include "ModelLink.h"
 #include "preview.h"
+#include "rmodel.h"
 
 #include <stdint.h>
 
@@ -24,6 +25,14 @@ struct Entry
     uint32_t mesh[kMaxParts], material[kMaxParts];
     uint32_t twoSided[kMaxParts]; // its material is double-sided in the file (the Double Sided knob adds to it)
     float    lo[3], hi[3]; // its bounds as cooked (object units)
+    // A skinned model's skeleton and clips (rmodel.h): the file's bytes from its RmodelSkeleton to its textures, read
+    // with the model (malloc, this module's own update), offsets in it from the file's start minus `animBase`.
+    uint8_t*              anim;
+    uint64_t              animBase;
+    const RmodelSkeleton* skel;
+    const RmodelNode*     nodes;
+    const RmodelBone*     bones;
+    const RmodelClip*     clips;
 };
 // Every model the view's modules declared, in the order declared (made in load()).
 extern Entry*   gEntries;

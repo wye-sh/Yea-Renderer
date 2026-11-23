@@ -21,6 +21,7 @@
 
 #include <math.h>
 #include <string.h>
+#include <stdio.h>
 
 namespace renderer_rt
 {
@@ -141,6 +142,30 @@ uint32_t       gPickLight[kShadowLayers], gPickId[kShadowLayers], gPickCount;
 uint64_t       gPickFrame;
 
 Blas gBlas[kMaxMeshes];
+// Skinned instances (RenderCaster::dynamic): bottom-level structures of their own, keyed by instance, so two placements
+// of one model never share one. With Yea's in-place refit (raytracing service v2, updateBottom), one per frame in flight,
+// refitted each frame to the copy the core posed it into and built afresh every kRebuildFrames frames (a refit keeps the
+// first build's tree, which traces slower as the pose moves away from it). On older hosts, one per posed copy (keyed by
+// vertexOffset too), built afresh from it each frame. Unused ones go after kDynamicKeep frames.
+const uint32_t kMaxDynamic = 256;
+const uint64_t kDynamicKeep = 8;
+const uint64_t kRebuildFrames = 60;
+struct DynamicBlas
+{
+    Blas     b;
+    uint32_t instance;
+    uint64_t used;  // the last frame it was refitted or built
+    uint64_t built; // the last frame it was built afresh (staggered by instance)
+};
+DynamicBlas gDynamic[kMaxDynamic];
+bool        gRefit;                        // updateBottom works here (off for good once it refuses one)
+DynamicBlas* gToBuild[kMaxDynamic];        // this frame's skinned structures to build afresh, after the refits
+// Their GPU time (a timestamp pair each for the refits and the builds, per frame slot), logged every 10 s while any
+// skinned instance is traced.
+QueryPool* gSkinPool[kMaxFrames];
+uint32_t   gSkinUsed[kMaxFrames], gSkinOps[kMaxFrames][2];
+double     gSkinTicks, gSkinSum[2], gSkinMax[2], gSkinLogged;
+uint32_t   gSkinFrames, gSkinCount[2], gSkinInstances;
 // Bottom-level structures replaced while frames in flight may still trace them: freed once those are done.
 struct Retired
 {
@@ -338,18 +363,10 @@ void freeRetired(uint64_t frame)
     gRetiredCount = kept;
 }
 
-// The mesh's bottom-level structure, made and built (on cmd) when it is new or its geometry moved or was rewritten (the
-// caster's generation: buffers are reused in place, so the same addresses can hold new data).
-AccelerationStructure* meshBlas(Cmd* cmd, const RenderFrame* F, const RenderCaster& c)
+// Makes b's structure for caster c's geometry and builds it on cmd; nullptr when the GPU refused it.
+AccelerationStructure* buildBlas(Cmd* cmd, const RenderFrame* F, const RenderCaster& c, Blas& b, AccelerationStructureBuildFlags flags,
+                                 bool now = true)
 {
-    if (c.mesh >= kMaxMeshes || !c.indexCount || !c.vertexCount)
-        return nullptr;
-    Blas& b = gBlas[c.mesh];
-    if (b.as && b.positions == F->positions && b.indices == F->indices && b.generation == c.generation && b.firstIndex == c.firstIndex &&
-        b.indexCount == c.indexCount && b.vertexOffset == (uint32_t)c.vertexOffset && b.vertexCount == c.vertexCount)
-        return b.as;
-    retire(b.as, F->frameNumber);
-    b = Blas{};
     AccelerationStructureGeometryDesc g = {};
     g.pVertexBuffer = F->positions;
     g.pIndexBuffer = F->indices;
@@ -363,16 +380,20 @@ AccelerationStructure* meshBlas(Cmd* cmd, const RenderFrame* F, const RenderCast
     g.mFlags = ACCELERATION_STRUCTURE_GEOMETRY_FLAG_OPAQUE;
     AccelerationStructureDesc d = {};
     d.mType = ACCELERATION_STRUCTURE_TYPE_BOTTOM;
-    d.mFlags = ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    d.mFlags = flags;
     d.mBottom.mDescCount = 1;
     d.mBottom.pGeometryDescs = &g;
+    b = Blas{};
     addAccelerationStructure(gRay, &d, &b.as);
     if (!b.as)
         return nullptr;
-    RaytracingBuildASDesc build = {};
-    build.pAccelerationStructure = b.as;
-    build.mIssueRWBarrier = true;
-    cmdBuildAccelerationStructure(cmd, gRay, &build);
+    if (now)
+    {
+        RaytracingBuildASDesc build = {};
+        build.pAccelerationStructure = b.as;
+        build.mIssueRWBarrier = true;
+        cmdBuildAccelerationStructure(cmd, gRay, &build);
+    }
     b.positions = F->positions;
     b.indices = F->indices;
     b.generation = c.generation;
@@ -381,6 +402,201 @@ AccelerationStructure* meshBlas(Cmd* cmd, const RenderFrame* F, const RenderCast
     b.vertexOffset = (uint32_t)c.vertexOffset;
     b.vertexCount = c.vertexCount;
     return b.as;
+}
+
+// The same triangles (a refit can move its vertices to another offset, not change them).
+bool sameTopology(const Blas& b, const RenderFrame* F, const RenderCaster& c)
+{
+    return b.as && b.positions == F->positions && b.indices == F->indices && b.firstIndex == c.firstIndex &&
+           b.indexCount == c.indexCount && b.vertexCount == c.vertexCount;
+}
+
+bool sameGeometry(const Blas& b, const RenderFrame* F, const RenderCaster& c)
+{
+    return sameTopology(b, F, c) && b.vertexOffset == (uint32_t)c.vertexOffset;
+}
+
+// A skinned caster's structure for this frame's pose: refitted to it (or, on older hosts, built over the one for its copy),
+// or queued in gToBuild (count) to build afresh. Structures are reused only once the last frame that traced them is
+// done (gFrames back: the host waited for it).
+DynamicBlas* dynamicBlas(const RenderFrame* F, const RenderCaster& c, uint32_t& count)
+{
+    DynamicBlas* e = nullptr;
+    DynamicBlas* free = nullptr;
+    for (uint32_t i = 0; i < kMaxDynamic; ++i)
+    {
+        DynamicBlas& d = gDynamic[i];
+        if (!d.b.as)
+        {
+            free = free ? free : &d;
+            continue;
+        }
+        if (d.instance != c.instance || (!gRefit && d.b.vertexOffset != (uint32_t)c.vertexOffset))
+            continue;
+        if (d.used == F->frameNumber)
+            return &d; // done already this frame
+        if (F->frameNumber >= d.used + gFrames && !e)
+            e = &d;
+    }
+    if (e && gRefit && sameTopology(e->b, F, c))
+    {
+        YeaRaytracingVertices v = { F->positions, (uint64_t)(uint32_t)c.vertexOffset * RENDER_POSITION_STRIDE };
+        if (gService->updateBottom(F->cmd, e->b.as, &v, 1, 1))
+        {
+            e->b.vertexOffset = (uint32_t)c.vertexOffset;
+            e->used = F->frameNumber;
+            if (F->frameNumber >= e->built + kRebuildFrames)
+            {
+                e->built = F->frameNumber; // the address is the new one: a build reads this pose
+                gToBuild[count++] = e;
+            }
+            gSkinOps[F->frameIndex][0]++;
+            return e;
+        }
+        gRefit = false; // refused (an older or broken path): every skinned structure is built afresh from now on
+        yea::host()->log(1, "renderer_rt: skinned instances' refit refused; building them afresh each frame");
+    }
+    else if (e && !gRefit && sameGeometry(e->b, F, c))
+    {
+        e->used = F->frameNumber; // its copy rewritten by this frame's skinning: built again over it
+        gToBuild[count++] = e;
+        return e;
+    }
+    if (e)
+        retire(e->b.as, F->frameNumber); // another LOD or region: a new one
+    else
+        e = free;
+    if (!e)
+        return nullptr; // more than kMaxDynamic: the rest go untraced
+    e->instance = c.instance;
+    e->used = F->frameNumber;
+    const uint64_t spread = c.instance * 7u % kRebuildFrames; // characters' rebuilds spread over frames
+    e->built = F->frameNumber > spread ? F->frameNumber - spread : 0;
+    const AccelerationStructureBuildFlags flags =
+        gRefit ? (AccelerationStructureBuildFlags)(ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE | ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD)
+               : ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD;
+    if (!buildBlas(F->cmd, F, c, e->b, flags, false))
+    {
+        *e = DynamicBlas{};
+        return nullptr;
+    }
+    gToBuild[count++] = e;
+    return e;
+}
+
+// Every skinned caster's structure for this frame: the refits first, then the builds, each timed.
+void skinnedBlas(RenderFrame* F, uint32_t casters)
+{
+    Cmd*           cmd = F->cmd;
+    const uint32_t fi = F->frameIndex;
+    uint32_t       builds = 0, skinned = 0;
+    for (uint32_t i = 0; i < casters; ++i)
+        skinned += F->drawables[i].dynamic ? 1u : 0u;
+    gSkinInstances = skinned;
+    if (!skinned)
+        return;
+    if (gSkinPool[fi])
+    {
+        QueryDesc q = { 0 };
+        cmdBeginQuery(cmd, gSkinPool[fi], &q);
+    }
+    for (uint32_t i = 0; i < casters; ++i)
+    {
+        const RenderCaster& c = F->drawables[i];
+        if (c.dynamic && c.mesh < kMaxMeshes && c.indexCount && c.vertexCount)
+            dynamicBlas(F, c, builds);
+    }
+    if (gSkinPool[fi])
+    {
+        QueryDesc q = { 0 };
+        cmdEndQuery(cmd, gSkinPool[fi], &q);
+        q.mIndex = 1;
+        cmdBeginQuery(cmd, gSkinPool[fi], &q);
+    }
+    for (uint32_t i = 0; i < builds; ++i)
+    {
+        RaytracingBuildASDesc build = {};
+        build.pAccelerationStructure = gToBuild[i]->b.as;
+        build.mIssueRWBarrier = true;
+        cmdBuildAccelerationStructure(cmd, gRay, &build);
+    }
+    gSkinOps[fi][1] += builds;
+    if (gSkinPool[fi])
+    {
+        QueryDesc q = { 1 };
+        cmdEndQuery(cmd, gSkinPool[fi], &q);
+        gSkinUsed[fi] = 1;
+    }
+}
+
+// What this frame slot timed last time, then a fresh start; a line every 10 s while skinned instances are traced.
+void skinnedTimes(Cmd* cmd, uint32_t fi)
+{
+    if (!gSkinPool[fi])
+        return;
+    if (gSkinUsed[fi])
+    {
+        for (uint32_t t = 0; t < 2; ++t)
+        {
+            QueryData q = {};
+            getQueryData(gRenderer, gSkinPool[fi], t, &q);
+            double ms = q.mEndTimestamp > q.mBeginTimestamp ? (double)(q.mEndTimestamp - q.mBeginTimestamp) * 1000.0 / gSkinTicks : 0.0;
+            gSkinSum[t] += ms;
+            gSkinMax[t] = ms > gSkinMax[t] ? ms : gSkinMax[t];
+            gSkinCount[t] += gSkinOps[fi][t];
+        }
+        gSkinFrames++;
+    }
+    cmdResetQuery(cmd, gSkinPool[fi], 0, 2);
+    gSkinUsed[fi] = 0;
+    gSkinOps[fi][0] = gSkinOps[fi][1] = 0;
+    double now = yea::host()->time();
+    if (now - gSkinLogged >= 10.0 && gSkinFrames)
+    {
+        char line[300];
+        snprintf(line, sizeof line,
+                 "renderer_rt: skinned ray structures gpu ms avg/max over %u frames: refit %.3f/%.3f (%u), rebuild %.3f/%.3f (%u)%s | %u skinned",
+                 gSkinFrames, gSkinSum[0] / gSkinFrames, gSkinMax[0], gSkinCount[0], gSkinSum[1] / gSkinFrames, gSkinMax[1], gSkinCount[1],
+                 gRefit ? "" : ", refit off: rebuilt every frame", gSkinInstances);
+        yea::log(line);
+        memset(gSkinSum, 0, sizeof gSkinSum);
+        memset(gSkinMax, 0, sizeof gSkinMax);
+        memset(gSkinCount, 0, sizeof gSkinCount);
+        gSkinFrames = 0;
+        gSkinLogged = now;
+    }
+}
+
+// Skinned structures no caster used lately (the instance stopped animating, went away or moved region): freed.
+void dropDynamic(uint64_t frame)
+{
+    for (uint32_t i = 0; i < kMaxDynamic; ++i)
+        if (gDynamic[i].b.as && frame > gDynamic[i].used + kDynamicKeep)
+        {
+            retire(gDynamic[i].b.as, frame);
+            gDynamic[i] = DynamicBlas{};
+        }
+}
+
+// The mesh's bottom-level structure, made and built (on cmd) when it is new or its geometry moved or was rewritten (the
+// caster's generation: buffers are reused in place, so the same addresses can hold new data).
+AccelerationStructure* meshBlas(Cmd* cmd, const RenderFrame* F, const RenderCaster& c)
+{
+    if (c.mesh >= kMaxMeshes || !c.indexCount || !c.vertexCount)
+        return nullptr;
+    if (c.dynamic)
+    {
+        // Done by skinnedBlas this frame (nullptr: no room).
+        for (uint32_t i = 0; i < kMaxDynamic; ++i)
+            if (gDynamic[i].b.as && gDynamic[i].instance == c.instance && gDynamic[i].used == F->frameNumber)
+                return gDynamic[i].b.as;
+        return nullptr;
+    }
+    Blas& b = gBlas[c.mesh];
+    if (sameGeometry(b, F, c) && b.generation == c.generation)
+        return b.as;
+    retire(b.as, F->frameNumber);
+    return buildBlas(cmd, F, c, b, ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE);
 }
 
 uint32_t grow(uint32_t need)
@@ -413,6 +629,17 @@ int load(int reloaded)
         yea::host()->log(1, "renderer_rt: ray tracing could not start; screen reflections stay");
         gRay = nullptr;
         return 0;
+    }
+    gRefit = gService->version >= 2 && gService->updateBottom;
+    getTimestampFrequency(gQueue, &gSkinTicks);
+    for (uint32_t i = 0; i < gFrames && gSkinTicks > 0; ++i)
+    {
+        QueryPoolDesc qd = {};
+        qd.pName = "renderer_rt_skinned";
+        qd.mType = QUERY_TYPE_TIMESTAMP;
+        qd.mQueryCount = 2;
+        initQueryPool(gRenderer, &qd, &gSkinPool[i]);
+        gSkinUsed[i] = 0;
     }
     gDescs = new AccelerationStructureInstanceDesc[kMaxInstances];
     gInstCpu = new uint32_t[kMaxInstances * 4];
@@ -553,8 +780,17 @@ void unload()
     for (uint32_t m = 0; m < kMaxMeshes; ++m)
         if (gBlas[m].as)
             removeAccelerationStructure(gRay, gBlas[m].as);
+    for (uint32_t i = 0; i < kMaxDynamic; ++i)
+    {
+        if (gDynamic[i].b.as)
+            removeAccelerationStructure(gRay, gDynamic[i].b.as);
+        gDynamic[i] = DynamicBlas{};
+    }
     for (uint32_t i = 0; i < kMaxFrames; ++i)
     {
+        if (gSkinPool[i])
+            exitQueryPool(gRenderer, gSkinPool[i]);
+        gSkinPool[i] = nullptr;
         if (gTlas[i])
             removeAccelerationStructure(gRay, gTlas[i]);
         if (gInstBuf[i])
@@ -965,6 +1201,7 @@ void rt_run(uint64_t address)
     uint32_t fi = F->frameIndex;
     uint32_t count = F->drawableCount < gDescCapacity ? F->drawableCount : gDescCapacity;
     freeRetired(F->frameNumber);
+    skinnedTimes(cmd, fi);
 
     cmdBeginDebugMarker(cmd, 0.5f, 0.8f, 1.0f, "Renderer ray-traced reflections");
     // Room for this frame's instances (grown rarely; the old top-level structure of this frame slot is done).
@@ -980,6 +1217,7 @@ void rt_run(uint64_t address)
     // ones are non-opaque (their rays test the cut-out, Cutout.h.fsl), and only with the core's maps to test it by.
     const bool cutouts = F->materialMaps && F->textures;
     uint32_t   n = 0;
+    skinnedBlas(F, count);
     for (uint32_t i = 0; i < count; ++i)
     {
         const RenderCaster& c = F->drawables[i];
@@ -1000,6 +1238,7 @@ void rt_run(uint64_t address)
         gInstCpu[n * 4 + 3] = cut ? F->instanceRows[c.instance].material + 1 : 0;
         n++;
     }
+    dropDynamic(F->frameNumber);
     if (!n || !gInstBuf[fi])
     {
         cmdEndDebugMarker(cmd);

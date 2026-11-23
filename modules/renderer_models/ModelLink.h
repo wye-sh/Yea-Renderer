@@ -13,6 +13,10 @@
 //       mdl::move(gChair, pos, rot);
 //   }
 //
+// Skinned models play their first clip, looping, once placed. mdl::play(h, "Run") switches clip (fading over a
+// fraction of a second by default), mdl::clipTime(h) gives how far in it is, and mdl::joint(h, "hand_r", m) a joint's
+// world transform (3x4 rows), to attach something to it. Clips and joints are named as in the source file.
+//
 // Placements are kept by renderer_models (through its reloads); Reset State empties them, so place again whenever
 // mdl::placed(h) is false. The handle is 0 while renderer_models isn't running.
 #pragma once
@@ -89,7 +93,15 @@ struct Api
     // For a panel (the Model Viewer): every model, in the order declared.
     uint32_t (*count)(void);
     int (*info)(uint32_t index, Info* out);
+    // Skinned models (later in Api: check `size`). play: by name (nullptr or "" the rest pose); speed 1 as authored,
+    // fade seconds from what played; 0 when it has no such clip.
+    int (*play)(uint32_t placement, const char* clip, float speed, int loop, float fade);
+    float (*time)(uint32_t placement); // seconds into its clip
+    int (*joint)(uint32_t placement, const char* name, float* out); // 12 floats, 3x4 rows, world; 0 no such joint
+    uint32_t (*clips)(uint32_t model); // its clips, for a panel
+    const char* (*clip)(uint32_t model, uint32_t index, float* duration);
 };
+inline bool hasAnim(const Api* a) { return a->size >= sizeof(Api); }
 
 struct Model;
 namespace detail
@@ -234,5 +246,24 @@ inline bool placed(uint32_t placement)
 {
     const Api* a = detail::api();
     return a && placement && a->placed(placement);
+}
+// A skinned placement's clip: by name, speed 1 as authored, faded in over `fade` seconds. False: no such clip (or not
+// skinned, or renderer_models isn't running). While its model is still loading it is taken by name once loaded (true).
+inline bool play(uint32_t placement, const char* clip, float speed = 1.0f, bool loop = true, float fade = 0.2f)
+{
+    const Api* a = detail::api();
+    return a && placement && hasAnim(a) && a->play(placement, clip, speed, loop ? 1 : 0, fade);
+}
+inline float clipTime(uint32_t placement)
+{
+    const Api* a = detail::api();
+    return a && placement && hasAnim(a) ? a->time(placement) : 0.0f;
+}
+// A joint's world transform this frame (3x4 rows: x, y and z axes in its columns, then its position), to attach
+// something to it. False when it has none of that name.
+inline bool joint(uint32_t placement, const char* name, float out[12])
+{
+    const Api* a = detail::api();
+    return a && placement && hasAnim(a) && a->joint(placement, name, out);
 }
 } // namespace mdl

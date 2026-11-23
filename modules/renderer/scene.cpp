@@ -782,6 +782,8 @@ void clear()
     MaterialBlends.clear();
     MaterialRefractions.clear();
     Decals.clear();
+    MeshSkins.clear();
+    SkinVertexes.clear();
     build()->active = 0;
     sceneState()->removed = yea::host()->frame();
     newEpoch();

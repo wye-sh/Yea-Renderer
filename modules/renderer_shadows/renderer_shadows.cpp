@@ -667,8 +667,10 @@ void drawCasters(Cmd* cmd, const RenderFrame* F, uint32_t view, const RenderGpuS
         }
         cmdDrawIndexedInstanced(cmd, m.indexCount, m.firstIndex, count, m.firstVertex, 0);
     };
-    // Without the masked pipeline (its shaders refused), alpha-tested casters draw whole with the others.
-    auto ours = [&](const RenderCaster& c) { return gMaskedNow ? (c.masked != 0) == masked : !masked; };
+    // Without the masked pipeline (its shaders refused), alpha-tested casters draw whole with the others. Skinned casters
+    // (dynamic) draw after the runs, each on its own.
+    auto mine = [&](const RenderCaster& c) { return gMaskedNow ? (c.masked != 0) == masked : !masked; };
+    auto ours = [&](const RenderCaster& c) { return !c.dynamic && mine(c); };
     for (uint32_t i = 0; i < F->casterCount && gStreamUsed < kMaxEntries;)
     {
         // The run of casters the screen draws with one version (the core sorts them by it).
@@ -701,6 +703,30 @@ void drawCasters(Cmd* cmd, const RenderFrame* F, uint32_t view, const RenderGpuS
             floor = pick + 1;
         }
         i = end;
+    }
+    // Skinned casters: only the version the core posed exists, at its own vertex offset.
+    for (uint32_t k = 0; k < F->casterCount && gStreamUsed < kMaxEntries; ++k)
+    {
+        const RenderCaster& c = F->casters[k];
+        if (!c.dynamic || !mine(c) || !sphereInside(planes, 6, V(c.sphere[0], c.sphere[1], c.sphere[2]), c.sphere[3]))
+            continue;
+        const uint32_t first = gStreamUsed;
+        stream[gStreamUsed++] = c.instance | (view << RENDER_VIEW_SHIFT);
+        if (masked)
+        {
+            Buffer*  bufs[3] = { F->positions, F->attributes, streamBuf };
+            uint32_t strides[3] = { RENDER_POSITION_STRIDE, RENDER_ATTRIBUTE_STRIDE, 4 };
+            uint64_t offsets[3] = { 0, 0, (uint64_t)first * 4 };
+            cmdBindVertexBuffer(cmd, 3, bufs, strides, offsets);
+        }
+        else
+        {
+            Buffer*  bufs[2] = { F->positions, streamBuf };
+            uint32_t strides[2] = { RENDER_POSITION_STRIDE, 4 };
+            uint64_t offsets[2] = { 0, (uint64_t)first * 4 };
+            cmdBindVertexBuffer(cmd, 2, bufs, strides, offsets);
+        }
+        cmdDrawIndexedInstanced(cmd, c.indexCount, c.firstIndex, 1, (uint32_t)c.vertexOffset, 0);
     }
 }
 } // namespace
