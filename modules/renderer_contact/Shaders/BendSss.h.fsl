@@ -24,7 +24,9 @@
 // - all of a light's dispatches merged into one, each group finding its own dispatch from a table;
 // - the early-out coordinated through groupshared memory alone, with no wave intrinsics, and skipped
 //   pixels written as unshadowed;
-// - writes kept on screen, and the result faded by the Renderer's intensity and distance.
+// - writes kept on screen, and the result faded by the Renderer's intensity and distance;
+// - each sample pushed back by its surface's own step from whichever side the surface carries on (two more
+//   depth reads), so steep planes and a surface's rim aren't point-filtered edges.
 
 // Number of bilinear sample reads performed per-thread
 #define READ_COUNT (BEND_SAMPLE_COUNT / WAVE_SIZE + 2)
@@ -157,8 +159,20 @@ void WriteScreenSpaceShadow(int3 inGroupID, int inGroupThreadID)
         // Depth thresholds (bilinear/shadow thickness) are based on a fractional ratio of the difference between sampled depth and the far clip depth
         depth_thickness_scale[i] = abs(FarDepthValue - depths.x);
 
-        // If depth variance is more than a specific threshold, then just use point filtering
-        bool use_point_filter = abs(depths.x - depths.y) > depth_thickness_scale[i] * gContact.params.y;
+        // Each sample is pushed back by its surface's own step to the next pixel, so a surface can't shadow
+        // itself. Bend takes the step towards the bilinear neighbour, or none (point filtering) when that
+        // differs by more than the edge threshold. A step that carries on through the pixel is a steep plane
+        // (reversed-Z depth is affine across one on screen: a floor near the horizon), not an edge; and where
+        // the neighbour is past an edge (a floor's far rim against the sky), the step from the other side is
+        // the surface's own. Only pixels with an edge on both sides (thin things) are point-filtered.
+        float behind = BendDepth(read_xy - offset_xy);
+        float behind2 = BendDepth(read_xy - offset_xy * 2.0);
+        float edge_limit = depth_thickness_scale[i] * gContact.params.y;
+        float ahead_step = depths.y - depths.x;
+        float back_step = depths.x - behind;
+        bool smooth_ahead = abs(ahead_step) <= edge_limit || abs(ahead_step - back_step) <= edge_limit;
+        bool smooth_behind = abs(back_step) <= edge_limit || abs(back_step - (behind - behind2)) <= edge_limit;
+        bool use_point_filter = !smooth_ahead && !smooth_behind;
 
         // The pixel starts sampling at this depth
         sampling_depth[i] = depths.x;
@@ -166,7 +180,7 @@ void WriteScreenSpaceShadow(int3 inGroupID, int inGroupThreadID)
         float edge_depth = gContact.fade.w > 0.5 ? edge_skip : depths.x;
         // Any sample in this wavefront is possibly interpolated towards the bilinear sample
         // So use should use a shadowing depth that is further away, based on the difference between the two samples
-        float shadow_depth = depths.x + abs(depths.x - depths.y) * z_sign;
+        float shadow_depth = depths.x + abs(smooth_ahead ? ahead_step : back_step) * z_sign;
 
         // Shadows cast from this depth
         shadowing_depth[i] = use_point_filter ? edge_depth : shadow_depth;
