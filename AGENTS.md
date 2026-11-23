@@ -712,7 +712,8 @@ instance in the pool, palettes uploaded (48 bytes a bone), each posed instance d
 shadow casters redrawn every frame it moves, and with ray tracing its own structure refitted (renderer_rt).
 Per frame: one depth prepass and one forward pass (draws grouped by mesh, sidedness and cut-out, instanced; cut-outs
 clip in a prepass of their own and the forward pass draws them depth-equal; back
-faces culled except for double-sided materials; a leaner forward shader unless PCSS or a debug view is on), one culling
+faces culled except for double-sided materials; a leaner forward shader unless PCSS or a debug view is on; the screen-space reflection march only in the `_ssr` variants, used
+while SSR runs and made only once it has), one culling
 dispatch per 16 px tile, a GTAO dispatch and `denoise` blur dispatches (at half size with half_resolution; the forward pass upsamples), one contact shadow dispatch (all full size; 64-pixel stretches of rays from the sun's point on screen, two bilinear depth reads per pixel), one
 rate dispatch per 16 px tile and a small dilation dispatch with variable-rate shading (the forward pass then shades smooth tiles at 2x2), one
 depth copy for screen reflections (their march, up to `steps` plus 4 depth reads per crossing, runs in the forward pass for

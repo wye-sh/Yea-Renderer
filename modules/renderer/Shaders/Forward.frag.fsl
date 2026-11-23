@@ -135,6 +135,13 @@ float4 clipOf(float3 W)
 
 float2 pixelOf(float4 c) { return (c.xy / c.w * float2(0.5, -0.5) + 0.5) * gFrame.screen.xy; }
 
+// The screen-space reflection march (renderer_ssr) only in the shaders it can run with (SSR: TAA on, no ray-traced
+// reflections) and the see-through ones: elsewhere it would only hold registers every pixel pays for.
+#if defined(SSR) || defined(TRANSLUCENT)
+#define FORWARD_SSR
+#endif
+
+#ifdef FORWARD_SSR
 // How far the ray is behind what the depth copy shows at pixel s (view metres; negative: in front).
 float behind(float2 s, float rayZ)
 {
@@ -143,6 +150,8 @@ float behind(float2 s, float rayZ)
     float  d = LoadTex2D(gSsrDepth, NO_SAMPLER, q, 0).r;
     return rayZ - gFrame.camPos.w / max(d, 1e-7); // reversed-Z, infinite far: sky is never in front
 }
+
+#endif
 
 #ifdef TRANSLUCENT
 // The scene's view depth at pixel q (reversed-Z, infinite far): the see-through pass's depth, or with MSAA its resolve.
@@ -203,6 +212,7 @@ float3 refractedScene(float3 P, float3 N, float3 V, float4 refr, float a2, float
 }
 #endif
 
+#ifdef FORWARD_SSR
 // Screen-space reflection (renderer_ssr): the reflected ray marched across the screen against the depth
 // copy, 1/depth stepped linearly in screen space (perspective-correct, McGuire and Mara 2014); at the first
 // step behind what the depth shows by less than `thickness`, refined by halving, the colour there from
@@ -304,6 +314,8 @@ float4 screenReflection(float3 P, float3 R, float rough, float noise)
     float3 c = SampleLvlTex2D(gPrevColor, gSamplerBilinearClamp, uvPrev, 0.0).rgb;
     return float4(c, w);
 }
+
+#endif
 
 ROOT_SIGNATURE(DefaultRootSignature)
 #if defined(MOTION) || defined(BLEND_PASS)
@@ -581,6 +593,7 @@ float4 PS_MAIN(VSOutput In)
     }
     float3 radiance = rtFound < 1.0 ? environment(In.WorldPos, R, r, m.params.z > 0.5) : rtSeen;
     float  ssrFound = 0.0;
+#ifdef FORWARD_SSR
     if ((gFrame.counts.z & FLAG_SSR) != 0u && m.params.z > 0.5)
     {
         // Glossy: the ray follows one microfacet normal drawn from the material's GGX lobe (Walter et al.
@@ -605,6 +618,7 @@ float4 PS_MAIN(VSOutput In)
         radiance = lerp(radiance, sr.rgb, sr.a);
         ssrFound = sr.a;
     }
+#endif
     if (rtFound > 0.0 && rtFound < 1.0)
         radiance = lerp(radiance, rtSeen, rtFound);
     radiance *= horizon * horizon;

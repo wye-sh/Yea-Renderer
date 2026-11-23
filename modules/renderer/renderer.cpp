@@ -154,11 +154,15 @@ const YeaRaytracing* gRaytracing; // nullptr: no ray queries on this GPU
 // The full forward shaders add PCSS, the debug views and Wireframe's unlit lines; the lean ones, used
 // otherwise, leave them out and so need fewer registers.
 Shader *gForwardFullShader, *gMotionFullShader;
+// With SSR (renderer_ssr: TAA on, no ray-traced reflections) the motion shaders with its march; the others leave it out.
+Shader *gMotionSsrShader, *gMotionFullSsrShader;
 Sampler*       gShadowSampler;
 DescriptorSet *gScenePersistent, *gSceneFrame, *gCompositeSet, *gExposureSet;
 // Scene pipelines in fours: [0] culls back faces, [1] draws both sides (double-sided materials); [2] and [3] the same for
 // alpha-tested materials (the prepass cuts them out; the forward pass draws them only at the depth it left).
 Pipeline *     gDepthPipe[4], *gForwardPipe[4], *gForwardFullPipe[4], *gForwardDepthPipe[4];
+Pipeline *     gForwardSsrPipe[4], *gForwardFullSsrPipe[4]; // made only once a frame has run SSR (gWarmSsr), with motion
+bool           gWarmSsr;
 // See-through surfaces (material_blend): [0] multiply by what they let through, back faces culled; [1] the same, front
 // faces culled (a double-sided surface's far side); [2] and [3] add their own light. With one sample a pixel they draw in
 // the see-through pass (hdr, reactive, transparency; the depth test in the shader), else inside the forward pass.
@@ -590,6 +594,8 @@ void destroyScenePipelines()
         freePipeline(gDepthSurfacePipe[s]);
         freePipeline(gForwardPipe[s]);
         freePipeline(gForwardFullPipe[s]);
+        freePipeline(gForwardSsrPipe[s]);
+        freePipeline(gForwardFullSsrPipe[s]);
         freePipeline(gForwardDepthPipe[s]);
         freePipeline(gBlendPipe[s]);
     }
@@ -603,7 +609,7 @@ void destroyScenePipelines()
 // ones ([2] and [3]) with `masked`, and of the forward pass the variants in `forward` (kForward*). A frame that draws
 // asks only for opaque ones it lacks (the first frame); warming asks for the rest, a few a frame. Making them all in
 // load() took past Yea's 2 s limit on a software GPU (about 400 ms a forward pipeline).
-const uint32_t kForwardLean = 1, kForwardFull = 2, kForwardDepth = 4, kForwardBlend = 8;
+const uint32_t kForwardLean = 1, kForwardFull = 2, kForwardDepth = 4, kForwardBlend = 8, kForwardLeanSsr = 16, kForwardFullSsr = 32;
 double clockMs()
 {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -820,6 +826,7 @@ bool createScenePipelines(uint32_t samples, bool motion, bool masked, uint32_t f
     };
     if (!missing(gDepthPipe) && !(motion && gGlossShader && missing(gDepthGlossPipe)) && !(motion && gSurfaceShader && missing(gDepthSurfacePipe)) &&
         !((forward & kForwardLean) && missing(gForwardPipe)) && !((forward & kForwardFull) && missing(gForwardFullPipe)) &&
+        !(motion && (forward & kForwardLeanSsr) && missing(gForwardSsrPipe)) && !(motion && (forward & kForwardFullSsr) && missing(gForwardFullSsrPipe)) &&
         !((forward & kForwardDepth) && (!gForwardDepthPipe[0] || !gForwardDepthPipe[1])) && !((forward & kForwardBlend) && (!gBlendPipe[0] || !gBlendPipe[1] || !gBlendPipe[2] || !gBlendPipe[3])) &&
         gSkyPipe && gHistogramPipe)
         return false; // every frame after the first: nothing to make
@@ -913,6 +920,16 @@ bool createScenePipelines(uint32_t samples, bool motion, bool masked, uint32_t f
         desc.pName = "renderer_forward_full";
         if ((forward & kForwardFull) && !gForwardFullPipe[s])
             make(desc, gForwardFullPipe[s]);
+        // SSR runs only with TAA, so only motion ones.
+        g.pShaderProgram = gMotionSsrShader;
+        desc.pName = "renderer_forward_ssr";
+        if (motion && (forward & kForwardLeanSsr) && !gForwardSsrPipe[s])
+            make(desc, gForwardSsrPipe[s]);
+        g.pShaderProgram = gMotionFullSsrShader;
+        desc.pName = "renderer_forward_full_ssr";
+        if (motion && (forward & kForwardFullSsr) && !gForwardFullSsrPipe[s])
+            make(desc, gForwardFullSsrPipe[s]);
+        g.pShaderProgram = motion ? gMotionFullShader : gForwardFullShader;
         // F1's view modes skip the prepass (Wireframe would draw it as edges): the forward pass writes depth itself
         // (alpha-tested materials whole, uncut), so only [0] and [1] (one- and two-sided) are made: [2] and [3] would be
         // the same pipelines, which queued together loaded one pipeline from the library on two threads (4.16.2's crash).
@@ -991,7 +1008,7 @@ bool createScenePipelines(uint32_t samples, bool motion, bool masked, uint32_t f
 
 uint32_t warmForward()
 {
-    uint32_t forward = kForwardLean | kForwardFull | kForwardBlend;
+    uint32_t forward = kForwardLean | kForwardFull | kForwardBlend | (gWarmSsr ? kForwardLeanSsr | kForwardFullSsr : 0);
 #if !defined(YEA_GAME_RELEASE)
     forward |= kForwardDepth; // F1's view modes
 #endif
@@ -2042,6 +2059,8 @@ int load(int reloaded)
     gMotionShader = loadShader("renderer_forward_motion.vert", "renderer_forward_motion.frag", nullptr);
     gForwardFullShader = loadShader("renderer_forward.vert", "renderer_forward_full.frag", nullptr);
     gMotionFullShader = loadShader("renderer_forward_motion.vert", "renderer_forward_motion_full.frag", nullptr);
+    gMotionSsrShader = loadShader("renderer_forward_motion.vert", "renderer_forward_motion_ssr.frag", nullptr);
+    gMotionFullSsrShader = loadShader("renderer_forward_motion.vert", "renderer_forward_motion_full_ssr.frag", nullptr);
     gSkyMotionShader = loadShader("renderer_fullscreen.vert", "renderer_sky_motion.frag", nullptr);
     gGlossShader = loadShader("renderer_forward_motion.vert", "renderer_gloss.frag", nullptr);
     gSurfaceShader = gRaytracing ? loadShader("renderer_forward_motion.vert", "renderer_surface.frag", nullptr) : nullptr;
@@ -2058,7 +2077,7 @@ int load(int reloaded)
     const char* histogram[4] = { "renderer_histogram_1.comp", "renderer_histogram_2.comp", "renderer_histogram_4.comp",
                                  "renderer_histogram_8.comp" };
     bool ok = gForwardDepthShader && gForwardShader && gSkyShader && gMotionDepthShader && gMotionShader && gSkyMotionShader &&
-              gForwardFullShader && gMotionFullShader && gGlossShader && gDepthMaskedShader && gMotionDepthMaskedShader && gGlossMaskedShader &&
+              gForwardFullShader && gMotionFullShader && gMotionSsrShader && gMotionFullSsrShader && gGlossShader && gDepthMaskedShader && gMotionDepthMaskedShader && gGlossMaskedShader &&
               (!gSurfaceShader || gSurfaceMaskedShader) && gBlendShader && gTransmitShader && gBlendMsaaShader && gTransmitMsaaShader;
     for (int i = 0; i < 4; ++i)
     {
@@ -2421,7 +2440,7 @@ void unload()
         removeSampler(gRenderer, gShadowSampler), gShadowSampler = nullptr;
     // Each one let go and forgotten, so a second unload (after a load that gave up) frees nothing twice.
     Shader** shaders[] = { &gForwardDepthShader, &gForwardShader, &gSkyShader, &gAdaptShader, &gMotionDepthShader, &gMotionShader,
-                           &gSkyMotionShader, &gForwardFullShader, &gMotionFullShader, &gGlossShader, &gSurfaceShader, &gTonemapShader,
+                           &gSkyMotionShader, &gForwardFullShader, &gMotionFullShader, &gMotionSsrShader, &gMotionFullSsrShader, &gGlossShader, &gSurfaceShader, &gTonemapShader,
                            &gDepthMaskedShader, &gMotionDepthMaskedShader, &gGlossMaskedShader, &gSurfaceMaskedShader, &gBlendShader,
                            &gTransmitShader, &gBlendMsaaShader, &gTransmitMsaaShader, &gChainShader, &gChainMsShader[1],
                            &gChainMsShader[2], &gChainMsShader[3] };
@@ -3670,10 +3689,19 @@ void draw(uint32_t pass, const YeaFrame* yf)
     uint32_t forward = viewMode ? kForwardDepth : full ? kForwardFull : kForwardLean;
     if (forward == kForwardFull && (!gForwardFullPipe[0] || !gForwardFullPipe[1]) && gForwardPipe[0] && gForwardPipe[1])
         forward = kForwardLean;
+    if (ssr && forward != kForwardDepth)
+    {
+        // The march's own shaders (the others leave it out): the lean one made now on first use, as the lean shader is;
+        // the full one while warming hasn't made it gives way to it. From then on warming makes both.
+        forward = forward == kForwardFull && gForwardFullSsrPipe[0] && gForwardFullSsrPipe[1] ? kForwardFullSsr : kForwardLeanSsr;
+        if (!gWarmSsr)
+            gWarmSsr = gWarmLeft = true;
+    }
     uint32_t sides = 3; // opaque, one- and two-sided
     Pipeline* const* prePipes = rtRun ? gDepthSurfacePipe : second ? gDepthGlossPipe : gDepthPipe;
     Pipeline* const  viewPipes[4] = { gForwardDepthPipe[0], gForwardDepthPipe[1], gForwardDepthPipe[0], gForwardDepthPipe[1] };
-    Pipeline* const* forwardPipes = forward == kForwardDepth ? viewPipes : forward == kForwardFull ? gForwardFullPipe : gForwardPipe;
+    Pipeline* const* forwardPipes = forward == kForwardDepth ? viewPipes : forward == kForwardFull ? gForwardFullPipe
+                                  : forward == kForwardFullSsr ? gForwardFullSsrPipe : forward == kForwardLeanSsr ? gForwardSsrPipe : gForwardPipe;
     if (geometry)
     {
         const uint32_t before = gPipesMade;

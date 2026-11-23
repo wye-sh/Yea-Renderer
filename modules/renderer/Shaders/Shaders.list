@@ -43,6 +43,19 @@
 #include "Forward.frag.fsl"
 #end
 
+#frag renderer_forward_motion_ssr.frag
+#define MOTION
+#define SSR
+#include "Forward.frag.fsl"
+#end
+
+#frag renderer_forward_motion_full_ssr.frag
+#define MOTION
+#define FULL
+#define SSR
+#include "Forward.frag.fsl"
+#end
+
 #frag renderer_sky_motion.frag
 #define MOTION
 #include "Sky.frag.fsl"
