@@ -124,6 +124,7 @@ Buffer *       gFrameCb[kMaxFrames], *gInstanceBuf[kMaxFrames], *gMaterialBuf[kM
 Buffer *       gCompositeCb[kMaxFrames], *gExposureCb[kMaxFrames];
 Buffer *       gLtc, *gShapeBuf[kMaxFrames];
 RenderGpuLightShape* gShapeCpu;
+v3                   gCamRight = { 1, 0, 0 }; // the view's right last frame, for a camera looking exactly straight down or up
 Buffer *       gDfg, *gExposure, *gHistogram, *gDummyU32, *gDummyViews, *gDummyProbes;
 Buffer *       gVertexBuf, *gIndexBuf;
 Buffer *       gPrevBuf[kMaxFrames]; // last frame's instance rows, for motion vectors
@@ -1245,8 +1246,17 @@ void draw(uint32_t pass, const YeaFrame* yf)
     CameraState* cam = cameraState();
     v3           eye = V(cam->eye.x, cam->eye.y, cam->eye.z);
     v3           fwd = normalize(V(cam->target.x, cam->target.y, cam->target.z) - eye);
-    v3           right, up;
-    basis(fwd, &right, &up);
+    // The view keeps world up for its roll at every pitch, right from up x forward: its heading never flips as the
+    // camera looks straight down or up (a helper axis switched near vertical turned the image to world x there).
+    // Only exactly vertical, where up x forward vanishes, the last frame's right carries the heading over.
+    v3    right = cross(V(0, 1, 0), fwd), up;
+    float rightLen = length(right);
+    if (rightLen > 1e-6f)
+        gCamRight = right * (1.0f / rightLen);
+    else
+        gCamRight = normalize(gCamRight - fwd * dot(gCamRight, fwd));
+    right = gCamRight;
+    up = cross(fwd, right);
     float nearZ = maxf(settings.near_plane, 0.001f);
     float p11 = 1.0f / tanf(cam->fov * 0.5f * 3.14159265f / 180.0f);
     float p00 = p11 * (float)dh / (float)dw;

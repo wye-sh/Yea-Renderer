@@ -261,14 +261,14 @@ void build(State* s)
             place(cylinder, s->housingMaterial, { foot.x, a.pos.y * 0.5f, foot.z }, { 0.05f, a.pos.y, 0.05f });
             place(cylinder, s->housingMaterial, { foot.x, 0.02f, foot.z }, { 0.5f, 0.04f, 0.5f });
         }
-        else if (a.type == 4) // a thin disc, under a canopy hung from a cord
+        else if (a.type == 4) // a glowing diffuser 4 cm deep, its rim showing under a slim canopy hung from a cord
         {
             yea_float4 q = basis(x, z, cross(x, z));
             e = renderer::instance_add(cylinder, s->areaMaterials[i]);
-            renderer::instance_place(e, behind, q, { a.width, 0.01f, a.height });
+            renderer::instance_place(e, { a.pos.x - z.x * 0.02f, a.pos.y - z.y * 0.02f, a.pos.z - z.z * 0.02f }, q, { a.width, 0.04f, a.height });
             yea_handle canopy = renderer::instance_add(cylinder, s->housingMaterial);
-            renderer::instance_place(canopy, { a.pos.x - z.x * 0.05f, a.pos.y - z.y * 0.05f, a.pos.z - z.z * 0.05f }, q,
-                                     { a.width + 0.08f, 0.08f, a.height + 0.08f });
+            renderer::instance_place(canopy, { a.pos.x - z.x * 0.06f, a.pos.y - z.y * 0.06f, a.pos.z - z.z * 0.06f }, q,
+                                     { a.width * 0.96f, 0.04f, a.height * 0.96f });
             renderer::instance_shadow(canopy, false);
             yea_handle cord = renderer::instance_add(cylinder, s->housingMaterial);
             renderer::instance_place(cord, { a.pos.x, a.pos.y + 2.09f, a.pos.z }, kNoRotation, { 0.015f, 4.0f, 0.015f });
@@ -390,10 +390,11 @@ void animate(State* s)
     }
     for (uint32_t i = 0; i < kAreas; ++i)
     {
-        // One luminance for every emitter: each light's candela is it times the emitter's area.
+        // Each emitter's luminance (the pendant's its own): each light's candela is it times the emitter's area.
         const AreaLight& a = kAreaLights[i];
-        renderer::light_color(s->areas[i], a.color, settings.area_luminance * areaOf(a));
-        renderer::material_emissive(s->areaMaterials[i], a.color, settings.area_luminance);
+        float            lum = a.type == 4 ? settings.pendant_luminance : settings.area_luminance;
+        renderer::light_color(s->areas[i], a.color, lum * areaOf(a));
+        renderer::material_emissive(s->areaMaterials[i], a.color, lum);
     }
     for (uint32_t i = 0; i < s->spinCount; ++i)
         renderer::instance_place(s->spin[i], s->spinPos[i], axisAngle(s->spinAxis[i], t * 0.6f + (float)i), s->spinScale[i]);
@@ -419,7 +420,9 @@ void moveCamera(State* s, float dt)
         s->yaw -= host->input("look_x") * look;
         s->pitch += host->input("look_y") * look;
     }
-    s->pitch = s->pitch < -1.55f ? -1.55f : (s->pitch > 1.55f ? 1.55f : s->pitch);
+    // Just short of straight down or up (89.5 degrees): the view's heading comes from yaw alone, so it never flips.
+    const float kMaxPitch = 1.5621f;
+    s->pitch = s->pitch < -kMaxPitch ? -kMaxPitch : (s->pitch > kMaxPitch ? kMaxPitch : s->pitch);
 
     yea_float3 f = { cosf(s->yaw) * cosf(s->pitch), sinf(s->pitch), sinf(s->yaw) * cosf(s->pitch) };
     yea_float3 r = { sinf(s->yaw), 0, -cosf(s->yaw) }; // up x forward: the camera's right

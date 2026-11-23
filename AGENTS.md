@@ -199,7 +199,8 @@ surface's luminance is that over its area). Colours linear RGB.
   `Assets/ltc.bin`; Heitz et al. 2016, 2017); to every other module they are point lights (a cube of shadow tiles)
   whose `RenderLight.kind` and `size` (the radius of a disc of their area) give their penumbra and face margin.
   Give an area light an emitter of its exact shape that casts no shadow.
-- `camera(eye, target, fov°)`, `clear()` (removes everything but probes).
+- `camera(eye, target, fov°)`: the view keeps world up (right = up × forward) at every pitch, so its heading never
+  flips looking straight down; exactly vertical, last frame's right carries over. `clear()` (removes everything but probes).
 - Reflection probes (exports of `renderer_probes`): `probe_add(pos, box_min, box_max)` (capture point and
   the world box where it is used and reflections are projected onto; put the box's bottom just under the
   floor), `probe_place`, `probe_remove`, `probe_clear`, `probe_count`.
@@ -322,7 +323,7 @@ for screen reflections (a quarter of it at half resolution).
 Floor, gold and red sphere rows sweeping roughness, pillars and assorted shapes, spinning tori, a sun,
 `light_count` moving coloured point lights (markers glow in their colour; the first `shadowed_points` cast
 shadows; all of them by default), `spot_count` sweeping shadowed spots (each a lamp: a dark body aimed along the beam,
-its lens glowing in the light's colour; neither casts shadows), four area lights at `area_luminance` (cd/m²): a
+its lens glowing in the light's colour; neither casts shadows), four area lights at `area_luminance` (cd/m²; the pendant at its own `pendant_luminance`): a
 softbox on a stand by the sphere rows, a pendant disc over the white boxes, a fluorescent tube on the stone ledge,
 the glowing sphere on the steel drum, two reflection probes (the sphere rows, the whole yard), a free-look camera: holding its `look` action (left mouse button) after a press on the game
 asks the host for the mouse each frame (`yea::captureMouse(true)`: hidden, kept in the window) and turns by
