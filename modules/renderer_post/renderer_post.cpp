@@ -1,5 +1,5 @@
 // Post-processing for the renderer core, on the anti-aliased (or upscaled) scene-linear HDR image at display size,
-// before the core's tonemapper: motion blur (McGuire 2012 with Jimenez 2014's refinements, Shaders/Blur.comp.fsl), bloom (a 13-tap downsample chain and tent upsamples, Jimenez 2014), a vignette, and
+// before the core's tonemapper: depth of field (a thin lens, half-size two-layer gather, Shaders/Dof.comp.fsl), motion blur (McGuire 2012 with Jimenez 2014's refinements, Shaders/Blur.comp.fsl), bloom (a 13-tap downsample chain and tent upsamples, Jimenez 2014), a vignette, and
 // colour grading through a 32^3 LUT in ACEScct (white balance, contrast, lift / gamma / gain, saturation). With every
 // effect neutral, post_prepare returns 0 and nothing runs.
 #include "yea_renderer_post.h"
@@ -25,17 +25,26 @@ struct PostData
     float    look[4];
     float    blur[4];     // motion blur: xy motion (uv) to blur radius (display pixels), z the tile size (the largest radius), w near
     float    blurSize[4]; // xy display size, zw render size (motion and depth)
+    float    dof[4];      // depth of field: x focal length (m), y its blur scale, z largest radius (px), w set focus (0: auto)
+    float    dof2[4];     // x autofocus easing, y 1: no focus history, z half-size tile (px)
     float    wb[3][4];
     float    lift[4];
     float    gamma[4];
     float    gain[4];
 };
 
-const uint32_t kMaxFrames = 4, kSlots = 24, kLevels = 6;
-enum Pass { kDownFirst, kDown, kUp, kLut, kCombine, kBlurTile, kBlurNeighbor, kBlurGather, kPasses };
+const uint32_t kMaxFrames = 4, kSlots = 32, kLevels = 6;
+enum Pass
+{
+    kDownFirst, kDown, kUp, kLut, kCombine, kBlurTile, kBlurNeighbor, kBlurGather,
+    kDofFocus, kDofCoc, kDofTile, kDofNeighbor, kDofGather, kDofCombine, kPasses
+};
 const char* const kShaderNames[kPasses] = { "renderer_post_down_first.comp", "renderer_post_down.comp", "renderer_post_up.comp",
                                             "renderer_post_lut.comp",        "renderer_post_combine.comp", "renderer_post_blur_tile.comp",
-                                            "renderer_post_blur_neighbor.comp", "renderer_post_blur_gather.comp" };
+                                            "renderer_post_blur_neighbor.comp", "renderer_post_blur_gather.comp",
+                                            "renderer_post_dof_focus.comp",    "renderer_post_dof_coc.comp",
+                                            "renderer_post_dof_tile.comp",     "renderer_post_dof_neighbor.comp",
+                                            "renderer_post_dof_gather.comp",   "renderer_post_dof_combine.comp" };
 
 Renderer*      gRenderer;
 Queue*         gQueue;
@@ -52,13 +61,20 @@ Texture*       gUp[kLevels - 1];
 Texture*       gBlur;               // display size: the motion-blurred scene, made only while motion blur is on
 Texture*       gTiles, *gNeighbors; // per tile: the longest velocity and the shortest length; and over its neighbours
 uint32_t       gTile, gTilesX, gTilesY;
+// Depth of field's targets, made only while it is on: half size (colour and blur; the background and foreground
+// layers), its tiles, the focus distance (1 x 1, this frame's and last's) and the full-size result.
+Texture*       gDofHalf, *gDofFar, *gDofNear, *gDofTiles, *gDofNeighbors, *gFocus[2], *gDofOut;
+uint32_t       gDofTile, gDofTilesX, gDofTilesY, gFocusIndex;
+bool           gFocusFresh; // no focus history yet: autofocus starts at its target
+Texture*       gFocusRead;  // what gFocus binds
+float          gDt = 1.0f / 60.0f;
 uint32_t       gWidth, gHeight, gLevels;
 bool           gReady;
 
 // This frame's choices, from post_prepare to post_run.
 struct Plan
 {
-    bool     on, bloom, grade, bake, blur;
+    bool     on, bloom, grade, bake, blur, dof;
     Texture* in;
     PostData data;
 } gPlan;
@@ -101,8 +117,18 @@ void freeBlur()
     gTile = gTilesX = gTilesY = 0;
 }
 
+void freeDof()
+{
+    Texture** all[] = { &gDofHalf, &gDofFar, &gDofNear, &gDofTiles, &gDofNeighbors, &gFocus[0], &gFocus[1], &gDofOut };
+    for (Texture** t : all)
+        freeTexture(*t);
+    gDofTile = gDofTilesX = gDofTilesY = 0;
+    gFocusRead = nullptr;
+}
+
 void freeSized()
 {
+    freeDof();
     freeBlur();
     freeTexture(gOut);
     for (uint32_t i = 0; i < kLevels; ++i)
@@ -144,6 +170,26 @@ bool makeBlur(uint32_t tile)
     waitForAllResourceLoads();
     gTile = tile;
     return gBlur && gTiles && gNeighbors;
+}
+
+// Depth of field's targets for half-size tiles of `tile` pixels, at the current size.
+bool makeDof(uint32_t tile)
+{
+    uint32_t hw = (gWidth + 1) / 2, hh = (gHeight + 1) / 2;
+    gDofTilesX = (hw + tile - 1) / tile;
+    gDofTilesY = (hh + tile - 1) / tile;
+    gDofHalf = makeTexture(hw, hh, "renderer_post_dof_half");
+    gDofFar = makeTexture(hw, hh, "renderer_post_dof_far");
+    gDofNear = makeTexture(hw, hh, "renderer_post_dof_near");
+    gDofTiles = makeTexture(gDofTilesX, gDofTilesY, "renderer_post_dof_tiles");
+    gDofNeighbors = makeTexture(gDofTilesX, gDofTilesY, "renderer_post_dof_neighbors");
+    gFocus[0] = makeTexture(2, 2, "renderer_post_focus"); // 2 x 2: a 1 x 1 texture gets a 1D view
+    gFocus[1] = makeTexture(2, 2, "renderer_post_focus");
+    gDofOut = makeTexture(gWidth, gHeight, "renderer_post_dof");
+    waitForAllResourceLoads();
+    gDofTile = tile;
+    gFocusFresh = true;
+    return gDofHalf && gDofFar && gDofNear && gDofTiles && gDofNeighbors && gFocus[0] && gFocus[1] && gDofOut;
 }
 
 void barrier(Cmd* cmd, Texture* t, ResourceState from, ResourceState to)
@@ -255,7 +301,8 @@ bool gradeData(PostData& d)
 
 // One dispatch: its constants in this frame's next slot, its reads and its output bound there.
 uint32_t gSlot;
-void dispatch(RenderFrame* F, Pass pass, const PostData& d, Texture* src, Texture* src2, Texture* out, uint32_t w, uint32_t h)
+void dispatch(RenderFrame* F, Pass pass, const PostData& d, Texture* src, Texture* src2, Texture* out, uint32_t w, uint32_t h,
+              Texture* src3 = nullptr, Texture* out2 = nullptr)
 {
     if (gSlot >= kSlots)
         return;
@@ -264,7 +311,9 @@ void dispatch(RenderFrame* F, Pass pass, const PostData& d, Texture* src, Textur
     Texture*       lut = gLut;
     Texture*       motion = F->motion ? F->motion->pTexture : gDummy;
     Buffer*        exposure = F->exposure;
-    DescriptorData p[8] = {};
+    Texture*       focus = gFocusRead ? gFocusRead : gDummy;
+    Texture*       second = out2 ? out2 : gDummy;
+    DescriptorData p[11] = {};
     p[0].mIndex = SRT_RES_IDX(PostSrt, PerFrame, gPost);
     p[0].ppBuffers = &gCb[index];
     p[1].mIndex = SRT_RES_IDX(PostSrt, PerFrame, gSrc);
@@ -281,13 +330,23 @@ void dispatch(RenderFrame* F, Pass pass, const PostData& d, Texture* src, Textur
     p[6].ppBuffers = &exposure;
     p[7].mIndex = SRT_RES_IDX(PostSrt, PerFrame, gOut);
     p[7].ppTextures = &out;
-    updateDescriptorSet(gRenderer, index, gSet, 8, p);
+    p[8].mIndex = SRT_RES_IDX(PostSrt, PerFrame, gSrc3);
+    p[8].ppTextures = src3 ? &src3 : &gDummy;
+    p[9].mIndex = SRT_RES_IDX(PostSrt, PerFrame, gFocus);
+    p[9].ppTextures = &focus;
+    p[10].mIndex = SRT_RES_IDX(PostSrt, PerFrame, gOut2);
+    p[10].ppTextures = &second;
+    updateDescriptorSet(gRenderer, index, gSet, 11, p);
     Cmd* cmd = F->cmd;
     barrier(cmd, out, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
+    if (out2)
+        barrier(cmd, out2, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
     cmdBindPipeline(cmd, gPipe[pass]);
     cmdBindDescriptorSet(cmd, index, gSet);
     cmdDispatch(cmd, (w + 7) / 8, (h + 7) / 8, 1);
     barrier(cmd, out, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE);
+    if (out2)
+        barrier(cmd, out2, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE);
 }
 } // namespace
 
@@ -365,7 +424,11 @@ void unload()
     gReady = false;
 }
 
-void update(uint32_t phase, float dt) {}
+void update(uint32_t phase, float dt)
+{
+    if (dt > 0)
+        gDt = dt; // autofocus eases by the frame's length
+}
 void draw(uint32_t pass, const YeaFrame* frame) {}
 
 uint64_t post_prepare(uint64_t address)
@@ -388,7 +451,8 @@ uint64_t post_prepare(uint64_t address)
     // Motion blur needs the motion vectors the core renders with TAA or an upscaler, at one sample.
     float shutter = settings.motion_blur ? clampf(settings.motion_blur_amount, 0, 1) : 0.0f;
     bool  blur = shutter > 0 && F->taaOn && F->motion && F->sampleCount == 1;
-    if (intensity <= 0 && vignette <= 0 && !grade && !blur)
+    bool  dof = settings.depth_of_field && F->p11 > 0;
+    if (intensity <= 0 && vignette <= 0 && !grade && !blur && !dof)
         return 0;
     if (w != gWidth || h != gHeight)
     {
@@ -419,6 +483,36 @@ uint64_t post_prepare(uint64_t address)
             blur = false;
         }
     }
+    // Depth of field: a thin lens on a 24 mm high (full-frame) sensor, its focal length from the field of view
+    // (f = S p11 / 2) and aperture from the f-stop; blur radius in display pixels f^2 H / (N S (zf - f)) (1 - zf / z).
+    // Largest radius 2.5% of the height (at most 64 pixels); half-size tiles at least that wide.
+    const float sensor = 0.024f;
+    float       focal = 0.5f * sensor * F->p11;
+    float       largest = 0.025f * (float)h < 64.0f ? 0.025f * (float)h : 64.0f;
+    uint32_t    dofTile = ((uint32_t)ceilf(largest * 0.5f / 8.0f)) * 8;
+    dofTile = dofTile < 8 ? 8 : dofTile;
+    if (!dof && gDofOut)
+    {
+        waitQueueIdle(gQueue);
+        freeDof();
+    }
+    if (dof && gDofTile != dofTile)
+    {
+        waitQueueIdle(gQueue);
+        freeDof();
+        if (!makeDof(dofTile))
+        {
+            freeDof();
+            dof = false;
+        }
+    }
+    d.dof[0] = focal;
+    d.dof[1] = focal * focal * (float)h / (clampf(settings.f_stop, 1, 32) * sensor);
+    d.dof[2] = largest;
+    d.dof[3] = settings.focus == Focus::Manual ? (settings.focus_distance > 2 * focal ? settings.focus_distance : 2 * focal) : 0.0f;
+    d.dof2[0] = 1.0f - expf(-gDt / 0.25f); // eases over about a quarter of a second
+    d.dof2[1] = gFocusFresh ? 1.0f : 0.0f;
+    d.dof2[2] = (float)dofTile;
     d.size[0] = w;
     d.size[1] = h;
     d.blur[0] = 0.5f * shutter * (float)w;
@@ -440,6 +534,7 @@ uint64_t post_prepare(uint64_t address)
     gPlan.on = true;
     gPlan.bloom = intensity > 0;
     gPlan.blur = blur;
+    gPlan.dof = dof;
     gPlan.grade = grade;
     gPlan.in = in;
     return (uint64_t)(uintptr_t)gOut;
@@ -456,6 +551,34 @@ void post_run(uint64_t address)
     cmdBeginDebugMarker(cmd, 1.0f, 0.8f, 0.4f, "Renderer post");
     const PostData& base = gPlan.data;
     Texture*        scene = gPlan.in;
+    if (gPlan.dof)
+    {
+        // The focus (from last frame's, eased), each half-size pixel's colour and blur, the foreground's reach per
+        // tile, the two layers, then the full-size image.
+        uint32_t hw = (gWidth + 1) / 2, hh = (gHeight + 1) / 2;
+        Texture* last = gFocus[gFocusIndex];
+        gFocusIndex ^= 1;
+        gFocusRead = nullptr;
+        dispatch(F, kDofFocus, base, nullptr, last, gFocus[gFocusIndex], 8, 8);
+        gFocusRead = gFocus[gFocusIndex];
+        gFocusFresh = false;
+        PostData d = base;
+        d.size[0] = hw;
+        d.size[1] = hh;
+        dispatch(F, kDofCoc, d, scene, nullptr, gDofHalf, hw, hh);
+        d.size[0] = gDofTilesX;
+        d.size[1] = gDofTilesY;
+        d.size[2] = hw;
+        d.size[3] = hh;
+        dispatch(F, kDofTile, d, gDofHalf, nullptr, gDofTiles, gDofTilesX * 8, gDofTilesY * 8);
+        dispatch(F, kDofNeighbor, d, gDofTiles, nullptr, gDofNeighbors, gDofTilesX, gDofTilesY);
+        d.size[0] = hw;
+        d.size[1] = hh;
+        dispatch(F, kDofGather, d, gDofHalf, gDofNeighbors, gDofFar, hw, hh, nullptr, gDofNear);
+        dispatch(F, kDofCombine, base, scene, gDofFar, gDofOut, gWidth, gHeight, gDofNear);
+        gFocusRead = nullptr;
+        scene = gDofOut;
+    }
     if (gPlan.blur)
     {
         // Each tile's motion, then over its neighbours, then the gather at full size; bloom and the rest read it.

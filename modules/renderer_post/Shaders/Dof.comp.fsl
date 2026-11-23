@@ -1,0 +1,183 @@
+// Depth of field: a thin lens (focal length from the camera's field of view on a 24 mm high sensor, the aperture from
+// f_stop) focused at a distance (autofocus on the screen's centre, or set), its circle of confusion in display pixels
+// cocScale (1 - focus / depth), signed (negative in front of the focus). Gathered at half size in two layers, as in
+// Jimenez's "Next Generation Post Processing in Call of Duty: Advanced Warfare" (2014) and UE's: the background, where a
+// sample blurs over the centre only as far as the centre's own blur (what is in front is never covered by what is
+// behind it), and the foreground, which blurs over anything, with its coverage as alpha; a tile's largest foreground
+// blur (over its 3 x 3 neighbours) sets how far each pixel looks, so blurred foreground spreads over sharp things
+// behind it. Then a full-size pass mixes the sharp image towards the background layer by the pixel's own blur and lays
+// the foreground over it (premultiplied).
+// FOCUS: one 8 x 8 group: the harmonic mean of the depths over the centre (the nearest things count most), eased in
+// dioptres (1 / distance, as a lens's focus moves), or the set distance. COC: half size, each pixel's colour (the 2 x 2
+// average) and blur in half pixels (the nearest's when any is in front). TILE, NEIGHBOR: the largest foreground blur
+// (x) and largest blur (y) per tile, then over 3 x 3 tiles. GATHER: the two layers. COMBINE: the full-size image.
+#include "Common.h.fsl"
+
+#if defined(FOCUS) || defined(TILE)
+GroupShared(float2, gsDof[64]);
+#endif
+
+float viewDepthAt(int2 r) { return gPost.blur.w / max(LoadTex2D(gDepth, NO_SAMPLER, r, 0).r, 1e-7); }
+
+// The depth at a display pixel's centre, from the render-size depth.
+float depthAtDisplay(float2 at)
+{
+    int2 r = min(int2(at * gPost.blurSize.zw / gPost.blurSize.xy), int2(gPost.blurSize.zw) - 1);
+    return viewDepthAt(r);
+}
+
+// Signed blur radius in display pixels at view depth z, focused at zf.
+float cocAt(float z, float zf)
+{
+    float c = gPost.dof.y / max(zf - gPost.dof.x, 1e-4) * (1.0 - zf / max(z, 1e-4));
+    return clamp(c, -gPost.dof.z, gPost.dof.z);
+}
+
+float focusDistance() { return LoadTex2D(gFocus, NO_SAMPLER, int2(0, 0), 0).x; }
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) id, SV_GroupID(uint3) gid, SV_GroupThreadID(uint3) tid, SV_GroupIndex(uint) gi)
+{
+    INIT_MAIN;
+#if defined(FOCUS)
+    // 64 depths over the middle 6% of the frame each way.
+    float2 uv = 0.5 + (float2(tid.xy) - 3.5) * (0.06 / 7.0);
+    int2   r = min(int2(uv * gPost.blurSize.zw), int2(gPost.blurSize.zw) - 1);
+    gsDof[gi] = float2(1.0 / min(viewDepthAt(r), 1000.0), 0.0);
+    GroupMemoryBarrier();
+    for (uint s = 32u; s > 0u; s >>= 1u)
+    {
+        if (gi < s)
+            gsDof[gi].x += gsDof[gi + s].x;
+        GroupMemoryBarrier();
+    }
+    if (gi == 0u)
+    {
+        float lo = gPost.dof.x * 2.0; // never nearer than twice the focal length
+        float zf;
+        if (gPost.dof.w > 0.0)
+            zf = gPost.dof.w;
+        else
+        {
+            float target = clamp(64.0 / max(gsDof[0].x, 1e-6), lo, 1000.0);
+            float last = LoadTex2D(gSrc2, NO_SAMPLER, int2(0, 0), 0).x;
+            last = gPost.dof2.y > 0.0 || !(last > 0.0) ? target : last;
+            zf = 1.0 / lerp(1.0 / last, 1.0 / target, gPost.dof2.x);
+        }
+        Write2D(gOut, int2(0, 0), float4(max(zf, lo), 0.0, 0.0, 1.0));
+    }
+#elif defined(COC)
+    int2 p = int2(id.xy);
+    if (p.x >= int(gPost.size.x) || p.y >= int(gPost.size.y))
+        RETURN();
+    float  zf = focusDistance();
+    int2   maxP = int2(gPost.blurSize.xy) - 1;
+    float3 sum = float3(0.0, 0.0, 0.0);
+    float  cocSum = 0.0, cocMin = 1e30;
+    for (int j = 0; j < 2; ++j)
+    {
+        for (int i = 0; i < 2; ++i)
+        {
+            int2  q = min(p * 2 + int2(i, j), maxP);
+            float c = cocAt(depthAtDisplay(float2(q) + 0.5), zf);
+            sum += LoadTex2D(gSrc, NO_SAMPLER, q, 0).rgb;
+            cocSum += c;
+            cocMin = min(cocMin, c);
+        }
+    }
+    float coc = cocMin < 0.0 ? cocMin : cocSum * 0.25;
+    Write2D(gOut, p, float4(sum * 0.25, coc * 0.5));
+#elif defined(TILE)
+    // One group per tile of dof2.z half pixels.
+    int  t = int(gPost.dof2.z);
+    int2 p0 = int2(gid.xy) * t;
+    int2 p1 = min(p0 + int2(t, t), int2(gPost.size.zw));
+    float2 m = float2(0.0, 0.0);
+    for (int y = p0.y + int(tid.y); y < p1.y; y += 8)
+    {
+        for (int x = p0.x + int(tid.x); x < p1.x; x += 8)
+        {
+            float c = LoadTex2D(gSrc, NO_SAMPLER, int2(x, y), 0).a;
+            m = max(m, float2(-c, abs(c)));
+        }
+    }
+    gsDof[gi] = m;
+    GroupMemoryBarrier();
+    for (uint s = 32u; s > 0u; s >>= 1u)
+    {
+        if (gi < s)
+            gsDof[gi] = max(gsDof[gi], gsDof[gi + s]);
+        GroupMemoryBarrier();
+    }
+    if (gi == 0u && gid.x < gPost.size.x && gid.y < gPost.size.y)
+        Write2D(gOut, int2(gid.xy), float4(gsDof[0], 0.0, 0.0));
+#elif defined(NEIGHBOR)
+    int2 p = int2(id.xy);
+    if (p.x >= int(gPost.size.x) || p.y >= int(gPost.size.y))
+        RETURN();
+    float2 m = float2(0.0, 0.0);
+    for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx)
+            m = max(m, LoadTex2D(gSrc, NO_SAMPLER, clamp(p + int2(dx, dy), int2(0, 0), int2(gPost.size.xy) - 1), 0).xy);
+    Write2D(gOut, p, float4(m, 0.0, 0.0));
+#elif defined(GATHER)
+    int2 p = int2(id.xy);
+    if (p.x >= int(gPost.size.x) || p.y >= int(gPost.size.y))
+        RETURN();
+    float4 c0 = LoadTex2D(gSrc, NO_SAMPLER, p, 0);
+    float2 tile = LoadTex2D(gSrc2, NO_SAMPLER, p / int(gPost.dof2.z), 0).xy;
+    float  R = max(abs(c0.a), tile.x); // as far as the centre's own blur, or the nearest foreground's
+    if (R < 0.5)
+    {
+        Write2D(gOut, p, float4(c0.rgb, 1.0));
+        Write2D(gOut2, p, float4(0.0, 0.0, 0.0, 0.0));
+        RETURN();
+    }
+    // A Vogel disk (golden-angle spiral) of R, about one sample per 1.7 square half pixels, 8 to 64.
+    uint   n = clamp(uint(R * R * 1.85), 8u, 64u);
+    float  inv = 1.0 / float(n);
+    int2   maxP = int2(gPost.size.xy) - 1;
+    float  fc = max(c0.a, 0.0);
+    float3 farSum = c0.rgb;
+    float  farW = 1.0;
+    float3 nearSum = float3(0.0, 0.0, 0.0);
+    float  nearW = 0.0, cover = 0.0;
+    float2 dir = float2(1.0, 0.0);
+    for (uint i = 0u; i < n; ++i)
+    {
+        float  rr = sqrt((float(i) + 0.5) * inv) * R;
+        float4 s = LoadTex2D(gSrc, NO_SAMPLER, clamp(int2(floor(float2(p) + 0.5 + dir * rr)), int2(0, 0), maxP), 0);
+        dir = float2(dir.x * -0.73736888 - dir.y * 0.67549029, dir.x * 0.67549029 + dir.y * -0.73736888);
+        // Background: the sample's blur reaches the centre, and no further than the centre's own.
+        float wf = saturate(min(max(s.a, 0.0), fc) - rr + 0.5);
+        farSum += s.rgb * wf;
+        farW += wf;
+        // Foreground: its blur reaches the centre; coverage is its share of the sample's blur disk.
+        float ns = max(-s.a, 0.0);
+        float wn = saturate(ns - rr + 0.5);
+        nearSum += s.rgb * wn;
+        nearW += wn;
+        cover += wn / max(ns * ns, 0.25);
+    }
+    Write2D(gOut, p, float4(farSum / farW, 1.0));
+    // Premultiplied by its coverage, so the full-size pass's bilinear reads blend it correctly at its edges.
+    float alpha = saturate(cover * R * R * inv);
+    Write2D(gOut2, p, float4(nearW > 0.0 ? nearSum * (alpha / nearW) : float3(0.0, 0.0, 0.0), alpha));
+#else
+    // COMBINE: the sharp image towards the background layer by the pixel's own blur (from a pixel and a half, where
+    // the half-size layer has anything to add), then the foreground over it.
+    int2 p = int2(id.xy);
+    if (p.x >= int(gPost.size.x) || p.y >= int(gPost.size.y))
+        RETURN();
+    float2 at = float2(p) + 0.5;
+    float2 uv = at / gPost.blurSize.xy;
+    float3 c = LoadTex2D(gSrc, NO_SAMPLER, p, 0).rgb;
+    float  coc = cocAt(depthAtDisplay(at), focusDistance());
+    c = lerp(c, SampleLvlTex2D(gSrc2, gSamplerBilinearClamp, uv, 0.0).rgb, saturate((coc - 1.0) * 0.5));
+    float4 near = SampleLvlTex2D(gSrc3, gSamplerBilinearClamp, uv, 0.0);
+    c = c * (1.0 - near.a) + near.rgb; // the foreground layer is premultiplied
+    Write2D(gOut, p, float4(c, 1.0));
+#endif
+    RETURN();
+}

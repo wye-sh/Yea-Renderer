@@ -6,6 +6,8 @@ STRUCT(PostData)
     DATA(float4, look, None);   // x vignette (0: none), y 1: grade through gLut, zw 1 / projection scale x, y (tan of half the FOV)
     DATA(float4, blur, None);     // motion blur: xy motion (uv) to blur radius (display pixels), z tile size (largest radius), w near
     DATA(float4, blurSize, None); // xy display size, zw render size (motion and depth)
+    DATA(float4, dof, None);      // depth of field: x focal length (m), y f^2 H / (N S) (blur scale, display px m), z largest blur radius (display px), w set focus (m; 0: auto)
+    DATA(float4, dof2, None);     // x autofocus easing this frame (0..1), y 1: no focus history, z half-size tile (px)
     DATA(float4, wb0, None);    // white balance, a linear Rec.709 3 x 3 (rows; the LUT bake)
     DATA(float4, wb1, None);
     DATA(float4, wb2, None);

@@ -6,10 +6,23 @@ module renderer_post
 export u64 post_prepare(u64 frame)
 export void post_run(u64 frame)
 
+category Depth of Field
+# What is nearer or farther than the focus blurs, as through a real lens (bright points become soft discs).
+setting bool depth_of_field false
+player depth_of_field
+# Focus on what is at the centre of the screen (Auto, eased as a lens pulls focus), or at focus_distance (Manual).
+setting choice focus Auto Auto Manual
+# Metres from the camera (Manual focus).
+setting float focus_distance 10 0.1 inf
+# The lens's aperture: smaller numbers blur more outside the focus (f/1.4 very shallow, f/16 nearly all sharp). The
+# focal length follows the field of view, on a full-frame sensor.
+setting float f_stop 2.8 1 32
+player f_stop
+
 category Motion Blur
 # Moving things and a turning camera smear along their motion, as on film. Needs TAA or an upscaler (their motion
 # vectors); off with neither.
-setting bool motion_blur true
+setting bool motion_blur false
 player motion_blur
 # How much of each frame the shutter is open: 0.5 as a film camera's 180 degree shutter; 1 the whole frame.
 setting float motion_blur_amount 0.5 0 1

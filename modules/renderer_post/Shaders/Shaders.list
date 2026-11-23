@@ -27,6 +27,35 @@
 #include "Combine.comp.fsl"
 #end
 
+#comp renderer_post_dof_focus.comp
+#define FOCUS
+#include "Dof.comp.fsl"
+#end
+
+#comp renderer_post_dof_coc.comp
+#define COC
+#include "Dof.comp.fsl"
+#end
+
+#comp renderer_post_dof_tile.comp
+#define TILE
+#include "Dof.comp.fsl"
+#end
+
+#comp renderer_post_dof_neighbor.comp
+#define NEIGHBOR
+#include "Dof.comp.fsl"
+#end
+
+#comp renderer_post_dof_gather.comp
+#define GATHER
+#include "Dof.comp.fsl"
+#end
+
+#comp renderer_post_dof_combine.comp
+#include "Dof.comp.fsl"
+#end
+
 #comp renderer_post_blur_tile.comp
 #define TILE
 #include "Blur.comp.fsl"

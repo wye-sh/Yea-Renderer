@@ -138,8 +138,15 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   the core's tonemapper, so it works the same with every upscaler (NVIDIA's DLSS guide and UE5 place it there).
   `post_prepare` (after the core's composite constants, before its descriptors) returns the image the tonemap pass and
   composite read, or 0 when every effect is neutral (nothing runs); `post_run` records right after the resolve. Not
-  under F1's view modes or the AO, contact or culling debug views; without TAA only at one sample. Motion blur first
-  (McGuire 2012 with Jimenez 2014's fast path, `Blur.comp.fsl`): the core's motion vectors (render size) scaled by
+  under F1's view modes or the AO, contact or culling debug views; without TAA only at one sample. Depth of field first (off by default; `Dof.comp.fsl`): a thin
+  lens on a 24 mm high sensor, focal length from the projection (f = 0.012 p11), aperture from f_stop; blur radius in
+  display pixels f^2 H / (N S (zf - f)) (1 - zf / z), capped at 2.5% of the height. Focus: Auto (harmonic mean of 64
+  depths over the centre, eased in dioptres over ~0.25 s; a 2 x 2 texture ping-ponged, as 1 x 1 gets a 1D view) or
+  Manual (focus_distance). Half size: colour and signed blur, the foreground's reach per tile over 3 x 3 tiles, a
+  Vogel-disk gather (8 to 64 samples) into a background layer (a sample covers the centre no further than the
+  centre's own blur) and a premultiplied foreground layer with its coverage; a full-size pass mixes the sharp image to
+  the background by the pixel's own blur and lays the foreground over it. Physically, a wide game lens blurs little
+  except near subjects or at low f-stops. Then motion blur (off by default; McGuire 2012 with Jimenez 2014's fast path, `Blur.comp.fsl`): the core's motion vectors (render size) scaled by
   half the shutter (motion_blur_amount) to a radius in display pixels, capped at the tile size (a 24th of the height);
   per tile the longest velocity and shortest length, then over 3 x 3 tiles, then a gather of 8 to 32 bilinear samples
   along it, depth- and spread-weighted, or a plain average where the tile's motion is uniform; still pixels copy.
