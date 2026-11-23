@@ -12,8 +12,6 @@ import renderer handle instance_add(u32 mesh, handle material) = 4294967295
 import renderer void instance_place(handle i, float3 pos, float4 rotation, float3 scale)
 import renderer void instance_shadow(handle i, bool cast)
 import renderer void instance_remove(handle i)
-import renderer u32 instance_count() = 0
-import renderer u32 light_count() = 0
 import renderer handle light_add(u32 type) = 4294967295
 import renderer void light_place(handle l, float3 pos, float3 dir)
 import renderer void light_color(handle l, float3 color, float intensity)
@@ -28,6 +26,8 @@ import renderer void light_shadow(handle l, bool cast)
 import renderer void light_remove(handle l)
 import renderer void camera(float3 eye, float3 target, float fov_deg)
 import renderer void clear()
+import renderer u32 scene_epoch() = 0
+import renderer_models u64 api(u32 version) = 0
 import renderer_probes handle probe_add(float3 pos, float3 box_min, float3 box_max) = 4294967295
 import renderer_probes void probe_clear()
 import renderer_probes u32 probe_count() = 0

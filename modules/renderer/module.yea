@@ -46,6 +46,10 @@ table Instance none 65536
   u32 gen
   u32 alive
 end
+# Each instance's detail kept with distance (instance_lod_quality): rows match Instance's; 0 or none reads as 1.
+table InstanceLod none 65536
+  float quality
+end
 table Light none 4096
   u32 type
   float3 pos
@@ -99,6 +103,9 @@ export handle instance_add(u32 mesh, handle material)
 export void instance_place(handle i, float3 pos, float4 rotation, float3 scale)
 export void instance_material(handle i, handle material)
 export void instance_shadow(handle i, bool cast)
+# Detail kept with distance for this instance: its lod_error divided by quality (2: finer versions twice as far; 1 as
+# every other instance).
+export void instance_lod_quality(handle i, float quality)
 export void instance_remove(handle i)
 export u32 instance_count()
 
@@ -130,6 +137,12 @@ export u32 light_count()
 export void camera(float3 eye, float3 target, float fov_deg)
 # Removes every mesh, material, instance and light.
 export void clear()
+# Changes whenever the scene a module built is gone (clear(), Reset State, a material layout change), never on a
+# reload that keeps it: a module that adds meshes, materials or instances builds them again when it changes. Never 0.
+export u32 scene_epoch()
+# The Model Viewer's preview (renderer_models' preview.h, a RenderPreview*): one model alone under a studio rig, into
+# the caller's own targets, from its draw(YEA_PASS_RENDER). False: nothing drawn (the renderer isn't ready).
+export bool preview_draw(u64 preview)
 
 import renderer_culling bool cull_prepare(u64 frame) = false
 import renderer_culling void cull_run(u64 frame)

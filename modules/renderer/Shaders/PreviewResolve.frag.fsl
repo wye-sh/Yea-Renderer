@@ -1,0 +1,30 @@
+// The Model Viewer's preview: each of the 4 samples exposed and tonemapped with the game's tonemapper (as the composite),
+// then averaged, weighted by coverage so edges against the empty background keep their colour. Straight alpha out.
+#include "Preview.h.fsl"
+#include "PreviewResolve.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float2, UV, TEXCOORD0);
+};
+
+#include "Tonemap.h.fsl"
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN(VSOutput In)
+{
+    INIT_MAIN;
+    int2   p = int2(In.Position.xy);
+    float  exposure = gPreview.camPos.w;
+    uint   mode = gPreview.mode.x;
+    float3 c = float3(0.0, 0.0, 0.0);
+    float  a = 0.0;
+    for (int i = 0; i < 4; ++i)
+    {
+        float4 h = LoadTex2DMS(gHdr, NO_SAMPLER, p, i);
+        c += saturate(tonemap(h.rgb * exposure, mode)) * h.a;
+        a += h.a;
+    }
+    RETURN(float4(a > 0.0 ? c / a : float3(0.0, 0.0, 0.0), a * 0.25));
+}

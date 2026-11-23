@@ -1,0 +1,134 @@
+// The Model Viewer's preview: the core's BRDF (Brdf.h.fsl) under a studio rig. A key light with a filtered shadow map,
+// the studio's sky for ambient light and reflections (split-sum with the DFG table, multiple scattering, as the forward
+// pass), emission. Written as HDR with alpha 1; PreviewResolve tonemaps it. GROUND: the floor under the model, which
+// shows only the shadow and a soft contact darkening (black, alpha the amount), so the canvas shows through elsewhere.
+#include "Common.h.fsl"
+#include "Preview.h.fsl"
+#include "Preview.srt.h"
+#ifndef GROUND
+#include "Brdf.h.fsl"
+#endif
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float3, WorldPos, TEXCOORD0);
+#ifndef GROUND
+    DATA(float3, Normal, TEXCOORD1);
+    DATA(FLAT(uint), Material, TEXCOORD2);
+#endif
+};
+
+// The key light's visibility at P: 16 taps of a Vogel disk 2.5 texels across, each compared against the receiver's own
+// depth there (offset along the normal by a texel, and by a slope-scaled bias).
+float keyShadow(float3 P, float3 N)
+{
+    float  texel = gPreview.sunDir.w;
+    float3 L = gPreview.sunDir.xyz;
+    float  NoL = saturate(dot(N, L));
+    float4 w = float4(P + N * (gPreview.sunColor.w * 1.5), 1.0); // a texel and a half along the normal (world units)
+    float3 c = float3(dot(gPreview.shadowProj[0], w), dot(gPreview.shadowProj[1], w), dot(gPreview.shadowProj[2], w));
+    float2 uv = c.xy * float2(0.5, -0.5) + float2(0.5, 0.5);
+    if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0 || c.z >= 1.0)
+        return 1.0;
+    float bias = texel * (0.5 + 1.5 * sqrt(1.0 - NoL * NoL) / max(NoL, 0.2));
+    float sum = 0.0;
+    for (uint i = 0u; i < 16u; ++i)
+    {
+        float  r = sqrt((float(i) + 0.5) / 16.0) * 2.5 * texel;
+        float  a = float(i) * 2.39996323;
+        float2 o = float2(cos(a), sin(a)) * r;
+        sum += CompareTex2D(gShadowMap, gShadowCmp, float3(uv + o, c.z - bias));
+    }
+    return sum / 16.0;
+}
+
+#ifdef GROUND
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN(VSOutput In)
+{
+    INIT_MAIN;
+    float  r = gPreview.ground.w;
+    float2 d = (In.WorldPos.xz - gPreview.ground.xz) / max(r, 1e-6);
+    float  edge = saturate(1.0 - dot(d, d));           // fades out towards the floor's rim
+    float  lit = keyShadow(In.WorldPos, float3(0.0, 1.0, 0.0));
+    float  contact = exp(-dot(d, d) * 24.0) * 0.35;      // the model's footprint: soft darkening, as ambient occlusion
+    float  a = saturate((1.0 - lit) * 0.6 + contact) * edge * edge;
+    RETURN(float4(0.0, 0.0, 0.0, a));
+}
+#else
+float3 studioSky(float3 d)
+{
+    if (d.y >= 0.0)
+        return lerp(gPreview.skyHorizon.rgb, gPreview.skyZenith.rgb, sqrt(saturate(d.y)));
+    return lerp(gPreview.skyHorizon.rgb, gPreview.skyGround.rgb, saturate(-d.y * 3.0));
+}
+float3 studioIrradiance(float3 N)
+{
+    float3 up = lerp(gPreview.skyHorizon.rgb, gPreview.skyZenith.rgb, 0.6);
+    float3 down = lerp(gPreview.skyHorizon.rgb, gPreview.skyGround.rgb, 0.85);
+    return lerp(down, up, N.y * 0.5 + 0.5);
+}
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN(VSOutput In)
+{
+    INIT_MAIN;
+    MaterialData m = gMaterials[In.Material];
+    float3       N = normalize(In.Normal);
+    float3       V = normalize(gPreview.camPos.xyz - In.WorldPos);
+    float        rough = clamp(m.albedoRough.a, 0.03, 1.0);
+    float        a2 = rough * rough;
+    a2 *= a2;
+    // Specular antialiasing, as the forward pass (strength 1).
+    float3 dndx = ddx(In.Normal);
+    float3 dndy = ddy(In.Normal);
+    a2 = saturate(a2 + min(0.5 * (dot(dndx, dndx) + dot(dndy, dndy)), 0.18));
+    float NoV = dot(N, V);
+    if (NoV < 0.0)
+    {
+        N = -N;
+        NoV = -NoV;
+    }
+    NoV = max(NoV, 1e-3);
+
+    float  metallic = saturate(m.params.x);
+    float3 albedo = m.albedoRough.rgb;
+    Surface s;
+    s.P = In.WorldPos;
+    s.N = N;
+    s.V = V;
+    s.diffuse = albedo * (1.0 - metallic);
+    s.f0 = lerp(float3(m.params.y, m.params.y, m.params.y), albedo, metallic);
+    s.a2 = a2;
+    s.NoV = NoV;
+    s.smithV = sqrt(NoV * NoV * (1.0 - a2) + a2);
+    float2 dfg = dfgLookup(NoV, sqrt(sqrt(a2)));
+    float  Ess = dfg.x + dfg.y;
+    s.energy = float3(1.0, 1.0, 1.0) + s.f0 * (1.0 / max(Ess, 1e-3) - 1.0);
+    s.rot = float2(1.0, 0.0);
+    s.pixel = int2(In.Position.xy);
+    s.ltcX = float3(1.0, 0.0, 0.0);
+    s.ltcY = float3(0.0, 1.0, 0.0);
+    s.ltcInv = float4(1.0, 0.0, 0.0, 1.0);
+    s.ltcSpec = float3(0.0, 0.0, 0.0);
+
+    float3 L = gPreview.sunDir.xyz;
+    float3 color = brdfLight(s, L, gPreview.sunColor.rgb * keyShadow(In.WorldPos, N));
+
+    // The studio's sky, as the forward pass lights with its own: reflections only where the material has them.
+    float3 R = reflect(-V, N);
+    float3 irradiance = studioIrradiance(N);
+    float3 radiance = m.params.z > 0.5 ? lerp(studioSky(R), studioIrradiance(R), rough) : studioIrradiance(R);
+    float  horizon = saturate(1.0 + dot(R, normalize(In.Normal) * (dot(In.Normal, V) < 0.0 ? -1.0 : 1.0)));
+    radiance *= horizon * horizon;
+    float3 FssEss = s.f0 * dfg.x + float3(dfg.y, dfg.y, dfg.y);
+    float  Ems = 1.0 - Ess;
+    float3 Favg = s.f0 + (float3(1.0, 1.0, 1.0) - s.f0) * (1.0 / 21.0);
+    float3 Fms = FssEss * Favg / (float3(1.0, 1.0, 1.0) - Ems * Favg);
+    float3 kD = s.diffuse * (float3(1.0, 1.0, 1.0) - FssEss - Fms * Ems);
+    color += FssEss * radiance + (Fms * Ems + kD) * irradiance;
+    color += m.emissive.rgb;
+    RETURN(float4(color, 1.0));
+}
+#endif

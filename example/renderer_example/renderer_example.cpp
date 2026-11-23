@@ -4,12 +4,18 @@
 // camera (hold the mouse button to look, the move keys to fly). Each light type can be switched off, which removes its
 // lights. Reset: the scene is rebuilt with the lights and camera where they start.
 #include "yea_renderer_example.h"
+#include "../../modules/renderer_models/ModelLink.h"
 
 #include <math.h>
 #include <stdio.h>
 
 namespace renderer_example
 {
+// Models for the Model Viewer (built-in shapes until the example has models of its own).
+MODEL(shape_box, "box");
+MODEL(shape_sphere, "sphere");
+MODEL(shape_torus, "torus");
+
 namespace
 {
 const uint32_t kMaxLights = 512, kMaxSpin = 16, kAreas = 5, kPanes = 12, kNone = 0xFFFFFFFFu;
@@ -37,7 +43,7 @@ struct State
     yea_float3 spinAxis[kMaxSpin];
     uint32_t   orbMesh, cylinderMesh, boxMesh, sphereMesh;
     yea_handle housingMaterial;
-    uint32_t   instances, lightsAlive; // the renderer's live counts once this frame's scene was in place
+    uint32_t   epoch, unusedCount; // the renderer's scene_epoch this scene was built in (was its instance and light counts)
     // The area lights: each light and its emitter (kNone while its type is off), and the emitter's material.
     yea_handle areas[kAreas];
     yea_handle areaEmitters[kAreas];
@@ -608,14 +614,15 @@ void update(uint32_t phase, float dt)
     if (phase != YEA_PHASE_SIMULATE)
         return;
     State* s = state();
+    mdl::update(); // the Model Viewer's models
     // The renderer's scene must be the one this module built: after a renderer crash, revert or reload that lost or
     // replaced it (or one that came back while this module had built against stubs), every handle held here is stale
-    // and nothing would move, so build it all again.
-    if (!s->built || gFreshVersion || renderer::instance_count() != s->instances || renderer::light_count() != s->lightsAlive)
+    // and nothing would move, so build it all again. Its scene_epoch says so, whatever other modules add to the scene.
+    if (!s->built || gFreshVersion || renderer::scene_epoch() != s->epoch)
     {
         char line[160];
-        snprintf(line, sizeof line, "renderer_example: building the scene (built %u; renderer has %u instances, %u lights; expected %u, %u)",
-                 s->built, renderer::instance_count(), renderer::light_count(), s->instances, s->lightsAlive);
+        snprintf(line, sizeof line, "renderer_example: building the scene (built %u; the renderer's scene %u, built in %u)", s->built,
+                 renderer::scene_epoch(), s->epoch);
         build(s);
         if (s->built)
         {
@@ -632,8 +639,7 @@ void update(uint32_t phase, float dt)
     syncLights(s);
     animate(s);
     moveCamera(s, dt);
-    s->instances = renderer::instance_count();
-    s->lightsAlive = renderer::light_count();
+    s->epoch = renderer::scene_epoch();
 }
 
 void draw(uint32_t pass, const YeaFrame* frame) {}

@@ -1,0 +1,20 @@
+// The Model Viewer's preview (preview.cpp): one model alone under a studio rig, drawn into renderer_models' target.
+// The C++ mirror is PreviewGpu in preview.cpp.
+#ifndef RENDER_PREVIEW_H
+#define RENDER_PREVIEW_H
+
+STRUCT(PreviewData)
+{
+    DATA(float4, viewProj[4], None);   // rows; reversed Z, infinite far, as the core's camera
+    DATA(float4, shadowProj[4], None); // rows, world -> the key light's view (xy -1..1, z 0..1, standard Z)
+    DATA(float4, camPos, None);        // xyz, w exposure
+    DATA(float4, sunDir, None);        // xyz towards the key light, w the shadow map's texel (uv)
+    DATA(float4, sunColor, None);      // rgb illuminance (lux), w a shadow texel in world units
+    DATA(float4, skyZenith, None);     // rgb luminance (cd/m2)
+    DATA(float4, skyHorizon, None);
+    DATA(float4, skyGround, None);
+    DATA(float4, ground, None);        // xyz the floor's centre (under the model), w its radius (0: no floor)
+    DATA(uint4, mode, None);           // x tonemapper, y the target's width, z its height
+};
+
+#endif

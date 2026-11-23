@@ -104,3 +104,29 @@
 #comp renderer_tonemap.comp
 #include "Tonemap.comp.fsl"
 #end
+
+#vert renderer_preview.vert
+#include "Preview.vert.fsl"
+#end
+
+#vert renderer_preview_shadow.vert
+#define SHADOW
+#include "Preview.vert.fsl"
+#end
+
+#vert renderer_preview_ground.vert
+#include "PreviewGround.vert.fsl"
+#end
+
+#frag renderer_preview.frag
+#include "Preview.frag.fsl"
+#end
+
+#frag renderer_preview_ground.frag
+#define GROUND
+#include "Preview.frag.fsl"
+#end
+
+#frag renderer_preview_resolve.frag
+#include "PreviewResolve.frag.fsl"
+#end

@@ -1,0 +1,50 @@
+// The Model Viewer's preview: a part of the model (the core's vertex layout, an instance-rate index into gInstances,
+// never SV_InstanceID). SHADOW: into the key light's shadow map.
+#include "Common.h.fsl"
+#include "Preview.h.fsl"
+#ifdef SHADOW
+#include "PreviewShadow.srt.h"
+#else
+#include "Preview.srt.h"
+#endif
+
+STRUCT(VSInput)
+{
+    DATA(float3, Position, POSITION);
+    DATA(float3, Normal, NORMAL);
+    DATA(uint, Instance, TEXCOORD1);
+};
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+#ifndef SHADOW
+    DATA(float3, WorldPos, TEXCOORD0);
+    DATA(float3, Normal, TEXCOORD1);
+    DATA(FLAT(uint), Material, TEXCOORD2);
+#endif
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN(VSInput In)
+{
+    INIT_MAIN;
+    VSOutput     Out;
+    InstanceData inst = gInstances[In.Instance];
+    float4       p = float4(In.Position, 1.0);
+    float4       w = float4(dot(inst.row0, p), dot(inst.row1, p), dot(inst.row2, p), 1.0);
+#ifdef SHADOW
+    Out.Position = float4(dot(gPreview.shadowProj[0], w), dot(gPreview.shadowProj[1], w), dot(gPreview.shadowProj[2], w), 1.0);
+#else
+    Out.Position = float4(dot(gPreview.viewProj[0], w), dot(gPreview.viewProj[1], w), dot(gPreview.viewProj[2], w), dot(gPreview.viewProj[3], w));
+    Out.WorldPos = w.xyz;
+    // Normals through the cofactor matrix, as the core's forward pass.
+    float3 a = inst.row0.xyz;
+    float3 b = inst.row1.xyz;
+    float3 c = inst.row2.xyz;
+    float3 n = In.Normal;
+    Out.Normal = float3(dot(cross(b, c), n), dot(cross(c, a), n), dot(cross(a, b), n));
+    Out.Material = inst.misc.x;
+#endif
+    RETURN(Out);
+}

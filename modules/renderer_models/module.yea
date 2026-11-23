@@ -1,0 +1,72 @@
+module renderer_models
+
+# Models for the renderer: the game declares each with a MODEL line through ModelLink.h (AGENTS.md beside the component
+# says how) and places it whole; this module keeps the view's registry, its placements and the Model Viewer.
+export u64 api(u32 version)
+
+import renderer u32 mesh_box() = 4294967295
+import renderer u32 mesh_sphere(u32 segments) = 4294967295
+import renderer u32 mesh_plane() = 4294967295
+import renderer u32 mesh_cylinder(u32 segments) = 4294967295
+import renderer u32 mesh_cone(u32 segments) = 4294967295
+import renderer u32 mesh_torus(float thickness, u32 segments) = 4294967295
+import renderer handle material_add(float3 albedo, float roughness, float metallic) = 4294967295
+import renderer void material_double_sided(handle m, bool on)
+import renderer handle instance_add(u32 mesh, handle material) = 4294967295
+import renderer void instance_place(handle i, float3 pos, float4 rotation, float3 scale)
+import renderer void instance_shadow(handle i, bool cast)
+import renderer void instance_lod_quality(handle i, float quality)
+import renderer void instance_remove(handle i)
+import renderer u32 scene_epoch() = 0
+import renderer bool preview_draw(u64 preview) = false
+import table renderer Mesh
+import table renderer MeshLod
+import table renderer Vertex
+
+# Where the game put its models: a row per placement, kept through reloads (Reset empties it; the game places them
+# again). `key` names the model (its owner and name, hashed), so a placement finds it again after this module restarts.
+table Placement none 4096
+  u32 key
+  float3 pos
+  float4 rot
+  float scale
+  u32 dirty
+  u32 gen
+  u32 alive
+end
+# The renderer's instances a placement draws with, one per part of its model.
+table PartInstance none 65536
+  u32 placement
+  u32 instance
+end
+# Each model's parts as the renderer has them now (its meshes and materials, made once per scene), so a restart of
+# this module finds them again instead of making them twice.
+table ModelPart none 4096
+  u32 key
+  u32 part
+  u32 mesh
+  u32 material
+  float3 lo
+  float3 hi
+end
+# The renderer's scene the rows above were made in (its scene_epoch).
+state Scene
+  u32 epoch
+end
+
+# Every model's knobs (ModelLink.h's mdl::Knobs, in that order): a module that imports this one gets them for each of its
+# MODEL lines (chair_scale), tuned only in the Model Viewer.
+each MODEL(name) panel Model Viewer
+category Model
+# Its size: 1 as cooked (metres).
+setting float scale 1 0 inf
+# Which way is up in its file: Auto as cooked (the cooker reads it from the file), else Y or Z.
+setting choice up_axis Auto Auto Y Z
+# Detail kept with distance: higher keeps finer versions further away (2: half the error on screen).
+setting float lod_quality 1 0.25 4
+setting bool cast_shadows true
+# Drawn from both sides, for open or thin surfaces.
+setting bool double_sided false
+end
+# The Model Viewer (panels/Viewer.cpp): every model the view's game declared, an orbiting preview, its knobs.
+panel Model Viewer 520x620

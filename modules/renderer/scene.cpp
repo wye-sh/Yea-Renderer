@@ -465,7 +465,22 @@ yea_handle instance_add(uint32_t mesh, yea_handle material)
     i->scale = { 1, 1, 1 };
     i->shadow = 1;
     i->moved = yea::host()->frame();
+    while (InstanceLods.size() <= row && InstanceLods.add())
+        InstanceLods[InstanceLods.size() - 1].quality = 1;
+    if (row < InstanceLods.size())
+        InstanceLods[row].quality = 1;
     return handleOf(Instances, row);
+}
+
+void instance_lod_quality(yea_handle h, float quality)
+{
+    uint32_t row = rowOf(Instances, h);
+    if (row == 0xFFFFFFFFu)
+        return;
+    while (InstanceLods.size() <= row && InstanceLods.add())
+        InstanceLods[InstanceLods.size() - 1].quality = 1;
+    if (row < InstanceLods.size())
+        InstanceLods[row].quality = quality > 0.01f ? quality : 0.01f;
 }
 
 void instance_place(yea_handle h, yea_float3 pos, yea_float4 rotation, yea_float3 scale)
@@ -613,6 +628,16 @@ uint32_t light_count()
 // module's, not this one's.
 SceneState*  gScene;
 CameraState* gCamera;
+EpochState*  gEpoch;
+
+namespace
+{
+void newEpoch()
+{
+    uint32_t e = gEpoch->epoch * 2654435761u + (uint32_t)yea::host()->frame() * 40503u + 0x9E3779B9u;
+    gEpoch->epoch = e ? e : 1;
+}
+} // namespace
 
 void bindState()
 {
@@ -626,7 +651,13 @@ void bindState()
         gCamera->target = { 0, 0, 0 };
         gCamera->fov = 60;
     }
+    int freshEpoch = 0;
+    gEpoch = (EpochState*)yea::host()->state("renderer.epoch", 1, sizeof(EpochState), &freshEpoch);
+    if (freshEpoch || !gEpoch->epoch)
+        newEpoch();
 }
+
+uint32_t scene_epoch() { return gEpoch ? gEpoch->epoch : 0; }
 
 SceneState* sceneState() { return gScene; }
 
@@ -638,11 +669,13 @@ void clear()
     Indexes.clear();
     Materials.clear();
     Instances.clear();
+    InstanceLods.clear();
     Lights.clear();
     LightTexels.clear();
     LightLooks.clear();
     build()->active = 0;
     sceneState()->removed = yea::host()->frame();
+    newEpoch();
 }
 
 // --- Camera -----------------------------------------------------------------------------------

@@ -19,6 +19,12 @@ struct SceneState
     uint64_t removed; // frame an instance was last removed (shadow caches redraw)
 };
 SceneState* sceneState();
+// A number every module that adds to the scene keeps: it changes whenever the scene it built is gone (clear(), Reset
+// State, a material layout change), never on a reload that keeps it. Never 0.
+struct EpochState
+{
+    uint32_t epoch;
+};
 bool        meshBuilding(); // a custom mesh is half made
 void        bindState();    // takes the state blocks: call in load(), before anything uses them
 

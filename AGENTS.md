@@ -164,6 +164,26 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   are made in full. Lines said from `upscale_prepare` wait for this module's `update()`, so they are filed under
   renderer_upscale: which upscaler is picked and runs, its sizes, and why FSR can't run.
   Nothing of Microsoft's ships.
+- `renderer_models`: models, and the Model Viewer panel. A game's module declares each model with `MODEL(name, "source")`
+  through `ModelLink.h` (`import renderer_models u64 api(u32 version) = 0`), registering in its own update (`mdl::update()`,
+  which passes its own `yea::assets()`), and places it whole (`mdl::place`, `move`, `remove`, `placed`). Sources: a built-in
+  shape (box, sphere, cylinder, cone, torus, plane) until the cooked loader lands. Its tables: `Placement` (a row per
+  placement, keyed by the model's owner and name), `PartInstance` (the core's instances, one per part), `ModelPart` (each
+  model's meshes and materials in the core, found again after a reload), state `Scene` (the core's scene_epoch they belong
+  to: when it changes, every part and instance is made again). It builds and syncs in `YEA_PHASE_LATE`, after the game's
+  modules moved things. Each MODEL line gets the knobs of its each block (scale, up_axis, lod_quality, cast_shadows,
+  double_sided), shown only in the Model Viewer. The Model Viewer (`panels/Viewer.cpp`): a dropdown of the view's models
+  (kind, triangles, a lit dot while placed), a canvas preview (drag orbits, the wheel zooms, a double-click goes back to
+  the front; the turntable and Front View icons), the LOD shown (Auto as `lod_error` picks at that size, or each LOD), the
+  model's knobs; Add Models (the header's +) and drops go to the agents. The preview: this module makes its targets in
+  its own `update()` at twice the canvas size (RGBA16F and D32 at 4 samples, a 1024² D32 shadow map, an RGBA8 sRGB out),
+  and in `draw(YEA_PASS_RENDER)`, only on frames the panel showed it, calls the core's `preview_draw` (a `RenderPreview*`,
+  `preview.h`, copied identically into renderer and renderer_models: change both and raise `RENDER_PREVIEW_VERSION`),
+  which draws the model alone with the core's meshes, materials, BRDF (`Shaders/Brdf.h.fsl`, shared with the forward
+  pass) and tonemapper under a studio rig (a key light with a 16-tap filtered shadow map, a neutral grey sky for
+  ambient and reflections, a floor showing only shadow and contact darkening), resolves its 4 samples tonemapped into
+  the out target, and leaves everything in SHADER_RESOURCE; the panel shows it with `yea::canvasImage`. The core's
+  preview pipelines and buffers are made in its own `load()` (`preview_core.h`); a failure turns only the preview off.
 - The core calls the others through optional imports with a `RenderFrame*` (as `u64`): `frame.h`, copied
   identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes`, `renderer_ssr`, `renderer_vrs`, `renderer_rt` and `renderer_upscale` (`mathx.h` into the
   first three). Change all copies together and raise `RENDER_FRAME_VERSION`. Ray-traced shadows (frame v15): renderer_rt's `rt_pick`, called just
@@ -219,12 +239,16 @@ surface's luminance is that over its area). Colours linear RGB.
   the world box where it is used and reflections are projected onto; put the box's bottom just under the
   floor), `probe_place`, `probe_remove`, `probe_clear`, `probe_count`.
 - Handles are `row | generation << 20`; stale handles are ignored.
+- `scene_epoch()`: changes whenever the scene a module built is gone (`clear()`, Reset State, a material layout change),
+  never on a reload that keeps it; never 0 (0 is the stub: the renderer isn't running). `instance_lod_quality(i, q)`:
+  that instance's `lod_error` divided by q (the models' LOD Quality knob). `preview_draw(preview)`: the Model Viewer's
+  (renderer_models above).
 
 Minimal link module: `use renderer`, a `preset` for every knob, and in `update(SIMULATE)` add meshes,
 materials, instances and lights once, then move what moves and set the camera. Build again whenever the
-renderer's `instance_count()`/`light_count()` differ from what you left last frame (a crash, revert or reload
-lost or replaced its scene: your handles are stale), and never while `mesh_sphere` etc. return 0xFFFFFFFF
-(the renderer is unloaded and its imports are stubs), as the example does.
+renderer's `scene_epoch()` differs from the one you built in (a crash, revert or reload lost or replaced its scene:
+your handles are stale), never by instance or light counts (other modules, such as renderer_models, add to the scene),
+and never while `scene_epoch()` is 0 (the renderer is unloaded and its imports are stubs), as the example does.
 
 ## Knobs
 
@@ -249,6 +273,8 @@ show_rates (green half rate, blue 2x2, magenta coarser). `renderer_rt`: enabled,
 reflected_shadows (Scene, Rays, Off), history_frames, brightest, max_distance, show_hits (green: hit seen on screen, blue: lit at the hit, grey: sky),
 probe_rays (temporary: 0 off; traces 1 sun ray plus k-1 local-light rays per pixel and discards them, to measure ray-traced
 shadows' cost on the user's GPU; remove once measured).
+`renderer_models` (per MODEL line, in the Model Viewer only): scale, up_axis (Auto, Y, Z: Z up in the file turned to Y up),
+lod_quality, cast_shadows, double_sided.
 Players of a released game tune (`player` lines): upscaler, quality_mode, dlss_model, exposure_ev (brightness), lod_error,
 TAA's sharpen, shadows' sun_resolution, shadow_distance, pcss and light_shadows, and enabled for AO, contact shadows, SSR,
 ray-traced reflections and VRS, with half_resolution for AO, SSR and ray-traced reflections, and probes' resolution.
@@ -259,7 +285,8 @@ either way.
 ## Reset
 
 All scene data is in `renderer`'s tables and state: Reset empties the scene; the feature's link module
-builds it again. GPU objects and shadow caches are rebuilt on load.
+builds it again. renderer_models' placements go with it: a game places its models again whenever `mdl::placed(h)` is
+false. GPU objects and shadow caches are rebuilt on load.
 
 ## Cost
 
@@ -274,7 +301,9 @@ exposure dispatches, with ray-traced reflections (instead of the SSR depth copy 
 rebuild, a trace dispatch (a closest-hit ray per glossy pixel, a quarter of them with half_resolution except
 mirror-like ones; where the hit isn't on screen a shadow map lookup per lit light with a map, a ray for the sun and for mapless casters), with half_resolution a
 full-size reconstruction (nine rays reused per glossy pixel) and a full-size resolve (temporal accumulation; tiles with no glossy pixel cost a read or two), one full-screen TAA resolve (when on; with an upscaler, its dispatch at the display size and a one-thread
-exposure copy instead, every scene pass then at the render size), one full-screen composite. No per-frame allocation. GPU memory at the defaults:
+exposure copy instead, every scene pass then at the render size), one full-screen composite. The Model Viewer's preview costs
+nothing unless its panel is open and showing a model: then, per frame, one 1024² shadow map pass and one 4-sample pass of
+that model at twice the canvas size, and a resolve (about 6 MB of targets at a 520 × 320 canvas). No per-frame allocation. GPU memory at the defaults:
 HDR + depth at 4x MSAA, sun atlas 4096² D32 (64 MB), local atlas 4096² (64 MB), a screen-size R32F depth copy
 for screen reflections (a quarter of it at half resolution).
 

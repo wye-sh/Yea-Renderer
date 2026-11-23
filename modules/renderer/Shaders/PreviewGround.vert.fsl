@@ -1,0 +1,25 @@
+// The Model Viewer's floor: a square of gPreview.ground's radius around its centre, two triangles from SV_VertexID
+// (drawn with first vertex 0).
+#include "Common.h.fsl"
+#include "Preview.h.fsl"
+#include "Preview.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float3, WorldPos, TEXCOORD0);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN(SV_VertexID(uint) id)
+{
+    INIT_MAIN;
+    VSOutput Out;
+    // 0 1 2, 2 1 3 over the corners (-1,-1) (1,-1) (-1,1) (1,1): counter-clockwise seen from above, as every shape.
+    uint   c = id < 3u ? id : (id == 3u ? 2u : (id == 4u ? 1u : 3u));
+    float2 q = float2(float(c & 1u) * 2.0 - 1.0, float(c >> 1u) * 2.0 - 1.0);
+    float4 w = float4(gPreview.ground.x + q.x * gPreview.ground.w, gPreview.ground.y, gPreview.ground.z - q.y * gPreview.ground.w, 1.0);
+    Out.Position = float4(dot(gPreview.viewProj[0], w), dot(gPreview.viewProj[1], w), dot(gPreview.viewProj[2], w), dot(gPreview.viewProj[3], w));
+    Out.WorldPos = w.xyz;
+    RETURN(Out);
+}

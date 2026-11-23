@@ -7,6 +7,7 @@
 #include <yea/shadingrate.h>
 #include <yea/raytracing.h>
 #include "frame.h"
+#include "preview.h"
 #include "mathx.h"
 #include "scene.h"
 
@@ -844,6 +845,8 @@ Texture* loadTonyLut()
     return tex;
 }
 
+#include "preview_core.h"
+
 int load(int reloaded)
 {
     const YeaHost* host = yea::host();
@@ -1069,6 +1072,7 @@ int load(int reloaded)
     memset(gLodChanged, 0, sizeof(uint64_t) * Instances.capacity());
     gPrevCpu = new float[Instances.capacity()][3][4];
     gPrevViewProjFrame = 0;
+    previewLoad(); // the Model Viewer's preview: off on its own if it fails
 
     gReady = true;
     return 0;
@@ -1079,6 +1083,7 @@ void unload()
     if (!gRenderer)
         return;
     waitQueueIdle(gQueue);
+    previewUnload();
     for (uint32_t i = 0; i < gFrames; ++i)
         if (gTimePool[i])
             exitQueryPool(gRenderer, gTimePool[i]), gTimePool[i] = nullptr;
@@ -1346,7 +1351,8 @@ void draw(uint32_t pass, const YeaFrame* yf)
             float d = length(sc - eye), r = info.sphere[3];
             float z = view[2][0] * sc.x + view[2][1] * sc.y + view[2][2] * sc.z + view[2][3];
             float perUnit = visible ? lodFocal * minf(d / maxf(z, nearZ), 2.0f) / maxf(z - r, nearZ) : lodFocal / maxf(d - r, nearZ);
-            float allowed = lodError / (perUnit * maxf(scale, 1e-6f)); // object units
+            float quality = row < InstanceLods.size() && InstanceLods[row].quality > 0 ? InstanceLods[row].quality : 1.0f;
+            float allowed = lodError / (quality * perUnit * maxf(scale, 1e-6f)); // object units
             for (uint32_t next = MeshLods[lod].next; next < lodRows && MeshLods[next].error <= allowed &&
                                                      Meshes[next].firstIndex + Meshes[next].indexCount <= gUploadedIndices;
                  next = MeshLods[next].next)

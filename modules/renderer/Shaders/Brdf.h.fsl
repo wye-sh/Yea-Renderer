@@ -1,0 +1,65 @@
+// The BRDF the core shades every surface with (the forward pass through Lighting.h.fsl, and the Model Viewer's
+// preview): dfgLookup reads gDfg, which the including shader's SRT declares.
+#ifndef RENDER_BRDF_H
+#define RENDER_BRDF_H
+
+float2 dfgLookup(float NoV, float rough)
+{
+    float  x = saturate(NoV) * 31.0;
+    float  y = saturate(rough) * 31.0;
+    uint   x0 = uint(x);
+    uint   y0 = uint(y);
+    uint   x1 = min(x0 + 1u, 31u);
+    uint   y1 = min(y0 + 1u, 31u);
+    float  fx = x - float(x0);
+    float  fy = y - float(y0);
+    float2 a = lerp(gDfg[y0 * 32u + x0], gDfg[y0 * 32u + x1], fx);
+    float2 b = lerp(gDfg[y1 * 32u + x0], gDfg[y1 * 32u + x1], fx);
+    return lerp(a, b, fy);
+}
+
+STRUCT(Surface)
+{
+    DATA(float3, P, None);
+    DATA(float3, N, None);
+    DATA(float3, V, None);
+    DATA(float3, diffuse, None);
+    DATA(float3, f0, None);
+    DATA(float3, energy, None);  // multiple-scattering compensation for direct light
+    DATA(float, a2, None);
+    DATA(float, NoV, None);
+    DATA(float, smithV, None);   // sqrt(NoV^2 (1 - a2) + a2): the view's half of the Smith term, the same for every light
+    DATA(float2, rot, None);     // (cos, sin) of the pixel's noise angle: turns the shadow filters' disk
+    DATA(int2, pixel, None);     // the pixel, for renderer_rt's traced shadows
+    // Area lights (FLAG_AREA): the LTC frame (x towards V, z = N), the inverse transform's m00 m02 m20 m22 and the
+    // specular's scale (its Fresnel-weighted norm with the multiple-scattering compensation).
+    DATA(float3, ltcX, None);
+    DATA(float3, ltcY, None);
+    DATA(float4, ltcInv, None);
+    DATA(float3, ltcSpec, None);
+};
+
+// Radiance reflected towards V from a light of illuminance E (lux) arriving along L: GGX D, the
+// height-correlated Smith V and Schlick's F, arranged for a loop over lights: H's length from L.V alone (|V + L|^2 =
+// 2 + 2 L.V, so N.H and V.H without forming H), the view's Smith half from the surface, D and V under one
+// divide, and Schlick's fifth power by multiplying (pow is a log and an exp).
+float3 brdfLight(Surface s, float3 L, float3 E)
+{
+    float NoL = saturate(dot(s.N, L));
+    if (NoL <= 0.0)
+        return float3(0.0, 0.0, 0.0);
+    float  LoV = dot(L, s.V);
+    float  invH = rsqrt(max(2.0 + 2.0 * LoV, 1e-8));
+    float  NoH = saturate((NoL + s.NoV) * invH);
+    float  VoH = saturate(invH + invH * LoV);
+    float  d = (NoH * s.a2 - NoH) * NoH + 1.0;
+    float  gv = NoL * s.smithV;
+    float  gl = s.NoV * sqrt(NoL * NoL * (1.0 - s.a2) + s.a2);
+    float  DV = s.a2 * 0.5 / (PI * d * d * max(gv + gl, 1e-5));
+    float  x = 1.0 - VoH;
+    float  x2 = x * x;
+    float3 F = s.f0 + (float3(1.0, 1.0, 1.0) - s.f0) * (x2 * x2 * x);
+    return (s.diffuse * (1.0 / PI) + DV * F * s.energy) * E * NoL;
+}
+
+#endif
