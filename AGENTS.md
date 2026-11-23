@@ -257,7 +257,7 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   two-sided surface's lit from that side instead, as the raster captures draw it), misses
   the sky fogged over the fog's range and GI_MISS; then giTraced = 1. Every hit's diffuse surroundings (reflections'
   too) come from last frame's probes (giIrradiance, blended to the sky's by `inside`) once renderer_gi has blended any.
-  Ray-traced shadows (`shadows`, off until measured on the user's GPU; `traced_lights`, 4): `rt_pick` takes the sun and up to `traced_lights` visible
+  Ray-traced shadows (`shadows`, on: the sun alone by default, as measured on the user's RTX 2080; `traced_lights`, 0): `rt_pick` takes the sun and up to `traced_lights` visible
   casting lights, area lights first (their PCSS costs most, and rays give their real shape), needing TAA and no debug
   view. After the top-level build, `Shaders/Shadows.comp.fsl`'s three full-size passes, each over every traced shadow
   (dispatch z, layers of 2D arrays matched to last frame's by light id): a trace (one any-hit ray a pixel, mask 2, to a
