@@ -206,8 +206,9 @@ shadows' cost on the user's GPU; remove once measured).
 Players of a released game tune (`player` lines): upscaler, quality_mode, dlss_model, exposure_ev (brightness), lod_error,
 TAA's sharpen, shadows' sun_resolution, shadow_distance, pcss and light_shadows, and enabled for AO, contact shadows, SSR,
 ray-traced reflections and VRS, with half_resolution for AO, SSR and ray-traced reflections, and probes' resolution.
-Debug views and show_ knobs never. renderer_rt's and renderer_vrs' `enabled` get `needs ... raytracing`/`shadingrate`
-once Yea takes a need on a bool that defaults to true; till then each switches itself off without its service.
+Debug views and show_ knobs never. renderer_rt's `enabled` needs `raytracing` and renderer_vrs' `shadingrate` (hidden and
+false without them); each still returns from `load()` before touching its service when that is nullptr, as `load()` runs
+either way.
 
 ## Reset
 

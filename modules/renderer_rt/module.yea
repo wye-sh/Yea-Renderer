@@ -6,8 +6,9 @@ export void rt_run(u64 frame)
 
 category Ray-Traced Reflections
 # Reflections found by tracing rays through the scene, also of what is off screen or hidden. Only on GPUs
-# with ray tracing, with Anti-aliasing (TAA) on; elsewhere Screen Reflections and the probes show.
+# with ray tracing (hidden elsewhere), with Anti-aliasing (TAA) on; elsewhere Screen Reflections and the probes show.
 setting bool enabled true
+needs enabled raytracing
 player enabled
 # Surfaces rougher than this keep the probes' blurred reflections; traced ones fade out towards it.
 setting float max_roughness 0.5 0 1
