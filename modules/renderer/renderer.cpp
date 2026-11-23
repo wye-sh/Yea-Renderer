@@ -249,16 +249,25 @@ PipelineCache*  gPipeCache;
 // Yea's background compiles (SDK 158; nullptr on an older host, which warms here, kWarmMs a frame). The frame that makes
 // the pipelines queues every variant on Yea's threads, then waits only for those it draws with; later frames take the
 // rest as they finish. A variant still compiling when a frame needs it is waited for, never compiled twice (Direct3D 12
-// forbids loading one pipeline from a library on two threads at once).
+// forbids loading one pipeline from a library on two threads at once). A settings change cancels what is queued, but a
+// compile already running goes on: the same desc asked for again (the settings back within a few frames, as TAA or an
+// upscaler loading can do) would then load the same pipeline from the library on two threads, which crashed Direct3D 12
+// (4.16.2). So each cancelled desc is tainted for the session: made again, it goes without the pipeline cache, and after
+// any cancel the cache is saved only at unload, once removeShader has waited out every compile.
 const YeaPipelines* gPipes;
 bool                gPipesFailed;                // a queued compile failed: the rest are made here, as without the service
 struct PendingPipe
 {
     Pipeline** slot;
     uint64_t   handle;
+    uint32_t   samples; // the settings it was queued for: with slot, which desc it is
+    bool       motion;
 };
 PendingPipe gPending[64];
 uint32_t    gPendingCount;
+PendingPipe gTainted[256];                       // descs cancelled this session (handle unused)
+uint32_t    gTaintedCount, gCancelledNow, gTaintedMade;
+bool        gCancelled;                          // a compile was cancelled: the cache is saved only at unload
 double      gWarmStart;                          // when the variants were queued (clockMs)
 bool            gPipeCacheDirty;
 char            gPipeCachePath[1024];
@@ -583,9 +592,9 @@ void pipeCacheOpen()
 }
 
 // Written beside it and renamed over it, so a run stopped halfway leaves the last one whole.
-void pipeCacheSave()
+void pipeCacheSave(bool unloading = false)
 {
-    if (!gPipeCache || !gPipeCacheDirty || !gPipeCachePath[0])
+    if (!gPipeCache || !gPipeCacheDirty || !gPipeCachePath[0] || (gCancelled && !unloading))
         return;
     gPipeCacheDirty = false;
     size_t size = 0;
@@ -652,11 +661,26 @@ void pollPipelines()
         takePending(k, false);
 }
 
-// Every queued compile dropped (before the pipelines are destroyed, or the shaders and cache go).
+bool tainted(Pipeline** slot, uint32_t samples, bool motion)
+{
+    for (uint32_t k = 0; k < gTaintedCount; ++k)
+        if (gTainted[k].slot == slot && gTainted[k].samples == samples && gTainted[k].motion == motion)
+            return true;
+    return false;
+}
+
+// Every queued compile dropped (before the pipelines are destroyed, or the shaders and cache go); each one's desc tainted.
 void cancelPipelines()
 {
     for (uint32_t k = 0; k < gPendingCount; ++k)
-        gPipes->cancel(gPending[k].handle);
+    {
+        const PendingPipe& p = gPending[k];
+        gPipes->cancel(p.handle);
+        if (!tainted(p.slot, p.samples, p.motion) && gTaintedCount < sizeof gTainted / sizeof gTainted[0])
+            gTainted[gTaintedCount++] = p;
+    }
+    gCancelled = gCancelled || gPendingCount > 0;
+    gCancelledNow = gPendingCount;
     gPendingCount = 0;
 }
 
@@ -672,7 +696,10 @@ bool createScenePipelines(uint32_t samples, bool motion, bool masked, uint32_t f
     auto make = [&](PipelineDesc& d, Pipeline*& p) {
         if (p)
             return;
-        d.pCache = gPipeCache;
+        // A desc whose cancelled compile may still be running stays out of the library (a full table taints all).
+        const bool taint = gCancelled && (tainted(&p, samples, motion) || gTaintedCount >= sizeof gTainted / sizeof gTainted[0]);
+        d.pCache = taint ? nullptr : gPipeCache;
+        gTaintedMade += taint ? 1 : 0;
         const int k = gPipes ? pendingOf(&p) : -1;
         if (k >= 0 && (queue || until > 0))
         {
@@ -684,7 +711,7 @@ bool createScenePipelines(uint32_t samples, bool motion, bool masked, uint32_t f
         if (queue && gPendingCount < sizeof gPending / sizeof gPending[0])
             if (uint64_t h = gPipes->add(&d))
             {
-                gPending[gPendingCount++] = { &p, h };
+                gPending[gPendingCount++] = { &p, h, samples, motion };
                 gPipeCacheDirty = true;
                 left = true;
                 return;
@@ -1854,6 +1881,8 @@ int load(int reloaded)
     pipeCacheOpen();
     gPipes = yea::pipelines();
     gPipesFailed = false;
+    gTaintedCount = gCancelledNow = gTaintedMade = 0;
+    gCancelled = false;
     gPendingCount = 0;
     getTimestampFrequency(gQueue, &gTimeTicks);
     for (uint32_t i = 0; i < gFrames && gTimeTicks > 0; ++i)
@@ -2183,7 +2212,6 @@ void unload()
     for (uint32_t i = 0; i < gFrames; ++i)
         if (gTimePool[i])
             exitQueryPool(gRenderer, gTimePool[i]), gTimePool[i] = nullptr;
-    pipeCacheSave();
     destroyScenePipelines(); // drops queued compiles; one already compiling ends when its shader is removed (below)
     freePipeline(gCompositePipe);
     freePipeline(gAdaptPipe);
@@ -2267,6 +2295,7 @@ void unload()
             removeShader(gRenderer, gHistogramShader[i]), gHistogramShader[i] = nullptr;
     }
     // After the shaders: removeShader waited for every compile still reading them, so none uses the cache now.
+    pipeCacheSave(true);
     if (gPipeCache)
         removePipelineCache(gRenderer, gPipeCache);
     gPipeCache = nullptr;
@@ -2377,6 +2406,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     if (samples != gPipeSamples || taa != gPipeMotion)
     {
         waitQueueIdle(gQueue);
+        gCancelledNow = gTaintedMade = 0;
         destroyScenePipelines();
         gWarmStart = clockMs();
         // With Yea's compile threads: what the first frame draws with queued first, then the cut-out set (a model's
@@ -2386,6 +2416,14 @@ void draw(uint32_t pass, const YeaFrame* yf)
         createScenePipelines(samples, taa, true, kForwardLean, 0, true);
         createScenePipelines(samples, taa, true, warmForward(), 0, true);
         createScenePipelines(samples, taa, masked, kForwardLean);
+        if (gCancelledNow || gTaintedMade)
+        {
+            char line[220];
+            snprintf(line, sizeof line,
+                     "renderer: scene pipelines remade for %u sample%s%s; %u compiles cancelled, %u made again without the pipeline cache",
+                     samples, samples > 1 ? "s" : "", taa ? " with motion" : "", gCancelledNow, gTaintedMade);
+            yea::log(line);
+        }
         gFrameFormat = TinyImageFormat_UNDEFINED;
         gWarmLeft = true; // from the next frame
         gWarmFrames = 0;

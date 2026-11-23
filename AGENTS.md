@@ -787,10 +787,14 @@ for the decals in its tile and z-bin (a box test, then up to three map reads or 
   and F1's view modes; not those in a release), and waits only for the first; later frames take the rest as they finish,
   and a variant still compiling when a frame needs it is waited for, never queued or made twice (Direct3D 12 forbids
   loading one pipeline from a library on two threads). Remaking or `unload()` cancels what is queued; the cache is
-  removed after the shaders, as removeShader waits for compiles reading them. On an older host, warming makes the
+  removed after the shaders, as removeShader waits for compiles reading them. A cancelled compile already running goes
+  on, so each cancelled desc (slot, samples, motion) is tainted for the session: asked for again (settings back within
+  seconds, as TAA or an upscaler loading after the core does), it compiles without the cache. Two threads loading one
+  pipeline from the library crashed Direct3D 12 on every start before 4.16.2. After any cancel the cache is saved only
+  at unload, after the shaders; each remake that cancelled or tainted logs how many. On an older host, warming makes the
   rest 2 ms a frame, one at least. Either way no variant compiles on a frame that draws: until warmed, cut-outs wait (both passes, so depth and colour agree) and
   the full shader gives way to the lean one. A pipeline cache in Yea's data folder (`renderer_pipelines_d3d12.bin` or
-  `_vulkan.bin`; a Direct3D 12 library from another driver starts empty) is saved when warming ends and in `unload()`.
+  `_vulkan.bin`; a Direct3D 12 library from another driver starts empty) is saved when warming ends (unless a compile was cancelled) and in `unload()`.
   It logs "scene pipelines warmed in X ms over N frames (at most Y ms a frame); cut-outs held back K frames", and any
   pipeline still made on a drawing frame.
 
