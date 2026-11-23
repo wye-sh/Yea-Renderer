@@ -24,6 +24,9 @@ char     gNames[kMaxModels][80], gRights[kMaxModels][48];
 char     gLodNames[9][16];
 constexpr uint32_t kClipRows = 256;
 YeaUiRow gClipRows[kClipRows + 1];
+YeaUiRow gFromRows[kMaxModels];
+uint32_t gFromIds[kMaxModels];
+char     gFromNames[kMaxModels][80], gFromRights[kMaxModels][24];
 char     gClipNames[kClipRows + 1][64], gClipRights[kClipRows + 1][16];
 
 // "old_chair": "Old Chair".
@@ -178,17 +181,57 @@ void panel_model_viewer()
     if (sel->anim && sel->state == 1 && gPreview.animModel == sel->id)
     {
         const PlacementAnim& a = gPreview.anim;
-        const uint32_t       clips = sel->skel->clipCount < kClipRows ? sel->skel->clipCount : kClipRows;
-        gClipRows[0] = { "Rest Pose", "", a.clip == kNoClip && gPreview.playing };
+        // Whose clips: its own, or another skinned model's, retargeted onto it (shown when the view has another).
+        const Entry* from = sel;
+        {
+            uint32_t n = 0;
+            int at = 0;
+            for (uint32_t i = 0; i < gEntryCount && n < kMaxModels; ++i)
+            {
+                const Entry& e = gEntries[i];
+                if (!e.anim || e.state != 1 || (&e != sel && !e.skel->clipCount))
+                    continue;
+                if (&e == sel && n) // its own first
+                {
+                    gFromRows[n] = gFromRows[0], gFromIds[n] = gFromIds[0];
+                    memcpy(gFromNames[n], gFromNames[0], sizeof gFromNames[n]), memcpy(gFromRights[n], gFromRights[0], sizeof gFromRights[n]);
+                    gFromRows[n].label = gFromNames[n], gFromRows[n].right = gFromRights[n];
+                }
+                const uint32_t k = &e == sel ? 0 : n;
+                char           name[64];
+                pretty(e.name, name, sizeof name);
+                snprintf(gFromNames[k], sizeof gFromNames[k], "%s##from%u", name, e.id);
+                snprintf(gFromRights[k], sizeof gFromRights[k], "%u clips", e.skel->clipCount);
+                gFromRows[k] = { gFromNames[k], gFromRights[k], 0 };
+                gFromIds[k] = &e == sel ? 0 : e.id;
+                ++n;
+            }
+            for (uint32_t i = 0; i < n; ++i)
+                if (gFromIds[i] == gPreview.clipsFrom)
+                    at = int(i);
+            if (n > 1)
+            {
+                const int picked = u->dropdown("Clips From##clipsFrom", gFromRows, int(n), at);
+                if (picked != at && picked >= 0 && picked < int(n))
+                    gPreview.clipsFrom = gFromIds[picked], gPreview.pickClip = 2, at = picked; // its first clip
+            }
+            for (uint32_t i = 0; i < gEntryCount && gPreview.clipsFrom; ++i)
+                if (gEntries[i].id == gPreview.clipsFrom && gEntries[i].anim && gEntries[i].state == 1)
+                    from = &gEntries[i];
+        }
+        const uint32_t fromKey = from == sel ? 0 : from->key;
+        const uint32_t clips = from->skel->clipCount < kClipRows ? from->skel->clipCount : kClipRows;
+        const bool     shown = gPreview.srcClip == fromKey; // the clip playing is one of these
+        gClipRows[0] = { "Rest Pose", "", shown && a.clip == kNoClip && gPreview.playing };
         for (uint32_t c = 0; c < clips; ++c)
         {
-            pretty(sel->clips[c].name, gClipNames[c + 1], sizeof gClipNames[c + 1]);
+            pretty(from->clips[c].name, gClipNames[c + 1], sizeof gClipNames[c + 1]);
             if (!gClipNames[c + 1][0])
                 snprintf(gClipNames[c + 1], sizeof gClipNames[c + 1], "Clip %u", c + 1);
-            snprintf(gClipRights[c + 1], sizeof gClipRights[c + 1], "%.2f s", sel->clips[c].duration);
-            gClipRows[c + 1] = { gClipNames[c + 1], gClipRights[c + 1], a.clip == c && gPreview.playing };
+            snprintf(gClipRights[c + 1], sizeof gClipRights[c + 1], "%.2f s", from->clips[c].duration);
+            gClipRows[c + 1] = { gClipNames[c + 1], gClipRights[c + 1], shown && a.clip == c && gPreview.playing };
         }
-        const int chosen = a.clip == kNoClip ? 0 : int(a.clip + 1);
+        const int chosen = !shown ? -1 : a.clip == kNoClip ? 0 : int(a.clip + 1);
         const int picked = u->dropdown("##clip", gClipRows, int(clips + 1), chosen);
         if (picked != chosen && picked >= 0 && picked <= int(clips))
             gPreview.pickClip = uint32_t(picked) + 1; // 1 the rest pose, clip c at c + 2
@@ -201,7 +244,7 @@ void panel_model_viewer()
             gPreview.anim.time = 0, gPreview.anim.from = kNoClip;
         u->slider("Speed##clip", &gPreview.speed, 0.0f, 2.0f, 0);
         u->slider("Crossfade (s)##clip", &gPreview.fade, 0.0f, 1.0f, 0);
-        if (sel->motionNode != kNoClip) // its clips with their travel (as authored) or in place (root motion on)
+        if (from->motionNode != kNoClip) // its clips with their travel (as authored) or in place (root motion on)
             u->toggle("In Place##clip", &gPreview.inPlace);
         // Its morph targets: each one's weight now; dragging one holds it there over the clip, until Follow the Clip.
         if (sel->targets && sel->skel->targetCount)

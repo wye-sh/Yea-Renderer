@@ -18,6 +18,11 @@
 // world transform (3x4 rows), to attach something to it. Clips and joints are named as in the source file. A model
 // with morph targets (blend shapes: a face's smile, a blink) follows its clip's weights; mdl::morph(h, "Smile", 0.8f)
 // holds one at a weight over them, mdl::unmorph(h, "Smile") (or every one, with no name) hands it back to the clip.
+// Retargeting: mdl::play(h, animations, "Run") plays another skinned model's clip on this one, as UE's IK Retargeter
+// does (its chains matched by their bones' names, the pelvis scaled by the two's heights, IK on the legs and arms so
+// feet stay planted), so one model can hold the clips every character uses:
+//   MODEL(hero, "models/Hero.rmodel");   MODEL(moves, "models/Moves.rmodel");
+//   mdl::play(heroPlacement, moves, "Run");
 // Root motion: mdl::rootMotion(h, true) plays its clips in place (the travel and turn of the node that carries them left
 // out), and each frame mdl::takeRootMotion(h, m) hands over what was left out, for the game to move it by (as UE's
 // root motion: the game owns where the character is, so it can collide, follow a path or be networked):
@@ -118,10 +123,14 @@ struct Api
     // takeMotion: what they left out since the last take, world (out[0..2] metres, out[3] radians about +Y).
     int (*rootMotion)(uint32_t placement, int on);
     int (*takeMotion)(uint32_t placement, float* out);
+    // Retargeting (later in Api: check `size`): another skinned model's clip, played on this one's skeleton; 0 when
+    // either isn't skinned or the source has no such clip.
+    int (*playFrom)(uint32_t placement, uint32_t model, const char* clip, float speed, int loop, float fade);
 };
 inline bool hasAnim(const Api* a) { return a->size >= offsetof(Api, morph); }
 inline bool hasMorph(const Api* a) { return a->size >= offsetof(Api, rootMotion); }
-inline bool hasRootMotion(const Api* a) { return a->size >= sizeof(Api); }
+inline bool hasRootMotion(const Api* a) { return a->size >= offsetof(Api, playFrom); }
+inline bool hasRetarget(const Api* a) { return a->size >= sizeof(Api); }
 
 struct Model;
 namespace detail
@@ -293,7 +302,14 @@ inline bool morph(uint32_t placement, const char* target, float weight)
     const Api* a = detail::api();
     return a && placement && hasMorph(a) && a->morph(placement, target, weight);
 }
-// Root motion on (its clips play in place) or off (as authored). False: it has no clips, or no node that carries them.
+// Another skinned model's clip (`from`'s, by name; nullptr or "" the rest pose) played on this one, retargeted onto its
+// skeleton, crossfaded as play() does. False: either isn't skinned, or `from` has no such clip.
+inline bool play(uint32_t placement, const Model& from, const char* clip, float speed = 1.0f, bool loop = true, float fade = 0.2f)
+{
+    const Api* a = detail::api();
+    return a && placement && from.id && hasRetarget(a) && a->playFrom(placement, from.id, clip, speed, loop ? 1 : 0, fade);
+}
+// Root motion on (its clips play in place) or off (as authored). False: it isn't skinned.
 inline bool rootMotion(uint32_t placement, bool on)
 {
     const Api* a = detail::api();

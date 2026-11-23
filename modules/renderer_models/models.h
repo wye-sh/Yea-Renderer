@@ -39,6 +39,7 @@ struct Entry
     // parent's model-space transform at rest (3x3 rows `motionLin`, its inverse, and its translation).
     uint32_t motionNode;
     float    motionLin[9], motionInv[9], motionT[3];
+    uint32_t animStamp; // counts its skeleton's reads (a retarget map made from it is made again after one)
 };
 // Every model the view's modules declared, in the order declared (made in load()).
 extern Entry*   gEntries;
@@ -69,6 +70,9 @@ struct Preview
     float         morphNow[kRmodelMaxTargets]; // the weights its last draw showed
     int           morphOpen;                   // its Morph Targets row unfolded
     int           inPlace;                     // its clips shown in place (their root motion left out)
+    // Whose clips it plays: clipsFrom the model the panel picked (its id; 0 its own); srcClip and srcFrom the models
+    // (keys; 0 its own) of `anim`'s clip and of the one it fades from, retargeted onto it.
+    uint32_t      clipsFrom, srcClip, srcFrom;
 };
 extern Preview gPreview;
 

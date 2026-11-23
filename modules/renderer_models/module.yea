@@ -80,6 +80,12 @@ table PlacementMotion none 4096
   float3 acc
   float yaw
 end
+# Whose clips a placement plays (rows as Placement's): the model (its key; 0 its own) of its clip and of the one it
+# fades from, retargeted onto its skeleton.
+table PlacementRetarget none 4096
+  u32 clip
+  u32 from
+end
 # The renderer's instances a placement draws with, one per part of its model.
 table PartInstance none 65536
   u32 placement

@@ -4,6 +4,7 @@
 // module's own targets).
 #include "yea_renderer_models.h"
 #include "models.h"
+#include "retarget.h"
 #include "rmodel.h"
 #include "anim.h"
 
@@ -37,6 +38,20 @@ anim::Pose*        gFrom;    // the clip it fades from,
 float*             gWorld;   // each node's model-space matrix (12 floats),
 float*             gPalette; // and each bone's (12 floats)
 float *            gWeights, *gFromWeights; // a placement's morph weights, and those of the clip it fades from
+// Retargeting (made in load()): a source's sampled poses and weights, pose()'s scratch, and the maps between two
+// skeletons (each made the first time a placement plays one's clips on the other, in this module's update).
+anim::Pose*        gSrcPoses;
+float*             gSrcWeights;
+retarget::Scratch  gRt;
+struct MapSlot
+{
+    uint32_t      tKey, sKey, tStamp, sStamp, used, live, ok;
+    float         tUp, sUp; // their Up Axis knobs, as made
+    retarget::Map map;
+};
+constexpr uint32_t kMaps = 32;
+MapSlot*           gMaps;
+uint32_t           gStamp, gTick;
 
 void freeAnim(Entry& e)
 {
@@ -44,6 +59,7 @@ void freeAnim(Entry& e)
     e.anim = nullptr;
     e.skel = nullptr, e.nodes = nullptr, e.bones = nullptr, e.clips = nullptr, e.targets = nullptr;
     e.motionNode = kNoClip;
+    e.animStamp = 0;
 }
 
 uint32_t fnv(const char* a, const char* b)
@@ -193,6 +209,10 @@ uint32_t apiPlace(uint32_t model, const float* pos, const float* rot, float scal
         ;
     if (row < PlacementMotions.size())
         PlacementMotions[row] = PlacementMotion{};
+    while (PlacementRetargets.size() <= row && PlacementRetargets.add())
+        ;
+    if (row < PlacementRetargets.size())
+        PlacementRetargets[row] = PlacementRetarget{};
     return row | gen << 20;
 }
 void apiMove(uint32_t h, const float* pos, const float* rot, float scale)
@@ -246,6 +266,14 @@ Entry* animOf(uint32_t h, PlacementAnim** out)
     *out = &PlacementAnims[row];
     return e;
 }
+// A placement's rows beside it in the tables made after Placement (placed before they existed, say before a reload).
+void grow(uint32_t row)
+{
+    while (row != 0xFFFFFFFFu && PlacementMotions.size() <= row && PlacementMotions.add())
+        ;
+    while (row != 0xFFFFFFFFu && PlacementRetargets.size() <= row && PlacementRetargets.add())
+        ;
+}
 uint32_t clipHash(const char* name, size_t max)
 {
     uint32_t h = 2166136261u;
@@ -267,32 +295,34 @@ uint32_t clipHashed(const Entry& e, uint32_t hash)
             return c;
     return kNoClip;
 }
-// Clip c (kNoClip: the rest pose) from now, faded from what played over `fade` seconds; the same clip keeps its time.
-void startClip(PlacementAnim& a, uint32_t c, float speed, int loop, float fade)
+// Clip c (kNoClip: the rest pose) of model `src` (its key; 0 the placement's own) from now, faded from what played
+// over `fade` seconds; the same clip keeps its time. key and fromKey: whose clip plays, and whose it fades from.
+void startClip(PlacementAnim& a, uint32_t& key, uint32_t& fromKey, uint32_t c, uint32_t src, float speed, int loop, float fade)
 {
-    if (c != a.clip && fade > 0)
-        a.from = a.clip, a.fromTime = a.time, a.fromSpeed = a.speed, a.fromLoop = a.loop, a.fade = fade, a.faded = 0;
-    else if (c != a.clip)
+    const bool same = c == a.clip && src == key;
+    if (!same && fade > 0)
+        a.from = a.clip, a.fromTime = a.time, a.fromSpeed = a.speed, a.fromLoop = a.loop, a.fade = fade, a.faded = 0, fromKey = key;
+    else if (!same)
         a.from = kNoClip;
-    if (c != a.clip)
+    if (!same)
         a.time = 0;
-    a.clip = c, a.speed = speed, a.loop = loop ? 1 : 0;
+    a.clip = c, a.speed = speed, a.loop = loop ? 1 : 0, key = src;
 }
-// Its clip (and the one it fades from) moved on by dt.
-void advanceClip(const Entry& e, PlacementAnim& a, float dt)
+// Its clip (and the one it fades from) moved on by dt: ce and fe the models they are of (nullptr: not ready).
+void advanceClip(const Entry* ce, const Entry* fe, PlacementAnim& a, float dt)
 {
-    auto step = [&](uint32_t clip, float& time, float speed, uint32_t loop) {
-        if (clip >= e.skel->clipCount)
+    auto step = [&](const Entry* e, uint32_t clip, float& time, float speed, uint32_t loop) {
+        if (!e || clip >= e->skel->clipCount)
             return;
-        const float d = e.clips[clip].duration;
+        const float d = e->clips[clip].duration;
         time += dt * speed;
         if (d > 0)
             time = loop ? (fmodf(time, d) + (time < 0 ? d : 0)) : (time < 0 ? 0 : (time > d ? d : time));
     };
-    step(a.clip, a.time, a.speed, a.loop);
+    step(ce, a.clip, a.time, a.speed, a.loop);
     if (a.from != kNoClip)
     {
-        step(a.from, a.fromTime, a.fromSpeed, a.fromLoop);
+        step(fe, a.from, a.fromTime, a.fromSpeed, a.fromLoop);
         a.faded += dt;
         if (a.faded >= a.fade)
             a.from = kNoClip;
@@ -313,13 +343,47 @@ int apiPlay(uint32_t h, const char* clip, float speed, int loop, float fade)
         p.want = clip && clip[0] ? clipHash(clip, 48) : 0;
         p.clip = clip && clip[0] ? 0 : kNoClip;
         p.speed = speed, p.loop = loop ? 1 : 0, p.time = 0, p.from = kNoClip;
+        grow(row);
+        if (row < PlacementRetargets.size())
+            PlacementRetargets[row] = PlacementRetarget{};
         return 1;
     }
     a->want = 0;
     const uint32_t c = clipNamed(*e, clip);
     if (c == kNoClip && clip && clip[0])
         return 0;
-    startClip(*a, c, speed, loop, fade);
+    const uint32_t row = placementRow(h);
+    grow(row);
+    if (row >= PlacementRetargets.size())
+        return 0;
+    startClip(*a, PlacementRetargets[row].clip, PlacementRetargets[row].from, c, 0, speed, loop, fade);
+    return 1;
+}
+int apiPlayFrom(uint32_t h, uint32_t model, const char* clip, float speed, int loop, float fade)
+{
+    const uint32_t row = placementRow(h);
+    grow(row);
+    Entry*         t = row != 0xFFFFFFFFu ? byKey(Placements[row].key) : nullptr;
+    const Entry*   s = byId(model);
+    if (!t || !s || row >= PlacementAnims.size() || row >= PlacementRetargets.size() || t->state == 2 || s->state == 2 ||
+        (t->state == 1 && !t->anim) || (s->state == 1 && !s->anim))
+        return 0;
+    if (s == t)
+        return apiPlay(h, clip, speed, loop, fade);
+    PlacementAnim&     a = PlacementAnims[row];
+    PlacementRetarget& r = PlacementRetargets[row];
+    if (t->state != 1 || s->state != 1) // either still loading: taken by name once both are
+    {
+        a.want = clip && clip[0] ? clipHash(clip, 48) : 0;
+        a.clip = kNoClip, a.speed = speed, a.loop = loop ? 1 : 0, a.time = 0, a.from = kNoClip;
+        r.clip = s->key, r.from = 0;
+        return 1;
+    }
+    a.want = 0;
+    const uint32_t c = clipNamed(*s, clip);
+    if (c == kNoClip && clip && clip[0])
+        return 0;
+    startClip(a, r.clip, r.from, c, s->key, speed, loop, fade);
     return 1;
 }
 float apiTime(uint32_t h)
@@ -547,24 +611,127 @@ void clipMotion(const Entry& e, uint32_t clip, float from, float step, bool loop
     }
 }
 
+// --- Retargeting ----------------------------------------------------------------------------------------------
+// The model a clip is of: the placement's own (key 0), another skinned one (retargeted), nullptr while it isn't ready.
+const Entry* sourceOf(const Entry& e, uint32_t key)
+{
+    if (!key || key == e.key)
+        return &e;
+    const Entry* s = byKey(key);
+    return s && s->anim && s->state == 1 ? s : nullptr;
+}
+retarget::Skel skelOf(const Entry& e)
+{
+    const yea_float4 u = upTurn(e);
+    return { e.nodes, e.skel->nodeCount, { u.x, u.y, u.z, u.w }, e.targets, e.targets ? e.skel->targetCount : 0,
+             e.motionNode };
+}
+// The map from s's skeleton onto t's: found, else (build: only from this module's update, as it allocates) made.
+const retarget::Map* mapFor(const Entry& t, const Entry& s, bool build)
+{
+    if (!gMaps || !t.anim || !s.anim)
+        return nullptr;
+    const float tUp = t.knobs[mdl::KnobUpAxis], sUp = s.knobs[mdl::KnobUpAxis];
+    for (uint32_t i = 0; i < kMaps; ++i)
+    {
+        MapSlot& m = gMaps[i];
+        if (m.live && m.tKey == t.key && m.sKey == s.key && m.tStamp == t.animStamp && m.sStamp == s.animStamp && m.tUp == tUp &&
+            m.sUp == sUp)
+        {
+            m.used = gTick;
+            return m.ok ? &m.map : nullptr;
+        }
+    }
+    if (!build)
+        return nullptr;
+    MapSlot* slot = &gMaps[0];
+    for (uint32_t i = 0; i < kMaps; ++i)
+        if (!gMaps[i].live || gMaps[i].used < slot->used)
+            slot = &gMaps[i];
+    if (slot->live)
+        retarget::release(slot->map);
+    *slot = MapSlot{};
+    slot->tKey = t.key, slot->sKey = s.key, slot->tStamp = t.animStamp, slot->sStamp = s.animStamp, slot->tUp = tUp, slot->sUp = sUp;
+    slot->live = 1, slot->used = gTick;
+    slot->ok = retarget::build(skelOf(t), skelOf(s), slot->map) ? 1 : 0;
+    char line[200];
+    if (!slot->ok)
+        snprintf(line, sizeof line, "renderer_models: %s (%s) can't play %s's clips: their skeletons have no bones in common", t.name,
+                 t.owner, s.name);
+    else
+        snprintf(line, sizeof line,
+                 "renderer_models: %s (%s) plays %s's clips: %u chains, %u more bones by name, %u limbs by IK, pelvis height x%.3f",
+                 t.name, t.owner, s.name, slot->map.chains, slot->map.byName, slot->map.ikCount, slot->map.ratio);
+    yea::log(line);
+    return slot->ok ? &slot->map : nullptr;
+}
+// Clip `clip` of model s at `time` as e's local poses (in place: its root motion left out) and its morph weights into w
+// (e's targets; nullptr skips them): s's own when s is e, else retargeted onto e's skeleton. False: the rest pose.
+bool sampleAs(const Entry& e, const Entry* s, uint32_t clip, float time, bool loop, bool still, anim::Pose* out, float* w)
+{
+    const uint32_t n = e.skel->nodeCount, nt = w && e.targets ? e.skel->targetCount : 0;
+    auto           rest = [&] {
+        anim::restPoses(e.nodes, n, out);
+        for (uint32_t t = 0; t < nt; ++t)
+            w[t] = e.targets[t].weight;
+        return false;
+    };
+    if (!s || clip >= s->skel->clipCount)
+        return rest();
+    const uint8_t* data = s->anim + (s->clips[clip].offset - s->animBase);
+    if (s == &e)
+    {
+        if (nt && !anim::sampleWeights(data, e.clips[clip], n, nt, time, loop, w))
+            for (uint32_t t = 0; t < nt; ++t)
+                w[t] = e.targets[t].weight;
+        if (!anim::sampleClip(data, e.clips[clip], n, time, loop, out))
+            return rest();
+        if (still)
+            inPlace(e, clip, out);
+        return true;
+    }
+    const retarget::Map* m = mapFor(e, *s, false);
+    const uint32_t       sn = s->skel->nodeCount, st = s->targets ? s->skel->targetCount : 0;
+    if (!m || !anim::sampleClip(data, s->clips[clip], sn, time, loop, gSrcPoses))
+        return rest();
+    if (still)
+        inPlace(*s, clip, gSrcPoses);
+    retarget::pose(*m, skelOf(e), skelOf(*s), gSrcPoses, out, gRt);
+    const bool weighed = nt && st && anim::sampleWeights(data, s->clips[clip], sn, st, time, loop, gSrcWeights);
+    for (uint32_t t = 0; t < nt; ++t)
+        w[t] = weighed && m->morph[t] != retarget::kNone ? gSrcWeights[m->morph[t]] : e.targets[t].weight;
+    return true;
+}
+// What clip `clip` of model s does from `from` over `step` (clipMotion), as e's.
+void motionOf(const Entry& e, const Entry* s, uint32_t clip, float from, float step, bool loop, float* out)
+{
+    out[0] = out[1] = out[2] = out[3] = 0;
+    if (!s)
+        return;
+    clipMotion(*s, clip, from, step, loop, out);
+    if (s == &e)
+        return;
+    if (const retarget::Map* m = mapFor(e, *s, false))
+        retarget::motion(*m, out);
+    else
+        out[0] = out[1] = out[2] = out[3] = 0;
+}
+
 // One placement's pose now into gPoses (its clip, faded from the one before), and its morph weights into gWeights
 // (the same, then what the game holds: `held` weights, `isHeld` where it does): false when it isn't skinned.
+// clipKey and fromKey: the models (keys; 0 its own) the clip and the one it fades from are of.
 bool evaluate(const Entry& e, const PlacementAnim& a, const float* held = nullptr, const uint8_t* isHeld = nullptr, uint32_t placement = 0,
-              bool still = false) // still: in place (root motion on)
+              bool still = false, uint32_t clipKey = 0, uint32_t fromKey = 0) // still: in place (root motion on)
 {
     const uint32_t n = e.skel->nodeCount, nt = e.targets ? e.skel->targetCount : 0;
-    auto           weigh = [&](uint32_t clip, float time, bool loop, float* out) {
-        if (clip >= e.skel->clipCount ||
-            !anim::sampleWeights(e.anim + (e.clips[clip].offset - e.animBase), e.clips[clip], n, nt, time, loop, out))
-            for (uint32_t t = 0; t < nt; ++t)
-                out[t] = e.targets[t].weight;
-    };
+    const bool     fading = a.from != kNoClip && a.fade > 0 && a.faded < a.fade;
+    sampleAs(e, sourceOf(e, clipKey), a.clip, a.time, a.loop, still, gPoses, nt ? gWeights : nullptr);
+    if (fading)
+        sampleAs(e, sourceOf(e, fromKey), a.from, a.fromTime, a.fromLoop, still, gFrom, nt ? gFromWeights : nullptr);
     if (nt)
     {
-        weigh(a.clip, a.time, a.loop, gWeights);
-        if (a.from != kNoClip && a.fade > 0 && a.faded < a.fade)
+        if (fading)
         {
-            weigh(a.from, a.fromTime, a.fromLoop, gFromWeights);
             float f = a.faded / a.fade;
             f = f * f * (3 - 2 * f);
             for (uint32_t t = 0; t < nt; ++t)
@@ -577,19 +744,8 @@ bool evaluate(const Entry& e, const PlacementAnim& a, const float* held = nullpt
             if (MorphOverrides[i].placement == placement && MorphOverrides[i].target < nt)
                 gWeights[MorphOverrides[i].target] = MorphOverrides[i].weight;
     }
-    auto           sample = [&](uint32_t clip, float time, bool loop, anim::Pose* out) {
-        if (clip >= e.skel->clipCount ||
-            !anim::sampleClip(e.anim + (e.clips[clip].offset - e.animBase), e.clips[clip], n, time, loop, out))
-            anim::restPoses(e.nodes, n, out);
-    };
-    sample(a.clip, a.time, a.loop, gPoses);
-    if (still)
-        inPlace(e, a.clip, gPoses);
-    if (a.from != kNoClip && a.fade > 0 && a.faded < a.fade)
+    if (fading)
     {
-        sample(a.from, a.fromTime, a.fromLoop, gFrom);
-        if (still)
-            inPlace(e, a.from, gFrom);
         float f = a.faded / a.fade;
         f = f * f * (3 - 2 * f); // eased
         anim::blendPoses(gFrom, gPoses, n, f);
@@ -611,7 +767,9 @@ int        apiJoint(uint32_t h, const char* name, float* out)
     if (node == kNoClip)
         return 0;
     const uint32_t row = placementRow(h);
-    evaluate(*e, *a, nullptr, nullptr, h, row < PlacementMotions.size() && PlacementMotions[row].on);
+    const bool     re = row < PlacementRetargets.size();
+    evaluate(*e, *a, nullptr, nullptr, h, row < PlacementMotions.size() && PlacementMotions[row].on, re ? PlacementRetargets[row].clip : 0,
+             re ? PlacementRetargets[row].from : 0);
     yea_float3 pos;
     yea_float4 r;
     float      s;
@@ -672,19 +830,20 @@ int apiRootMotion(uint32_t h, int on)
 {
     // Taken while its model still loads (as a clip asked for by name is); gathering starts with its first frame.
     const uint32_t row = placementRow(h);
+    grow(row);
     const Entry*   e = row != 0xFFFFFFFFu ? byKey(Placements[row].key) : nullptr;
-    if (!e || row >= PlacementMotions.size() || (e->state == 1 && (!e->anim || e->motionNode == kNoClip)) || e->state > 1)
+    if (!e || row >= PlacementMotions.size() || (e->state == 1 && !e->anim) || e->state > 1)
         return 0;
     PlacementMotion& m = PlacementMotions[row];
     const bool       was = m.on != 0;
     m.on = on ? 1 : 0, m.acc = { 0, 0, 0 }, m.yaw = 0;
     // Switched on partway through a clip: what it did since its first frame is pending, so the model stays where it
     // stands (in place, the node goes back to that frame's spot) and the game's first take moves it there.
-    if (on && !was && e->state == 1 && row < PlacementAnims.size() && PlacementAnims[row].clip < e->skel->clipCount)
+    if (on && !was && e->state == 1 && row < PlacementAnims.size() && row < PlacementRetargets.size())
     {
         const PlacementAnim& a = PlacementAnims[row];
         float                d[4];
-        clipMotion(*e, a.clip, 0, a.time, false, d);
+        motionOf(*e, sourceOf(*e, PlacementRetargets[row].clip), a.clip, 0, a.time, false, d);
         m.acc = { d[0], d[1], d[2] }, m.yaw = d[3];
     }
     Placements[row].dirty = 1;
@@ -720,7 +879,7 @@ const char* apiClip(uint32_t model, uint32_t index, float* duration)
 }
 mdl::Api gApi = { mdl::kApi, sizeof(mdl::Api), 0,       apiBegin, apiDefine, apiEnd,   apiKnobs, apiPlace, apiMove,
                   apiRemove, apiPlaced,        apiCount, apiInfo,  apiPlay,   apiTime,  apiJoint, apiClips, apiClip,
-                  apiMorph,  apiUnmorph,       apiMorphs, apiMorphTarget, apiRootMotion, apiTakeMotion };
+                  apiMorph,  apiUnmorph,       apiMorphs, apiMorphTarget, apiRootMotion, apiTakeMotion, apiPlayFrom };
 
 // --- Building models in the renderer's scene (this module's own update) ------------------------------------------
 
@@ -907,6 +1066,7 @@ void loadCooked(Entry& e)
                 e.clips = (const RmodelClip*)(e.anim + (e.skel->clips - h.skeleton));
                 e.targets = morphs ? (const RmodelMorphTarget*)(e.anim + (e.skel->targets - h.skeleton) + sizeof(RmodelMorphs)) : nullptr;
                 findMotion(e);
+                e.animStamp = ++gStamp;
             }
         }
     }
@@ -1044,6 +1204,7 @@ void loadAnim(Entry& e)
                                  sk->targets + sizeof(RmodelMorphs) + (uint64_t)sk->targetCount * sizeof(RmodelMorphTarget) <= h.textures;
             e.targets = morphed ? (const RmodelMorphTarget*)(e.anim + (sk->targets - h.skeleton) + sizeof(RmodelMorphs)) : nullptr;
             findMotion(e);
+            e.animStamp = ++gStamp;
         }
     }
     fclose(f);
@@ -1191,6 +1352,7 @@ void syncPlacements()
 // Every skinned placement's clip moved on by dt, then its palette handed to the renderer for each of its instances.
 void animate(float dt)
 {
+    ++gTick;
     const uint32_t rows = Placements.size() < PlacementAnims.size() ? Placements.size() : PlacementAnims.size();
     for (uint32_t row = 0; row < rows; ++row)
     {
@@ -1198,21 +1360,28 @@ void animate(float dt)
         if (!e || !e->anim || e->state != 1)
             continue;
         PlacementAnim& a = PlacementAnims[row];
-        if (a.want) // asked for by name while it loaded
+        const uint32_t ck = row < PlacementRetargets.size() ? PlacementRetargets[row].clip : 0;
+        const uint32_t fk = row < PlacementRetargets.size() ? PlacementRetargets[row].from : 0;
+        const Entry *  ce = sourceOf(*e, ck), *fe = sourceOf(*e, fk);
+        if (a.want && ce) // asked for by name while it (or the model whose clips it plays) loaded
         {
-            const uint32_t c = clipHashed(*e, a.want);
-            a.clip = c != kNoClip ? c : 0, a.want = 0;
+            const uint32_t c = clipHashed(*ce, a.want);
+            a.clip = c != kNoClip ? c : (ce == e ? 0 : kNoClip), a.want = 0;
         }
+        if (ce && ce != e) // another model's clips: the map between their skeletons (made here, once)
+            mapFor(*e, *ce, true);
+        if (fe && fe != e && a.from != kNoClip)
+            mapFor(*e, *fe, true);
         // Root motion: what its clips do this frame, gathered (faded between two clips as their poses are).
-        if (row < PlacementMotions.size() && PlacementMotions[row].on && e->motionNode != kNoClip)
+        if (row < PlacementMotions.size() && PlacementMotions[row].on)
         {
             float to[4], from[4] = { 0, 0, 0, 0 }, m[4];
-            clipMotion(*e, a.clip, a.time, dt * a.speed, a.loop, to);
+            motionOf(*e, ce, a.clip, a.time, dt * a.speed, a.loop, to);
             const bool fading = a.from != kNoClip && a.fade > 0 && a.faded < a.fade;
             float      f = fading ? a.faded / a.fade : 1.0f;
             f = f * f * (3 - 2 * f);
             if (fading)
-                clipMotion(*e, a.from, a.fromTime, dt * a.fromSpeed, a.fromLoop, from);
+                motionOf(*e, fe, a.from, a.fromTime, dt * a.fromSpeed, a.fromLoop, from);
             for (int k = 0; k < 4; ++k)
                 m[k] = from[k] + (to[k] - from[k]) * f;
             PlacementMotion& pm = PlacementMotions[row];
@@ -1223,7 +1392,7 @@ void animate(float dt)
             pm.yaw += m[3];
             Placements[row].dirty = 1; // drawn moved on by it (syncPlacements, next)
         }
-        advanceClip(*e, a, dt);
+        advanceClip(ce, fe, a, dt);
     }
     // The Model Viewer's own clip (its model's, whether placed or not), while it plays.
     if (const Entry* e = byId(gPreview.model); e && e->anim && e->state == 1)
@@ -1235,15 +1404,25 @@ void animate(float dt)
             a.from = kNoClip, a.clip = e->skel->clipCount ? 0 : kNoClip, a.speed = 1, a.loop = 1;
             memset(gPreview.morphHeld, 0, sizeof gPreview.morphHeld);
             gPreview.animModel = e->id;
+            gPreview.clipsFrom = gPreview.srcClip = gPreview.srcFrom = 0;
         }
+        const Entry* from = gPreview.clipsFrom ? byId(gPreview.clipsFrom) : e; // whose clips the panel lists
+        if (!from || !from->anim || from->state != 1)
+            from = e, gPreview.clipsFrom = 0;
         if (gPreview.pickClip) // picked in the panel: 1 the rest pose, clip c at c + 2
         {
             const uint32_t c = gPreview.pickClip - 2;
-            startClip(a, gPreview.pickClip >= 2 && c < e->skel->clipCount ? c : kNoClip, a.speed, 1, gPreview.fade);
+            startClip(a, gPreview.srcClip, gPreview.srcFrom, gPreview.pickClip >= 2 && c < from->skel->clipCount ? c : kNoClip,
+                      from == e ? 0 : from->key, a.speed, 1, gPreview.fade);
             gPreview.pickClip = 0;
         }
+        const Entry *ce = sourceOf(*e, gPreview.srcClip), *fe = sourceOf(*e, gPreview.srcFrom);
+        if (ce && ce != e)
+            mapFor(*e, *ce, true);
+        if (fe && fe != e && a.from != kNoClip)
+            mapFor(*e, *fe, true);
         a.speed = gPreview.speed;
-        advanceClip(*e, a, gPreview.playing ? dt : 0.0f);
+        advanceClip(ce, fe, a, gPreview.playing ? dt : 0.0f);
     }
     // Held weights of placements that are gone go with them.
     for (uint32_t i = MorphOverrides.size(); i-- > 0;)
@@ -1257,9 +1436,11 @@ void animate(float dt)
         {
             last = row, bones = 0, targets = 0;
             const Entry* e = row < rows && Placements[row].alive ? byKey(Placements[row].key) : nullptr;
+            const bool re = row < PlacementRetargets.size();
             if (e && e->anim && e->state == 1 &&
                 evaluate(*e, PlacementAnims[row], nullptr, nullptr, row | (Placements[row].gen & 0xFFFu) << 20,
-                         row < PlacementMotions.size() && PlacementMotions[row].on))
+                         row < PlacementMotions.size() && PlacementMotions[row].on, re ? PlacementRetargets[row].clip : 0,
+                         re ? PlacementRetargets[row].from : 0))
                 bones = e->skel->boneCount, targets = e->targets ? e->skel->targetCount : 0;
         }
         if (bones)
@@ -1363,6 +1544,10 @@ int load(int reloaded)
     gPalette = new float[kMaxBones * 12];
     gWeights = new float[kRmodelMaxTargets];
     gFromWeights = new float[kRmodelMaxTargets];
+    gSrcPoses = new anim::Pose[kMaxNodes];
+    gSrcWeights = new float[kRmodelMaxTargets];
+    gRt = { new float[kMaxNodes * 12], new float[kMaxNodes * 4], new float[kMaxNodes * 12], new float[kMaxNodes * 4] };
+    gMaps = new MapSlot[kMaps]();
     gPreview = Preview{};
     gPreview.yaw = 35.0f;
     gPreview.pitch = 20.0f;
@@ -1388,6 +1573,14 @@ void unload()
     delete[] gWeights;
     delete[] gFromWeights;
     gWeights = gFromWeights = nullptr;
+    for (uint32_t i = 0; gMaps && i < kMaps; ++i)
+        if (gMaps[i].live)
+            retarget::release(gMaps[i].map);
+    delete[] gMaps;
+    delete[] gSrcPoses;
+    delete[] gSrcWeights;
+    delete[] gRt.sw, delete[] gRt.sq, delete[] gRt.tw, delete[] gRt.tq;
+    gMaps = nullptr, gSrcPoses = nullptr, gSrcWeights = nullptr, gRt = {};
     gPoses = gFrom = nullptr;
     gWorld = gPalette = nullptr;
     gEntries = nullptr;
@@ -1522,7 +1715,8 @@ void draw(uint32_t pass, const YeaFrame* frame)
     p.lodQuality = e->knobs[mdl::KnobLodQuality];
     p.lod = gPreview.lod;
     if (e->anim && gPreview.animModel == e->id &&
-        evaluate(*e, gPreview.anim, gPreview.morph, gPreview.morphHeld, 0, gPreview.inPlace != 0)) // posed as its clip is now
+        evaluate(*e, gPreview.anim, gPreview.morph, gPreview.morphHeld, 0, gPreview.inPlace != 0, gPreview.srcClip,
+                 gPreview.srcFrom)) // posed as its clip is now
     {
         p.palette = (uint64_t)(uintptr_t)gPalette, p.bones = e->skel->boneCount;
         if (e->targets)
