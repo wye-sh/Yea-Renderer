@@ -688,6 +688,7 @@ bool dlssRun(const RenderFrame* F, RenderTarget* out, bool reset, uint32_t q)
     in.depth = F->depth->pTexture;
     in.motion = F->motion->pTexture;
     in.exposure = gExposureTex;
+    in.biasColour = F->reactive; // particles' coverage: trust this frame there (dlss.h version 2; nullptr: none)
     in.output = out->pTexture;
     in.renderWidth = F->width;
     in.renderHeight = F->height;

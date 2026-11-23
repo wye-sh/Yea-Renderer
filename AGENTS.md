@@ -265,7 +265,8 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   allocated in this module's own `update()`, never in `upscale_prepare`. Jitter: Halton 2,3 over 8 x ratio² phases;
   the render size is the vendors' ratio per quality mode (DLSS's own `renderSize` for DLSS); the core's exposure is copied into a 1x1 texture (one tiny
   dispatch); the upscalers' own sharpening is off. Particles' coverage (frame.h `reactive`, when set) is FSR's reactive
-  mask; DLSS doesn't take it yet (Yea's dlss.h has no bias-current-colour input). After one records, The Forge's bound state is forgotten so its next binds
+  mask and DLSS's `biasColour` (dlss.h version 2, Yea 146; an older host ignores it). DLSS's `transparency` waits for
+  blended surfaces. After one records, The Forge's bound state is forgotten so its next binds
   are made in full. Lines said from `upscale_prepare` wait for this module's `update()`, so they are filed under
   renderer_upscale: which upscaler is picked and runs, its sizes, and why FSR can't run.
   Nothing of Microsoft's ships.

@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <chrono>
 
 #include <Common_3/Graphics/Interfaces/IGraphics.h>
 #include <Common_3/Resources/ResourceLoader/Interfaces/IResourceLoader.h>
@@ -168,6 +169,17 @@ bool            gTargetMotion;
 uint32_t        gPipeSamples;                    // the pipelines as made
 bool            gPipeMotion;
 bool            gPipeMasked;                     // the alpha-tested pipelines ([2] and [3]) are made too
+// Scene pipelines are warmed: after the first frame made what it draws with, every other variant the view can need
+// (cut-outs, the full forward shader, F1's view modes) is made a few a frame, within kWarmMs, so none compiles on the
+// frame it first draws. Through gPipeCache, kept in Yea's data folder, a later start makes them from the driver's
+// last results.
+const double    kWarmMs = 2.0;
+bool            gWarmLeft;                       // variants still to warm
+uint32_t        gPipesMade, gWarmFrames;           // scene pipelines made since load; frames that warmed
+double          gWarmMs, gWarmWorstMs;           // their time in all, and the most in one frame
+PipelineCache*  gPipeCache;
+bool            gPipeCacheDirty;
+char            gPipeCachePath[1024];
 TinyImageFormat gFrameFormat = TinyImageFormat_UNDEFINED;
 uint32_t        gFrameSamples;
 ResourceState   gDepthState, gExposureState;
@@ -387,8 +399,112 @@ void destroyScenePipelines()
 // ones ([2] and [3]) once a material is, and of the forward pass only the variants in `forward` (kForward*), when a frame
 // first draws with them. The forward shaders are large, so a scene compiles only what it draws with.
 const uint32_t kForwardLean = 1, kForwardFull = 2, kForwardDepth = 4;
-void createScenePipelines(uint32_t samples, bool motion, bool masked, uint32_t forward)
+double clockMs()
 {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// The pipeline cache: Yea's data folder holds the driver's results from the last run (per graphics API), so a start
+// makes the pipelines from them. Direct3D 12 refuses a library from another driver or GPU: tried here first, it then
+// starts empty (The Forge would assert). Over 64 MB (pipelines of many shader versions gathered), it starts again.
+#if defined(_WIN32)
+const char* const kPipeCacheFile = "renderer_pipelines_d3d12.bin";
+#else
+const char* const kPipeCacheFile = "renderer_pipelines_vulkan.bin";
+#endif
+const long kPipeCacheMax = 64l << 20;
+
+void pipeCacheOpen()
+{
+    const char* dir = yea::host()->path("data");
+    gPipeCachePath[0] = 0;
+    if (dir && *dir)
+        snprintf(gPipeCachePath, sizeof gPipeCachePath, "%s/%s", dir, kPipeCacheFile);
+    void* data = nullptr;
+    long  size = 0;
+    if (FILE* f = gPipeCachePath[0] ? fopen(gPipeCachePath, "rb") : nullptr)
+    {
+        fseek(f, 0, SEEK_END);
+        size = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (size > 0 && size <= kPipeCacheMax && (data = malloc((size_t)size)) && fread(data, 1, (size_t)size, f) != (size_t)size)
+            size = 0;
+        fclose(f);
+        if (size > kPipeCacheMax)
+            size = 0;
+    }
+#if defined(_WIN32)
+    if (size > 0)
+    {
+        ID3D12Device1*         device = nullptr;
+        ID3D12PipelineLibrary* library = nullptr;
+        if (FAILED(gRenderer->mDx.pDevice->QueryInterface(__uuidof(ID3D12Device1), (void**)&device)) ||
+            FAILED(device->CreatePipelineLibrary(data, (SIZE_T)size, __uuidof(ID3D12PipelineLibrary), (void**)&library)))
+            size = 0;
+        if (library)
+            library->Release();
+        if (device)
+            device->Release();
+    }
+#endif
+    PipelineCacheDesc desc = {};
+    desc.pData = size > 0 ? data : nullptr;
+    desc.mSize = size > 0 ? (size_t)size : 0;
+    addPipelineCache(gRenderer, &desc, &gPipeCache); // keeps its own copy
+    free(data);
+    gPipeCacheDirty = false;
+}
+
+// Written beside it and renamed over it, so a run stopped halfway leaves the last one whole.
+void pipeCacheSave()
+{
+    if (!gPipeCache || !gPipeCacheDirty || !gPipeCachePath[0])
+        return;
+    gPipeCacheDirty = false;
+    size_t size = 0;
+    getPipelineCacheData(gRenderer, gPipeCache, &size, nullptr);
+    if (!size || size > (size_t)kPipeCacheMax)
+        return;
+    void* data = malloc(size);
+    if (!data)
+        return;
+    getPipelineCacheData(gRenderer, gPipeCache, &size, data);
+    char tmp[1040];
+    snprintf(tmp, sizeof tmp, "%s.new", gPipeCachePath);
+    FILE* f = fopen(tmp, "wb");
+    bool  ok = f && fwrite(data, 1, size, f) == size;
+    if (f)
+        ok = fclose(f) == 0 && ok;
+    free(data);
+    if (ok)
+    {
+        remove(gPipeCachePath); // Windows' rename won't replace a file
+        ok = rename(tmp, gPipeCachePath) == 0;
+    }
+    if (!ok)
+        remove(tmp);
+}
+
+// With `until` (clockMs), it stops making pipelines once past it, after one at least, and returns true while some
+// asked for are still missing; without (0), it makes every one asked for.
+bool createScenePipelines(uint32_t samples, bool motion, bool masked, uint32_t forward, double until = 0)
+{
+    uint32_t made = 0;
+    bool     left = false;
+    auto     make = [&](PipelineDesc& d, Pipeline*& p) {
+        if (p)
+            return;
+        if (until > 0 && made > 0 && clockMs() >= until)
+        {
+            left = true;
+            return;
+        }
+        d.pCache = gPipeCache;
+        addPipeline(gRenderer, &d, &p);
+        gPipeCacheDirty = true;
+        ++made;
+        ++gPipesMade;
+    };
     masked = masked || gPipeMasked;
     const uint32_t sEnd = masked ? 4 : 2;
     auto missing = [&](Pipeline* const* p) {
@@ -400,7 +516,7 @@ void createScenePipelines(uint32_t samples, bool motion, bool masked, uint32_t f
     if (!missing(gDepthPipe) && !(motion && gGlossShader && missing(gDepthGlossPipe)) && !(motion && gSurfaceShader && missing(gDepthSurfacePipe)) &&
         !((forward & kForwardLean) && missing(gForwardPipe)) && !((forward & kForwardFull) && missing(gForwardFullPipe)) &&
         !((forward & kForwardDepth) && missing(gForwardDepthPipe)) && gSkyPipe && gHistogramPipe)
-        return; // every frame after the first: nothing to make
+        return false; // every frame after the first: nothing to make
     VertexLayout        layout = sceneLayout();
     // Triangles wind counter-clockwise around their outward normal (cross(b - a, c - a) points out);
     // seen through the left-handed camera that is clockwise on screen. The Forge flips Vulkan's
@@ -435,7 +551,7 @@ void createScenePipelines(uint32_t samples, bool motion, bool masked, uint32_t f
         raster.mCullMode = s & 1 ? CULL_MODE_NONE : CULL_MODE_BACK;
         g.pShaderProgram = s < 2 ? (motion ? gMotionDepthShader : gForwardDepthShader) : (motion ? gMotionDepthMaskedShader : gDepthMaskedShader);
         if (!gDepthPipe[s])
-            addPipeline(gRenderer, &desc, &gDepthPipe[s]);
+            make(desc, gDepthPipe[s]);
     }
     if (motion && gGlossShader)
     {
@@ -448,7 +564,7 @@ void createScenePipelines(uint32_t samples, bool motion, bool masked, uint32_t f
             raster.mCullMode = s & 1 ? CULL_MODE_NONE : CULL_MODE_BACK;
             g.pShaderProgram = s < 2 ? gGlossShader : gGlossMaskedShader;
             if (!gDepthGlossPipe[s])
-                addPipeline(gRenderer, &desc, &gDepthGlossPipe[s]);
+                make(desc, gDepthGlossPipe[s]);
         }
         g.mRenderTargetCount = 0;
         g.pColorFormats = nullptr;
@@ -464,7 +580,7 @@ void createScenePipelines(uint32_t samples, bool motion, bool masked, uint32_t f
             raster.mCullMode = s & 1 ? CULL_MODE_NONE : CULL_MODE_BACK;
             g.pShaderProgram = s < 2 ? gSurfaceShader : gSurfaceMaskedShader;
             if (!gDepthSurfacePipe[s])
-                addPipeline(gRenderer, &desc, &gDepthSurfacePipe[s]);
+                make(desc, gDepthSurfacePipe[s]);
         }
         g.mRenderTargetCount = 0;
         g.pColorFormats = nullptr;
@@ -486,28 +602,29 @@ void createScenePipelines(uint32_t samples, bool motion, bool masked, uint32_t f
         g.pShaderProgram = motion ? gMotionShader : gForwardShader;
         desc.pName = "renderer_forward";
         if ((forward & kForwardLean) && !gForwardPipe[s])
-            addPipeline(gRenderer, &desc, &gForwardPipe[s]);
+            make(desc, gForwardPipe[s]);
         g.pShaderProgram = motion ? gMotionFullShader : gForwardFullShader;
         desc.pName = "renderer_forward_full";
         if ((forward & kForwardFull) && !gForwardFullPipe[s])
-            addPipeline(gRenderer, &desc, &gForwardFullPipe[s]);
+            make(desc, gForwardFullPipe[s]);
         // F1's view modes skip the prepass (Wireframe would draw it as edges): the forward pass writes depth itself
         // (alpha-tested materials whole, uncut).
         g.pDepthState = &depthWrite;
         desc.pName = "renderer_forward_depth";
         if ((forward & kForwardDepth) && !gForwardDepthPipe[s])
-            addPipeline(gRenderer, &desc, &gForwardDepthPipe[s]);
+            make(desc, gForwardDepthPipe[s]);
     }
     g.pDepthState = &depthTest;
     raster.mCullMode = CULL_MODE_NONE;
 
-    gPipeMasked = masked;
+    if (!left)
+        gPipeMasked = masked;
     // The sky: a full-screen triangle at depth 0 (reversed-Z far), only where nothing was drawn.
     g.pVertexLayout = nullptr;
     g.pShaderProgram = motion ? gSkyMotionShader : gSkyShader;
     desc.pName = "renderer_sky";
     if (!gSkyPipe)
-        addPipeline(gRenderer, &desc, &gSkyPipe);
+        make(desc, gSkyPipe);
 
     PipelineDesc cdesc = {};
     cdesc.mType = PIPELINE_TYPE_COMPUTE;
@@ -515,9 +632,46 @@ void createScenePipelines(uint32_t samples, bool motion, bool masked, uint32_t f
     cdesc.mComputeDesc.pShaderProgram = gHistogramShader[sampleIndex(samples)];
     cdesc.pName = "renderer_histogram";
     if (!gHistogramPipe)
-        addPipeline(gRenderer, &cdesc, &gHistogramPipe);
+        make(cdesc, gHistogramPipe);
     gPipeSamples = samples;
     gPipeMotion = motion;
+    return left;
+}
+
+// One frame's warming: the variants not made yet, within kWarmMs. Logs once when all are made.
+void warmScenePipelines(uint32_t samples, bool motion)
+{
+    const double t0 = clockMs();
+    uint32_t     forward = kForwardLean | kForwardFull;
+#if !defined(YEA_GAME_RELEASE)
+    forward |= kForwardDepth; // F1's view modes
+#endif
+    const bool masked = gPipeMasked;
+    gWarmLeft = createScenePipelines(samples, motion, true, forward, t0 + kWarmMs);
+    gPipeMasked = masked || !gWarmLeft;
+    const double ms = clockMs() - t0;
+    gWarmMs += ms;
+    gWarmWorstMs = ms > gWarmWorstMs ? ms : gWarmWorstMs;
+    ++gWarmFrames;
+    if (gWarmLeft)
+        return;
+    char line[200];
+    snprintf(line, sizeof line, "renderer: scene pipelines warmed in %.0f ms over %u frames (at most %.1f ms a frame)%s", gWarmMs,
+             gWarmFrames, gWarmWorstMs, gPipeCache ? "" : "; no pipeline cache");
+    yea::log(line);
+    pipeCacheSave();
+}
+
+// A variant warming hadn't reached yet, made by the frame that draws with it (a hitch): logged, so the user's reports
+// show it. The frame that makes the pipelines after a settings change isn't counted.
+void pipesMadeOnDraw(uint32_t before, double t0)
+{
+    if (gPipesMade == before || gWarmFrames == 0)
+        return;
+    char line[160];
+    snprintf(line, sizeof line, "renderer: %u scene pipeline%s made on the frame that drew with them: %.1f ms", gPipesMade - before,
+             gPipesMade - before == 1 ? "" : "s", clockMs() - t0);
+    yea::log(line);
 }
 
 void createCompositePipeline(TinyImageFormat format, uint32_t frameSamples, uint32_t samples)
@@ -1028,6 +1182,7 @@ int load(int reloaded)
     gRenderer = (Renderer*)host->renderer;
     gQueue = (Queue*)host->queue;
     gFrames = host->framesInFlight < kMaxFrames ? host->framesInFlight : kMaxFrames;
+    pipeCacheOpen();
     getTimestampFrequency(gQueue, &gTimeTicks);
     for (uint32_t i = 0; i < gFrames && gTimeTicks > 0; ++i)
     {
@@ -1272,7 +1427,11 @@ void unload()
     for (uint32_t i = 0; i < gFrames; ++i)
         if (gTimePool[i])
             exitQueryPool(gRenderer, gTimePool[i]), gTimePool[i] = nullptr;
+    pipeCacheSave();
     destroyScenePipelines();
+    if (gPipeCache)
+        removePipelineCache(gRenderer, gPipeCache);
+    gPipeCache = nullptr;
     freePipeline(gCompositePipe);
     freePipeline(gAdaptPipe);
     freePipeline(gTonemapPipe);
@@ -1441,15 +1600,25 @@ void draw(uint32_t pass, const YeaFrame* yf)
     bool masked = gPipeMasked;
     for (uint32_t i = 0; i < MaterialMaps.size() && i < Materials.size() && !masked; ++i)
         masked = Materials[i].alive && MaterialMaps[i].cutoff > 0;
+    if (samples == gPipeSamples && taa == gPipeMotion && gWarmLeft)
+        warmScenePipelines(samples, taa);
+    const uint32_t pipesBefore = gPipesMade;
+    const double   pipesT0 = clockMs();
     if (samples != gPipeSamples || taa != gPipeMotion)
     {
         waitQueueIdle(gQueue);
         destroyScenePipelines();
         createScenePipelines(samples, taa, masked, 0);
         gFrameFormat = TinyImageFormat_UNDEFINED;
+        gWarmLeft = true; // from the next frame
+        gWarmFrames = 0;
+        gWarmMs = gWarmWorstMs = 0;
     }
     else if (masked && !gPipeMasked)
+    {
         createScenePipelines(samples, taa, true, 0);
+        pipesMadeOnDraw(pipesBefore, pipesT0);
+    }
     if (target->mFormat != gFrameFormat || (uint32_t)target->mSampleCount != gFrameSamples)
     {
         waitQueueIdle(gQueue);
@@ -2426,7 +2595,10 @@ void draw(uint32_t pass, const YeaFrame* yf)
     if (geometry)
     {
         bool full = (gf->counts[2] & (kFlagHeatmap | kFlagCascades | kFlagAoDebug | kFlagContactDebug | kFlagSsrDebug | kFlagRtDebug)) || (shadows && F.lightSize > 0);
+        const uint32_t before = gPipesMade;
+        const double   t0 = clockMs();
         createScenePipelines(samples, taa, gPipeMasked, viewMode ? kForwardDepth : full ? kForwardFull : kForwardLean); // first use only
+        pipesMadeOnDraw(before, t0);
         drawVisible(cmd, fi, viewMode ? gForwardDepthPipe : full ? gForwardFullPipe : gForwardPipe);
     }
     if (!viewMode)
