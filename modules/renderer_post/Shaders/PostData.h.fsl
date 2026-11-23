@@ -1,0 +1,13 @@
+// The post passes' constants (renderer_post.cpp's PostData).
+STRUCT(PostData)
+{
+    DATA(uint4, size, None);    // xy this pass's output size, zw its source's size
+    DATA(float4, bloom, None);  // x intensity (0: none), y the upsample tent's radius in source texels, z 1 / levels
+    DATA(float4, look, None);   // x vignette (0: none), y 1: grade through gLut, zw 1 / projection scale x, y (tan of half the FOV)
+    DATA(float4, wb0, None);    // white balance, a linear Rec.709 3 x 3 (rows; the LUT bake)
+    DATA(float4, wb1, None);
+    DATA(float4, wb2, None);
+    DATA(float4, lift, None);   // rgb lift, w contrast
+    DATA(float4, gamma, None);  // rgb gamma, w saturation
+    DATA(float4, gain, None);   // rgb gain
+};

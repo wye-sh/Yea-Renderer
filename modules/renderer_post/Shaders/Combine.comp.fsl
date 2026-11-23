@@ -1,0 +1,48 @@
+// The full-size pass: the scene (gSrc), bloom mixed in (gSrc2, the chain's sum, energy-conserving: a share of the
+// scene's light spread, none added), the lens's natural falloff (cos^4 of the angle off axis, scaled), then the
+// grading LUT on exposed values. Out: scene-linear HDR for the core's tonemapper.
+#include "Common.h.fsl"
+
+float3 lutTap(float2 rg, float slice)
+{
+    return SampleLvlTex2D(gLut, gSamplerBilinearClamp, float2((slice * 32.0 + rg.x * 31.0 + 0.5) / 1024.0, (rg.y * 31.0 + 0.5) / 32.0), 0.0).rgb;
+}
+
+float3 lut(float3 c)
+{
+    // Past the LUT's top (222 x middle grey) the brightest entry scaled, so the hue holds.
+    float  top = max(c.r, max(c.g, c.b));
+    float  over = top > 222.0 ? top / 222.0 : 1.0;
+    float3 x = c / over;
+    float3 v = saturate(float3(toCct(x.r), toCct(x.g), toCct(x.b)));
+    float  z = v.b * 31.0;
+    float  z0 = min(floor(z), 30.0);
+    return lerp(lutTap(v.rg, z0), lutTap(v.rg, z0 + 1.0), z - z0) * over;
+}
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) id)
+{
+    INIT_MAIN;
+    int2 p = int2(id.xy);
+    if (p.x >= int(gPost.size.x) || p.y >= int(gPost.size.y))
+        RETURN();
+    float2 uv = (float2(p) + 0.5) / float2(gPost.size.xy);
+    float3 c = LoadTex2D(gSrc, NO_SAMPLER, p, 0).rgb;
+    if (gPost.bloom.x > 0.0)
+        c = lerp(c, SampleLvlTex2D(gSrc2, gSamplerBilinearClamp, uv, 0.0).rgb * gPost.bloom.z, gPost.bloom.x);
+    if (gPost.look.x > 0.0)
+    {
+        float2 t = (uv * 2.0 - 1.0) * gPost.look.zw; // tan of the angle off axis, each way
+        float  k = 1.0 / (1.0 + dot(t, t));
+        c *= lerp(1.0, k * k, gPost.look.x);
+    }
+    if (gPost.look.y > 0.0)
+    {
+        float e = max(gExposure[1], 1e-20);
+        c = lut(max(c, float3(0.0, 0.0, 0.0)) * e) / e;
+    }
+    Write2D(gOut, p, float4(c, 1.0));
+    RETURN();
+}

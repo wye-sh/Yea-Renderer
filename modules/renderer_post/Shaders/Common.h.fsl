@@ -1,0 +1,10 @@
+// Shared by the post passes.
+#include "PostData.h.fsl"
+#include "Post.srt.h"
+
+float postLuma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
+
+// ACEScct (S-2016-001), the log encoding the grading LUT is indexed by: a log2 curve above 0.0078125 with a linear
+// toe below, so near-black keeps its precision; 1.0 is 222 times middle grey.
+float toCct(float x) { return x <= 0.0078125 ? 10.5402377416545 * x + 0.0729055341958355 : (log2(x) + 9.72) / 17.52; }
+float fromCct(float v) { return v <= 0.155251141552511 ? (v - 0.0729055341958355) / 10.5402377416545 : exp2(v * 17.52 - 9.72); }

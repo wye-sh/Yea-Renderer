@@ -694,8 +694,8 @@ void barrierBuf(Cmd* cmd, Buffer* buf, ResourceState from, ResourceState to)
 // (that frame's fence has passed by then, so nothing waits), averaged and logged every 10 s.
 namespace
 {
-enum Timing : uint32_t { kTimeShadows, kTimeProbes, kTimePrepass, kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeVrs, kTimeRt, kTimeForward, kTimeExposure, kTimeTaa, kTimeUpscale, kTimeTonemap, kTimeComposite, kTimeTotal, kTimings };
-const char* const kTimingNames[kTimings] = { "shadows", "probes", "prepass", "culling", "ao", "contact", "ssr", "vrs", "rt", "forward+sky", "exposure", "taa", "upscale", "tonemap", "composite", "total" };
+enum Timing : uint32_t { kTimeShadows, kTimeProbes, kTimePrepass, kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeVrs, kTimeRt, kTimeForward, kTimeExposure, kTimeTaa, kTimeUpscale, kTimePost, kTimeTonemap, kTimeComposite, kTimeTotal, kTimings };
+const char* const kTimingNames[kTimings] = { "shadows", "probes", "prepass", "culling", "ao", "contact", "ssr", "vrs", "rt", "forward+sky", "exposure", "taa", "upscale", "post", "tonemap", "composite", "total" };
 QueryPool*        gTimePool[kMaxFrames];
 uint32_t          gTimeUsed[kMaxFrames]; // bits: what that frame recorded
 double            gTimeTicks;            // per second
@@ -1864,6 +1864,11 @@ void draw(uint32_t pass, const YeaFrame* yf)
     composite.params[1] = shadows && (F.showCascades & 2) ? floorf(mx::minf(dh * 0.5f, dw * 0.4f)) : 0.0f;
     composite.params[2] = shadows && F.localTexel > 0 ? 1.0f / F.localTexel : 0.0f;
     memcpy(gCompositeCb[fi]->pCpuMappedAddress, &composite, sizeof composite);
+    // Post-processing (renderer_post) on the resolved HDR image, before the tonemapper: the image it returns is what
+    // the tonemap pass and the composite read. Not under the debug views, which show their values as they are.
+    Texture* post = !rawDebug && !(culled && F.heatmap) && (taa || samples == 1)
+                        ? (Texture*)(uintptr_t)renderer_post::post_prepare((uint64_t)(uintptr_t)&F)
+                        : nullptr;
     ExposureData* ed = (ExposureData*)gExposureCb[fi]->pCpuMappedAddress;
     float         minLog = -8.0f, range = 26.0f;
     float         dt = (float)(yea::host()->time());
@@ -1944,7 +1949,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         c[0].mIndex = SRT_RES_IDX(CompositeSrt, PerFrame, gComposite);
         c[0].ppBuffers = &gCompositeCb[fi];
         c[1].mIndex = SRT_RES_IDX(CompositeSrt, PerFrame, gHdr);
-        c[1].ppTextures = taa ? &F.resolved->pTexture : &gHdr->pTexture;
+        c[1].ppTextures = post ? &post : taa ? &F.resolved->pTexture : &gHdr->pTexture;
         c[2].mIndex = SRT_RES_IDX(CompositeSrt, PerFrame, gExposure);
         c[2].ppBuffers = &gExposure;
         c[3].mIndex = SRT_RES_IDX(CompositeSrt, PerFrame, gShadowAtlas);
@@ -1965,7 +1970,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
             t[0].mIndex = SRT_RES_IDX(TonemapSrt, PerFrame, gComposite);
             t[0].ppBuffers = &gCompositeCb[fi];
             t[1].mIndex = SRT_RES_IDX(TonemapSrt, PerFrame, gHdr);
-            t[1].ppTextures = &F.resolved->pTexture;
+            t[1].ppTextures = post ? &post : &F.resolved->pTexture;
             t[2].mIndex = SRT_RES_IDX(TonemapSrt, PerFrame, gExposure);
             t[2].ppBuffers = &gExposure;
             t[3].mIndex = SRT_RES_IDX(TonemapSrt, PerFrame, gTony);
@@ -2170,6 +2175,13 @@ void draw(uint32_t pass, const YeaFrame* yf)
         else
             renderer_taa::taa_resolve((uint64_t)(uintptr_t)&F);
         timeEnd(cmd, fi, slot);
+    }
+    if (post)
+    {
+        if (timed)
+            timeBegin(cmd, fi, kTimePost);
+        renderer_post::post_run((uint64_t)(uintptr_t)&F);
+        timeEnd(cmd, fi, kTimePost);
     }
     if (ldr)
     {

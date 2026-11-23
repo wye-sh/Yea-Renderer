@@ -1,0 +1,32 @@
+// The grading LUT: 32 x 32 x 32, flattened to 1024 x 32 (blue picks the 32-wide slice), indexed by ACEScct and holding
+// the graded linear colour, both of exposed values (middle grey 0.18). Baked only when a grading knob changes.
+// White balance (a von Kries scaling in Bradford's cone space, as a 3 x 3 from renderer_post.cpp), contrast about
+// middle grey in log2, lift / gamma / gain on the ACEScct value (as colourists grade log footage), saturation by Rec.709
+// luma.
+#include "Common.h.fsl"
+
+float3 grade(float3 c)
+{
+    c = max(float3(dot(gPost.wb0.xyz, c), dot(gPost.wb1.xyz, c), dot(gPost.wb2.xyz, c)), float3(0.0, 0.0, 0.0));
+    float k = gPost.lift.w;
+    c = 0.18 * exp2(log2(max(c, float3(1e-10, 1e-10, 1e-10)) / 0.18) * k);
+    float3 v = float3(toCct(c.r), toCct(c.g), toCct(c.b));
+    v = pow(max(gPost.gain.rgb * (v + gPost.lift.rgb * (float3(1.0, 1.0, 1.0) - v)), float3(0.0, 0.0, 0.0)), 1.0 / gPost.gamma.rgb);
+    c = float3(fromCct(v.r), fromCct(v.g), fromCct(v.b));
+    float l = postLuma(c);
+    return max(float3(l, l, l) + (c - float3(l, l, l)) * gPost.gamma.w, float3(0.0, 0.0, 0.0));
+}
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) id)
+{
+    INIT_MAIN;
+    int2 p = int2(id.xy);
+    if (p.x >= 1024 || p.y >= 32)
+        RETURN();
+    float3 v = float3(float(p.x % 32), float(p.y), float(p.x / 32)) / 31.0;
+    float3 c = float3(fromCct(v.r), fromCct(v.g), fromCct(v.b));
+    Write2D(gOut, p, float4(grade(c), 1.0));
+    RETURN();
+}

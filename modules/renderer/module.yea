@@ -166,6 +166,8 @@ import renderer_rt bool rt_prepare(u64 frame) = false
 import renderer_rt void rt_run(u64 frame)
 import renderer_upscale bool upscale_prepare(u64 frame) = false
 import renderer_upscale void upscale_run(u64 frame)
+import renderer_post u64 post_prepare(u64 frame) = 0
+import renderer_post void post_run(u64 frame)
 
 category Exposure
 setting float exposure_ev 0

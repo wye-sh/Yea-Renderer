@@ -134,6 +134,18 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   `max_roughness` (`gTiles`, flag sets double-buffered so no thread reads a flag another rewrites); the resolve skips
   the rest and writes their zeros only when the history there isn't zero already. Every GPU object is freed
   in `unload()` (device-loss recovery unloads modules); nothing GPU-side is in tables.
+- `renderer_post`: post-processing on the resolved (TAA or upscaled) scene-linear HDR image at display size, before
+  the core's tonemapper, so it works the same with every upscaler (NVIDIA's DLSS guide and UE5 place it there).
+  `post_prepare` (after the core's composite constants, before its descriptors) returns the image the tonemap pass and
+  composite read, or 0 when every effect is neutral (nothing runs); `post_run` records right after the resolve. Not
+  under F1's view modes or the AO, contact or culling debug views; without TAA only at one sample. Bloom: a 13-tap
+  downsample chain from half size (6 levels, Karis's average on the first) and 3 x 3 tent upsamples summed back up
+  (Jimenez 2014), mixed energy-conserving (lerp by bloom_intensity, no threshold). Vignette: cos^4 off axis from the
+  projection. Grading: a 32^3 LUT (flattened 1024 x 32, RGBA16F) indexed by ACEScct of exposed values (gExposure[1]),
+  baked on the GPU only when a grading knob changes: white balance (Bradford von Kries; temperature 60 mired a unit
+  along the CIE daylight locus, tint across it in CIE 1960 v), contrast about 0.18 in log2, lift / gamma / gain on the
+  ACEScct value with luma-normalised tint colours, saturation by Rec.709 luma. One descriptor layout for every pass
+  (`Post.srt.h`), a slot (set and constants) per dispatch per frame. Timed as "post".
 - `renderer_upscale`: render scale and upscaling. `upscale_prepare` runs first of all; when it upscales it lowers
   `width`/`height` to the render size (every scene pass, the prepass, culling, AO, contact, SSR, VRS, RT, the forward
   pass and exposure run at it; jitter is in its pixels), and `upscale_run` takes the TAA resolve's place, writing
@@ -185,7 +197,7 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   the out target, and leaves everything in SHADER_RESOURCE; the panel shows it with `yea::canvasImage`. The core's
   preview pipelines and buffers are made in its own `load()` (`preview_core.h`); a failure turns only the preview off.
 - The core calls the others through optional imports with a `RenderFrame*` (as `u64`): `frame.h`, copied
-  identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes`, `renderer_ssr`, `renderer_vrs`, `renderer_rt` and `renderer_upscale` (`mathx.h` into the
+  identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes`, `renderer_ssr`, `renderer_vrs`, `renderer_rt`, `renderer_upscale` and `renderer_post` (`mathx.h` into the
   first three). Change all copies together and raise `RENDER_FRAME_VERSION`. Ray-traced shadows (frame v15): renderer_rt's `rt_pick`, called just
   before `shadows_prepare`, marks the lights (`RenderLight.traced`) and the sun (`rtSunShadows`) it traces; renderer_shadows
   then draws no cascades for a traced sun and no tiles for traced lights, the core writes LightData params.w = 2 + n for

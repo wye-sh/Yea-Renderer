@@ -1,0 +1,28 @@
+#include "Common_3/Graphics/FSL/defaults.h"
+
+#rootsig default.rootsig
+#end
+
+#rootsig compute.rootsig
+#end
+
+#comp renderer_post_down_first.comp
+#define FIRST
+#include "Down.comp.fsl"
+#end
+
+#comp renderer_post_down.comp
+#include "Down.comp.fsl"
+#end
+
+#comp renderer_post_up.comp
+#include "Up.comp.fsl"
+#end
+
+#comp renderer_post_lut.comp
+#include "Lut.comp.fsl"
+#end
+
+#comp renderer_post_combine.comp
+#include "Combine.comp.fsl"
+#end

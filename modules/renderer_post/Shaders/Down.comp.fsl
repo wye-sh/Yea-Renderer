@@ -1,0 +1,50 @@
+// Bloom's downsample (Jimenez, "Next Generation Post Processing in Call of Duty: Advanced Warfare", 2014): 13 bilinear
+// taps as five overlapping 2 x 2 boxes, the centre box weighted 0.5 and the four corner boxes 0.125, which keeps the
+// chain free of the aliasing a plain 2 x 2 box shimmers with. FIRST (from the full image): each box weighted by
+// 1 / (1 + its luma) (Karis's average), so a single over-bright pixel can't flare into a pulsing blob.
+#include "Common.h.fsl"
+
+float3 tap(float2 uv) { return SampleLvlTex2D(gSrc, gSamplerBilinearClamp, uv, 0.0).rgb; }
+
+float3 box(float3 a, float3 b, float3 c, float3 d, float weight, inout float total)
+{
+    float3 s = (a + b + c + d) * 0.25;
+#ifdef FIRST
+    weight /= 1.0 + postLuma(s);
+#endif
+    total += weight;
+    return s * weight;
+}
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) id)
+{
+    INIT_MAIN;
+    int2 p = int2(id.xy);
+    if (p.x >= int(gPost.size.x) || p.y >= int(gPost.size.y))
+        RETURN();
+    float2 uv = (float2(p) + 0.5) / float2(gPost.size.xy);
+    float2 t = 1.0 / float2(gPost.size.zw);
+    float3 a = tap(uv + t * float2(-2.0, -2.0));
+    float3 b = tap(uv + t * float2(0.0, -2.0));
+    float3 c = tap(uv + t * float2(2.0, -2.0));
+    float3 d = tap(uv + t * float2(-2.0, 0.0));
+    float3 e = tap(uv);
+    float3 f = tap(uv + t * float2(2.0, 0.0));
+    float3 g = tap(uv + t * float2(-2.0, 2.0));
+    float3 h = tap(uv + t * float2(0.0, 2.0));
+    float3 i = tap(uv + t * float2(2.0, 2.0));
+    float3 j = tap(uv + t * float2(-1.0, -1.0));
+    float3 k = tap(uv + t * float2(1.0, -1.0));
+    float3 l = tap(uv + t * float2(-1.0, 1.0));
+    float3 m = tap(uv + t * float2(1.0, 1.0));
+    float  total = 0.0;
+    float3 s = box(j, k, l, m, 0.5, total);
+    s += box(a, b, d, e, 0.125, total);
+    s += box(b, c, e, f, 0.125, total);
+    s += box(d, e, g, h, 0.125, total);
+    s += box(e, f, h, i, 0.125, total);
+    Write2D(gOut, p, float4(s / total, 1.0));
+    RETURN();
+}

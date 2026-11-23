@@ -1,0 +1,39 @@
+module renderer_post
+
+# Called by renderer (the core) each frame with the address of its RenderFrame (frame.h): post_prepare before the
+# core sets its descriptors (the image the tonemapper should read, or 0 when every effect is neutral), post_run right
+# after the anti-aliasing or upscaling resolve.
+export u64 post_prepare(u64 frame)
+export void post_run(u64 frame)
+
+category Bloom
+# Bright light spreads into its surroundings, as through a real lens: a share of every pixel's light, so only the
+# brightest things show it (no threshold).
+setting bool bloom true
+player bloom
+# The share of the light spread (0.04: a clean modern lens).
+setting float bloom_intensity 0.04 0 1
+# How wide each step of the spread is (1: as designed; larger is softer and wider).
+setting float bloom_radius 1 0.25 4
+
+category Vignette
+# The image darkens towards its corners, as a lens's light falls off away from its axis (stronger at wide angles).
+setting bool vignette false
+player vignette
+setting float vignette_intensity 0.5 0 1
+
+category Colour Grading
+setting bool grading true
+# White balance: warmer (positive) or cooler, and magenta (positive) or green.
+setting float temperature 0 -1 1
+setting float tint 0 -1 1
+# About middle grey: above 1 darker darks and brighter lights.
+setting float contrast 1 0 2
+setting float saturation 1 0 2
+# Shadows, midtones and highlights (on the log image, as a colourist's wheels), each with a colour to tint it.
+setting float lift 0 -0.5 0.5
+setting color lift_color 1 1 1
+setting float gamma 1 0.25 4
+setting color gamma_color 1 1 1
+setting float gain 1 0 2
+setting color gain_color 1 1 1
