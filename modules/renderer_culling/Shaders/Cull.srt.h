@@ -10,5 +10,7 @@ BEGIN_SRT(CullSrt)
         DECL_TEXTURE(PerFrame, Depth2D(float), gDepth)
 #endif
         DECL_RWBUFFER(PerFrame, RWBuffer(uint), gTileMasks)
+        DECL_BUFFER(PerFrame, Buffer(float4), gDecals)         // the core's decals' spheres (frame.h decalSphereBuffer)
+        DECL_RWBUFFER(PerFrame, RWBuffer(uint), gDecalMasks)   // DECAL_WORDS a tile
     END_SRT_SET(PerFrame)
 END_SRT(CullSrt)

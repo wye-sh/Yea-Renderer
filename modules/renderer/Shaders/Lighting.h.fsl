@@ -667,7 +667,11 @@ float3 shadeLocalLight(uint i, Surface s, float3 sofar)
             if (max(lit.r, max(lit.g, lit.b)) <= 0.0)
                 return lit;
             NoL = max(NoL, 0.1); // part of the light may be in view when its centre isn't
+#ifdef TRANSLUCENT
+            bool tracedA = false; // traced shadows are the opaque scene's pixels: its map (kept while see-through surfaces show)
+#else
             bool tracedA = l.params.w > 1.5;
+#endif
             if ((!tracedA && (gFrame.counts.z & FLAG_SHADOWS) == 0u) || shadowUnseen(lit, sofar))
                 return lit;
             if (tracedA)
@@ -686,7 +690,11 @@ float3 shadeLocalLight(uint i, Surface s, float3 sofar)
     lit = brdfLight(s, L, l.color.rgb * atten);
     // Where the light adds under one 8-bit step on screen (shadowUnseen), its shadow can't be seen: the lookup is skipped.
     // A traced light (params.w 2 + n, only while renderer_rt traces) reads its slice instead of a map.
+#ifdef TRANSLUCENT
+    bool traced = false;
+#else
     bool traced = l.params.w > 1.5;
+#endif
     if ((!traced && (gFrame.counts.z & FLAG_SHADOWS) == 0u) || shadowUnseen(lit, sofar))
         return lit;
     if (traced)

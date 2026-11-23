@@ -36,6 +36,11 @@
 #include "Sim.comp.fsl"
 #end
 
+#comp renderer_particles_split.comp
+#define SPLIT
+#include "Sim.comp.fsl"
+#end
+
 #vert renderer_particles.vert
 #include "Draw.vert.fsl"
 #end

@@ -1,7 +1,13 @@
-// A camera-facing quad per listed particle, back to front: vertex 6 q + c is corner c of the list's entry q. Drawn
-// with first vertex 0 (SV_VertexID); entries past the list's end collapse to nothing.
+// A camera-facing quad per listed particle, back to front: vertex 6 q + c is corner c of the run's entry q (the list's
+// entry Start + q; Start an instance-rate stream bound at the run's offset). Drawn indirectly with first vertex and
+// instance 0 (SV_VertexID); entries past the list's end collapse to nothing.
 #include "ParticleData.h.fsl"
 #include "Draw.srt.h"
+
+STRUCT(VSInput)
+{
+    DATA(uint, Start, TEXCOORD0);
+};
 
 STRUCT(VSOutput)
 {
@@ -12,7 +18,7 @@ STRUCT(VSOutput)
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
-VSOutput VS_MAIN(SV_VertexID(uint) vid)
+VSOutput VS_MAIN(VSInput In, SV_VertexID(uint) vid)
 {
     INIT_MAIN;
     VSOutput Out;
@@ -20,7 +26,7 @@ VSOutput VS_MAIN(SV_VertexID(uint) vid)
     Out.Corner = float2(0.0, 0.0);
     Out.Color = float4(0.0, 0.0, 0.0, 0.0);
     Out.Depth = float2(0.0, 0.0);
-    uint q = vid / 6u, c = vid % 6u;
+    uint q = In.Start + vid / 6u, c = vid % 6u;
     if (q >= gCounters[1])
         RETURN(Out);
     uint     slot = gList[q].y;

@@ -71,6 +71,7 @@ struct GpuFrame
     float    fogAlbedo[4];
     float    textures[4];    // x texture mip bias
     float    gi[4][4];       // frame.h giGrid (FLAG_GI)
+    uint32_t decals[4];      // x decals in gDecals (FLAG_DECALS)
     float    taps[32][4]; // xy: the shadow filters' Vogel disk, unturned
 };
 // A material's texture maps (Shaders/Common.h.fsl MaterialMapData).
@@ -80,6 +81,19 @@ struct GpuMaterialMap
     float    baseFactor[4];
     float    factors[4]; // roughness, metallic, normal scale, occlusion strength
     float    misc[4];    // alpha cutoff, maps given
+};
+// A decal as the forward pass reads it (Shaders/Common.h.fsl DecalData).
+struct GpuDecal
+{
+    float    row[3][4];  // world -> the unit box
+    float    axisZ[4];   // world, out of the surface; w the cosine where the angle fade ends
+    float    axisX[4];   // w 1 / the angle fade's width in cosine
+    float    axisY[4];   // w normal map scale
+    float    albedo[4];  // a opacity
+    float    material[4]; // roughness, metallic, edge, noise
+    float    emissive[4]; // rgb nits, w shape
+    float    weights[4];
+    uint32_t maps[4];    // base colour, normal, ORM: slot + 1, 0 none; w its noise seed
 };
 struct GpuMaterial
 {
@@ -105,7 +119,7 @@ const uint32_t kFlagCulled = 1, kFlagHeatmap = 2, kFlagCascades = 4, kFlagShadow
                kFlagContactDebug = 128, kFlagUnlit = 256, kFlagSsr = 512, kFlagSsrDebug = 1024,
                kFlagReceiverPlane = 2048, kFlagRt = 4096, kFlagRtDebug = 8192, kFlagRtShadows = 16384,
                kFlagRtSun = 32768, kFlagArea = 65536, kFlagSky = 131072, kFlagFog = 262144,
-               kFlagGi = 524288, kFlagGiDebug = 1048576;
+               kFlagGi = 524288, kFlagGiDebug = 1048576, kFlagDecals = 2097152;
 const uint32_t kMaxFrames = 4;
 const uint32_t kMaxUnculledLights = 256;
 const uint32_t kHistogramBins = 128;
@@ -134,6 +148,12 @@ DescriptorSet *gScenePersistent, *gSceneFrame, *gCompositeSet, *gExposureSet;
 // Scene pipelines in fours: [0] culls back faces, [1] draws both sides (double-sided materials); [2] and [3] the same for
 // alpha-tested materials (the prepass cuts them out; the forward pass draws them only at the depth it left).
 Pipeline *     gDepthPipe[4], *gForwardPipe[4], *gForwardFullPipe[4], *gForwardDepthPipe[4];
+// See-through surfaces (material_blend): [0] multiply by what they let through, back faces culled; [1] the same, front
+// faces culled (a double-sided surface's far side); [2] and [3] add their own light. With one sample a pixel they draw in
+// the see-through pass (hdr, reactive, transparency; the depth test in the shader), else inside the forward pass.
+Pipeline*      gBlendPipe[4];
+Shader *       gBlendShader, *gTransmitShader, *gBlendMsaaShader, *gTransmitMsaaShader;
+RenderTarget * gReactive, *gTransparency; // R8 at render size, one sample: frame.h reactive and transparency
 Shader *       gDepthMaskedShader, *gMotionDepthMaskedShader, *gGlossMaskedShader, *gSurfaceMaskedShader;
 Buffer*        gMaterialMapBuf[kMaxFrames];
 GpuMaterialMap* gMaterialMapCpu;
@@ -152,6 +172,10 @@ const YeaShadingRate* gShadingRate; // nullptr: no variable-rate shading on this
 Buffer *       gFrameCb[kMaxFrames], *gInstanceBuf[kMaxFrames], *gMaterialBuf[kMaxFrames], *gLightBuf[kMaxFrames], *gStreamBuf[kMaxFrames];
 Buffer *       gCompositeCb[kMaxFrames], *gExposureCb[kMaxFrames];
 Buffer *       gLtc, *gShapeBuf[kMaxFrames], *gLookBuf[kMaxFrames];
+Buffer *       gDecalBuf[kMaxFrames], *gDecalSphereBuf[kMaxFrames]; // this frame's decals in view (GpuDecal; float4 spheres)
+GpuDecal*      gDecalCpu;
+float (*gDecalSphereCpu)[4];
+uint32_t*      gDecalList; // Decal rows in view, in paint order
 Texture*       gLightImages; // the rect lights' images (images.cpp)
 uint32_t*      gLookCpu;     // per GPU light: its image + 1, 0 none (gLightLooks)
 RenderGpuLightShape* gShapeCpu;
@@ -210,7 +234,7 @@ struct InstanceInfo
 {
     uint32_t mesh; // the version drawn
     uint32_t row;  // in the Instance table
-    uint32_t flags; // 1 visible, 2 casts shadow, 4 double-sided, 8 alpha-tested
+    uint32_t flags; // 1 visible, 2 casts shadow, 4 double-sided, 8 alpha-tested, 16 see-through (drawn sorted, alone)
     float    sphere[4];
     uint64_t moved;
 };
@@ -227,6 +251,15 @@ RenderCaster* gCasters;
 RenderCaster* gDrawables; // every instance, by mesh (reflection probes draw them all)
 RenderLight*  gLocal;
 uint32_t*     gOutside; // rows of lights outside the view, for what reflections see
+// Visible see-through instances, sorted back to front by their bounding spheres' view depth; their stream entries
+// follow the opaque ones' (from gBlendStream).
+struct BlendEntry
+{
+    float    z;
+    uint32_t instance, mesh, twoSided;
+};
+BlendEntry* gBlendList;
+uint32_t    gBlendCount, gBlendStream;
 // Visible instances by key: mesh * 4 + masked * 2 + double-sided, so each kind draws with its own pipeline.
 uint32_t        gMeshCount[4096], gMeshStart[4096], gMeshCursor[4096];
 RenderFrame   gFrame;
@@ -411,6 +444,7 @@ void destroyScenePipelines()
         freePipeline(gForwardPipe[s]);
         freePipeline(gForwardFullPipe[s]);
         freePipeline(gForwardDepthPipe[s]);
+        freePipeline(gBlendPipe[s]);
     }
     freePipeline(gSkyPipe);
     freePipeline(gHistogramPipe);
@@ -422,7 +456,7 @@ void destroyScenePipelines()
 // ones ([2] and [3]) with `masked`, and of the forward pass the variants in `forward` (kForward*). A frame that draws
 // asks only for opaque ones it lacks (the first frame); warming asks for the rest, a few a frame. Making them all in
 // load() took past Yea's 2 s limit on a software GPU (about 400 ms a forward pipeline).
-const uint32_t kForwardLean = 1, kForwardFull = 2, kForwardDepth = 4;
+const uint32_t kForwardLean = 1, kForwardFull = 2, kForwardDepth = 4, kForwardBlend = 8;
 double clockMs()
 {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -608,7 +642,8 @@ bool createScenePipelines(uint32_t samples, bool motion, bool masked, uint32_t f
     };
     if (!missing(gDepthPipe) && !(motion && gGlossShader && missing(gDepthGlossPipe)) && !(motion && gSurfaceShader && missing(gDepthSurfacePipe)) &&
         !((forward & kForwardLean) && missing(gForwardPipe)) && !((forward & kForwardFull) && missing(gForwardFullPipe)) &&
-        !((forward & kForwardDepth) && missing(gForwardDepthPipe)) && gSkyPipe && gHistogramPipe)
+        !((forward & kForwardDepth) && missing(gForwardDepthPipe)) && !((forward & kForwardBlend) && (!gBlendPipe[0] || !gBlendPipe[1] || !gBlendPipe[2] || !gBlendPipe[3])) &&
+        gSkyPipe && gHistogramPipe)
         return false; // every frame after the first: nothing to make
     VertexLayout        layout = sceneLayout();
     // Triangles wind counter-clockwise around their outward normal (cross(b - a, c - a) points out);
@@ -708,6 +743,50 @@ bool createScenePipelines(uint32_t samples, bool motion, bool masked, uint32_t f
             make(desc, gForwardDepthPipe[s]);
     }
     g.pDepthState = &depthTest;
+
+    // See-through surfaces: the forward vertex shader without motion (they write no motion vectors), no depth written.
+    if (forward & kForwardBlend)
+    {
+        const bool pass = samples == 1; // the see-through pass: no depth target, three colour targets
+        TinyImageFormat blendFormats[3] = { TinyImageFormat_R16G16B16A16_SFLOAT, TinyImageFormat_R8_UNORM, TinyImageFormat_R8_UNORM };
+        DepthStateDesc  noDepth = {};
+        BlendStateDesc  blend = {};
+        g.mRenderTargetCount = pass ? 3 : 1;
+        g.pColorFormats = blendFormats;
+        g.mDepthStencilFormat = pass ? TinyImageFormat_UNDEFINED : TinyImageFormat_D32_SFLOAT;
+        g.pDepthState = pass ? &noDepth : &depthTest;
+        g.pBlendState = &blend;
+        blend.mIndependentBlend = pass;
+        blend.mRenderTargetMask = pass ? (BlendStateTargets)(BLEND_STATE_TARGET_0 | BLEND_STATE_TARGET_1 | BLEND_STATE_TARGET_2) : BLEND_STATE_TARGET_0;
+        for (uint32_t s = 0; s < 4; ++s)
+        {
+            const bool transmit = s < 2;
+            raster.mCullMode = s & 1 ? CULL_MODE_FRONT : CULL_MODE_BACK;
+            // Multiply: hdr times the shader's rgb (the light let through), masks untouched. Add: its own light, masks the
+            // larger of what they hold and its coverage. hdr's alpha is left alone, as the particles leave it.
+            blend.mSrcFactors[0] = transmit ? BC_ZERO : BC_ONE;
+            blend.mDstFactors[0] = transmit ? BC_SRC_COLOR : BC_ONE;
+            blend.mSrcAlphaFactors[0] = BC_ZERO;
+            blend.mDstAlphaFactors[0] = BC_ONE;
+            blend.mBlendModes[0] = blend.mBlendAlphaModes[0] = BM_ADD;
+            blend.mColorWriteMasks[0] = COLOR_MASK_RED | COLOR_MASK_GREEN | COLOR_MASK_BLUE;
+            for (uint32_t t = 1; t < 3; ++t)
+            {
+                blend.mSrcFactors[t] = blend.mDstFactors[t] = blend.mSrcAlphaFactors[t] = blend.mDstAlphaFactors[t] = BC_ONE;
+                blend.mBlendModes[t] = blend.mBlendAlphaModes[t] = BM_MAX;
+                blend.mColorWriteMasks[t] = transmit ? COLOR_MASK_NONE : COLOR_MASK_ALL;
+            }
+            g.pShaderProgram = pass ? (transmit ? gTransmitShader : gBlendShader) : (transmit ? gTransmitMsaaShader : gBlendMsaaShader);
+            desc.pName = transmit ? "renderer_transmit" : "renderer_blend";
+            if (!gBlendPipe[s])
+                make(desc, gBlendPipe[s]);
+        }
+        g.pBlendState = nullptr;
+        g.mRenderTargetCount = motion ? 2 : 1;
+        g.pColorFormats = formats;
+        g.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+        g.pDepthState = &depthTest;
+    }
     raster.mCullMode = CULL_MODE_NONE;
 
     if (!left && masked)
@@ -733,7 +812,7 @@ bool createScenePipelines(uint32_t samples, bool motion, bool masked, uint32_t f
 
 uint32_t warmForward()
 {
-    uint32_t forward = kForwardLean | kForwardFull;
+    uint32_t forward = kForwardLean | kForwardFull | kForwardBlend;
 #if !defined(YEA_GAME_RELEASE)
     forward |= kForwardDepth; // F1's view modes
 #endif
@@ -814,6 +893,8 @@ void destroyTargets()
     freeTarget(gMotion);
     freeTarget(gGloss);
     freeTarget(gSurface);
+    freeTarget(gReactive);
+    freeTarget(gTransparency);
     if (gLdr)
         removeResource(gLdr);
     gLdr = nullptr;
@@ -845,6 +926,16 @@ void createTargets(uint32_t w, uint32_t h, uint32_t samples, bool motion, uint32
     d.pName = "renderer_depth";
     addRenderTarget(gRenderer, &d, &gDepth);
     gDepthState = RESOURCE_STATE_SHADER_RESOURCE;
+    if (samples == 1)
+    {
+        // The see-through pass's masks (frame.h reactive, transparency).
+        d.mFormat = TinyImageFormat_R8_UNORM;
+        d.mClearValue = { { 0, 0, 0, 0 } };
+        d.pName = "renderer_reactive";
+        addRenderTarget(gRenderer, &d, &gReactive);
+        d.pName = "renderer_transparency";
+        addRenderTarget(gRenderer, &d, &gTransparency);
+    }
     if (motion)
     {
         d.mFormat = TinyImageFormat_R16G16_SFLOAT;
@@ -1083,11 +1174,30 @@ void drawVisible(Cmd* cmd, uint32_t fi, Pipeline* const pipes[4], uint32_t sides
     }
 }
 
+// See-through instance j of the sorted list (one instance, its stream entry after the opaque ones'): a double-sided one's
+// far side first, then its near side; each side multiplies what is behind by the light it lets through, then adds its own.
+void drawBlended(Cmd* cmd, uint32_t fi, uint32_t j)
+{
+    const BlendEntry& e = gBlendList[j];
+    const Mesh&       mesh = Meshes[e.mesh];
+    bindGeometry(cmd, gStreamBuf[fi], gBlendStream + j);
+    cmdBindIndexBuffer(cmd, gIndexBuf, INDEX_TYPE_UINT32, 0);
+    const uint32_t order[4] = { 1, 3, 0, 2 };
+    for (uint32_t k = e.twoSided ? 0 : 2; k < 4; ++k)
+    {
+        cmdBindPipeline(cmd, gBlendPipe[order[k]]);
+        cmdBindDescriptorSet(cmd, 0, gScenePersistent);
+        cmdBindDescriptorSet(cmd, fi, gSceneFrame);
+        cmdDrawIndexedInstanced(cmd, mesh.indexCount, mesh.firstIndex, 1, mesh.firstVertex, 0);
+    }
+}
+
 // A material row's texture maps as the shaders read them: a slot only once its texture is loaded (until then the
 // material's flat look stands in).
 void fillMaterialMap(GpuMaterialMap& out, uint32_t row)
 {
     out = GpuMaterialMap{};
+    out.misc[2] = materialOpacity(row); // blended: the see-through variants read it (a material with no maps too)
     if (row >= MaterialMaps.size())
         return;
     const MaterialMap& mm = MaterialMaps[row];
@@ -1123,8 +1233,8 @@ void barrierBuf(Cmd* cmd, Buffer* buf, ResourceState from, ResourceState to)
 // (that frame's fence has passed by then, so nothing waits), averaged and logged every 10 s.
 namespace
 {
-enum Timing : uint32_t { kTimeSky, kTimeShadows, kTimeProbes, kTimePrepass, kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeVrs, kTimeRt, kTimeGi, kTimeFog, kTimeParticles, kTimeForward, kTimeParticlesDraw, kTimeExposure, kTimeTaa, kTimeUpscale, kTimePost, kTimeTonemap, kTimeComposite, kTimeTotal, kTimings };
-const char* const kTimingNames[kTimings] = { "sky", "shadows", "probes", "prepass", "culling", "ao", "contact", "ssr", "vrs", "rt", "gi", "fog", "particles", "forward+sky", "particles-draw", "exposure", "taa", "upscale", "post", "tonemap", "composite", "total" };
+enum Timing : uint32_t { kTimeSky, kTimeShadows, kTimeProbes, kTimePrepass, kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeVrs, kTimeRt, kTimeGi, kTimeFog, kTimeParticles, kTimeForward, kTimeBlend, kTimeExposure, kTimeTaa, kTimeUpscale, kTimePost, kTimeTonemap, kTimeComposite, kTimeTotal, kTimings };
+const char* const kTimingNames[kTimings] = { "sky", "shadows", "probes", "prepass", "culling", "ao", "contact", "ssr", "vrs", "rt", "gi", "fog", "particles", "forward+sky", "see-through", "exposure", "taa", "upscale", "post", "tonemap", "composite", "total" };
 QueryPool*        gTimePool[kMaxFrames];
 uint32_t          gTimeUsed[kMaxFrames]; // bits: what that frame recorded
 double            gTimeTicks;            // per second
@@ -1322,13 +1432,17 @@ int load(int reloaded)
     gMotionDepthMaskedShader = loadShader("renderer_forward_motion.vert", "renderer_depth_masked_motion.frag", nullptr);
     gGlossMaskedShader = loadShader("renderer_forward_motion.vert", "renderer_gloss_masked.frag", nullptr);
     gSurfaceMaskedShader = gSurfaceShader ? loadShader("renderer_forward_motion.vert", "renderer_surface_masked.frag", nullptr) : nullptr;
+    gBlendShader = loadShader("renderer_forward.vert", "renderer_blend.frag", nullptr);
+    gTransmitShader = loadShader("renderer_forward.vert", "renderer_transmit.frag", nullptr);
+    gBlendMsaaShader = loadShader("renderer_forward.vert", "renderer_blend_msaa.frag", nullptr);
+    gTransmitMsaaShader = loadShader("renderer_forward.vert", "renderer_transmit_msaa.frag", nullptr);
     const char* composite[4] = { "renderer_composite_1.frag", "renderer_composite_2.frag", "renderer_composite_4.frag",
                                  "renderer_composite_8.frag" };
     const char* histogram[4] = { "renderer_histogram_1.comp", "renderer_histogram_2.comp", "renderer_histogram_4.comp",
                                  "renderer_histogram_8.comp" };
     bool ok = gForwardDepthShader && gForwardShader && gSkyShader && gMotionDepthShader && gMotionShader && gSkyMotionShader &&
               gForwardFullShader && gMotionFullShader && gGlossShader && gDepthMaskedShader && gMotionDepthMaskedShader && gGlossMaskedShader &&
-              (!gSurfaceShader || gSurfaceMaskedShader);
+              (!gSurfaceShader || gSurfaceMaskedShader) && gBlendShader && gTransmitShader && gBlendMsaaShader && gTransmitMsaaShader;
     for (int i = 0; i < 4; ++i)
     {
         gCompositeShader[i] = loadShader("renderer_fullscreen.vert", composite[i], nullptr);
@@ -1384,6 +1498,8 @@ int load(int reloaded)
         gShapeBuf[i] = makeBuffer((uint64_t)Lights.capacity() * sizeof(RenderGpuLightShape), sizeof(RenderGpuLightShape),
                                   DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_light_shapes");
         gLookBuf[i] = makeBuffer((uint64_t)Lights.capacity() * 4, 4, DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_light_looks");
+        gDecalBuf[i] = makeBuffer(sizeof(GpuDecal) * RENDER_MAX_DECALS, sizeof(GpuDecal), DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_decals");
+        gDecalSphereBuf[i] = makeBuffer(16 * RENDER_MAX_DECALS, 16, DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_decal_spheres");
         gStreamBuf[i] = makeBuffer((uint64_t)Instances.capacity() * 4, 0, DESCRIPTOR_TYPE_VERTEX_BUFFER, cpu,
                                    RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, "renderer_stream");
         gPrevBuf[i] = makeBuffer((uint64_t)Instances.capacity() * 48, 48, DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_prev_instances");
@@ -1471,6 +1587,7 @@ int load(int reloaded)
                 gDummyRates && gDummyArray && gScenePersistent && gSceneFrame && gCompositeSet && gExposureSet && gTonemapSet && gShadowSampler;
     for (uint32_t i = 0; i < gFrames; ++i)
         made = made && gMaterialMapBuf[i] && gMaterialMapBuf[i]->pCpuMappedAddress && gFrameCb[i] && gCompositeCb[i] && gExposureCb[i] && gInstanceBuf[i] && gMaterialBuf[i] && gLightBuf[i] && gShapeBuf[i] && gLookBuf[i] && gLookBuf[i]->pCpuMappedAddress &&
+               gDecalBuf[i] && gDecalBuf[i]->pCpuMappedAddress && gDecalSphereBuf[i] && gDecalSphereBuf[i]->pCpuMappedAddress &&
                gStreamBuf[i] && gPrevBuf[i] && gFrameCb[i]->pCpuMappedAddress && gCompositeCb[i]->pCpuMappedAddress &&
                gExposureCb[i]->pCpuMappedAddress && gInstanceBuf[i]->pCpuMappedAddress && gMaterialBuf[i]->pCpuMappedAddress &&
                gLightBuf[i]->pCpuMappedAddress && gShapeBuf[i]->pCpuMappedAddress && gStreamBuf[i]->pCpuMappedAddress && gPrevBuf[i]->pCpuMappedAddress;
@@ -1515,8 +1632,12 @@ int load(int reloaded)
     texturesInit(gDummyColor->pTexture);
     gCasters = new RenderCaster[Instances.capacity()];
     gDrawables = new RenderCaster[Instances.capacity()];
+    gBlendList = new BlendEntry[Instances.capacity()];
     gLocal = new RenderLight[Lights.capacity()];
     gOutside = new uint32_t[Lights.capacity()];
+    gDecalCpu = new GpuDecal[RENDER_MAX_DECALS];
+    gDecalSphereCpu = new float[RENDER_MAX_DECALS][4];
+    gDecalList = new uint32_t[Decals.capacity()];
     gPrevRows = new PrevRows[Instances.capacity()];
     memset(gPrevRows, 0, sizeof(PrevRows) * Instances.capacity());
     gLodMesh = new uint32_t[Instances.capacity()];
@@ -1568,6 +1689,8 @@ void unload()
         freeBuffer(gLightBuf[i]);
         freeBuffer(gShapeBuf[i]);
         freeBuffer(gLookBuf[i]);
+        freeBuffer(gDecalBuf[i]);
+        freeBuffer(gDecalSphereBuf[i]);
         freeBuffer(gStreamBuf[i]);
         freeBuffer(gPrevBuf[i]);
     }
@@ -1599,7 +1722,8 @@ void unload()
     // Each one let go and forgotten, so a second unload (after a load that gave up) frees nothing twice.
     Shader** shaders[] = { &gForwardDepthShader, &gForwardShader, &gSkyShader, &gAdaptShader, &gMotionDepthShader, &gMotionShader,
                            &gSkyMotionShader, &gForwardFullShader, &gMotionFullShader, &gGlossShader, &gSurfaceShader, &gTonemapShader,
-                           &gDepthMaskedShader, &gMotionDepthMaskedShader, &gGlossMaskedShader, &gSurfaceMaskedShader };
+                           &gDepthMaskedShader, &gMotionDepthMaskedShader, &gGlossMaskedShader, &gSurfaceMaskedShader, &gBlendShader,
+                           &gTransmitShader, &gBlendMsaaShader, &gTransmitMsaaShader };
     for (Shader** s : shaders)
         if (*s)
             removeShader(gRenderer, *s), *s = nullptr;
@@ -1700,7 +1824,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         waitQueueIdle(gQueue);
         destroyTargets();
         createTargets(w, h, samples, taa, dw, dh);
-        if (!gHdr || !gDepth || (taa && (!gMotion || !gGloss || (gRaytracing && !gSurface))))
+        if (!gHdr || !gDepth || (samples == 1 && (!gReactive || !gTransparency)) || (taa && (!gMotion || !gGloss || (gRaytracing && !gSurface))))
         {
             // Refused (out of memory, say): nothing drawn this frame, tried again next frame, said once.
             if (!gTargetsFailed)
@@ -1793,7 +1917,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     float                lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
     memset(gMeshCount, 0, sizeof gMeshCount);
     uint32_t keyCount = meshCount * 4;
-    uint32_t casterCount[1024], drawCount[4096];
+    uint32_t casterCount[1024], drawCount[4096], blendCount = 0, blendAll = 0;
     memset(casterCount, 0, sizeof casterCount);
     memset(drawCount, 0, sizeof drawCount);
     // Mesh versions: display pixels per world unit at view depth 1, and the error allowed on screen (0: always the finest).
@@ -1832,7 +1956,10 @@ void draw(uint32_t pass, const YeaFrame* yf)
         bool twoSided = in.material < Materials.size() && Materials[in.material].doubleSided;
         bool masked = in.material < MaterialMaps.size() && in.material < Materials.size() && MaterialMaps[in.material].cutoff > 0;
         bool visible = sphereInside(frustum, 5, sc, info.sphere[3]);
-        info.flags = (visible ? 1u : 0u) | (in.shadow ? 2u : 0u) | (twoSided ? 4u : 0u) | (masked ? 8u : 0u);
+        // See-through (material_blend): drawn alone, sorted, after the opaque scene; no prepass, shadow, probe or ray
+        // tracing sees it yet. F1's view modes draw it as any surface.
+        bool blended = !viewMode && materialOpacity(in.material) > 0;
+        info.flags = (visible ? 1u : 0u) | (in.shadow && !blended ? 2u : 0u) | (twoSided ? 4u : 0u) | (masked ? 8u : 0u) | (blended ? 16u : 0u);
         if (masked && gTexturesChanged > info.moved)
             info.moved = gTexturesChanged;
         // The simplest version whose error stays under lod_error display pixels where the instance is nearest the
@@ -1859,6 +1986,14 @@ void draw(uint32_t pass, const YeaFrame* yf)
         }
         info.mesh = lod;
         info.row = row;
+        if (blended)
+        {
+            blendAll++;
+            if (visible)
+                gBlendList[blendCount++] = { view[2][0] * sc.x + view[2][1] * sc.y + view[2][2] * sc.z + view[2][3], count, lod, twoSided ? 1u : 0u };
+            count++;
+            continue;
+        }
         uint32_t key = lod * 4 + (masked ? 2 : 0) + (twoSided ? 1 : 0);
         drawCount[key]++;
         if (info.flags & 1)
@@ -1898,6 +2033,8 @@ void draw(uint32_t pass, const YeaFrame* yf)
     for (uint32_t i = 0; i < count; ++i)
     {
         const InstanceInfo& info = gInfo[i];
+        if (info.flags & 16)
+            continue; // see-through: listed apart
         uint32_t            key = info.mesh * 4 + ((info.flags >> 2) & 3);
         if (info.flags & 1)
             stream[gMeshCursor[key]++] = i;
@@ -1935,6 +2072,21 @@ void draw(uint32_t pass, const YeaFrame* yf)
         }
     }
     (void)casterStart;
+    // See-through instances back to front, their stream entries after the opaque ones'; the depths particles split at
+    // (frame.h blendRuns): the nearest RENDER_MAX_BLEND_RUNS surfaces' (past that many, farther ones share a run).
+    qsort(gBlendList, blendCount, sizeof(BlendEntry), [](const void* a, const void* b) {
+        float za = ((const BlendEntry*)a)->z, zb = ((const BlendEntry*)b)->z;
+        return za > zb ? -1 : za < zb ? 1 : 0;
+    });
+    gBlendCount = blendCount;
+    gBlendStream = 0;
+    for (uint32_t k = 0; k < keyCount; ++k)
+        gBlendStream += gMeshCount[k];
+    for (uint32_t j = 0; j < blendCount; ++j)
+        stream[gBlendStream + j] = gBlendList[j].instance;
+    F.blendRuns = blendCount < RENDER_MAX_BLEND_RUNS ? blendCount : RENDER_MAX_BLEND_RUNS;
+    for (uint32_t k = 0; k < F.blendRuns; ++k)
+        F.blendDepths[k] = gBlendList[blendCount - F.blendRuns + k].z;
 
     // --- Lights -----------------------------------------------------------------------------
     GpuFrame* gf = &gFrameCpu;
@@ -2078,7 +2230,78 @@ void draw(uint32_t pass, const YeaFrame* yf)
     F.gloss = gGloss;
     F.exposure = gExposure;
 
+    // Decals in view, in the order they paint (priority, then the order they were added); past RENDER_MAX_DECALS the
+    // lowest priorities and oldest are left out. renderer_culling bins them with the lights.
+    uint32_t decalCount = 0;
+    if (settings.decals && !viewMode)
+    {
+        uint32_t n = 0;
+        for (uint32_t row = 0; row < Decals.size(); ++row)
+        {
+            const Decal& d = Decals[row];
+            if (!d.alive)
+                continue;
+            float r = length(V(d.half.x, d.half.y, d.half.z));
+            if (sphereInside(frustum, 5, V(d.pos.x, d.pos.y, d.pos.z), r))
+                gDecalList[n++] = row;
+        }
+        qsort(gDecalList, n, sizeof(uint32_t), [](const void* a, const void* b) {
+            const Decal &x = Decals[*(const uint32_t*)a], &y = Decals[*(const uint32_t*)b];
+            if (x.priority != y.priority)
+                return x.priority < y.priority ? -1 : 1;
+            return x.order < y.order ? -1 : x.order > y.order ? 1 : 0;
+        });
+        const uint32_t skip = n > RENDER_MAX_DECALS ? n - RENDER_MAX_DECALS : 0;
+        for (uint32_t i = skip; i < n; ++i)
+        {
+            const uint32_t row = gDecalList[i];
+            const Decal&   d = Decals[row];
+            GpuDecal&      g = gDecalCpu[decalCount];
+            float          R[3][4];
+            quatRows(d.rot, { 1, 1, 1 }, { 0, 0, 0 }, R);
+            const float half[3] = { d.half.x, d.half.y, d.half.z }, pos[3] = { d.pos.x, d.pos.y, d.pos.z };
+            for (int j = 0; j < 3; ++j)
+            {
+                float t = 0;
+                for (int k = 0; k < 3; ++k)
+                {
+                    g.row[j][k] = R[k][j] / half[j];
+                    t += R[k][j] * pos[k];
+                }
+                g.row[j][3] = -t / half[j];
+            }
+            for (int k = 0; k < 3; ++k)
+            {
+                g.axisX[k] = R[k][0];
+                g.axisY[k] = R[k][1];
+                g.axisZ[k] = R[k][2];
+            }
+            // Surfaces turned past `angle` from facing along z are left alone, fading over its last 15 degrees.
+            const float a1 = d.angle * 0.01745329f, a0 = maxf(d.angle - 15.0f, 0.0f) * 0.01745329f;
+            g.axisZ[3] = cosf(a1);
+            g.axisX[3] = 1.0f / maxf(cosf(a0) - cosf(a1), 1e-3f);
+            g.axisY[3] = d.normalScale;
+            memcpy(g.albedo, &d.albedo, sizeof g.albedo);
+            g.material[0] = d.roughness, g.material[1] = d.metallic, g.material[2] = d.edge, g.material[3] = d.noise;
+            g.emissive[0] = d.emissive.x, g.emissive[1] = d.emissive.y, g.emissive[2] = d.emissive.z, g.emissive[3] = (float)d.shape;
+            memcpy(g.weights, &d.weights, sizeof g.weights);
+            g.maps[0] = textureSlot(d.baseColor);
+            g.maps[1] = textureSlot(d.normal);
+            g.maps[2] = textureSlot(d.orm);
+            g.maps[3] = (row * 0x9E3779B9u) ^ (d.gen * 0x85EBCA6Bu); // its own noise, kept while it lives
+            gDecalSphereCpu[decalCount][0] = d.pos.x, gDecalSphereCpu[decalCount][1] = d.pos.y, gDecalSphereCpu[decalCount][2] = d.pos.z;
+            gDecalSphereCpu[decalCount][3] = length(V(d.half.x, d.half.y, d.half.z));
+            decalCount++;
+        }
+        memcpy(gDecalBuf[fi]->pCpuMappedAddress, gDecalCpu, sizeof(GpuDecal) * decalCount);
+        memcpy(gDecalSphereBuf[fi]->pCpuMappedAddress, gDecalSphereCpu, 16 * decalCount);
+    }
+    F.decalCount = decalCount;
+    F.decalSpheres = decalCount ? gDecalSphereCpu : nullptr;
+    F.decalSphereBuffer = decalCount ? gDecalSphereBuf[fi] : nullptr;
     bool culled = renderer_culling::cull_prepare((uint64_t)(uintptr_t)&F) && F.tileMasks && F.zbins && F.wordsPerTile;
+    // Decals need culling's bins with it; without culling the forward pass tries every one.
+    const bool decals = decalCount && (!culled || (F.decalMasks && F.decalBins));
     if (!culled && F.lightCount > kMaxUnculledLights)
         F.lightCount = kMaxUnculledLights;
     // Ray-traced shadows (renderer_rt): its pick comes first, so renderer_shadows draws nothing for what it traces.
@@ -2086,7 +2309,8 @@ void draw(uint32_t pass, const YeaFrame* yf)
     // While fog or particles run they read the shadow maps: renderer_shadows keeps them even for what renderer_rt traces.
     const bool fogMaps = !viewMode && renderer_fog::fog_on();
     const bool particlesOn = !viewMode && renderer_particles::particles_on();
-    F.keepShadowMaps = fogMaps || particlesOn ? 1u : 0u;
+    // See-through surfaces read them too (traced shadows are the opaque scene's pixels).
+    F.keepShadowMaps = fogMaps || particlesOn || blendCount ? 1u : 0u;
     const bool rtPicked = rtGate && renderer_rt::rt_pick((uint64_t)(uintptr_t)&F);
     if (!rtPicked)
     {
@@ -2101,7 +2325,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     const yea_float3 zen = settings.sky_color, hor = settings.horizon_color, gnd = settings.ground_color;
     float            L = settings.sky_luminance;
     F.drawables = gDrawables;
-    F.drawableCount = count;
+    F.drawableCount = count - blendAll;
     F.materials = gMaterialBuf[fi];
     F.skyZenith[0] = zen.x * L, F.skyZenith[1] = zen.y * L, F.skyZenith[2] = zen.z * L;
     F.skyHorizon[0] = hor.x * L, F.skyHorizon[1] = hor.y * L, F.skyHorizon[2] = hor.z * L;
@@ -2261,7 +2485,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
                     ((viewMode & YEA_VIEW_WIREFRAME) ? kFlagUnlit : 0) | (ssr ? kFlagSsr : 0) | (ssr && F.ssrDebug ? kFlagSsrDebug : 0) |
                     (shadows && F.receiverPlane ? kFlagReceiverPlane : 0) | (rt ? kFlagRt : 0) | (rt && F.rtDebug ? kFlagRtDebug : 0) |
                     (rtShadows ? kFlagRtShadows : 0) | (rtShadows && F.rtSunShadows ? kFlagRtSun : 0) | (anyShape ? kFlagArea : 0) | (sky ? kFlagSky : 0) | (fog ? kFlagFog : 0) |
-                    (gi ? kFlagGi : 0) | (gi && F.giDebug ? kFlagGiDebug : 0);
+                    (gi ? kFlagGi : 0) | (gi && F.giDebug ? kFlagGiDebug : 0) | (decals ? kFlagDecals : 0);
     if (ssr)
     {
         gf->ssr[0] = F.ssrMaxRoughness;
@@ -2326,6 +2550,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     gf->misc[1] = settings.specular_aa;
     gf->textures[0] = F.mipBias;
     memcpy(gf->gi, F.giGrid, sizeof gf->gi);
+    gf->decals[0] = decals ? decalCount : 0;
     gf->misc[2] = settings.sun_disk > 0 ? cosf(settings.sun_disk * 0.5f * 3.14159265f / 180.0f) : 1.0f;
     if (shadows)
     {
@@ -2343,9 +2568,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     gf->shadow2[2] = taa && !viewMode ? (float)(F.frameNumber % 64u) : -1.0f;
 
     // One copy per buffer into the mapped memory.
-    uint32_t visibleTotal = 0;
-    for (uint32_t k = 0; k < keyCount; ++k)
-        visibleTotal += gMeshCount[k];
+    uint32_t visibleTotal = gBlendStream + gBlendCount;
     memcpy(gInstanceBuf[fi]->pCpuMappedAddress, gInstCpu, (size_t)count * sizeof(RenderGpuInstance));
     memcpy(gStreamBuf[fi]->pCpuMappedAddress, gStream, (size_t)visibleTotal * 4);
     memcpy(gLightBuf[fi]->pCpuMappedAddress, gLightCpu, (size_t)F.allLightCount * sizeof(RenderGpuLight));
@@ -2434,7 +2657,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         Buffer*  masks = culled ? F.tileMasks : gDummyU32;
         Buffer*  bins = culled ? F.zbins : gDummyU32;
         Buffer*  views = shadows ? F.shadowViews : gDummyViews;
-        DescriptorData p[31] = {};
+        DescriptorData p[35] = {};
         Texture*       ssrDepth = ssr ? F.ssrDepth : gDummyDepth->pTexture;
         Texture*       previous = ssr ? F.previous->pTexture : gDummyColor->pTexture;
         Texture*       probeTex = probes ? F.probes->pTexture : gDummyArray->pTexture;
@@ -2512,14 +2735,27 @@ void draw(uint32_t pass, const YeaFrame* yf)
         p[28].ppTextures = &giDist;
         p[29].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gGiProbes);
         p[29].ppBuffers = &giProbes;
-        uint32_t bindings = 30;
+        // The see-through pass tests against the scene's depth itself (one sample a pixel only).
+        Texture* sceneDepth = samples == 1 ? gDepth->pTexture : gDummyDepth->pTexture;
+        p[30].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gSceneDepth);
+        p[30].ppTextures = &sceneDepth;
+        Buffer* decalBuf = gDecalBuf[fi];
+        Buffer* decalMasks = decals && culled ? F.decalMasks : gDummyU32;
+        Buffer* decalBins = decals && culled ? F.decalBins : gDummyU32;
+        p[31].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gDecals);
+        p[31].ppBuffers = &decalBuf;
+        p[32].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gDecalMasks);
+        p[32].ppBuffers = &decalMasks;
+        p[33].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gDecalBins);
+        p[33].ppBuffers = &decalBins;
+        uint32_t bindings = 34;
         if (gTexturesBound[fi] != F.textureVersion)
         {
-            p[30].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gTextures);
-            p[30].ppTextures = (Texture**)F.textures;
-            p[30].mCount = RENDER_MAX_TEXTURES;
+            p[34].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gTextures);
+            p[34].ppTextures = (Texture**)F.textures;
+            p[34].mCount = RENDER_MAX_TEXTURES;
             gTexturesBound[fi] = F.textureVersion;
-            bindings = 31;
+            bindings = 35;
         }
         updateDescriptorSet(gRenderer, fi, gSceneFrame, bindings, p);
 
@@ -2650,8 +2886,15 @@ void draw(uint32_t pass, const YeaFrame* yf)
                 for (uint32_t m = 0; m < meshCount && !held; ++m)
                     held = gMeshCount[m * 4 + s] > 0;
         }
+        if (gBlendCount && !viewMode)
+        {
+            // See-through pipelines: warmed with the rest (queued at load), held back until they are made.
+            createScenePipelines(samples, taa, false, kForwardBlend, clockMs() + kWarmMs);
+            held = held || !gBlendPipe[0] || !gBlendPipe[1] || !gBlendPipe[2] || !gBlendPipe[3];
+        }
         gHeldFrames += held ? 1 : 0;
     }
+    const bool blendDraw = geometry && gBlendCount && !viewMode && gBlendPipe[0] && gBlendPipe[1] && gBlendPipe[2] && gBlendPipe[3];
     if (gDepthState != RESOURCE_STATE_DEPTH_WRITE)
         barrierRt(cmd, gDepth, gDepthState, RESOURCE_STATE_DEPTH_WRITE);
     BindRenderTargetsDesc bind = {};
@@ -2771,6 +3014,14 @@ void draw(uint32_t pass, const YeaFrame* yf)
         cmdBindDescriptorSet(cmd, fi, gSceneFrame);
         cmdDraw(cmd, 3, 0);
     }
+    if (blendDraw && samples > 1)
+    {
+        // With MSAA (no particles, no masks): see-through surfaces here, depth-tested by the target.
+        cmdBeginDebugMarker(cmd, 0.6f, 0.9f, 1.0f, "Renderer see-through");
+        for (uint32_t j = 0; j < gBlendCount; ++j)
+            drawBlended(cmd, fi, j);
+        cmdEndDebugMarker(cmd);
+    }
     cmdBindRenderTargets(cmd, nullptr);
     barrierRt(cmd, gHdr, RESOURCE_STATE_RENDER_TARGET, RESOURCE_STATE_SHADER_RESOURCE);
     if (taa)
@@ -2778,15 +3029,54 @@ void draw(uint32_t pass, const YeaFrame* yf)
     gDepthState = RESOURCE_STATE_DEPTH_WRITE;
     cmdEndDebugMarker(cmd);
     timeEnd(cmd, fi, kTimeForward);
-    // Particles over the lit scene, soft against its depth, before exposure meters it and TAA or the upscaler resolve it.
-    if (particles)
+    // The see-through pass (one sample a pixel): blended surfaces back to front, the particles' sorted runs between them
+    // (renderer_particles split its list at their depths, frame.h blendRuns), so steam behind a pane is seen through it and
+    // steam in front of it covers it. Into hdr, with the reactive and transparency masks for TAA and the upscalers; depth
+    // read in the shaders. Before exposure meters it and TAA or the upscaler resolve it.
+    const bool blendPass = samples == 1 && gReactive && gTransparency && (blendDraw || particles);
+    if (blendPass)
     {
         if (timed)
-            timeBegin(cmd, fi, kTimeParticlesDraw);
+            timeBegin(cmd, fi, kTimeBlend);
         barrierRt(cmd, gDepth, RESOURCE_STATE_DEPTH_WRITE, RESOURCE_STATE_SHADER_RESOURCE);
         gDepthState = RESOURCE_STATE_SHADER_RESOURCE;
-        renderer_particles::particles_draw((uint64_t)(uintptr_t)&F);
-        timeEnd(cmd, fi, kTimeParticlesDraw);
+        const bool runs = particles && renderer_particles::particles_draw_begin((uint64_t)(uintptr_t)&F);
+        cmdBeginDebugMarker(cmd, 0.6f, 0.9f, 1.0f, "Renderer see-through");
+        RenderTargetBarrier rb[3] = { { gHdr, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_RENDER_TARGET },
+                                      { gReactive, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_RENDER_TARGET },
+                                      { gTransparency, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_RENDER_TARGET } };
+        cmdResourceBarrier(cmd, 0, nullptr, 0, nullptr, 3, rb);
+        bind = {};
+        bind.mRenderTargetCount = 3;
+        bind.mRenderTargets[0] = { gHdr, LOAD_ACTION_LOAD };
+        bind.mRenderTargets[1] = { gReactive, LOAD_ACTION_CLEAR };
+        bind.mRenderTargets[2] = { gTransparency, LOAD_ACTION_CLEAR };
+        cmdBindRenderTargets(cmd, &bind);
+        cmdSetViewport(cmd, 0, 0, (float)w, (float)h, 0, 1);
+        cmdSetScissor(cmd, 0, 0, w, h);
+        // Past RENDER_MAX_BLEND_RUNS surfaces the farthest ones come first, with no particles between them.
+        const uint32_t surfaces = blendDraw ? gBlendCount : 0;
+        const uint32_t split = surfaces - F.blendRuns;
+        for (uint32_t j = 0; j < surfaces; ++j)
+        {
+            if (runs && j >= split)
+                renderer_particles::particles_draw((uint64_t)(uintptr_t)&F, j - split);
+            drawBlended(cmd, fi, j);
+        }
+        // The runs nearer than every surface drawn (all of them while the see-through pipelines are still being made).
+        for (uint32_t r = surfaces ? F.blendRuns : 0; runs && r <= F.blendRuns; ++r)
+            renderer_particles::particles_draw((uint64_t)(uintptr_t)&F, r);
+        cmdBindRenderTargets(cmd, nullptr);
+        RenderTargetBarrier back[3] = { { gHdr, RESOURCE_STATE_RENDER_TARGET, RESOURCE_STATE_SHADER_RESOURCE },
+                                        { gReactive, RESOURCE_STATE_RENDER_TARGET, RESOURCE_STATE_SHADER_RESOURCE },
+                                        { gTransparency, RESOURCE_STATE_RENDER_TARGET, RESOURCE_STATE_SHADER_RESOURCE } };
+        cmdResourceBarrier(cmd, 0, nullptr, 0, nullptr, 3, back);
+        cmdEndDebugMarker(cmd);
+        if (runs)
+            renderer_particles::particles_draw_end((uint64_t)(uintptr_t)&F);
+        F.reactive = gReactive->pTexture;
+        F.transparency = blendDraw ? gTransparency->pTexture : nullptr;
+        timeEnd(cmd, fi, kTimeBlend);
     }
 
     // Auto exposure: histogram, then the adapted exposure. Held still in a view mode or a debug view,

@@ -1,8 +1,9 @@
 // GPU particles for the renderer core: emitters the game places, emitted, simulated (gravity, drag, divergence-free
 // turbulence), lit (the sun through its cascade, the sky's ambient, the local lights through their shadow maps, with a
 // Henyey-Greenstein phase) and sorted back to front (bitonic) in compute, then drawn after the forward pass at render
-// size as soft camera-facing sprites, behind the volumetric fog in front of them, before TAA or the upscaler, with a
-// reactive mask (frame.h reactive) for them. Nothing runs while no emitter exists and no particle is alive.
+// size as soft camera-facing sprites, behind the volumetric fog in front of them, before TAA or the upscaler, into the
+// core's see-through pass (frame.h blendRuns): the sorted list split on the GPU at each blended surface's depth, each run
+// drawn indirectly just before its surface. Nothing runs while no emitter exists and no particle is alive.
 #include "yea_renderer_particles.h"
 #include "frame.h"
 
@@ -25,6 +26,8 @@ struct PartFrame
     float    camPos[4], proj[4], screen[4], soft[4], sunDir[4], sunColor[4], cascadeEnd[4], ambient[4], texel[4], fog[4], fog2[4];
     uint32_t counts[4], spawn[4];
     float    gi[4][4];
+    uint32_t runs[4];
+    float    blend[RENDER_MAX_BLEND_RUNS];
 };
 struct GpuEmitter
 {
@@ -37,10 +40,11 @@ struct GpuParticle
 };
 
 const uint32_t kMaxFrames = 4, kSlots = 40, kMaxEmitters = 64, kRing = 8192;
-enum Pass { kInit, kEmit, kSimulate, kPad, kSortLocal, kSortGlobal, kPasses };
+enum Pass { kInit, kEmit, kSimulate, kPad, kSortLocal, kSortGlobal, kSplit, kPasses };
 const char* const kShaderNames[kPasses] = { "renderer_particles_init.comp", "renderer_particles_emit.comp", "renderer_particles_simulate.comp",
                                             "renderer_particles_pad.comp", "renderer_particles_sort_local.comp",
-                                            "renderer_particles_sort_global.comp" };
+                                            "renderer_particles_sort_global.comp", "renderer_particles_split.comp" };
+const uint32_t kRuns = RENDER_MAX_BLEND_RUNS + 1;
 
 Renderer*      gRenderer;
 Queue*         gQueue;
@@ -62,8 +66,11 @@ Buffer*        gGiProbes;
 // between frames; SHADER_RESOURCE only while drawn.
 Buffer*        gPool, *gLit, *gDead, *gList, *gCounters;
 uint32_t       gCap;
-RenderTarget*  gReactive;
-uint32_t       gReactiveW, gReactiveH;
+// The draw's runs (frame.h blendRuns), written by the split pass: per run its indirect draw (vertices, 1, 0, 0) and its
+// first list entry, read as an instance-rate vertex stream at the run's offset (never SV_InstanceID).
+// UNORDERED_ACCESS between frames.
+Buffer*        gRunArgs, *gRunStart;
+uint32_t       gRunCount; // this frame's: blendRuns + 1
 bool           gReady, gInit;
 
 // This frame's plan, from particles_prepare to particles_run and particles_draw.
@@ -156,30 +163,6 @@ bool ensurePool(uint32_t cap)
     return true;
 }
 
-bool ensureReactive(uint32_t w, uint32_t h)
-{
-    if (gReactive && gReactiveW == w && gReactiveH == h)
-        return true;
-    if (gReactive)
-    {
-        waitQueueIdle(gQueue);
-        removeRenderTarget(gRenderer, gReactive);
-        gReactive = nullptr;
-    }
-    RenderTargetDesc d = {};
-    d.mWidth = w;
-    d.mHeight = h;
-    d.mDepth = d.mArraySize = d.mMipLevels = 1;
-    d.mSampleCount = SAMPLE_COUNT_1;
-    d.mFormat = TinyImageFormat_R8_UNORM;
-    d.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
-    d.mClearValue = { { 0, 0, 0, 0 } };
-    d.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
-    d.pName = "renderer_particles_reactive";
-    addRenderTarget(gRenderer, &d, &gReactive);
-    gReactiveW = w, gReactiveH = h;
-    return gReactive != nullptr;
-}
 
 void uavBarrier(Cmd* cmd)
 {
@@ -225,7 +208,7 @@ void dispatch(const RenderFrame* F, Pass pass, uint32_t groups, uint32_t k, uint
     uint32_t step[4] = { k, j, 0, 0 };
     memcpy(gStepCb[index]->pCpuMappedAddress, step, sizeof step);
     Buffer*        emitters = gEmitterBuf[F->frameIndex], *spawn = gSpawnBuf[F->frameIndex];
-    DescriptorData p[19] = {};
+    DescriptorData p[21] = {};
     p[0].mIndex = SRT_RES_IDX(PartSrt, PerFrame, gFrame);
     p[0].ppBuffers = &gFrameCb[F->frameIndex];
     p[1].mIndex = SRT_RES_IDX(PartSrt, PerFrame, gStep);
@@ -264,7 +247,11 @@ void dispatch(const RenderFrame* F, Pass pass, uint32_t groups, uint32_t k, uint
     p[17].ppTextures = &gGiDist;
     p[18].mIndex = SRT_RES_IDX(PartSrt, PerFrame, gGiProbes);
     p[18].ppBuffers = &gGiProbes;
-    updateDescriptorSet(gRenderer, index, gSet, 19, p);
+    p[19].mIndex = SRT_RES_IDX(PartSrt, PerFrame, gRunArgs);
+    p[19].ppBuffers = &gRunArgs;
+    p[20].mIndex = SRT_RES_IDX(PartSrt, PerFrame, gRunStart);
+    p[20].ppBuffers = &gRunStart;
+    updateDescriptorSet(gRenderer, index, gSet, 21, p);
     Cmd* cmd = F->cmd;
     cmdBindPipeline(cmd, gPipe[pass]);
     cmdBindDescriptorSet(cmd, 0, gPersistent);
@@ -376,12 +363,16 @@ int load(int reloaded)
     gDummyShapes = makeMapped(sizeof(RenderGpuLightShape) * 2, sizeof(RenderGpuLightShape), DESCRIPTOR_TYPE_BUFFER, "renderer_particles_no_shapes");
     for (uint32_t i = 0; i < gFrames; ++i)
     {
-        gFrameCb[i] = makeMapped(512, 0, DESCRIPTOR_TYPE_UNIFORM_BUFFER, "renderer_particles_cb");
+        gFrameCb[i] = makeMapped(1024, 0, DESCRIPTOR_TYPE_UNIFORM_BUFFER, "renderer_particles_cb");
         gEmitterBuf[i] = makeMapped(sizeof(GpuEmitter) * kMaxEmitters, sizeof(GpuEmitter), DESCRIPTOR_TYPE_BUFFER, "renderer_particles_emitters");
         gSpawnBuf[i] = makeMapped(16 * kMaxEmitters, 16, DESCRIPTOR_TYPE_BUFFER, "renderer_particles_spawn");
     }
     for (uint32_t i = 0; i < gFrames * kSlots; ++i)
         gStepCb[i] = makeMapped(256, 0, DESCRIPTOR_TYPE_UNIFORM_BUFFER, "renderer_particles_step");
+    gRunArgs = makeBuffer(kRuns * 16, 4, DESCRIPTOR_TYPE_RW_BUFFER | DESCRIPTOR_TYPE_INDIRECT_BUFFER, RESOURCE_MEMORY_USAGE_GPU_ONLY,
+                          RESOURCE_STATE_UNORDERED_ACCESS, "renderer_particles_run_args");
+    gRunStart = makeBuffer(kRuns * 4, 4, DESCRIPTOR_TYPE_RW_BUFFER | DESCRIPTOR_TYPE_VERTEX_BUFFER, RESOURCE_MEMORY_USAGE_GPU_ONLY,
+                           RESOURCE_STATE_UNORDERED_ACCESS, "renderer_particles_run_start");
     DescriptorSetDesc persistent = SRT_SET_DESC(PartSrt, Persistent, 1, 0);
     addDescriptorSet(gRenderer, &persistent, &gPersistent);
     DescriptorSetDesc perFrame = SRT_SET_DESC(PartSrt, PerFrame, gFrames * kSlots, 0);
@@ -390,7 +381,7 @@ int load(int reloaded)
     addDescriptorSet(gRenderer, &drawDesc, &gDrawSet);
     waitForAllResourceLoads();
     bool ok = gNoGi && gShadowCmp && gDummyAtlas && gDummyAtlas->pTexture && gDummyFog && gDummyViews && gDummyBins && gDummySh && gDummyLights &&
-              gDummyShapes && gPersistent && gSet && gDrawSet;
+              gDummyShapes && gPersistent && gSet && gDrawSet && gRunArgs && gRunStart;
     for (uint32_t i = 0; i < gFrames; ++i)
         ok = ok && gFrameCb[i] && gEmitterBuf[i] && gSpawnBuf[i] && gFrameCb[i]->pCpuMappedAddress && gEmitterBuf[i]->pCpuMappedAddress &&
              gSpawnBuf[i]->pCpuMappedAddress;
@@ -417,10 +408,6 @@ void unload()
         return;
     waitQueueIdle(gQueue);
     freePool();
-    if (gReactive)
-        removeRenderTarget(gRenderer, gReactive);
-    gReactive = nullptr;
-    gReactiveW = gReactiveH = 0;
     for (uint32_t i = 0; i < kMaxFrames; ++i)
     {
         Buffer** per[] = { &gFrameCb[i], &gEmitterBuf[i], &gSpawnBuf[i] };
@@ -434,7 +421,7 @@ void unload()
     for (uint32_t i = 0; i < kMaxFrames * kSlots; ++i)
         if (gStepCb[i])
             removeResource(gStepCb[i]), gStepCb[i] = nullptr;
-    Buffer** bufs[] = { &gDummyViews, &gDummyBins, &gDummySh, &gDummyLights, &gDummyShapes };
+    Buffer** bufs[] = { &gDummyViews, &gDummyBins, &gDummySh, &gDummyLights, &gDummyShapes, &gRunArgs, &gRunStart };
     for (Buffer** b : bufs)
     {
         if (*b)
@@ -616,7 +603,6 @@ bool particles_prepare(uint64_t address)
     gPendingDt = 0;
     if (!F || F->version != RENDER_FRAME_VERSION)
         return false;
-    F->reactive = nullptr;
     if (!gReady || !settings.particles || F->sampleCount != 1 || !F->hdr || !F->depth || !F->width || !F->height)
         return false;
     // Reset (or a first frame): the pool starts empty.
@@ -684,12 +670,16 @@ bool particles_prepare(uint64_t address)
     gLiveBound = bound;
     if (!bound && !gInit)
         return false; // nothing alive, nothing made
-    if (!ensurePool(cap) || !ensureReactive(F->width, F->height))
+    if (!ensurePool(cap))
         return false;
     bound = bound < cap ? bound : cap;
     gSortN = pow2Ceil(bound > 1024 ? bound : 1024);
     gSortN = gSortN < gCap ? gSortN : gCap;
-    gSort = sort && bound > 1;
+    // Blended surfaces split the list at their depths: it is sorted then, additive particles too (behind a pane, they are
+    // seen through it).
+    const uint32_t runs = F->blendRuns < RENDER_MAX_BLEND_RUNS ? F->blendRuns : RENDER_MAX_BLEND_RUNS;
+    gSort = (sort || runs > 0) && bound > 1;
+    gRunCount = runs + 1;
 
     PartFrame& d = gData;
     memset(&d, 0, sizeof d);
@@ -731,6 +721,8 @@ bool particles_prepare(uint64_t address)
     d.counts[2] = (shadowMaps ? 1u : 0u) | (F->zbins && F->binCount ? 2u : 0u);
     d.counts[3] = gCap;
     d.spawn[0] = total, d.spawn[1] = spawns, d.spawn[2] = gSortN, d.spawn[3] = (uint32_t)F->frameNumber * 2654435761u;
+    d.runs[0] = runs;
+    memcpy(d.blend, F->blendDepths, sizeof(float) * runs);
     memcpy(gFrameCb[F->frameIndex]->pCpuMappedAddress, &d, sizeof d);
     gLights = lights ? F->lightBuffer : gDummyLights;
     gShapes = lights ? F->lightShapes : gDummyShapes;
@@ -780,61 +772,96 @@ void particles_run(uint64_t address)
             dispatch(F, kSortLocal, gSortN / 1024, k, 0);
         }
     }
+    dispatch(F, kSplit, 1, 0, 0); // the draw's runs
     cmdEndDebugMarker(cmd);
 }
 
-void particles_draw(uint64_t address)
+namespace
+{
+// The pipeline for the core's see-through pass (hdr, reactive, transparency), made once, again if the format changes.
+bool ensureDrawPipe(TinyImageFormat format)
+{
+    if (gDrawPipe && gDrawFormat == format)
+        return true;
+    if (gDrawPipe)
+    {
+        waitQueueIdle(gQueue);
+        removePipeline(gRenderer, gDrawPipe);
+        gDrawPipe = nullptr;
+    }
+    RasterizerStateDesc raster = {};
+    raster.mCullMode = CULL_MODE_NONE;
+    DepthStateDesc depth = {};
+    // Premultiplied over the scene (additive particles write alpha 0); the reactive mask adds coverage; the transparency
+    // mask is blended surfaces' alone.
+    BlendStateDesc blend = {};
+    blend.mSrcFactors[0] = BC_ONE;
+    blend.mDstFactors[0] = BC_ONE_MINUS_SRC_ALPHA;
+    blend.mSrcAlphaFactors[0] = BC_ONE;
+    blend.mDstAlphaFactors[0] = BC_ONE_MINUS_SRC_ALPHA;
+    blend.mSrcFactors[1] = blend.mDstFactors[1] = blend.mSrcAlphaFactors[1] = blend.mDstAlphaFactors[1] = BC_ONE;
+    blend.mSrcFactors[2] = blend.mSrcAlphaFactors[2] = BC_ZERO;
+    blend.mDstFactors[2] = blend.mDstAlphaFactors[2] = BC_ONE;
+    for (int t = 0; t < 3; ++t)
+        blend.mBlendModes[t] = blend.mBlendAlphaModes[t] = BM_ADD;
+    blend.mColorWriteMasks[0] = COLOR_MASK_RED | COLOR_MASK_GREEN | COLOR_MASK_BLUE;
+    blend.mColorWriteMasks[1] = COLOR_MASK_ALL;
+    blend.mColorWriteMasks[2] = COLOR_MASK_NONE;
+    blend.mRenderTargetMask = (BlendStateTargets)(BLEND_STATE_TARGET_0 | BLEND_STATE_TARGET_1 | BLEND_STATE_TARGET_2);
+    blend.mIndependentBlend = true;
+    TinyImageFormat formats[3] = { format, TinyImageFormat_R8_UNORM, TinyImageFormat_R8_UNORM };
+    // The run's first list entry: an instance-rate stream bound at the run's offset.
+    VertexLayout layout = {};
+    layout.mBindingCount = 1;
+    layout.mBindings[0].mStride = 4;
+    layout.mBindings[0].mRate = VERTEX_BINDING_RATE_INSTANCE;
+    layout.mAttribCount = 1;
+    layout.mAttribs[0].mSemantic = SEMANTIC_TEXCOORD0;
+    layout.mAttribs[0].mFormat = TinyImageFormat_R32_UINT;
+    layout.mAttribs[0].mBinding = 0;
+    layout.mAttribs[0].mLocation = 0;
+    layout.mAttribs[0].mOffset = 0;
+    PipelineDesc desc = {};
+    desc.mType = PIPELINE_TYPE_GRAPHICS;
+    PIPELINE_LAYOUT_DESC(desc, NULL, SRT_LAYOUT_DESC(DrawSrt, PerFrame), NULL, NULL);
+    GraphicsPipelineDesc& g = desc.mGraphicsDesc;
+    g.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+    g.mRenderTargetCount = 3;
+    g.pColorFormats = formats;
+    g.mSampleCount = SAMPLE_COUNT_1;
+    g.mDepthStencilFormat = TinyImageFormat_UNDEFINED;
+    g.pShaderProgram = gDrawShader;
+    g.pRasterizerState = &raster;
+    g.pDepthState = &depth;
+    g.pBlendState = &blend;
+    g.pVertexLayout = &layout;
+    desc.pName = "renderer_particles_draw";
+    addPipeline(gRenderer, &desc, &gDrawPipe);
+    gDrawFormat = format;
+    return gDrawPipe != nullptr;
+}
+
+void runBarrier(Cmd* cmd, bool toDraw)
+{
+    const ResourceState uav = RESOURCE_STATE_UNORDERED_ACCESS;
+    BufferBarrier b[2] = { { gRunArgs, toDraw ? uav : RESOURCE_STATE_INDIRECT_ARGUMENT, toDraw ? RESOURCE_STATE_INDIRECT_ARGUMENT : uav },
+                           { gRunStart, toDraw ? uav : RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+                             toDraw ? RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER : uav } };
+    cmdResourceBarrier(cmd, 2, b, 0, nullptr, 0, nullptr);
+}
+} // namespace
+
+// Before the core binds its see-through pass: the pipeline, this frame's set and the buffers ready to draw. false: no
+// particles this frame (particles_draw and particles_draw_end then do nothing).
+bool particles_draw_begin(uint64_t address)
 {
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
-    if (!gOn || !F || !gReactive)
-        return;
+    gDrawn = false;
+    if (!gOn || !F || !F->hdr || !F->depth)
+        return false;
     gOn = false;
-    Cmd* cmd = F->cmd;
-    // The pipeline, for the frame's colour format (made once, again if it changes).
-    TinyImageFormat format = F->hdr->mFormat;
-    if (!gDrawPipe || gDrawFormat != format)
-    {
-        if (gDrawPipe)
-        {
-            waitQueueIdle(gQueue);
-            removePipeline(gRenderer, gDrawPipe);
-            gDrawPipe = nullptr;
-        }
-        RasterizerStateDesc raster = {};
-        raster.mCullMode = CULL_MODE_NONE;
-        DepthStateDesc depth = {};
-        // Premultiplied over the scene (additive particles write alpha 0); the reactive mask adds coverage.
-        BlendStateDesc blend = {};
-        blend.mSrcFactors[0] = BC_ONE;
-        blend.mDstFactors[0] = BC_ONE_MINUS_SRC_ALPHA;
-        blend.mSrcAlphaFactors[0] = BC_ONE;
-        blend.mDstAlphaFactors[0] = BC_ONE_MINUS_SRC_ALPHA;
-        blend.mSrcFactors[1] = blend.mDstFactors[1] = blend.mSrcAlphaFactors[1] = blend.mDstAlphaFactors[1] = BC_ONE;
-        blend.mBlendModes[0] = blend.mBlendModes[1] = blend.mBlendAlphaModes[0] = blend.mBlendAlphaModes[1] = BM_ADD;
-        blend.mColorWriteMasks[0] = COLOR_MASK_RED | COLOR_MASK_GREEN | COLOR_MASK_BLUE;
-        blend.mColorWriteMasks[1] = COLOR_MASK_ALL;
-        blend.mRenderTargetMask = (BlendStateTargets)(BLEND_STATE_TARGET_0 | BLEND_STATE_TARGET_1);
-        blend.mIndependentBlend = true;
-        TinyImageFormat formats[2] = { format, TinyImageFormat_R8_UNORM };
-        PipelineDesc    desc = {};
-        desc.mType = PIPELINE_TYPE_GRAPHICS;
-        PIPELINE_LAYOUT_DESC(desc, NULL, SRT_LAYOUT_DESC(DrawSrt, PerFrame), NULL, NULL);
-        GraphicsPipelineDesc& g = desc.mGraphicsDesc;
-        g.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
-        g.mRenderTargetCount = 2;
-        g.pColorFormats = formats;
-        g.mSampleCount = SAMPLE_COUNT_1;
-        g.mDepthStencilFormat = TinyImageFormat_UNDEFINED;
-        g.pShaderProgram = gDrawShader;
-        g.pRasterizerState = &raster;
-        g.pDepthState = &depth;
-        g.pBlendState = &blend;
-        desc.pName = "renderer_particles_draw";
-        addPipeline(gRenderer, &desc, &gDrawPipe);
-        gDrawFormat = format;
-        if (!gDrawPipe)
-            return;
-    }
+    if (!ensureDrawPipe(F->hdr->mFormat))
+        return false;
     Buffer*        emitters = gEmitterBuf[F->frameIndex];
     Texture*       depthTex = F->depth->pTexture;
     DescriptorData p[8] = {};
@@ -855,29 +882,36 @@ void particles_draw(uint64_t address)
     p[7].mIndex = SRT_RES_IDX(DrawSrt, PerFrame, gFogVolume);
     p[7].ppTextures = &gFogTex;
     updateDescriptorSet(gRenderer, F->frameIndex, gDrawSet, 8, p);
+    poolBarrier(F->cmd, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE);
+    runBarrier(F->cmd, true);
+    gDrawn = true;
+    return true;
+}
 
-    cmdBeginDebugMarker(cmd, 0.9f, 0.8f, 0.6f, "Renderer particles draw");
-    poolBarrier(cmd, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE);
-    RenderTargetBarrier rt[2] = { { F->hdr, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_RENDER_TARGET },
-                                  { gReactive, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_RENDER_TARGET } };
-    cmdResourceBarrier(cmd, 0, nullptr, 0, nullptr, 2, rt);
-    BindRenderTargetsDesc bind = {};
-    bind.mRenderTargetCount = 2;
-    bind.mRenderTargets[0] = { F->hdr, LOAD_ACTION_LOAD };
-    bind.mRenderTargets[1] = { gReactive, LOAD_ACTION_CLEAR };
-    cmdBindRenderTargets(cmd, &bind);
-    cmdSetViewport(cmd, 0, 0, (float)F->width, (float)F->height, 0, 1);
-    cmdSetScissor(cmd, 0, 0, F->width, F->height);
+// Inside the core's see-through pass: run `run` of the sorted list (frame.h blendRuns), drawn indirectly from the split
+// pass's counts, first vertex 0.
+void particles_draw(uint64_t address, uint32_t run)
+{
+    RenderFrame* F = (RenderFrame*)(uintptr_t)address;
+    if (!gDrawn || !F || run >= gRunCount)
+        return;
+    Cmd* cmd = F->cmd;
     cmdBindPipeline(cmd, gDrawPipe);
     cmdBindDescriptorSet(cmd, F->frameIndex, gDrawSet);
-    cmdDraw(cmd, gSortN * 6, 0);
-    cmdBindRenderTargets(cmd, nullptr);
-    RenderTargetBarrier back[2] = { { F->hdr, RESOURCE_STATE_RENDER_TARGET, RESOURCE_STATE_SHADER_RESOURCE },
-                                    { gReactive, RESOURCE_STATE_RENDER_TARGET, RESOURCE_STATE_SHADER_RESOURCE } };
-    cmdResourceBarrier(cmd, 0, nullptr, 0, nullptr, 2, back);
-    poolBarrier(cmd, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
-    cmdEndDebugMarker(cmd);
-    F->reactive = gReactive->pTexture;
-    gDrawn = true;
+    uint32_t stride = 4;
+    uint64_t offset = (uint64_t)run * 4;
+    cmdBindVertexBuffer(cmd, 1, &gRunStart, &stride, &offset);
+    cmdExecuteIndirect(cmd, INDIRECT_DRAW, 1, gRunArgs, (uint64_t)run * 16, nullptr, 0);
+}
+
+// After the core unbinds its pass.
+void particles_draw_end(uint64_t address)
+{
+    RenderFrame* F = (RenderFrame*)(uintptr_t)address;
+    if (!gDrawn || !F)
+        return;
+    runBarrier(F->cmd, false);
+    poolBarrier(F->cmd, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
+    gDrawn = false;
 }
 } // namespace renderer_particles

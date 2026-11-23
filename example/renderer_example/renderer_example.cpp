@@ -57,6 +57,7 @@ struct State
 };
 State* gState;
 bool   gFreshVersion; // this version of the module hasn't built its scene yet: build it once (new meshes reach a running game)
+bool   gGlassBuilt, gDecalsBuilt; // the glass and decals knobs as the scene was built (switching one builds it again)
 
 // Mouse look: the host holds the mouse (hidden, kept in the window) while the left button stays down
 // after a press on the game; it lets go itself when F1 opens, focus is lost, the view switches or resets.
@@ -227,6 +228,60 @@ void placeModels()
         models->boomBox = mdl::place(boom_box, { 5.0f, 1.4f, 2.0f }, toView);
 }
 
+// Glass: a clear pane between the start view and the steam, a teal one behind it (the steam drawn between them), and a
+// clear ball on the floor. See-through surfaces cast no shadows yet.
+void addGlass()
+{
+    gGlassBuilt = settings.glass;
+    if (!settings.glass)
+        return;
+    uint32_t         box = renderer::mesh_box(), sphere = renderer::mesh_sphere(128);
+    const yea_float4 facing = axisAngle({ 0, 1, 0 }, 1.08f); // square to the start view, over the drum
+    yea_handle       clear = renderer::material_add({ 0.95f, 0.97f, 1.0f }, 0.03f, 0);
+    renderer::material_blend(clear, 0.06f);
+    yea_handle teal = renderer::material_add({ 0.2f, 0.75f, 0.7f }, 0.08f, 0);
+    renderer::material_blend(teal, 0.45f);
+    yea_handle panes[3] = { renderer::instance_add(box, clear), renderer::instance_add(box, teal), renderer::instance_add(sphere, clear) };
+    renderer::instance_place(panes[0], { 1.9f, 0.95f, 2.95f }, facing, { 2.0f, 1.9f, 0.02f });
+    renderer::instance_place(panes[1], { -0.73f, 0.95f, 1.54f }, facing, { 2.0f, 1.9f, 0.02f });
+    renderer::instance_place(panes[2], { -0.6f, 0.6f, 5.6f }, kNoRotation, { 1.2f, 1.2f, 1.2f });
+    for (yea_handle h : panes)
+        renderer::instance_shadow(h, false);
+}
+
+// Decals painted over the floor, the copper block and the stone ledge.
+void addDecals()
+{
+    gDecalsBuilt = settings.decals;
+    if (!settings.decals)
+        return;
+    const yea_float4 up = axisAngle({ 1, 0, 0 }, -0.5f * kPi); // the box's z out of the floor
+    const yea_float4 none = { 0, 0, 0, 1 };
+    // A scorch by the white boxes: soot, ragged and patchy.
+    yea_handle d = renderer::decal_add({ -3.2f, 0, 1.0f }, up, { 1.3f, 1.3f, 0.3f });
+    renderer::decal_look(d, { 0.02f, 0.018f, 0.016f, 0.95f }, 0.95f, 0, { 0, 0, 0 }, 0, { 1, 1, 1, 0 });
+    renderer::decal_shape(d, 0, 0.5f, 0.8f, 80);
+    // Worn yellow lines along the path, and a puddle over them in front: dark, mirror-smooth, flat.
+    for (float x : { -1.1f, 2.1f })
+    {
+        d = renderer::decal_add({ x, 0, 4.5f }, up, { 0.07f, 3.5f, 0.3f });
+        renderer::decal_look(d, { 0.85f, 0.62f, 0.05f, 1 }, 0.55f, 0, { 0, 0, 0 }, 0, { 1, 1, 1, 0 });
+        renderer::decal_shape(d, 1, 0.15f, 0.2f, 80);
+    }
+    d = renderer::decal_add({ 2.0f, 0, 6.2f }, up, { 2.0f, 1.1f, 0.3f });
+    renderer::decal_look(d, { 0.04f, 0.04f, 0.045f, 1 }, 0.04f, 0, { 0, 0, 0 }, 0, { 0.35f, 1, 1, 1 });
+    renderer::decal_shape(d, 0, 0.45f, 0.5f, 60);
+    renderer::decal_priority(d, 1);
+    // Green patina creeping up the copper block's front.
+    d = renderer::decal_add({ 5.2f, 0.45f, 2.5f }, none, { 1.0f, 0.5f, 0.2f });
+    renderer::decal_look(d, { 0.25f, 0.55f, 0.42f, 0.9f }, 0.8f, 0, { 0, 0, 0 }, 0, { 1, 1, 1, 0 });
+    renderer::decal_shape(d, 0, 0.6f, 0.7f, 70);
+    // A glowing cyan strip along the stone ledge's front.
+    d = renderer::decal_add({ -3.0f, 0.25f, -6.75f }, none, { 1.2f, 0.05f, 0.2f });
+    renderer::decal_look(d, { 0.05f, 0.4f, 0.5f, 1 }, 0.3f, 0, { 0.3f, 0.9f, 1.0f }, 40, { 1, 1, 1, 0 });
+    renderer::decal_shape(d, 1, 0.2f, 0, 80);
+}
+
 void build(State* s)
 {
     s->built = 0;
@@ -290,6 +345,8 @@ void build(State* s)
     addSpin(s, torus, white, { -8.5f, 1.3f, -1.0f }, { 2.2f, 2.2f, 2.2f }, { 0, 0, 1 });
 
     addProbes();
+    addGlass();
+    addDecals();
 
     // The area lights' dark fittings: the softbox's backing and stand, the pendant's canopy and cord, the tube's
     // brackets. They stay when a type is switched off (a lamp turned off). Those beside an emitter cast no shadow (they
@@ -684,7 +741,7 @@ void update(uint32_t phase, float dt)
     // The renderer's scene must be the one this module built: after a renderer crash, revert or reload that lost or
     // replaced it (or one that came back while this module had built against stubs), every handle held here is stale
     // and nothing would move, so build it all again. Its scene_epoch says so, whatever other modules add to the scene.
-    if (!s->built || gFreshVersion || renderer::scene_epoch() != s->epoch)
+    if (!s->built || gFreshVersion || renderer::scene_epoch() != s->epoch || settings.glass != gGlassBuilt || settings.decals != gDecalsBuilt)
     {
         char line[160];
         snprintf(line, sizeof line, "renderer_example: building the scene (built %u; the renderer's scene %u, built in %u)", s->built,

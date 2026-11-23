@@ -44,5 +44,6 @@ void              texturesUpdate(Queue* queue);   // in draw, before the frame: 
 Texture* const*   textureSlots();                 // RENDER_MAX_TEXTURES of them, for the shaders' array
 uint32_t          textureVersion();               // changes whenever textureSlots() does
 uint32_t          textureSlot(yea_handle t);      // a texture's slot + 1 once it is drawn with, else 0
-void              materialMapsReset(uint32_t materialRow); // a material row made afresh has no maps
+void              materialMapsReset(uint32_t materialRow); // a material row made afresh has no maps (and is opaque)
+float             materialOpacity(uint32_t materialRow);   // material_blend's opacity, 0: opaque
 } // namespace renderer

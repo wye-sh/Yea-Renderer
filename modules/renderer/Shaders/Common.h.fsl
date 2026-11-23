@@ -45,6 +45,7 @@ STRUCT(FrameData)
     DATA(float4, fogAlbedo, None);
     DATA(float4, textures, None);            // x texture mip bias (log2 of render over display width; 0 at native)
     DATA(float4, gi[4], None);               // dynamic diffuse GI (FLAG_GI): frame.h giGrid
+    DATA(uint4, decals, None);               // x decals in gDecals (FLAG_DECALS)
     DATA(float4, taps[32], None);            // xy: the shadow filters' Vogel disk of counts.w taps, unturned
 };
 
@@ -77,6 +78,7 @@ STRUCT(ProbeData)
 #define FLAG_FOG      262144u // renderer_fog: gFogVolume
 #define FLAG_GI       524288u // renderer_gi: diffuse ambient from its probes (gGiIrradiance, gGiDistance, gGiProbes)
 #define FLAG_GI_DEBUG 1048576u
+#define FLAG_DECALS   2097152u // decals: gDecals, binned (with FLAG_CULLED) in gDecalMasks and gDecalBins
 #define FLAG_AREA     65536u // gLightShapes is filled: some light has a shape or its own size (area lights take LTC terms)
 #define RT_MISS       60000.0
 
@@ -111,9 +113,27 @@ STRUCT(MaterialMapData)
     DATA(uint4, maps, None);
     DATA(float4, baseFactor, None);   // rgb times the base colour map, a times its alpha
     DATA(float4, factors, None);      // x roughness, y metallic (times ORM's g, b), z normal scale, w occlusion strength
-    DATA(float4, misc, None);         // x alpha cutoff (0: opaque), y 1 when the maps were given (vertex colours count)
+    DATA(float4, misc, None);         // x alpha cutoff (0: opaque), y 1 when the maps were given (vertex colours count),
+                                      // z blended opacity (material_blend; 0: opaque)
 };
 #define MAX_TEXTURES 1024
+
+// A decal (renderer.cpp GpuDecal): the box it paints, mapped to -1..1 by its rows.
+STRUCT(DecalData)
+{
+    DATA(float4, row0, None);
+    DATA(float4, row1, None);
+    DATA(float4, row2, None);
+    DATA(float4, axisZ, None);    // world, out of the surface; w the cosine where its angle fade ends
+    DATA(float4, axisX, None);    // w 1 / the angle fade's width in cosine
+    DATA(float4, axisY, None);    // w normal map scale
+    DATA(float4, albedo, None);   // a opacity
+    DATA(float4, material, None); // x roughness, y metallic, z edge, w noise
+    DATA(float4, emissive, None); // rgb nits, w shape (0 ellipse, 1 rectangle)
+    DATA(float4, weights, None);  // colour, roughness, metallic, normal
+    DATA(uint4, maps, None);      // base colour, normal, ORM: slot in gTextures + 1, 0 none; w its noise seed
+};
+#define DECAL_WORDS 8u // RENDER_MAX_DECALS / 32: gDecalMasks' words a tile
 
 STRUCT(LightData)
 {

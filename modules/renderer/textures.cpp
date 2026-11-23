@@ -256,12 +256,27 @@ void material_alpha(yea_handle m, float cutoff)
         mm->cutoff = cutoff > 0 ? cutoff : 0;
 }
 
+void material_blend(yea_handle m, float opacity)
+{
+    uint32_t row = rowOf(Materials, m);
+    if (row == kNone)
+        return;
+    while (MaterialBlends.size() <= row)
+        if (!MaterialBlends.add())
+            return;
+    MaterialBlends[row].opacity = opacity > 0 ? (opacity < 1 ? opacity : 1) : 0;
+}
+
+float materialOpacity(uint32_t row) { return row < MaterialBlends.size() ? MaterialBlends[row].opacity : 0.0f; }
+
 // --- The renderer's side ------------------------------------------------------------------------------------------------
 
 void materialMapsReset(uint32_t materialRow)
 {
     if (materialRow < MaterialMaps.size())
         MaterialMaps[materialRow] = MaterialMap{};
+    if (materialRow < MaterialBlends.size())
+        MaterialBlends[materialRow] = MaterialBlend{};
 }
 
 uint32_t textureSlot(yea_handle h)

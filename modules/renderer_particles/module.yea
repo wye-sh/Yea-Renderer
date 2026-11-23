@@ -64,11 +64,15 @@ export void particle_emitter_clear()
 
 # Called by renderer (the core) each frame with the address of its RenderFrame (frame.h): particles_on before the
 # shadows are planned (whether it needs the shadow maps), particles_prepare after fog_prepare, particles_run after
-# fog_run (emit, simulate, light, sort), particles_draw after the forward pass (into hdr, with depth in SHADER_RESOURCE).
+# fog_run (emit, simulate, light, sort, split into runs at blended surfaces' depths), and in the core's see-through pass
+# (frame.h blendRuns): particles_draw_begin before it binds it, particles_draw for each run between the blended surfaces,
+# particles_draw_end after.
 export bool particles_on()
 export bool particles_prepare(u64 frame)
 export void particles_run(u64 frame)
-export void particles_draw(u64 frame)
+export bool particles_draw_begin(u64 frame)
+export void particles_draw(u64 frame, u32 run)
+export void particles_draw_end(u64 frame)
 
 category Particles
 # Dust, steam, smoke and sparks from the game's emitters.

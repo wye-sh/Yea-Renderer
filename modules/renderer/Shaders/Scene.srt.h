@@ -40,5 +40,9 @@ BEGIN_SRT(SceneSrt)
         DECL_TEXTURE(PerFrame, Tex2D(float4), gGiIrradiance) // renderer_gi (FLAG_GI): its probes (GiSample.h.fsl)
         DECL_TEXTURE(PerFrame, Tex2D(float4), gGiDistance)
         DECL_BUFFER(PerFrame, Buffer(float4), gGiProbes)
+        DECL_TEXTURE(PerFrame, Depth2D(float), gSceneDepth) // the see-through pass's depth test (BLEND_PASS)
+        DECL_BUFFER(PerFrame, Buffer(DecalData), gDecals)   // decals (FLAG_DECALS)
+        DECL_BUFFER(PerFrame, Buffer(uint), gDecalMasks)     // renderer_culling's tiles of them
+        DECL_BUFFER(PerFrame, Buffer(uint), gDecalBins)      // and z-bins
     END_SRT_SET(PerFrame)
 END_SRT(SceneSrt)

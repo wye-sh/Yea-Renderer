@@ -19,6 +19,8 @@ STRUCT(PartFrame)
     DATA(uint4, counts, None);      // x lights, y bins, z flags (1 local lights' maps, 2 z-bins, 4 renderer_gi's probes), w the pool's size
     DATA(uint4, spawn, None);       // x particles to emit this frame, y emitters in gSpawn, z the sort's size (power of 2), w seed
     DATA(float4, gi[4], None);      // frame.h giGrid (flag 4)
+    DATA(uint4, runs, None);        // x blended surfaces' depths in blend (frame.h blendRuns): the draw has x + 1 runs
+    DATA(float4, blend[16], None);  // their view depths, farthest first: depth k is blend[k / 4][k % 4]
 };
 
 // A particle in the pool.

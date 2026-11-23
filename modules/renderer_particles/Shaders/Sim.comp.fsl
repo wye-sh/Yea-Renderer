@@ -7,6 +7,8 @@
 // PAD: the draw list past its end, up to the sort's size, with depth 0 (they sort last).
 // SORT_LOCAL, SORT_GLOBAL: a bitonic sort of the draw list by depth, farthest first (back to front), 1024 entries a
 //   group in shared memory, the strides past it a pass each.
+// SPLIT: the sorted list cut into the draw's runs at the blended surfaces' depths (frame.h blendRuns), a binary search
+//   each: run k the entries deeper than depth k and not deeper than depth k - 1, the last run the rest.
 #include "ParticleData.h.fsl"
 #include "Particles.srt.h"
 #define GI_IRRADIANCE gGiIrradiance
@@ -364,6 +366,44 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
         gList[i] = b;
         gList[l] = a;
     }
+    RETURN();
+}
+#endif
+
+#if defined(SPLIT)
+// Entries deeper than z (the list is sorted farthest first; a depth's bits order as the depth, all >= 0).
+uint deeperThan(float z, uint n)
+{
+    uint lo = 0u, hi = n;
+    while (lo < hi)
+    {
+        uint mid = (lo + hi) / 2u;
+        if (asfloat(gList[mid].x) > z)
+            lo = mid + 1u;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(128, 1, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) id)
+{
+    INIT_MAIN;
+    uint runs = gFrame.runs.x;
+    uint k = id.x;
+    if (k > runs)
+        RETURN();
+    uint n = gCounters[1];
+    uint first = k == 0u ? 0u : deeperThan(gFrame.blend[(k - 1u) / 4u][(k - 1u) % 4u], n);
+    uint end = k == runs ? n : deeperThan(gFrame.blend[k / 4u][k % 4u], n);
+    end = max(end, first);
+    gRunArgs[k * 4u + 0u] = (end - first) * 6u;
+    gRunArgs[k * 4u + 1u] = 1u;
+    gRunArgs[k * 4u + 2u] = 0u;
+    gRunArgs[k * 4u + 3u] = 0u;
+    gRunStart[k] = first;
     RETURN();
 }
 #endif

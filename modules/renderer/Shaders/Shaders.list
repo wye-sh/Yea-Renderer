@@ -149,3 +149,27 @@
 #define MASKED
 #include "Surface.frag.fsl"
 #end
+
+#frag renderer_blend.frag
+#define TRANSLUCENT
+#define BLEND_PASS
+#include "Forward.frag.fsl"
+#end
+
+#frag renderer_blend_msaa.frag
+#define TRANSLUCENT
+#include "Forward.frag.fsl"
+#end
+
+#frag renderer_transmit.frag
+#define TRANSLUCENT
+#define TRANSMIT
+#define BLEND_PASS
+#include "Forward.frag.fsl"
+#end
+
+#frag renderer_transmit_msaa.frag
+#define TRANSLUCENT
+#define TRANSMIT
+#include "Forward.frag.fsl"
+#end

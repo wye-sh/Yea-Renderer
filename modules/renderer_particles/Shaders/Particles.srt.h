@@ -1,6 +1,6 @@
 #pragma once
 
-// Every compute pass of the particles (init, emit, simulate, pad, sort): each binds the whole set, in its own slot.
+// Every compute pass of the particles (init, emit, simulate, pad, sort, split): each binds the whole set, in its own slot.
 BEGIN_SRT(PartSrt)
     BEGIN_SRT_SET(Persistent)
         DECL_SAMPLER(Persistent, SamplerComparisonState, gShadowCmp)
@@ -25,5 +25,7 @@ BEGIN_SRT(PartSrt)
         DECL_RWBUFFER(PerFrame, RWBuffer(uint), gDead)      // free pool slots, gCounters[0] of them
         DECL_RWBUFFER(PerFrame, RWBuffer(uint2), gList)     // to draw: x the depth's bits, y the slot; gCounters[1] of them
         DECL_RWBUFFER(PerFrame, RWBuffer(uint), gCounters)  // [0] free slots, [1] particles to draw
+        DECL_RWBUFFER(PerFrame, RWBuffer(uint), gRunArgs)   // SPLIT: per draw run its indirect draw (vertices, 1, 0, 0)
+        DECL_RWBUFFER(PerFrame, RWBuffer(uint), gRunStart)  // and its first list entry
     END_SRT_SET(PerFrame)
 END_SRT(PartSrt)

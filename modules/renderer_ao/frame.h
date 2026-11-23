@@ -10,10 +10,12 @@ struct Buffer;
 struct RenderTarget;
 struct Texture;
 
-#define RENDER_FRAME_VERSION 22u
+#define RENDER_FRAME_VERSION 23u
 #define RENDER_RT_MAX_TRACED 8u
 #define RENDER_MAX_CASCADES  4u
 #define RENDER_MAX_TEXTURES  1024u // texture maps the shaders' array holds (the core's Texture table)
+#define RENDER_MAX_BLEND_RUNS 64u  // depths blended surfaces split the particles at (frame v23)
+#define RENDER_MAX_DECALS     256u // decals drawn in a frame (frame v23)
 #define RENDER_VIEW_SHIFT    20u // shadow instance stream entry: instance | view << 20
 // Vertex streams (positions, attributes): bytes per vertex.
 #define RENDER_POSITION_STRIDE  12u // float3
@@ -318,11 +320,11 @@ struct RenderFrame
                              // fogShadowMaps): renderer_shadows keeps the sun's cascades and traced lights' tiles even when
                              // renderer_rt traces them (fog and particles read the maps)
 
-    // Particles (renderer_particles, frame v20). particles_prepare runs after fog_prepare (nullptr reactive without it),
-    // particles_run after fog_run, particles_draw after the forward pass, into hdr at render size, with depth in
-    // SHADER_RESOURCE; before exposure, TAA and the upscaler.
-    Texture* reactive;      // R8 at render size, SHADER_RESOURCE after particles_draw: how much of each pixel is particle (0
-                            // where none drew), for TAA and the upscalers (their reactive or bias masks); nullptr: none drawn
+    // Particles (renderer_particles, frame v20). particles_prepare runs after fog_prepare, particles_run after fog_run.
+    // They draw in the core's see-through pass (frame v23: blendRuns), before exposure, TAA and the upscaler.
+    Texture* reactive;      // R8 at render size, SHADER_RESOURCE after the see-through pass: how much of each pixel is particle
+                            // or blended surface (0 where none drew), for TAA and the upscalers (their reactive or bias
+                            // masks); nullptr: none drawn. The core's (frame v23; renderer_particles' before).
 
     // Texture maps (frame v21), set before shadows_prepare. A material's maps are materialMaps[its index] (renderer's
     // Shaders/Common.h.fsl MaterialMapData: each map's slot in textures + 1, 0 none); a pass that draws masked casters or
@@ -349,5 +351,23 @@ struct RenderFrame
     Texture* giDistance;        // RGBA16F octahedral tiles: xy mean distance and its square
     uint32_t giTraced;          // set by rt_run: this frame's rays are in giRayOut
     uint32_t giDebug;           // show only the bounced light (the core)
+
+    // See-through surfaces (frame v23). With one sample a pixel, the core draws blended surfaces (material_blend) and
+    // particles in one pass after the forward pass and the sky, back to front: hdr, reactive and transparency bound in
+    // that order (R8 both; reactive and transparency cleared), depth in SHADER_RESOURCE, nothing else. particles_draw_begin
+    // records before the core binds them, particles_draw(run) inside (run 0 to blendRuns, the k-th just before the
+    // surface at blendDepths[k]), particles_draw_end after it unbinds. Run k holds the particles deeper than
+    // blendDepths[k] and not deeper than blendDepths[k - 1]; run blendRuns those nearer than all.
+    uint32_t blendRuns;                              // set before particles_prepare; particles sort whenever it isn't 0
+    float    blendDepths[RENDER_MAX_BLEND_RUNS];     // view depth (m), farthest first
+    Texture* transparency;  // R8 at render size, SHADER_RESOURCE after that pass: how much of each pixel blended surfaces cover
+                            // (1 - what they let through), for the upscalers' transparency masks; nullptr: none drawn
+    // Decals (frame v23): the core's in view, at most RENDER_MAX_DECALS, in the order they paint, set before cull_prepare.
+    // renderer_culling bins them as it bins the lights (decalMasks, decalBins), or leaves both nullptr.
+    uint32_t     decalCount;
+    const float (*decalSpheres)[4]; // each one's bounding sphere: world centre, radius
+    Buffer*      decalSphereBuffer; // the same, float4 each, SHADER_RESOURCE
+    Buffer*      decalMasks;        // set by cull_prepare: RENDER_MAX_DECALS / 32 bitmask words per tile (tiles as tileMasks)
+    Buffer*      decalBins;         // set by cull_prepare: per z-bin (as zbins), the first decal in it | the last << 16
 };
 #define RENDER_RT_MISS 60000.0f

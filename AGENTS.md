@@ -11,7 +11,31 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   tonemap, composite. Code: `renderer.cpp` (frame), `scene.cpp` (exports), `textures.cpp` (texture maps), `Shaders/`
   (`Material.h.fsl`: the maps, shared by every pass that shades materials or clips cut-outs).
 - `renderer_culling`: Z-bins (CPU, lights sorted by view depth) and per-tile light bitmasks (compute,
-  tile depth range from the prepass). Switch off: every pixel loops all visible lights (capped at 256).
+  tile depth range from the prepass). Switch off: every pixel loops all visible lights (capped at 256). The core's
+  decals (frame v23 `decalSpheres`, in paint order) are binned the same way into `decalMasks` (8 words a tile) and
+  `decalBins`; without culling the forward pass tries every decal in view.
+- See-through surfaces (the core, frame v23): `material_blend(m, opacity)` (Table `MaterialBlend`; GpuMaterialMap
+  misc.z). Blended instances leave the opaque lists (gMeshCount, drawables, casters: no prepass, shadows, probes, GI or
+  ray tracing sees them yet) and are sorted back to front by their spheres' view depth on the CPU (`gBlendList`, stream
+  entries after the opaque ones). Each draws alone, two blends per side (`gBlendPipe`: multiply what is behind by
+  T = (1 - coverage)(1 - the specular's directional albedo) per channel, then add its own light; the Forge has no
+  dual-source blending), a double-sided one's far side first. Lit as every surface (Forward.frag TRANSLUCENT: no AO,
+  contact, traced shadows or traced reflections, which are the opaque scene's pixels; maps kept via keepShadowMaps;
+  lights from the z-bin alone), fog and aerial perspective kept exact (f(c) - T f(0)). With one sample a pixel they draw
+  in the see-through pass after the forward pass (timed "see-through"; BLEND_PASS: no depth target, the depth test
+  against gSceneDepth in the shader) into hdr, `reactive` and `transparency` (R8, max-blended coverage; frame
+  `reactive` is now the core's, particles and glass, `transparency` glass alone, for DLSS `transparency` and FSR's
+  transparency-and-composition mask); with MSAA inside the forward pass, without particles or masks. The particles
+  draw in the same pass: renderer_particles splits its sorted list at the surfaces' depths (frame `blendDepths`, the
+  nearest RENDER_MAX_BLEND_RUNS), and the core calls `particles_draw(frame, run)` just before each surface, so steam
+  behind a pane is seen through it. F1's view modes draw blended surfaces as opaque ones.
+- Decals (the core, frame v23): `decal_add` and friends (Table `Decal`, 4096). Up to RENDER_MAX_DECALS (256) in view
+  a frame, sorted by priority then add order (`gDecalList`; past 256 the lowest go), as GpuDecal rows (a world-to-box
+  matrix, axes, look, maps' slots, a noise seed). Applied in the forward pass before any lighting (DOOM 2016's
+  clustered decals): the tile mask ANDed with the z-bin's range, in paint order, blending albedo and glow, roughness,
+  metallic and the normal by coverage times weights. Coverage: the base colour map's alpha, else a procedural ellipse or
+  rectangle with an `edge` fade and value-noise `noise` (ragged rim, patches), times the angle fade and the box's depth
+  fade. Not on see-through surfaces, in probe captures, GI captures or ray hits yet. Knob `decals` (Performance).
 - `renderer_shadows`: sun cascades (stabilised, PCF or PCSS; each redrawn only when its view or a caster over it
   changed) and a cached atlas for spot and point lights
   (6 tiles per point light), redrawn only when the light or a nearby caster moves. Each face's tile is a square of
@@ -222,12 +246,14 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   sun through one cascade compare, the sky's mean light, the local lights in the core's z-bin at its depth with one
   map compare each (z-bins, not screen tiles: the tiles end at the opaque depth), a 4x Henyey-Greenstein phase per
   emitter, and listed with its view depth), then while any alpha-blended emitter made particles a bitonic sort of the
-  list back to front (1024 a group in shared memory, larger strides a pass each). `particles_draw` (right after the
-  forward pass, depth in SHADER_RESOURCE, timed \"particles-draw\"): camera-facing round sprites, premultiplied into
-  `hdr` (additive ones write alpha 0), soft against the prepass depth (`soft_distance`) and the camera (`near_fade`),
-  behind the froxel fog at their depth, before exposure, TAA and the upscaler; a second target, `reactive` (frame
-  v20, R8, render size, cleared each draw), gets their coverage: TAA takes up to 0.6 more of the current frame there;
-  renderer_upscale's FSR reactive and DLSS bias masks read it (the upscaling agent's). Only at one sample (no MSAA).
+  list back to front (1024 a group in shared memory, larger strides a pass each; always sorted while blended surfaces
+  are in view), then SPLIT: one binary search per blended surface's depth cuts the list into runs (`gRunArgs`, indirect
+  draws; `gRunStart`, each run's first entry, an instance-rate stream). In the core's see-through pass
+  (`particles_draw_begin`, `particles_draw(frame, run)` per run between the surfaces, `particles_draw_end`), each run
+  draws indirectly: camera-facing round sprites, premultiplied into `hdr` (additive ones write alpha 0), soft against
+  the prepass depth (`soft_distance`) and the camera (`near_fade`), behind the froxel fog at their depth, before
+  exposure, TAA and the upscaler; their coverage adds into the core's `reactive` (TAA takes up to 0.6 more of the
+  current frame there; renderer_upscale's FSR reactive and DLSS bias masks read it). Only at one sample (no MSAA).
   The core sets frame `keepShadowMaps` (v19's fogShadowMaps) while fog or particles run. Every GPU object is freed in
   `unload()`.
 - `renderer_gi`: dynamic diffuse global illumination (on by default, `gi`): DDGI (Majercik et al. 2019, JCGT; 2021's
@@ -390,6 +416,14 @@ surface's luminance is that over its area). Colours linear RGB.
   (BC7 sRGB/linear or BC5, read from the file over the next frames, up to 24 MB a frame), `texture_state`, `texture_remove`;
   `material_maps(m, base_color, orm, normal, emissive)`, `material_factors` (glTF's), `material_alpha(m, cutoff)` (cut out
   below it; 0 opaque). Tables `TextureMap` (a row a shader slot), `TexturePath`, `MaterialMap`.
+- See-through: `material_blend(m, opacity)` (glass, lenses, visors, water; opacity times the base colour's alpha is how
+  much of the surface is there, its reflection stays whole; 0 opaque). Blended surfaces cast no shadows yet.
+  renderer_models calls `material_blend(m, 1)` for glTF BLEND materials, their alpha in the factors.
+- Decals: `decal_add(pos, quat, half)` (a box; it paints along its -z, its z out of the surface), `decal_place`,
+  `decal_look(d, albedo+opacity, roughness, metallic, emissive, nits, weights)` (weights: colour and glow, roughness,
+  metallic, normal; 0 leaves that part), `decal_shape(d, 0 ellipse | 1 rectangle, edge, noise, angle°)`,
+  `decal_maps(d, base_color, normal, orm, normal_scale)` (texture_add's handles), `decal_priority`, `decal_remove`,
+  `decal_clear`. `clear()` removes them too.
 - Instances: `instance_add(mesh, material)`, `instance_place(i, pos, quat, scale)`, `instance_material`,
   `instance_shadow(i, cast)`, `instance_remove`. Only call `instance_place` when it moved: a move redraws
   local shadows near it.
@@ -501,7 +535,7 @@ library keeps its licence file beside its source, since the component's reposito
 ## Reset
 
 All scene data is in `renderer`'s tables and state: Reset empties the scene; the feature's link module
-builds it again. renderer_fog's volumes and renderer_particles' emitters are in their tables: Reset removes them too (and starts the
+builds it again (decals included). renderer_fog's volumes and renderer_particles' emitters are in their tables: Reset removes them too (and starts the
 particle pool empty). renderer_gi's volume (state) goes back to fitted, and its probes start again from dark: they fill
 within a second or two traced, a few seconds rasterized. renderer_models' placements go with it: a game places its models again whenever `mdl::placed(h)` is
 false. GPU objects and shadow caches are rebuilt on load.
@@ -545,6 +579,11 @@ in GPU memory (BC7/BC5, 1 byte a texel; a 2048² map about 5.6 MB with mips), re
 frame at most), one sample per map per pixel. No per-frame allocation. GPU memory at the defaults:
 HDR + depth at 4x MSAA, sun atlas 4096² D32 (64 MB), local atlas 4096² (64 MB), a screen-size R32F depth copy
 for screen reflections (a quarter of it at half resolution).
+
+See-through surfaces: per visible blended instance two draws a side (multiply, add) with the forward shader's lighting,
+sorted on the CPU (one qsort); particles add one tiny split dispatch and an indirect draw a run. Decals: their
+spheres binned with the lights (one more mask loop in the culling dispatch); in the forward pass each pixel pays only
+for the decals in its tile and z-bin (a box test, then up to three map reads or a few noise taps).
 
 ## Pitfalls
 
@@ -626,7 +665,10 @@ casts shadows; `spot_intensity`, range 20). The first `shadowed_lights` slots ca
 Types: `sun`, `points`, `spots`, `rects`, `discs`, `spheres`, `tubes`, each off removing that type's lights and
 emitters (their fittings stay). Particles (`state Particles`, each emitter's handle + 1): `dust` (motes over the
 middle of the floor, 500 a second, 6 to 10 s, scattering forwards so they glint towards the sun and lamps) and `steam`
-(off the steel drum's top, rising and spreading), each off removing its emitter; `build()` clears them with the scene. Four area lights at `area_luminance` (cd/m²; the pendant at three times it): a
+(off the steel drum's top, rising and spreading), each off removing its emitter; Glass and Decals: `glass` (a clear pane
+between the start view and the steam, a teal one behind it, a clear ball by the path) and `decals` (a scorch by the white
+boxes, worn yellow lines along the path with a puddle over them, green patina on the copper block, a glowing cyan strip on
+the stone ledge), switching either building the scene again; `build()` clears them with the scene. Four area lights at `area_luminance` (cd/m²; the pendant at three times it): a
 softbox on a stand by the sphere rows, a pendant disc over the white boxes, a fluorescent tube on the stone ledge,
 the glowing sphere on the steel drum, a 4 × 3 stained-glass panel on a stand opposite the softbox (a rect with a
 light_image, its panes glowing slabs in their colours, at twice `area_luminance`; under Rects), two reflection probes (the sphere rows, the whole yard), four sample models (Khronos' glTF samples, CC0; cooked

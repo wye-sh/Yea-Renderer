@@ -779,9 +779,103 @@ void clear()
     TextureMaps.clear();
     TexturePaths.clear();
     MaterialMaps.clear();
+    MaterialBlends.clear();
+    Decals.clear();
     build()->active = 0;
     sceneState()->removed = yea::host()->frame();
     newEpoch();
+}
+
+// --- Decals -----------------------------------------------------------------------------------
+
+yea_handle decal_add(yea_float3 pos, yea_float4 rotation, yea_float3 half)
+{
+    uint32_t row;
+    Decal*   d = allocRow(Decals, &row);
+    if (!d)
+        return 0xFFFFFFFFu;
+    d->albedo = { 0.1f, 0.1f, 0.1f, 1.0f };
+    d->roughness = 0.8f;
+    d->weights = { 1, 1, 1, 1 };
+    d->edge = 0.3f;
+    d->angle = 80.0f;
+    d->baseColor = d->normal = d->orm = 0xFFFFFFFFu;
+    d->normalScale = 1.0f;
+    uint32_t order = 0; // after every decal alive, so equal priorities paint in the order they were added
+    for (const Decal& o : Decals)
+        order = o.alive && o.order > order ? o.order : order;
+    d->order = order + 1;
+    decal_place(handleOf(Decals, row), pos, rotation, half);
+    return handleOf(Decals, row);
+}
+
+void decal_place(yea_handle h, yea_float3 pos, yea_float4 rotation, yea_float3 half)
+{
+    uint32_t row = rowOf(Decals, h);
+    if (row == 0xFFFFFFFFu)
+        return;
+    float l = sqrtf(rotation.x * rotation.x + rotation.y * rotation.y + rotation.z * rotation.z + rotation.w * rotation.w);
+    Decals[row].pos = pos;
+    Decals[row].rot = l > 1e-8f ? yea_float4{ rotation.x / l, rotation.y / l, rotation.z / l, rotation.w / l } : yea_float4{ 0, 0, 0, 1 };
+    Decals[row].half = { fabsf(half.x) > 1e-4f ? fabsf(half.x) : 1e-4f, fabsf(half.y) > 1e-4f ? fabsf(half.y) : 1e-4f,
+                         fabsf(half.z) > 1e-4f ? fabsf(half.z) : 1e-4f };
+}
+
+void decal_look(yea_handle h, yea_float4 albedo, float roughness, float metallic, yea_float3 emissive, float luminance, yea_float4 weights)
+{
+    uint32_t row = rowOf(Decals, h);
+    if (row == 0xFFFFFFFFu)
+        return;
+    Decal& d = Decals[row];
+    d.albedo = albedo;
+    d.roughness = roughness;
+    d.metallic = metallic;
+    d.emissive = { emissive.x * luminance, emissive.y * luminance, emissive.z * luminance };
+    d.weights = weights;
+}
+
+void decal_shape(yea_handle h, uint32_t shape, float edge, float noise, float angle_deg)
+{
+    uint32_t row = rowOf(Decals, h);
+    if (row == 0xFFFFFFFFu)
+        return;
+    Decal& d = Decals[row];
+    d.shape = shape > 1 ? 1 : shape;
+    d.edge = edge < 0 ? 0 : edge > 1 ? 1 : edge;
+    d.noise = noise < 0 ? 0 : noise > 1 ? 1 : noise;
+    d.angle = angle_deg < 1 ? 1 : angle_deg > 180 ? 180 : angle_deg;
+}
+
+void decal_maps(yea_handle h, yea_handle base_color, yea_handle normal, yea_handle orm, float normal_scale)
+{
+    uint32_t row = rowOf(Decals, h);
+    if (row == 0xFFFFFFFFu)
+        return;
+    Decal& d = Decals[row];
+    d.baseColor = base_color;
+    d.normal = normal;
+    d.orm = orm;
+    d.normalScale = normal_scale;
+}
+
+void decal_priority(yea_handle h, int32_t priority)
+{
+    uint32_t row = rowOf(Decals, h);
+    if (row != 0xFFFFFFFFu)
+        Decals[row].priority = priority;
+}
+
+void decal_remove(yea_handle h)
+{
+    uint32_t row = rowOf(Decals, h);
+    if (row != 0xFFFFFFFFu)
+        Decals[row].alive = 0;
+}
+
+void decal_clear()
+{
+    for (Decal& d : Decals)
+        d.alive = 0;
 }
 
 // --- Camera -----------------------------------------------------------------------------------

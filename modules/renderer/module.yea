@@ -88,6 +88,10 @@ end
 table TexturePath none 262144
   u8 c
 end
+# Blended (see-through) materials (material_blend), at their Material row: opacity 0 opaque.
+table MaterialBlend none 4096
+  float opacity
+end
 # A material's texture maps (material_maps), at its Material row: each map's texture handle (4294967295 none), the
 # factors the maps are multiplied by, and its alpha cutoff (0: opaque). set: 1 maps given, 2 factors given.
 table MaterialMap none 4096
@@ -102,6 +106,30 @@ table MaterialMap none 4096
   float occlusion
   float cutoff
   u32 set
+end
+# Decals (decal_add): boxes that paint what lies inside them, applied in the forward pass through the light culling's
+# tiles (renderer_culling), in order of priority then age. Rows as Light's (handles row | gen << 20).
+table Decal none 4096
+  float3 pos
+  float4 rot
+  float3 half
+  float4 albedo
+  float roughness
+  float metallic
+  float3 emissive
+  float4 weights
+  u32 shape
+  float edge
+  float noise
+  float angle
+  u32 baseColor
+  u32 normal
+  u32 orm
+  float normalScale
+  i32 priority
+  u32 order
+  u32 gen
+  u32 alive
 end
 # Images for rect lights (light_image): up to 16, each 65536 rows (256 x 256, sRGB rgba8, row 0 at the top) one after
 # another; LightLook's rows match Light's (image + 1, 0 none).
@@ -160,6 +188,11 @@ export void material_maps(handle m, handle base_color, handle orm, handle normal
 export void material_factors(handle m, float4 base_color, float roughness, float metallic, float normal_scale, float occlusion)
 # Alpha-tested (cut out) where base colour alpha is below cutoff, for leaves, fences and cloth; 0 opaque (the default).
 export void material_alpha(handle m, float cutoff)
+# See-through, blended over what is behind (glass, lenses, visors, water): opacity times the base colour's own alpha
+# (material_factors' base_color alpha, its map's and the vertex colour's) is how much of the surface is there; its
+# reflections stay whole (clear glass still reflects). Drawn sorted back to front after the opaque scene, lit as every
+# surface is, through fog. 0 opaque (the default). Blended surfaces cast no shadows and write no depth.
+export void material_blend(handle m, float opacity)
 
 export handle instance_add(u32 mesh, handle material)
 export void instance_place(handle i, float3 pos, float4 rotation, float3 scale)
@@ -196,8 +229,31 @@ export void light_shadow(handle l, bool cast)
 export void light_remove(handle l)
 export u32 light_count()
 
+# Decals: paint on whatever lies inside a box (a scorch, a puddle, a sign, dirt, a painted line), projected along the
+# box's own -z (its local z: rotation applied to (0, 0, 1) points back out of the surface). pos its centre, half its half
+# size (m): x and y across the paint, z how deep it reaches. Its handle, 4294967295 when 4096 are made.
+export handle decal_add(float3 pos, float4 rotation, float3 half)
+export void decal_place(handle d, float3 pos, float4 rotation, float3 half)
+# What it paints: albedo with opacity (how much of the surface's own colour it covers), roughness, metallic and an
+# emissive glow (colour times luminance, nits). weights: how much of each it applies, x colour (and glow), y roughness, z
+# metallic, w the normal (towards its normal map's, or flat without one); 0 leaves that part as the surface had it. A wet
+# puddle: dark albedo at colour 0.3, roughness 0.05 at 1, normal 1 (flat water over the bumps).
+export void decal_look(handle d, float4 albedo, float roughness, float metallic, float3 emissive, float luminance, float4 weights)
+# Its outline: shape 0 a soft ellipse, 1 a rectangle; edge (0 to 1) how much of it fades out towards the rim; noise (0
+# to 1) how ragged and patchy it is (splats, dirt, rust). angle (degrees): surfaces turned further than this from facing
+# along its z are left unpainted, fading over the last 15.
+export void decal_shape(handle d, u32 shape, float edge, float noise, float angle_deg)
+# Texture maps (texture_add's handles; 4294967295 none) across the box, its top along y: base colour (rgb times albedo,
+# alpha times opacity), a tangent-space normal map (BC5 x, y) times normal_scale, and ORM (roughness and metallic times
+# decal_look's). With a base colour map, its alpha replaces the shape's outline.
+export void decal_maps(handle d, handle base_color, handle normal, handle orm, float normal_scale)
+# Higher priorities paint over lower ones; equal ones in the order they were added.
+export void decal_priority(handle d, i32 priority)
+export void decal_remove(handle d)
+export void decal_clear()
+
 export void camera(float3 eye, float3 target, float fov_deg)
-# Removes every mesh, material, instance and light.
+# Removes every mesh, material, instance, light and decal.
 export void clear()
 # Changes whenever the scene a module built is gone (clear(), Reset State, a material layout change), never on a
 # reload that keeps it: a module that adds meshes, materials or instances builds them again when it changes. Never 0.
@@ -237,7 +293,9 @@ import renderer_fog bool fog_on() = false
 import renderer_particles bool particles_on() = false
 import renderer_particles bool particles_prepare(u64 frame) = false
 import renderer_particles void particles_run(u64 frame)
-import renderer_particles void particles_draw(u64 frame)
+import renderer_particles bool particles_draw_begin(u64 frame) = false
+import renderer_particles void particles_draw(u64 frame, u32 run)
+import renderer_particles void particles_draw_end(u64 frame)
 import renderer_post void post_run(u64 frame)
 import renderer_gi bool gi_prepare(u64 frame) = false
 import renderer_gi void gi_run(u64 frame)
@@ -270,6 +328,8 @@ category Camera
 setting float near_plane 0.05 0.01 inf
 category Performance
 setting bool gpu_timings true
+# Decals (decal_add) painted on the scene; off saves their cost.
+setting bool decals true
 # How far a mesh's outline may be off on screen (display pixels) before a simpler version of it is drawn; 0 always
 # draws the finest. Built-in shapes only: meshes made vertex by vertex have one version.
 setting float lod_error 0.5 0 inf
