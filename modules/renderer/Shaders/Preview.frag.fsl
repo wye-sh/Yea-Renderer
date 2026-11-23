@@ -99,8 +99,11 @@ float4 PS_MAIN(VSOutput In)
     float        a2 = rough * rough;
     a2 *= a2;
     // Specular antialiasing, as the forward pass (strength 1).
-    float3 dndx = ddx(In.Normal);
-    float3 dndy = ddy(In.Normal);
+    // The unit normal's change across the pixel: In.Normal's length is the instance's scale squared (Forward.vert),
+    // which would widen a scaled-up object's highlights and sharpen a scaled-down one's past what their curvature asks.
+    float3 unitN = normalize(In.Normal);
+    float3 dndx = ddx(unitN);
+    float3 dndy = ddy(unitN);
     a2 = saturate(a2 + min(0.5 * (dot(dndx, dndx) + dot(dndy, dndy)), 0.18));
     float NoV = dot(N, V);
     float facing = 1.0;

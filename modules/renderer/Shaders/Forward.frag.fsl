@@ -342,8 +342,11 @@ float4 PS_MAIN(VSOutput In)
     float  uvScale = exp2(gFrame.textures.x);
     float2 uvDx = ddx(In.Uv) * uvScale;
     float2 uvDy = ddy(In.Uv) * uvScale;
-    float3 dndx = ddx(In.Normal);
-    float3 dndy = ddy(In.Normal);
+    // The unit normal's change across the pixel: In.Normal's length is the instance's scale squared (Forward.vert),
+    // which would widen a scaled-up object's highlights and sharpen a scaled-down one's past what their curvature asks.
+    float3 unitN = normalize(In.Normal);
+    float3 dndx = ddx(unitN);
+    float3 dndy = ddy(unitN);
 #ifdef BLEND_PASS
     // Behind the opaque scene (reversed-Z: smaller is farther); after the derivatives, which need the whole quad.
     if (In.Position.z < LoadTex2D(gSceneDepth, NO_SAMPLER, int2(In.Position.xy), 0).r)

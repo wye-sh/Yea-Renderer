@@ -28,7 +28,8 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   transparency-and-composition mask); with MSAA inside the forward pass, without particles or masks. The particles
   draw in the same pass: renderer_particles splits its sorted list at the surfaces' depths (frame `blendDepths`, the
   nearest RENDER_MAX_BLEND_RUNS), and the core calls `particles_draw(frame, run)` just before each surface, so steam
-  behind a pane is seen through it. F1's view modes draw blended surfaces as opaque ones.
+  behind a pane is seen through it. F1's view modes draw blended surfaces as opaque ones. Their pipelines (`gBlendPipe`) are warmed with the rest and never made on a frame that
+  draws: until they are, blended surfaces wait.
 - Decals (the core, frame v23): `decal_add` and friends (Table `Decal`, 4096). Up to RENDER_MAX_DECALS (256) in view
   a frame, sorted by priority then add order (`gDecalList`; past 256 the lowest go), as GpuDecal rows (a world-to-box
   matrix, axes, look, maps' slots, a noise seed). Applied in the forward pass before any lighting (DOOM 2016's
@@ -253,7 +254,8 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   draws indirectly: camera-facing round sprites, premultiplied into `hdr` (additive ones write alpha 0), soft against
   the prepass depth (`soft_distance`) and the camera (`near_fade`), behind the froxel fog at their depth, before
   exposure, TAA and the upscaler; their coverage adds into the core's `reactive` (TAA takes up to 0.6 more of the
-  current frame there; renderer_upscale's FSR reactive and DLSS bias masks read it). Only at one sample (no MSAA).
+  current frame there; renderer_upscale's FSR reactive and DLSS bias masks read it). Only at one sample (no MSAA). The draw pipeline is queued on Yea's compile threads by the first particles_prepare (never made on a
+  drawing frame; particles simulate undrawn until it is ready; made in load() on a host without the service).
   The core sets frame `keepShadowMaps` (v19's fogShadowMaps) while fog or particles run. Every GPU object is freed in
   `unload()`.
 - `renderer_gi`: dynamic diffuse global illumination (on by default, `gi`): DDGI (Majercik et al. 2019, JCGT; 2021's

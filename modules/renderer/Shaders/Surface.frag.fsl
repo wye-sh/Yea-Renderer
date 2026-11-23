@@ -50,8 +50,11 @@ PSOutput PS_MAIN(VSOutput In)
     float rough = clamp(m.albedoRough.a, 0.03, 1.0);
     float a2 = rough * rough;
     a2 *= a2;
-    float3 dndx = ddx(In.Normal);
-    float3 dndy = ddy(In.Normal);
+    // The unit normal's change across the pixel: In.Normal's length is the instance's scale squared (Forward.vert),
+    // which would widen a scaled-up object's highlights and sharpen a scaled-down one's past what their curvature asks.
+    float3 unitN = normalize(In.Normal);
+    float3 dndx = ddx(unitN);
+    float3 dndy = ddy(unitN);
     float  variance = 0.25 * gFrame.misc.y * (dot(dndx, dndx) + dot(dndy, dndy));
     a2 = saturate(a2 + min(2.0 * variance, 0.18));
     float r = m.params.z > 0.5 ? sqrt(sqrt(a2)) : 1.0;
