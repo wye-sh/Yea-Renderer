@@ -910,9 +910,12 @@ for the decals in its tile and z-bin (a box test, then up to three map reads or 
   Yea's 2 s hang limit on the orb's software GPU (about 400 ms a forward pipeline). The frame that (re)makes them makes
   the opaque prepass, lean forward and sky ones. With Yea's background compiles (`yea::pipelines()`, SDK 158) it first
   queues on Yea's threads what that frame draws with, then the cut-out set, then every other variant (the full shader
-  and F1's view modes; not those in a release), and waits only for the first; later frames take the rest as they finish,
-  and a variant still compiling when a frame needs it is waited for, never queued or made twice (Direct3D 12 forbids
-  loading one pipeline from a library on two threads). Remaking or `unload()` cancels what is queued; the cache is
+  and F1's view modes; not those in a release), and waits for none (7.2.1): draw returns before recording anything till
+  the first frame's set (prepass, lean forward, sky, histogram) is in, logging "the first picture after N frames". Cold
+  (a new driver, a new Yea root signature, a first install) that set took 1.7 to 2.3 s on his RTX 2080, and waiting for
+  it in draw hung past Yea's 2 s limit. A variant still compiling when a frame needs it (SSR's, the full shader, a view
+  mode's) is never waited for: the lean shader draws meanwhile (a view mode draws no geometry). Nothing is queued or
+  made twice (Direct3D 12 forbids loading one pipeline from a library on two threads). Remaking or `unload()` cancels what is queued; the cache is
   removed after the shaders, as removeShader waits for compiles reading them. A cancelled compile already running goes
   on, so each cancelled desc (slot, samples, motion) is tainted for the session: asked for again (settings back within
   seconds, as TAA or an upscaler loading after the core does), it compiles without the cache. Two threads loading one

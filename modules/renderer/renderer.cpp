@@ -17,7 +17,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <chrono>
-#include <thread>
 
 #include <Common_3/Graphics/Interfaces/IGraphics.h>
 #include <Common_3/Resources/ResourceLoader/Interfaces/IResourceLoader.h>
@@ -205,6 +204,8 @@ RenderTarget * gHdr, *gDepth, *gDummyDepth, *gMotion, *gDummyArray, *gDummyColor
 Texture*       gDummyRates;   // stands in for renderer_vrs's rate copy (R32_UINT)
 Texture*       gTonyLut;      // Tony McMapface's 48^3 table (Assets/tony_mc_mapface.dds) while it is picked and loaded
 bool           gTargetsFailed; // the screen targets were refused (logged once)
+uint32_t       gFirstWaitFrames; // frames drawn empty so far, the first frame's pipelines still compiling (0: none)
+double         gFirstWaitStart;  // clockMs() of the first of them
 bool           gTonyTried;    // read the table since Tony McMapface was picked (once per pick, even when it failed)
 const YeaShadingRate* gShadingRate; // nullptr: no variable-rate shading on this GPU
 Buffer *       gFrameCb[kMaxFrames], *gInstanceBuf[kMaxFrames], *gMaterialBuf[kMaxFrames], *gLightBuf[kMaxFrames], *gStreamBuf[kMaxFrames];
@@ -816,13 +817,12 @@ int pendingOf(Pipeline** slot)
     return -1;
 }
 
-// A finished background compile into its slot (1), or not yet (0); -1: it failed, and the slot is left empty.
-int takePending(uint32_t k, bool wait)
+// A finished background compile into its slot (1), or not yet (0); -1: it failed, and the slot is left empty. Never
+// waits (7.2.1): draw doesn't start till the first frame's set is in.
+int takePending(uint32_t k)
 {
-    void* out = nullptr;
-    int   r;
-    while ((r = gPipes->ready(gPending[k].handle, &out)) == 0 && wait)
-        std::this_thread::yield();
+    void*     out = nullptr;
+    const int r = gPipes->ready(gPending[k].handle, &out);
     if (r == 0)
         return 0;
     if (r == 1)
@@ -843,7 +843,7 @@ int takePending(uint32_t k, bool wait)
 void pollPipelines()
 {
     for (uint32_t k = gPendingCount; k-- > 0;)
-        takePending(k, false);
+        takePending(k);
 }
 
 bool tainted(Pipeline** slot, uint32_t samples, bool motion)
@@ -886,12 +886,12 @@ bool createScenePipelines(uint32_t samples, bool motion, bool masked, uint32_t f
         d.pCache = taint ? nullptr : gPipeCache;
         gTaintedMade += taint ? 1 : 0;
         const int k = gPipes ? pendingOf(&p) : -1;
-        if (k >= 0 && (queue || until > 0))
+        if (k >= 0 && takePending((uint32_t)k) != 1)
         {
-            left = true; // still compiling: later
+            left = true; // still compiling (never waited for): later; or failed, and made here from now on
             return;
         }
-        if (k >= 0 && CPU_T("pipeline wait", takePending((uint32_t)k, true)) == 1) // needed now: wait for this one only
+        if (k >= 0)
             return;
         // Another slot's identical desc still compiling: queued only once it is in (a later frame); made here now,
         // without the library.
@@ -2841,12 +2841,13 @@ void draw(uint32_t pass, const YeaFrame* yf)
         destroyScenePipelines();
         gWarmStart = clockMs();
         // With Yea's compile threads: what the first frame draws with queued first, then the cut-out set (a model's
-        // material may turn up any frame), then every other variant, and only the first waited for (they compile side
-        // by side). Without, those made here and the rest warmed later.
+        // material may turn up any frame), then every other variant, none waited for (below: nothing is drawn till the
+        // first set is in). Without, those made here and the rest warmed later.
         createScenePipelines(samples, taa, masked, kForwardLean, 0, true);
         createScenePipelines(samples, taa, true, kForwardLean, 0, true);
         createScenePipelines(samples, taa, true, warmForward(), 0, true);
-        createScenePipelines(samples, taa, masked, kForwardLean);
+        if (!gPipes || gPipesFailed)
+            createScenePipelines(samples, taa, masked, kForwardLean); // no compile threads: made here, as before
         if (gCancelledNow || gTaintedMade)
         {
             char line[220];
@@ -2867,6 +2868,30 @@ void draw(uint32_t pass, const YeaFrame* yf)
         gFrameFormat = target->mFormat;
         gFrameSamples = target->mSampleCount;
         createCompositePipeline(gFrameFormat, gFrameSamples, samples);
+    }
+    // Draw never waits on a compile (7.2.1): with every pipeline cold (a new driver, a new Yea root signature, a first
+    // install), waiting for the first frame's set held draw past Yea's 2 s hang limit on an RTX 2080. Till that set (the
+    // prepass, the lean forward shader, sky and histogram) is in from Yea's compile threads, nothing is drawn; then the
+    // view starts by itself, logging how long it waited. Once a background compile failed, the rest are made here, after
+    // the ones still compiling are in (never waited for either).
+    if (gPipes)
+    {
+        pollPipelines();
+        if (gPipesFailed ? gPendingCount > 0 : createScenePipelines(samples, taa, false, kForwardLean, 0, true))
+        {
+            gFirstWaitFrames += gFirstWaitFrames == 0 ? (gFirstWaitStart = clockMs(), 1u) : 1u;
+            return;
+        }
+        if (gPipesFailed)
+            createScenePipelines(samples, taa, false, kForwardLean); // the one that failed (or was dropped), made here
+        if (gFirstWaitFrames)
+        {
+            char line[160];
+            snprintf(line, sizeof line, "renderer: the first picture after %u frames (%.0f ms) waiting for its pipelines to compile",
+                     gFirstWaitFrames, clockMs() - gFirstWaitStart);
+            yea::log(line);
+            gFirstWaitFrames = 0;
+        }
     }
     uploadMeshes(gSkinOn ? skinNeed() : 0);
     skinBegin(gUploadedVertices, gVertexCap > gUploadedVertices ? gVertexCap - gUploadedVertices : 0);
@@ -4016,11 +4041,24 @@ void draw(uint32_t pass, const YeaFrame* yf)
     Pipeline* const  viewPipes[4] = { gForwardDepthPipe[0], gForwardDepthPipe[1], gForwardDepthPipe[0], gForwardDepthPipe[1] };
     Pipeline* const* forwardPipes = forward == kForwardDepth ? viewPipes : forward == kForwardFull ? gForwardFullPipe
                                   : forward == kForwardFullSsr ? gForwardFullSsrPipe : forward == kForwardLeanSsr ? gForwardSsrPipe : gForwardPipe;
+    if (geometry && gPipes && !gPipesFailed && createScenePipelines(samples, taa, false, forward, 0, true))
+    {
+        // A variant on first use (SSR's, the full shader, a view mode's) is queued, never waited for (7.2.1): till it is
+        // in, the lean shader draws (the draw's gate made sure of it), and a view mode draws no geometry.
+        if (forward == kForwardDepth)
+            geometry = false;
+        else
+        {
+            forward = kForwardLean;
+            forwardPipes = gForwardPipe;
+        }
+    }
     if (geometry)
     {
         const uint32_t before = gPipesMade;
         const double   t0 = clockMs();
-        createScenePipelines(samples, taa, false, forward); // first use only
+        if (!gPipes || gPipesFailed)
+            createScenePipelines(samples, taa, false, forward); // first use only; without compile threads, made here
         pipesMadeOnDraw(before, t0);
         bool held = false;
         for (uint32_t s = 2; s < 4; ++s)
