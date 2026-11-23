@@ -774,8 +774,8 @@ int load(int reloaded)
                 fsr = false;
         }
 #endif
-        yea::offer(settings.upscaler, 1u << (uint32_t)Upscaler::TAA | 1u << (uint32_t)Upscaler::DLSS |
-                                          (fsr ? 1u << (uint32_t)Upscaler::FSR : 0u));
+        // DLSS is off for now (6.6.4; module.yea's `needs upscaler DLSS offer`): not offered.
+        yea::offer(settings.upscaler, 1u << (uint32_t)Upscaler::TAA | (fsr ? 1u << (uint32_t)Upscaler::FSR : 0u));
     }
     {
         const YeaDevice* device = yea::device();

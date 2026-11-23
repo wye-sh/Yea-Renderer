@@ -425,7 +425,10 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   dispatch); the upscalers' own sharpening is off. Particles' and glass's coverage (frame.h `reactive`, when set) is FSR's
   reactive mask; glass's alone (`transparency`) is FSR's transparency-and-composition mask. DLSS gets neither (6.6.3):
   with `biasColour` set, presentation stalled after DLSS evaluate on an RTX 2080 (6.6.2; Yea is looking into it), and
-  Streamline 2.14 takes `transparency`'s resource state wrong (Yea 152 ignores it; a device loss in 6.1.0). After one records, The Forge's bound state is forgotten so its next binds
+  Streamline 2.14 takes `transparency`'s resource state wrong (Yea 152 ignores it; a device loss in 6.1.0). DLSS itself
+  is off for now (6.6.4): the device was removed with DLSS picked even without masks, and Streamline's swap chain proxy
+  hid the loss from Yea. module.yea has no `service dlss` line (so Yea starts no Streamline) and DLSS `needs offer`,
+  which load() doesn't give, so F1 hides it and a saved DLSS runs as the default (TAA). After one records, The Forge's bound state is forgotten so its next binds
   are made in full. Lines said from `upscale_prepare` wait for this module's `update()`, so they are filed under
   renderer_upscale: which upscaler is picked and runs, its sizes, and why FSR can't run.
   Nothing of Microsoft's ships.
