@@ -31,6 +31,10 @@
 #include "Shaders/Tonemap.srt.h"
 #include "Shaders/Chain.srt.h"
 #include "Shaders/ChainMs.srt.h"
+#include "Shaders/LightCount.srt.h"
+#if !defined(_WIN32)
+#include <dlfcn.h>
+#endif
 #undef SAMPLE_COUNT
 
 using namespace mx;
@@ -2028,8 +2032,100 @@ void segSwitch(Cmd* cmd, uint32_t fi, uint32_t part)
 }
 
 // At the start of a frame's recording: what this slot measured last time, then a fresh start.
+// What the forward pass's local lights cost a pixel (7.0.1), for his gpu line: LightCount.comp.fsl counts, one frame in
+// kCountEvery while the gpu timings are on (no MSAA), the lights each pixel's cluster holds, those in range, lit above one
+// 8-bit step, with a shadow map, traced and area lights. gCountBuf only grows; a counted frame's totals are copied into
+// gCountRead[fi] and read with that frame's timings, their growth since the last read added to gCountSum.
+const uint32_t kCounts = 7, kCountEvery = 16;
+Shader*        gCountShader;
+Pipeline*      gCountPipe;
+DescriptorSet* gCountSet;
+Buffer *       gCountBuf, *gCountRead[kMaxFrames];
+bool           gCountPending[kMaxFrames];
+uint32_t       gCountLast[kCounts];
+double         gCountSum[kCounts];
+#if !defined(_WIN32)
+PFN_vkCmdCopyBuffer gVkCopyBuffer;
+#endif
+
+// gCountBuf (COPY_SOURCE) into gCountRead[fi]: The Forge has no buffer copy, so the API's own.
+void copyCounts(Cmd* cmd, uint32_t fi)
+{
+#if defined(_WIN32)
+    cmd->mDx.pCmdList->CopyBufferRegion(gCountRead[fi]->mDx.pResource, 0, gCountBuf->mDx.pResource, 0, kCounts * 4);
+#else
+    VkBufferCopy c = { gCountBuf->mVk.mOffset, gCountRead[fi]->mVk.mOffset, kCounts * 4 };
+    gVkCopyBuffer(cmd->mVk.pCmdBuf, gCountBuf->mVk.pBuffer, gCountRead[fi]->mVk.pBuffer, 1, &c);
+#endif
+}
+
+// The counter's shader, set, pipeline and buffers; false (no counts, nothing else changes) when any is missing.
+bool makeLightCount()
+{
+#if !defined(_WIN32)
+    void* loader = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_NOLOAD);
+    auto  instanceProc = loader ? (PFN_vkGetInstanceProcAddr)dlsym(loader, "vkGetInstanceProcAddr") : nullptr;
+    gVkCopyBuffer = instanceProc ? (PFN_vkCmdCopyBuffer)instanceProc(gRenderer->pContext->mVk.pInstance, "vkCmdCopyBuffer") : nullptr;
+    if (!gVkCopyBuffer)
+        return false;
+#endif
+    gCountShader = loadShader(nullptr, nullptr, "renderer_light_count.comp");
+    if (!gCountShader)
+        return false;
+    DescriptorSetDesc sd = SRT_SET_DESC(LightCountSrt, PerFrame, gFrames, 0);
+    addDescriptorSet(gRenderer, &sd, &gCountSet);
+    PipelineDesc d = {};
+    d.mType = PIPELINE_TYPE_COMPUTE;
+    PIPELINE_LAYOUT_DESC(d, NULL, SRT_LAYOUT_DESC(LightCountSrt, PerFrame), NULL, NULL);
+    d.mComputeDesc.pShaderProgram = gCountShader;
+    d.pName = "renderer_light_count";
+    addPipeline(gRenderer, &d, &gCountPipe);
+#if defined(_WIN32)
+    if (gCountPipe && !gCountPipe->mDx.pPipelineState) // refused by Direct3D 12: never bound
+    {
+        removePipeline(gRenderer, gCountPipe);
+        gCountPipe = nullptr;
+    }
+#endif
+    gCountBuf = makeBuffer(kCounts * 4, 4, DESCRIPTOR_TYPE_BUFFER | DESCRIPTOR_TYPE_RW_BUFFER, RESOURCE_MEMORY_USAGE_GPU_ONLY,
+                           RESOURCE_STATE_UNORDERED_ACCESS, "renderer_light_count", nullptr, true);
+    bool ok = gCountSet && gCountPipe && gCountBuf;
+    for (uint32_t i = 0; i < gFrames; ++i)
+    {
+        gCountRead[i] = makeBuffer(kCounts * 4, 0, DESCRIPTOR_TYPE_UNDEFINED, RESOURCE_MEMORY_USAGE_GPU_TO_CPU, RESOURCE_STATE_COPY_DEST,
+                                   "renderer_light_count_read");
+        ok = ok && gCountRead[i] && gCountRead[i]->pCpuMappedAddress;
+        gCountPending[i] = false;
+    }
+    memset(gCountLast, 0, sizeof gCountLast);
+    memset(gCountSum, 0, sizeof gCountSum);
+    return ok;
+}
+
+void freeLightCount()
+{
+    if (gCountPipe)
+        removePipeline(gRenderer, gCountPipe);
+    if (gCountSet)
+        removeDescriptorSet(gRenderer, gCountSet);
+    if (gCountShader)
+        removeShader(gRenderer, gCountShader);
+    gCountPipe = nullptr, gCountSet = nullptr, gCountShader = nullptr;
+    freeBuffer(gCountBuf);
+    for (uint32_t i = 0; i < kMaxFrames; ++i)
+        freeBuffer(gCountRead[i]);
+}
+
 void timeFrame(Cmd* cmd, uint32_t fi, bool on, const char* scene)
 {
+    if (gCountPending[fi])
+    {
+        // A counted frame's totals: their growth since the last (unsigned, so a wrap still subtracts right).
+        const uint32_t* c = (const uint32_t*)gCountRead[fi]->pCpuMappedAddress;
+        for (uint32_t k = 0; k < kCounts; ++k)
+            gCountSum[k] += (double)(uint32_t)(c[k] - gCountLast[k]), gCountLast[k] = c[k];
+        gCountPending[fi] = false;
+    }
     if (!on || !gTimePool[fi])
     {
         gTimeUsed[fi] = gSegCount[fi] = 0;
@@ -2067,12 +2163,19 @@ void timeFrame(Cmd* cmd, uint32_t fi, bool on, const char* scene)
     double now = yea::host()->time();
     if (now - gTimeLogged >= 30.0 && gTimeCount[kTimeTotal]) // 30 s in 6.1.0: Yea takes 10 lines a minute
     {
-        char line[768];
+        char line[1024];
         int  n = snprintf(line, sizeof line, "gpu ms avg/max over %u frames:", gTimeCount[kTimeTotal]);
         for (uint32_t t = 0; t < kTimings && n < (int)sizeof line - 40; ++t)
             if (gTimeCount[t])
                 n += snprintf(line + n, sizeof line - n, " %s %.3f/%.3f", kTimingNames[t], gTimeSum[t] / gTimeCount[t], gTimeMax[t]);
-        snprintf(line + n, sizeof line - n, " | %s", scene);
+        n += snprintf(line + n, sizeof line - n, " | %s", scene);
+        // Local lights a pixel (one pixel in four, on the counted frames): in its cluster, in range, lit above one 8-bit step
+        // (on white, facing them; area lights not counted there), with a shadow map, traced, area.
+        if (gCountSum[0] > 0)
+            snprintf(line + n, sizeof line - n, " | lights a pixel: %.1f in its cluster, %.1f in range, %.1f lit above one step, %.1f shadow maps, %.1f traced, %.1f area",
+                     gCountSum[1] / gCountSum[0], gCountSum[2] / gCountSum[0], gCountSum[3] / gCountSum[0], gCountSum[4] / gCountSum[0],
+                     gCountSum[5] / gCountSum[0], gCountSum[6] / gCountSum[0]);
+        memset(gCountSum, 0, sizeof gCountSum);
         yea::log(line);
         memset(gTimeSum, 0, sizeof gTimeSum);
         memset(gTimeMax, 0, sizeof gTimeMax);
@@ -2274,6 +2377,11 @@ int load(int reloaded)
     addDescriptorSet(gRenderer, &chainDesc, &gChainSet);
     DescriptorSetDesc chainMsDesc = SRT_SET_DESC(ChainMsSrt, PerFrame, gFrames * kChainCopies, 0);
     addDescriptorSet(gRenderer, &chainMsDesc, &gChainMsSet);
+    if (!makeLightCount())
+    {
+        freeLightCount();
+        host->log(1, "renderer: lights a pixel aren't counted here (the counter's pass couldn't be made)");
+    }
 
     const ResourceMemoryUsage cpu = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
     const ResourceState       sr = RESOURCE_STATE_SHADER_RESOURCE;
@@ -2525,6 +2633,7 @@ void unload()
         if (gTimePool[i])
             exitQueryPool(gRenderer, gTimePool[i]), gTimePool[i] = nullptr;
     destroyScenePipelines(); // drops queued compiles; one already compiling ends when its shader is removed (below)
+    freeLightCount();
     freePipeline(gCompositePipe);
     freePipeline(gAdaptPipe);
     freePipeline(gTonemapPipe);
@@ -3975,7 +4084,38 @@ void draw(uint32_t pass, const YeaFrame* yf)
             if (timed)
                 timeBegin(cmd, fi, which[k]);
             if (k == 0)
+            {
                 (gOk.culling ? CPU_T("cull_run", renderer_culling::cull_run((uint64_t)(uintptr_t)&F)) : (void)0);
+                // One frame in kCountEvery: the local lights each pixel runs, for the gpu line (timeFrame).
+                if (culled && timed && gCountPipe && samples == 1 && F.frameNumber % kCountEvery == 0 && !gCountPending[fi])
+                {
+                    DescriptorData c[8] = {};
+                    c[0].mIndex = SRT_RES_IDX(LightCountSrt, PerFrame, gFrame);
+                    c[0].ppBuffers = &gFrameCb[fi];
+                    c[1].mIndex = SRT_RES_IDX(LightCountSrt, PerFrame, gDepth);
+                    c[1].ppTextures = &gDepth->pTexture;
+                    c[2].mIndex = SRT_RES_IDX(LightCountSrt, PerFrame, gTileMasks);
+                    c[2].ppBuffers = &F.tileMasks;
+                    c[3].mIndex = SRT_RES_IDX(LightCountSrt, PerFrame, gZBins);
+                    c[3].ppBuffers = &F.zbins;
+                    c[4].mIndex = SRT_RES_IDX(LightCountSrt, PerFrame, gLights);
+                    c[4].ppBuffers = &gLightBuf[fi];
+                    c[5].mIndex = SRT_RES_IDX(LightCountSrt, PerFrame, gLightShapes);
+                    c[5].ppBuffers = &gShapeBuf[fi];
+                    c[6].mIndex = SRT_RES_IDX(LightCountSrt, PerFrame, gExposure);
+                    c[6].ppBuffers = &gExposure;
+                    c[7].mIndex = SRT_RES_IDX(LightCountSrt, PerFrame, gCount);
+                    c[7].ppBuffers = &gCountBuf;
+                    updateDescriptorSet(gRenderer, fi, gCountSet, 8, c);
+                    cmdBindPipeline(cmd, gCountPipe);
+                    cmdBindDescriptorSet(cmd, fi, gCountSet);
+                    cmdDispatch(cmd, (w + 15) / 16, (h + 15) / 16, 1);
+                    barrierBuf(cmd, gCountBuf, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_SOURCE);
+                    copyCounts(cmd, fi);
+                    barrierBuf(cmd, gCountBuf, RESOURCE_STATE_COPY_SOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
+                    gCountPending[fi] = true;
+                }
+            }
             else if (k == 1)
                 (gOk.ao ? CPU_T("ao_run", renderer_ao::ao_run((uint64_t)(uintptr_t)&F)) : (void)0);
             else if (k == 2)

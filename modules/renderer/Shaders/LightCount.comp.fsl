@@ -1,0 +1,89 @@
+// The local lights a pixel runs in the forward pass, counted on the frames the core asks (one in 16, renderer.cpp
+// lightCount): one pixel of each 2 x 2 (sky left out), its point from the depth prepass, the same tile mask and z-bin the
+// forward pass walks. Added to gCount, which is never cleared (the CPU takes differences): pixels, lights in their clusters,
+// in range, lit above one 8-bit step on a white surface facing them (shadowUnseen's floor, the spot's cone too; area
+// lights left out), with a shadow map, traced shadows, area lights in range. Counts only: nothing is drawn.
+#include "Common.h.fsl"
+#include "LightCount.srt.h"
+
+GroupShared(uint, gsCount[8]);
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) id, SV_GroupIndex(uint) gi)
+{
+    INIT_MAIN;
+    if (gi < 8u)
+        gsCount[gi] = 0u;
+    GroupMemoryBarrier();
+    uint  pixels = 0u, cluster = 0u, inRange = 0u, visible = 0u, maps = 0u, traced = 0u, area = 0u;
+    uint2 px = id.xy * 2u;
+    float depth = px.x < uint(gFrame.screen.x) && px.y < uint(gFrame.screen.y) ? LoadTex2D(gDepth, NO_SAMPLER, int2(px), 0).r : 0.0;
+    if (depth > 0.0 && (gFrame.counts.z & FLAG_CULLED) != 0u)
+    {
+        pixels = 1u;
+        float  viewZ = gFrame.camPos.w / depth; // reversed-Z: depth = near / z
+        float2 ndc = float2((float(px.x) + 0.5) * gFrame.screen.z * 2.0 - 1.0, 1.0 - (float(px.y) + 0.5) * gFrame.screen.w * 2.0);
+        float3 P = gFrame.camPos.xyz + gFrame.view[0].xyz * (ndc.x / gFrame.proj.x * viewZ) +
+                   gFrame.view[1].xyz * (ndc.y / gFrame.proj.y * viewZ) + gFrame.view[2].xyz * viewZ;
+        float  exposure = gExposure[1];
+        uint   binIndex = min(uint(max(viewZ, 0.0) * gFrame.misc.x), gFrame.tiles.w - 1u);
+        uint   bin = gZBins[binIndex];
+        uint   first = bin & 0xFFFFu;
+        uint   last = bin >> 16;
+        uint2  tile = px / gFrame.tiles.x;
+        uint   base = (tile.y * gFrame.tiles.y + tile.x) * gFrame.tiles.z;
+        for (uint w = first >> 5; first <= last && w <= (last >> 5); ++w)
+        {
+            uint lo = w == (first >> 5) ? (first & 31u) : 0u;
+            uint hi = w == (last >> 5) ? (last & 31u) : 31u;
+            uint mask = gTileMasks[base + w] & (0xFFFFFFFFu << lo) & (0xFFFFFFFFu >> (31u - hi));
+            while (mask != 0u)
+            {
+                uint i = w * 32u + FirstBitLow(mask);
+                mask &= mask - 1u;
+                cluster += 1u;
+                LightData l = gLights[i];
+                float3    toLight = l.pos.xyz - P;
+                float     d2 = dot(toLight, toLight);
+                if (d2 >= l.pos.w * l.pos.w)
+                    continue;
+                inRange += 1u;
+                if ((gFrame.counts.z & FLAG_AREA) != 0u && gLightShapes[i].ex.w > 2.5)
+                    area += 1u;
+                else
+                {
+                    float f = d2 * l.params.z;
+                    float window = saturate(1.0 - f * f);
+                    float atten = window * window / max(d2, 1e-4);
+                    if (l.color.w > 1.5)
+                    {
+                        float cone = saturate(dot(-toLight * rsqrt(max(d2, 1e-8)), l.dir.xyz) * l.dir.w + l.params.x);
+                        atten *= cone * cone;
+                    }
+                    if (max(l.color.r, max(l.color.g, l.color.b)) * atten * (1.0 / PI) * exposure >= 1.0 / 4096.0)
+                        visible += 1u;
+                }
+                if (l.params.w > 1.5)
+                    traced += 1u;
+                else if (l.params.y >= 0.0 && (gFrame.counts.z & FLAG_SHADOWS) != 0u)
+                    maps += 1u;
+            }
+        }
+    }
+    uint prev;
+    if (pixels != 0u)
+    {
+        AtomicAdd(gsCount[0], pixels, prev);
+        AtomicAdd(gsCount[1], cluster, prev);
+        AtomicAdd(gsCount[2], inRange, prev);
+        AtomicAdd(gsCount[3], visible, prev);
+        AtomicAdd(gsCount[4], maps, prev);
+        AtomicAdd(gsCount[5], traced, prev);
+        AtomicAdd(gsCount[6], area, prev);
+    }
+    GroupMemoryBarrier();
+    if (gi < 7u && gsCount[gi] != 0u)
+        AtomicAdd(gCount[gi], gsCount[gi], prev);
+    RETURN();
+}

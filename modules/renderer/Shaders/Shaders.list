@@ -106,6 +106,10 @@
 #include "Adapt.comp.fsl"
 #end
 
+#comp renderer_light_count.comp
+#include "LightCount.comp.fsl"
+#end
+
 #frag renderer_gloss.frag
 #include "Gloss.frag.fsl"
 #end
