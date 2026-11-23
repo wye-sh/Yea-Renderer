@@ -406,15 +406,66 @@ float3 ltcEdge(float3 a, float3 b)
     return cross(a, b) * k;
 }
 
-// A quad (its corners from the shading point, in the lobe's space), seen from its own lit side.
-float ltcQuad(float3 p0, float3 p1, float3 p2, float3 p3)
+// A quad's vector form factor (its corners from the shading point, in the lobe's space), seen from its own lit side.
+float3 ltcQuadF(float3 p0, float3 p1, float3 p2, float3 p3)
 {
     float3 a = normalize(p0);
     float3 b = normalize(p1);
     float3 c = normalize(p2);
     float3 d = normalize(p3);
     float3 F = (ltcEdge(a, b) + ltcEdge(b, c) + ltcEdge(c, d) + ltcEdge(d, a)) * (0.5 / PI);
-    return ltcHorizon(dot(F, a + b + c + d) < 0.0 ? -F : F);
+    return dot(F, a + b + c + d) < 0.0 ? -F : F;
+}
+
+float ltcQuad(float3 p0, float3 p1, float3 p2, float3 p3) { return ltcHorizon(ltcQuadF(p0, p1, p2, p3)); }
+
+// A rect light's image as the lobe sees it (Heitz, Dupuy, Hill and Neubelt 2016, section 5, "textured polygons"): in
+// the lobe's space (a clamped cosine), the vector form factor F points at the lit part's centre, so the image is read
+// where F's direction meets the rect, from the mip whose footprint matches the cosine's spread there: the plane's
+// distance against the rect's size (a footprint of about twice the distance across). Seen edge-on or from behind
+// F's direction, the rect's nearest point instead. p0 is the corner at the image's bottom left, p1 along its width,
+// p3 along its height; the image's row 0 is its top. The images are prefiltered (images.cpp), sampled trilinearly.
+float3 ltcImage(float3 p0, float3 p1, float3 p3, float3 F, float layer)
+{
+    float3 e1 = p1 - p0;
+    float3 e2 = p3 - p0;
+    float3 n = cross(e1, e2);
+    float  n2 = max(dot(n, n), 1e-30);
+    float  pd = dot(n, p0); // the plane's distance from the point, times |n|
+    float3 dir = F * rsqrt(max(dot(F, F), 1e-30));
+    float  dn = dot(dir, n);
+    float  t = abs(dn) > 1e-3 * sqrt(n2) ? pd / dn : -1.0;
+    float3 h = t > 0.0 ? dir * t : n * (pd / n2);
+    float3 q = h - p0;
+    float  a = dot(e1, e1);
+    float  b = dot(e1, e2);
+    float  c = dot(e2, e2);
+    float  det = max(a * c - b * b, 1e-30);
+    float  u = (dot(q, e1) * c - dot(q, e2) * b) / det;
+    float  v = (dot(q, e2) * a - dot(q, e1) * b) / det;
+    float  spread = abs(pd) * rsqrt(n2) * rsqrt(sqrt(n2)); // distance / sqrt(area)
+    float  lod = clamp(log2(max(512.0 * spread, 1.0)), 0.0, 8.0);
+    float3 uvw = float3(saturate(u), 1.0 - saturate(v), layer);
+#if defined(VULKAN)
+    return SampleLvlTex2DArray(gLightImages, gSamplerTrilinearClamp, uvw, lod).rgb;
+#else
+    return gLightImages.SampleLevel(gSamplerTrilinearClamp, uvw, lod).rgb; // FSL's helper takes no float4 array on Direct3D 12
+#endif
+}
+
+// A textured rect's term for one lobe (inv: the identity for the diffuse, s.ltcInv for the specular): its form
+// factor times its image as that lobe sees it.
+float3 rectImageTerm(Surface s, float3 C, float3 e1, float3 e2, float4 inv, float layer)
+{
+    float3 p0 = ltcTo(s, C - e1 - e2, inv);
+    float3 p1 = ltcTo(s, C + e1 - e2, inv);
+    float3 p2 = ltcTo(s, C + e1 + e2, inv);
+    float3 p3 = ltcTo(s, C - e1 + e2, inv);
+    float3 F = ltcQuadF(p0, p1, p2, p3);
+    float  ff = ltcHorizon(F);
+    if (ff <= 0.0)
+        return float3(0.0, 0.0, 0.0);
+    return ltcImage(p0, p1, p3, F, layer) * ff;
 }
 
 // An ellipse (centre C, semi-axes e1 and e2 from the shading point, in the lobe's space): the cone through it, whose
@@ -545,8 +596,20 @@ float3 shadeLocalLight(uint i, Surface s)
             // Rects and discs light one side only (along dir).
             if (sh.ex.w < 4.5 && dot(toLight, l.dir.xyz) >= 0.0)
                 return float3(0.0, 0.0, 0.0);
-            float2 ff = areaTerms(s, sh, toLight, sh.ex.w);
-            lit = (s.diffuse * ff.x + s.ltcSpec * ff.y) * (l.color.rgb * (sh.ey.w * window * window));
+            uint image = sh.ex.w < 3.5 ? gLightLooks[i] : 0u;
+            if (image != 0u)
+            {
+                float4 id = float4(1.0, 0.0, 0.0, 1.0);
+                float  layer = float(image - 1u);
+                lit = (s.diffuse * rectImageTerm(s, toLight, sh.ex.xyz, sh.ey.xyz, id, layer) +
+                       s.ltcSpec * rectImageTerm(s, toLight, sh.ex.xyz, sh.ey.xyz, s.ltcInv, layer)) *
+                      (l.color.rgb * (sh.ey.w * window * window));
+            }
+            else
+            {
+                float2 ff = areaTerms(s, sh, toLight, sh.ex.w);
+                lit = (s.diffuse * ff.x + s.ltcSpec * ff.y) * (l.color.rgb * (sh.ey.w * window * window));
+            }
             if (max(lit.r, max(lit.g, lit.b)) <= 0.0)
                 return lit;
             NoL = max(NoL, 0.1); // part of the light may be in view when its centre isn't

@@ -525,6 +525,7 @@ yea_handle light_add(uint32_t type)
     if (!l)
         return 0xFFFFFFFFu;
     l->type = type > 6 ? 1 : type;
+    lightImageForget(row);
     l->dir = { 0, -1, 0 };
     l->tangent = { 1, 0, 0 };
     l->size = type == 5 ? yea_float2{ 0.1f, 0 } : type == 6 ? yea_float2{ 1.0f, 0.1f } : type >= 3 ? yea_float2{ 1.0f, 1.0f } : yea_float2{ 0, 0 };
@@ -638,6 +639,8 @@ void clear()
     Materials.clear();
     Instances.clear();
     Lights.clear();
+    LightTexels.clear();
+    LightLooks.clear();
     build()->active = 0;
     sceneState()->removed = yea::host()->frame();
 }

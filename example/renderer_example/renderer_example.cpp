@@ -12,7 +12,7 @@ namespace renderer_example
 {
 namespace
 {
-const uint32_t kMaxLights = 512, kMaxSpin = 16, kAreas = 4, kNone = 0xFFFFFFFFu;
+const uint32_t kMaxLights = 512, kMaxSpin = 16, kAreas = 5, kPanes = 12, kNone = 0xFFFFFFFFu;
 const float    kPi = 3.14159265f;
 
 struct State
@@ -42,6 +42,10 @@ struct State
     yea_handle areas[kAreas];
     yea_handle areaEmitters[kAreas];
     yea_handle areaMaterials[kAreas];
+    // The stained-glass panel: its image (renderer's light_image) and its panes, each a glowing slab of its colour.
+    uint32_t   glassImage;
+    yea_handle panes[kPanes];
+    yea_handle paneMaterials[kPanes];
 };
 State* gState;
 bool   gFreshVersion; // this version of the module hasn't built its scene yet: build it once (new meshes reach a running game)
@@ -67,7 +71,7 @@ State* state()
     if (!gState)
     {
         int fresh = 0;
-        gState = (State*)yea::host()->state("renderer_example", 7, sizeof(State), &fresh);
+        gState = (State*)yea::host()->state("renderer_example", 8, sizeof(State), &fresh);
         if (fresh)
             startCamera(gState);
     }
@@ -129,13 +133,38 @@ struct AreaLight
     yea_float3 pos, dir, across;
     float      width, height, range;
     yea_float3 color;
+    bool       glass; // a rect carrying the stained-glass image
 };
 const AreaLight kAreaLights[kAreas] = {
     { 3, { -9.3f, 1.8f, -3.2f }, { 1, -0.15f, 0.1f }, { 0.1f, 0, -1 }, 1.4f, 0.9f, 10, { 1.0f, 0.95f, 0.88f } }, // softbox
     { 4, { -5.1f, 3.4f, 2.5f }, { 0, -1, 0 }, { 1, 0, 0 }, 0.9f, 0.9f, 9, { 1.0f, 0.8f, 0.55f } },               // pendant
     { 6, { 0.0f, 0.65f, -6.85f }, { 1, 0, 0 }, { 0, 1, 0 }, 4.0f, 0.03f, 8, { 0.8f, 0.92f, 1.0f } },              // tube
     { 5, { 0.5f, 1.2f, 2.2f }, { 0, -1, 0 }, { 1, 0, 0 }, 0.3f, 0, 8, { 0.4f, 0.8f, 1.0f } },                     // sphere
+    { 3, { 9.3f, 1.9f, -3.0f }, { -1, -0.12f, 0.1f }, { 0.1f, 0, 1 }, 1.6f, 1.2f, 10, { 1, 1, 1 }, true },         // stained glass
 };
+
+// The stained-glass panel: 4 x 3 panes (top row first) in lead. Its image is 16 pixels a pane with a pixel of lead
+// round each, so each pane's glass is 14/16 of its cell, as the slabs that show it.
+const uint32_t   kGlassCols = 4, kGlassRows = 3;
+const yea_float3 kGlass[kPanes] = {
+    { 0.9f, 0.62f, 0.12f }, { 0.12f, 0.25f, 0.95f }, { 0.85f, 0.08f, 0.06f }, { 0.95f, 0.9f, 0.7f },
+    { 0.1f, 0.65f, 0.25f }, { 0.95f, 0.85f, 0.35f }, { 0.12f, 0.25f, 0.95f }, { 0.85f, 0.08f, 0.06f },
+    { 0.85f, 0.08f, 0.06f }, { 0.95f, 0.9f, 0.7f }, { 0.1f, 0.65f, 0.25f }, { 0.9f, 0.62f, 0.12f },
+};
+
+uint32_t makeGlassImage()
+{
+    if (!renderer::light_image_begin(kGlassCols * 16, kGlassRows * 16))
+        return kNone;
+    for (uint32_t y = 0; y < kGlassRows * 16; ++y)
+        for (uint32_t x = 0; x < kGlassCols * 16; ++x)
+        {
+            uint32_t lx = x % 16, ly = y % 16;
+            bool     lead = lx == 0 || lx == 15 || ly == 0 || ly == 15;
+            renderer::light_image_pixel(lead ? yea_float3{ 0, 0, 0 } : kGlass[(y / 16) * kGlassCols + x / 16]);
+        }
+    return renderer::light_image_end();
+}
 
 // The emitting surface's area as light_color's candela count it (seen face-on: a tube's and a sphere's outline).
 float areaOf(const AreaLight& a)
@@ -240,12 +269,16 @@ void build(State* s)
     // The area lights' dark fittings: the softbox's backing and stand, the pendant's canopy and cord, the tube's
     // brackets. They stay when a type is switched off (a lamp turned off). Those beside an emitter cast no shadow (they
     // would shadow its light); the stand's pole and foot do.
+    s->glassImage = makeGlassImage();
     for (uint32_t i = 0; i < kAreas; ++i)
     {
         const AreaLight& a = kAreaLights[i];
         yea_float3       z = normalized(a.dir), x = normalized(a.across), y = cross(z, x);
         s->areas[i] = s->areaEmitters[i] = kNone;
         s->areaMaterials[i] = renderer::material_add({ 0, 0, 0 }, 1, 0);
+        if (a.glass)
+            for (uint32_t k = 0; k < kPanes; ++k)
+                s->paneMaterials[k] = renderer::material_add({ 0, 0, 0 }, 1, 0);
         if (a.type == 3)
         {
             yea_handle back = renderer::instance_add(box, s->housingMaterial);
@@ -328,8 +361,22 @@ void addArea(State* s, uint32_t i)
     renderer::light_size(s->areas[i], a.width, a.height, x);
     renderer::light_range(s->areas[i], a.range);
     renderer::light_shadow(s->areas[i], true);
-    yea_handle e;
-    if (a.type == 3) // a thin slab, its face on the light's plane
+    yea_handle e = kNone;
+    if (a.glass) // the image on the light; a slab a pane, in front of the dark backing that shows as the lead
+    {
+        renderer::light_image(s->areas[i], s->glassImage);
+        float cw = a.width / kGlassCols, ch = a.height / kGlassRows;
+        for (uint32_t k = 0; k < kPanes; ++k)
+        {
+            float      u = ((float)(k % kGlassCols) + 0.5f) * cw - 0.5f * a.width, v = 0.5f * a.height - ((float)(k / kGlassCols) + 0.5f) * ch;
+            yea_float3 c = { a.pos.x + x.x * u + y.x * v - z.x * 0.006f, a.pos.y + x.y * u + y.y * v - z.y * 0.006f,
+                             a.pos.z + x.z * u + y.z * v - z.z * 0.006f };
+            s->panes[k] = renderer::instance_add(s->boxMesh, s->paneMaterials[k]);
+            renderer::instance_place(s->panes[k], c, basis(x, y, z), { cw * 0.875f, ch * 0.875f, 0.01f });
+            renderer::instance_shadow(s->panes[k], false);
+        }
+    }
+    else if (a.type == 3) // a thin slab, its face on the light's plane
     {
         e = renderer::instance_add(s->boxMesh, s->areaMaterials[i]);
         renderer::instance_place(e, { a.pos.x - z.x * 0.006f, a.pos.y - z.y * 0.006f, a.pos.z - z.z * 0.006f }, basis(x, y, z),
@@ -351,7 +398,8 @@ void addArea(State* s, uint32_t i)
         e = renderer::instance_add(s->cylinderMesh, s->areaMaterials[i]);
         renderer::instance_place(e, a.pos, basis(x, z, cross(x, z)), { 2 * a.height, a.width, 2 * a.height });
     }
-    renderer::instance_shadow(e, false);
+    if (e != kNone)
+        renderer::instance_shadow(e, false);
     s->areaEmitters[i] = e;
 }
 
@@ -397,7 +445,11 @@ void syncLights(State* s)
         else if (!on && s->areas[i] != kNone)
         {
             renderer::light_remove(s->areas[i]);
-            renderer::instance_remove(s->areaEmitters[i]);
+            if (kAreaLights[i].glass)
+                for (uint32_t k = 0; k < kPanes; ++k)
+                    renderer::instance_remove(s->panes[k]);
+            else
+                renderer::instance_remove(s->areaEmitters[i]);
             s->areas[i] = s->areaEmitters[i] = kNone;
         }
     }
@@ -463,7 +515,11 @@ void animate(State* s)
         const AreaLight& a = kAreaLights[i];
         if (s->areas[i] == kNone)
             continue;
-        float lum = settings.area_luminance * (a.type == 4 ? 3.0f : 1.0f);
+        // The glass twice: its colours pass a part of the light.
+        float lum = settings.area_luminance * (a.type == 4 ? 3.0f : a.glass ? 2.0f : 1.0f);
+        if (a.glass)
+            for (uint32_t k = 0; k < kPanes; ++k)
+                renderer::material_emissive(s->paneMaterials[k], kGlass[k], lum);
         renderer::light_color(s->areas[i], a.color, lum * areaOf(a));
         renderer::material_emissive(s->areaMaterials[i], a.color, lum);
     }

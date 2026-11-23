@@ -61,6 +61,14 @@ table Light none 4096
   u32 gen
   u32 alive
 end
+# Images for rect lights (light_image): up to 16, each 65536 rows (256 x 256, sRGB rgba8, row 0 at the top) one after
+# another; LightLook's rows match Light's (image + 1, 0 none).
+table LightTexel none 1048576
+  u32 rgba
+end
+table LightLook none 4096
+  u32 image
+end
 
 # Meshes: built-in shapes, or your own, vertex by vertex. Each returns a mesh id (4294967295 when full).
 export u32 mesh_box()
@@ -102,6 +110,15 @@ export handle light_add(u32 type)
 # spot: their source radius in width, for soft shadows (0: the shadows' light_size). Rects and discs light the side
 # light_place's dir points to. Area lights default to 1 x 1 m (spheres and tubes 0.1 m radius).
 export void light_size(handle l, float width, float height, float3 across)
+# An image across a rect light (a window, a stained-glass panel, a screen): light_image_begin(width, height), then
+# light_image_pixel(linear rgb, 0 to 1) for every pixel, row by row from the top left, then light_image_end, which
+# returns the image (4294967295 when 16 are made, or on a short count). Kept at 256 x 256. light_image(l, image) puts it
+# on a rect light (4294967295: none), its top along the light's height: it tints the light, so the light's candela
+# holds where the image is white and its average sets the light's output.
+export bool light_image_begin(u32 width, u32 height)
+export void light_image_pixel(float3 rgb)
+export u32 light_image_end()
+export void light_image(handle l, u32 image)
 export void light_place(handle l, float3 pos, float3 dir)
 export void light_color(handle l, float3 color, float intensity)
 export void light_range(handle l, float range)

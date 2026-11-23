@@ -122,7 +122,9 @@ bool           gTonyTried;    // read the table since Tony McMapface was picked 
 const YeaShadingRate* gShadingRate; // nullptr: no variable-rate shading on this GPU
 Buffer *       gFrameCb[kMaxFrames], *gInstanceBuf[kMaxFrames], *gMaterialBuf[kMaxFrames], *gLightBuf[kMaxFrames], *gStreamBuf[kMaxFrames];
 Buffer *       gCompositeCb[kMaxFrames], *gExposureCb[kMaxFrames];
-Buffer *       gLtc, *gShapeBuf[kMaxFrames];
+Buffer *       gLtc, *gShapeBuf[kMaxFrames], *gLookBuf[kMaxFrames];
+Texture*       gLightImages; // the rect lights' images (images.cpp)
+uint32_t*      gLookCpu;     // per GPU light: its image + 1, 0 none (gLightLooks)
 RenderGpuLightShape* gShapeCpu;
 v3                   gCamRight = { 1, 0, 0 }; // the view's right last frame, for a camera looking exactly straight down or up
 Buffer *       gDfg, *gExposure, *gHistogram, *gDummyU32, *gDummyViews, *gDummyProbes;
@@ -933,6 +935,7 @@ int load(int reloaded)
                                   cpu, sr, "renderer_lights");
         gShapeBuf[i] = makeBuffer((uint64_t)Lights.capacity() * sizeof(RenderGpuLightShape), sizeof(RenderGpuLightShape),
                                   DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_light_shapes");
+        gLookBuf[i] = makeBuffer((uint64_t)Lights.capacity() * 4, 4, DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_light_looks");
         gStreamBuf[i] = makeBuffer((uint64_t)Instances.capacity() * 4, 0, DESCRIPTOR_TYPE_VERTEX_BUFFER, cpu,
                                    RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, "renderer_stream");
         gPrevBuf[i] = makeBuffer((uint64_t)Instances.capacity() * 48, 48, DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_prev_instances");
@@ -1008,10 +1011,12 @@ int load(int reloaded)
 
     // Every buffer and texture made above, before anything uses them: a GPU or driver that refuses one stops the
     // module cleanly instead of crashing on it later.
-    bool made = gDfg && gLtc && gExposure && gHistogram && gDummyU32 && gDummyViews && gDummyProbes && gDummyDepth && gDummyColor &&
+    lightImagesInit();
+    gLightImages = lightImagesMake();
+    bool made = gDfg && gLtc && gLightImages && gExposure && gHistogram && gDummyU32 && gDummyViews && gDummyProbes && gDummyDepth && gDummyColor &&
                 gDummyRates && gDummyArray && gScenePersistent && gSceneFrame && gCompositeSet && gExposureSet && gTonemapSet && gShadowSampler;
     for (uint32_t i = 0; i < gFrames; ++i)
-        made = made && gFrameCb[i] && gCompositeCb[i] && gExposureCb[i] && gInstanceBuf[i] && gMaterialBuf[i] && gLightBuf[i] && gShapeBuf[i] &&
+        made = made && gFrameCb[i] && gCompositeCb[i] && gExposureCb[i] && gInstanceBuf[i] && gMaterialBuf[i] && gLightBuf[i] && gShapeBuf[i] && gLookBuf[i] && gLookBuf[i]->pCpuMappedAddress &&
                gStreamBuf[i] && gPrevBuf[i] && gFrameCb[i]->pCpuMappedAddress && gCompositeCb[i]->pCpuMappedAddress &&
                gExposureCb[i]->pCpuMappedAddress && gInstanceBuf[i]->pCpuMappedAddress && gMaterialBuf[i]->pCpuMappedAddress &&
                gLightBuf[i]->pCpuMappedAddress && gShapeBuf[i]->pCpuMappedAddress && gStreamBuf[i]->pCpuMappedAddress && gPrevBuf[i]->pCpuMappedAddress;
@@ -1021,14 +1026,16 @@ int load(int reloaded)
         unload();
         return 1;
     }
-    DescriptorData p[3] = {};
+    DescriptorData p[4] = {};
+    p[3].mIndex = SRT_RES_IDX(SceneSrt, Persistent, gLightImages);
+    p[3].ppTextures = &gLightImages;
     p[0].mIndex = SRT_RES_IDX(SceneSrt, Persistent, gShadowCmp);
     p[0].ppSamplers = &gShadowSampler;
     p[1].mIndex = SRT_RES_IDX(SceneSrt, Persistent, gDfg);
     p[1].ppBuffers = &gDfg;
     p[2].mIndex = SRT_RES_IDX(SceneSrt, Persistent, gLtc);
     p[2].ppBuffers = &gLtc;
-    updateDescriptorSet(gRenderer, 0, gScenePersistent, 3, p);
+    updateDescriptorSet(gRenderer, 0, gScenePersistent, 4, p);
 
     PipelineDesc cdesc = {};
     cdesc.mType = PIPELINE_TYPE_COMPUTE;
@@ -1048,6 +1055,7 @@ int load(int reloaded)
     gStream = new uint32_t[Instances.capacity()];
     gLightCpu = new RenderGpuLight[Lights.capacity()];
     gShapeCpu = new RenderGpuLightShape[Lights.capacity()];
+    gLookCpu = new uint32_t[Lights.capacity()];
     gMaterialCpu = new GpuMaterial[Materials.capacity()];
     gCasters = new RenderCaster[Instances.capacity()];
     gDrawables = new RenderCaster[Instances.capacity()];
@@ -1098,6 +1106,7 @@ void unload()
         freeBuffer(gMaterialBuf[i]);
         freeBuffer(gLightBuf[i]);
         freeBuffer(gShapeBuf[i]);
+        freeBuffer(gLookBuf[i]);
         freeBuffer(gStreamBuf[i]);
         freeBuffer(gPrevBuf[i]);
     }
@@ -1106,6 +1115,10 @@ void unload()
     freeBuffer(gDummyProbes);
     freeBuffer(gDfg);
     freeBuffer(gLtc);
+    if (gLightImages)
+        removeResource(gLightImages);
+    gLightImages = nullptr;
+    lightImagesFree();
     freeBuffer(gExposure);
     freeBuffer(gHistogram);
     freeBuffer(gVertexBuf);
@@ -1241,6 +1254,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         createCompositePipeline(gFrameFormat, gFrameSamples, samples);
     }
     uploadMeshes();
+    lightImagesUpload(gLightImages);
 
     // --- Camera -----------------------------------------------------------------------------
     CameraState* cam = cameraState();
@@ -1622,6 +1636,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         // Its shape (frame.h's RenderGpuLightShape).
         RenderGpuLightShape& sh = gShapeCpu[i];
         memset(&sh, 0, sizeof sh);
+        gLookCpu[i] = lightImageOf(row);
         if (l.type >= 3)
         {
             v3    t = normalize(V(l.tangent.x, l.tangent.y, l.tangent.z));
@@ -1790,6 +1805,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     memcpy(gStreamBuf[fi]->pCpuMappedAddress, gStream, (size_t)visibleTotal * 4);
     memcpy(gLightBuf[fi]->pCpuMappedAddress, gLightCpu, (size_t)F.allLightCount * sizeof(RenderGpuLight));
     memcpy(gShapeBuf[fi]->pCpuMappedAddress, gShapeCpu, (size_t)F.allLightCount * sizeof(RenderGpuLightShape));
+    memcpy(gLookBuf[fi]->pCpuMappedAddress, gLookCpu, (size_t)F.allLightCount * 4);
     memcpy(gMaterialBuf[fi]->pCpuMappedAddress, gMaterialCpu, (size_t)Materials.size() * sizeof(GpuMaterial));
     memcpy(gFrameCb[fi]->pCpuMappedAddress, &gFrameCpu, sizeof gFrameCpu);
     if (taa)
@@ -1865,7 +1881,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         Buffer*  masks = culled ? F.tileMasks : gDummyU32;
         Buffer*  bins = culled ? F.zbins : gDummyU32;
         Buffer*  views = shadows ? F.shadowViews : gDummyViews;
-        DescriptorData p[20] = {};
+        DescriptorData p[21] = {};
         Texture*       ssrDepth = ssr ? F.ssrDepth : gDummyDepth->pTexture;
         Texture*       previous = ssr ? F.previous->pTexture : gDummyColor->pTexture;
         Texture*       probeTex = probes ? F.probes->pTexture : gDummyArray->pTexture;
@@ -1914,7 +1930,9 @@ void draw(uint32_t pass, const YeaFrame* yf)
         p[18].ppTextures = &rtShadowTex;
         p[19].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gLightShapes);
         p[19].ppBuffers = &gShapeBuf[fi];
-        updateDescriptorSet(gRenderer, fi, gSceneFrame, 20, p);
+        p[20].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gLightLooks);
+        p[20].ppBuffers = &gLookBuf[fi];
+        updateDescriptorSet(gRenderer, fi, gSceneFrame, 21, p);
 
         DescriptorData c[7] = {};
         c[0].mIndex = SRT_RES_IDX(CompositeSrt, PerFrame, gComposite);

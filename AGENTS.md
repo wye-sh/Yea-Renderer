@@ -199,6 +199,14 @@ surface's luminance is that over its area). Colours linear RGB.
   `Assets/ltc.bin`; Heitz et al. 2016, 2017); to every other module they are point lights (a cube of shadow tiles)
   whose `RenderLight.kind` and `size` (the radius of a disc of their area) give their penumbra and face margin.
   Give an area light an emitter of its exact shape that casts no shadow.
+- Rect light images (textured rects: a window, stained glass, a screen): `light_image_begin(w, h)`, then
+  `light_image_pixel(rgb)` w × h times (row by row from the top left, linear 0–1), then `light_image_end()` → image
+  (4294967295 when 16 are made or the count is short); `light_image(l, image)` puts it on a rect (4294967295: none).
+  Kept at 256 × 256 in the LightTexel table (rgba8 sRGB, cleared by `clear()`), uploaded (a stall: make them up front)
+  with a [1 3 3 1] Gaussian mip chain into one 16-layer array (`images.cpp`). Shading (Lighting.h.fsl `ltcImage`):
+  each lobe reads the image where its vector form factor's direction meets the rect, at a mip from the plane's
+  distance over the rect's size (Heitz et al. 2016, textured polygons); the image tints the light, so white keeps
+  its candela. Shadows stay the rect's. The per-light index is `gLightLooks` (image + 1), no frame.h change.
 - `camera(eye, target, fov°)`: the view keeps world up (right = up × forward) at every pitch, so its heading never
   flips looking straight down; exactly vertical, last frame's right carries over. `clear()` (removes everything but probes).
 - Reflection probes (exports of `renderer_probes`): `probe_add(pos, box_min, box_max)` (capture point and
@@ -331,7 +339,8 @@ casts shadows; `spot_intensity`, range 20). The first `shadowed_lights` slots ca
 Types: `sun`, `points`, `spots`, `rects`, `discs`, `spheres`, `tubes`, each off removing that type's lights and
 emitters (their fittings stay). Four area lights at `area_luminance` (cd/m²; the pendant at three times it): a
 softbox on a stand by the sphere rows, a pendant disc over the white boxes, a fluorescent tube on the stone ledge,
-the glowing sphere on the steel drum, two reflection probes (the sphere rows, the whole yard), a free-look camera: holding its `look` action (left mouse button) after a press on the game
+the glowing sphere on the steel drum, a 4 × 3 stained-glass panel on a stand opposite the softbox (a rect with a
+light_image, its panes glowing slabs in their colours, at twice `area_luminance`; under Rects), two reflection probes (the sphere rows, the whole yard), a free-look camera: holding its `look` action (left mouse button) after a press on the game
 asks the host for the mouse each frame (`yea::captureMouse(true)`: hidden, kept in the window) and turns by
 `yea_mouse_dx`/`yea_mouse_dy` (`look_sensitivity`); the move keys fly (WASD, Q/E down/up, `move_speed`).
 The host lets go when the button is up (it is no longer asked), F1 opens, focus is lost, or on a view switch

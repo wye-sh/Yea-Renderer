@@ -19,6 +19,10 @@ import renderer void light_place(handle l, float3 pos, float3 dir)
 import renderer void light_color(handle l, float3 color, float intensity)
 import renderer void light_range(handle l, float range)
 import renderer void light_size(handle l, float width, float height, float3 across)
+import renderer bool light_image_begin(u32 width, u32 height) = false
+import renderer void light_image_pixel(float3 rgb)
+import renderer u32 light_image_end() = 4294967295
+import renderer void light_image(handle l, u32 image)
 import renderer void light_cone(handle l, float inner_deg, float outer_deg)
 import renderer void light_shadow(handle l, bool cast)
 import renderer void light_remove(handle l)

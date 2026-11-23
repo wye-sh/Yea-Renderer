@@ -2,6 +2,8 @@
 #pragma once
 #include "yea_renderer.h"
 
+typedef struct Texture Texture;
+
 namespace renderer
 {
 struct CameraState
@@ -19,4 +21,12 @@ struct SceneState
 SceneState* sceneState();
 bool        meshBuilding(); // a custom mesh is half made
 void        bindState();    // takes the state blocks: call in load(), before anything uses them
+
+// Rect lights' images (images.cpp).
+void     lightImagesInit();                  // in load()
+void     lightImagesFree();                  // in unload()
+Texture* lightImagesMake();                  // the texture array (16 images of 256 x 256, with mips)
+void     lightImagesUpload(Texture* tex);    // before the frame's lights: uploads when the images changed
+uint32_t lightImageOf(uint32_t lightRow);    // a rect light row's image + 1 (uploaded), else 0
+void     lightImageForget(uint32_t lightRow); // a light row made afresh has none
 } // namespace renderer
