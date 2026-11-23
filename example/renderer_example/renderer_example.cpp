@@ -37,6 +37,9 @@ struct State
     yea_handle spotMarkers[kMaxSpots];
     yea_handle spotMarkerMaterials[kMaxSpots];
     uint32_t   instances, lightsAlive; // the renderer's live counts once this frame's scene was in place
+    uint32_t   cylinderMesh;           // the spot lamps' housings and lenses
+    yea_handle housingMaterial;
+    yea_handle spotHousings[kMaxSpots];
 };
 State* gState;
 bool   gFreshVersion; // this version of the module hasn't built its scene yet: build it once (new meshes reach a running game)
@@ -62,7 +65,7 @@ State* state()
     if (!gState)
     {
         int fresh = 0;
-        gState = (State*)yea::host()->state("renderer_example", 4, sizeof(State), &fresh);
+        gState = (State*)yea::host()->state("renderer_example", 5, sizeof(State), &fresh);
         if (fresh)
             startCamera(gState);
     }
@@ -127,6 +130,8 @@ void build(State* s)
     uint32_t box = renderer::mesh_box(), plane = renderer::mesh_plane();
     uint32_t cylinder = renderer::mesh_cylinder(96), cone = renderer::mesh_cone(96), torus = renderer::mesh_torus(0.15f, 128);
     s->sphereMesh = renderer::mesh_sphere(32); // the light orbs
+    s->cylinderMesh = cylinder;
+    s->housingMaterial = renderer::material_add({ 0.06f, 0.06f, 0.065f }, 0.45f, 0.0f); // a dark painted lamp body
 
     yea_handle floor = renderer::material_add({ 0.42f, 0.42f, 0.42f }, 0.65f, 0);
     place(plane, floor, { 0, 0, 0 }, { 60, 1, 60 });
@@ -205,15 +210,20 @@ void syncLights(State* s)
         renderer::light_cone(h, 14, 24);
         renderer::light_shadow(h, true);
         s->spots[i] = h;
+        // A lamp: a short dark body behind the light, aimed along it, and a glowing lens disc at its front. Neither casts
+        // a shadow (it would shadow its own light), as the point lights' orbs don't.
         s->spotMarkerMaterials[i] = renderer::material_add({ 0, 0, 0 }, 1, 0);
-        s->spotMarkers[i] = renderer::instance_add(s->sphereMesh, s->spotMarkerMaterials[i]);
+        s->spotMarkers[i] = renderer::instance_add(s->cylinderMesh, s->spotMarkerMaterials[i]);
         renderer::instance_shadow(s->spotMarkers[i], false);
+        s->spotHousings[i] = renderer::instance_add(s->cylinderMesh, s->housingMaterial);
+        renderer::instance_shadow(s->spotHousings[i], false);
     }
     while (s->spotCount > spots)
     {
         uint32_t i = --s->spotCount;
         renderer::light_remove(s->spots[i]);
         renderer::instance_remove(s->spotMarkers[i]);
+        renderer::instance_remove(s->spotHousings[i]);
     }
 }
 
@@ -251,7 +261,14 @@ void animate(State* s)
         renderer::light_place(s->spots[i], p, { target.x - p.x, target.y - p.y, target.z - p.z });
         renderer::light_color(s->spots[i], c, settings.spot_intensity);
         renderer::material_emissive(s->spotMarkerMaterials[i], c, settings.spot_intensity * 0.6f + 1.0f);
-        renderer::instance_place(s->spotMarkers[i], p, kNoRotation, { 0.16f, 0.16f, 0.16f });
+        // The lamp turned so its axis (the cylinder's y) points along the light: the body 0.3 m long behind the light,
+        // the lens 0.2 m across just in front of it.
+        yea_float3 d = { target.x - p.x, target.y - p.y, target.z - p.z };
+        float      dl = sqrtf(d.x * d.x + d.y * d.y + d.z * d.z);
+        d = { d.x / dl, d.y / dl, d.z / dl };
+        yea_float4 q = axisAngle({ d.z, 0, -d.x }, acosf(d.y < -1 ? -1 : (d.y > 1 ? 1 : d.y))); // +y onto d
+        renderer::instance_place(s->spotHousings[i], { p.x - d.x * 0.16f, p.y - d.y * 0.16f, p.z - d.z * 0.16f }, q, { 0.26f, 0.3f, 0.26f });
+        renderer::instance_place(s->spotMarkers[i], { p.x + d.x * 0.0f, p.y + d.y * 0.0f, p.z + d.z * 0.0f }, q, { 0.2f, 0.02f, 0.2f });
         renderer::light_range(s->spots[i], 16);
     }
     for (uint32_t i = 0; i < s->spinCount; ++i)

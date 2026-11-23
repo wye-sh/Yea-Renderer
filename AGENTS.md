@@ -20,7 +20,11 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   ray-traced shadows; drawables that don't cast count for nothing). Needs are cached, four lights refreshed a frame.
   A face changes size only when its need doubles or halves, a shown face stays at least half its neighbours', and
   the most over-served face is halved until all fit 90% of the atlas. It logs the sizes, the atlas fill and what the
-  faces wanted when they change (at most every 20 s).
+  faces wanted when they change (at most every 20 s, by the clock). The atlas sizes itself: it starts at 4096 (or
+  local_atlas_resolution, if smaller) and doubles, up to that knob, once the faces have wanted more than fits for a
+  second, on cards of 6 GB or more (total VRAM, until Yea reports the free budget); never smaller while running, and
+  every light is redrawn on the frame it grows. Up to 64 lights are shadowed (shadowed_lights), the most important on
+  screen first (intensity times their reach's size on screen).
   Sampling (in the core's Lighting.h.fsl): every filter tap compares against the receiver's own depth
   there (receiver-plane bias: the surface's tangent plane carried into the view's ndc by the first three
   columns of its inverse, `inv` in the shadow view, three dot products; no screen derivatives, as lights are
@@ -303,7 +307,8 @@ for screen reflections (a quarter of it at half resolution).
 
 Floor, gold and red sphere rows sweeping roughness, pillars and assorted shapes, spinning tori, a sun,
 `light_count` moving coloured point lights (markers glow in their colour; the first `shadowed_points` cast
-shadows), `spot_count` sweeping shadowed spots (each with a small orb in its colour), two reflection probes (the sphere rows, the whole yard), a free-look camera: holding its `look` action (left mouse button) after a press on the game
+shadows; all of them by default), `spot_count` sweeping shadowed spots (each a lamp: a dark body aimed along the beam,
+its lens glowing in the light's colour; neither casts shadows), two reflection probes (the sphere rows, the whole yard), a free-look camera: holding its `look` action (left mouse button) after a press on the game
 asks the host for the mouse each frame (`yea::captureMouse(true)`: hidden, kept in the window) and turns by
 `yea_mouse_dx`/`yea_mouse_dy` (`look_sensitivity`); the move keys fly (WASD, Q/E down/up, `move_speed`).
 The host lets go when the button is up (it is no longer asked), F1 opens, focus is lost, or on a view switch

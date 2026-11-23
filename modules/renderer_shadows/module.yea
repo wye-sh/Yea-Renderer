@@ -32,8 +32,10 @@ setting bool show_cascades false
 category Light Shadows
 setting bool light_shadows true
 player light_shadows
-setting int shadowed_lights 24 0 32
-setting int local_atlas_resolution 4096 1024 8192
+setting int shadowed_lights 64 0 64
+# The largest the lights' shadow atlas may grow to: it starts at 4096 (or this, if smaller) and doubles once its
+# lights want more detail than fits, on cards with 6 GB or more (8192 takes 256 MB).
+setting int local_atlas_resolution 8192 1024 8192
 setting int updates_per_frame 8 1 32
 setting int max_tile_resolution 1024 128 2048
 # Light shadows sharp where an object meets what it stands on, softer further away, as from a light

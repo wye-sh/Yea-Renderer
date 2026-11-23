@@ -37,7 +37,7 @@ setting int light_count 16 0 512
 setting float light_intensity 6000 0 inf
 setting float light_range 9 1 inf
 setting float light_speed 0.4 0 inf
-setting int shadowed_points 16 0 32
+setting int shadowed_points 512 0 512
 setting int spot_count 4 0 16
 setting float spot_intensity 4000 0 inf
 category Sun

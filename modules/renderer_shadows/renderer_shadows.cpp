@@ -7,6 +7,7 @@
 #include "mathx.h"
 
 #include <stdio.h>
+#include <chrono>
 
 #include <Common_3/Graphics/Interfaces/IGraphics.h>
 #include <Common_3/Resources/ResourceLoader/Interfaces/IResourceLoader.h>
@@ -23,7 +24,7 @@ const uint32_t kMaxFrames = 4;
 const uint32_t kSunViews = RENDER_MAX_CASCADES;
 const uint32_t kCell = 128;              // the local atlas is handed out in squares of 128 px cells
 const uint32_t kMaxSide = 64;            // cells per side at the largest atlas (8192)
-const uint32_t kGroups = 42;             // shadowed lights at most, each with six view slots
+const uint32_t kGroups = 64;             // shadowed lights at most, each with six view slots
 const uint32_t kMaxViews = kSunViews + kGroups * 6;
 const uint32_t kMaxEntries = 1u << 20;   // caster entries per frame
 
@@ -335,10 +336,15 @@ void lightKey(const RenderLight& l, float key[9])
 }
 
 // When the faces' sizes change, at most every 20 s: how many faces hold each size, and how full the atlas is.
-uint64_t gLogFrame;
+double   gLogTime = -1e9; // when the faces were last logged (s)
 uint32_t gLogSizes[5];
 uint32_t gWanted; // cells the faces wanted this frame, before they were fitted into the atlas
-void logAtlas(uint64_t frame)
+uint32_t gLocalAuto;      // the lights' atlas size it has grown to (0: not yet chosen)
+double   gOverSince = -1; // since when the faces have wanted more than fits (s), or -1
+bool     gRedrawAll;      // the atlas was just made larger: every light is redrawn this frame
+double secondsNow() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
+void logAtlas()
 {
     uint32_t sizes[5] = {}, used = 0;
     for (const Group& g : gGroups)
@@ -350,10 +356,11 @@ void logAtlas(uint64_t frame)
             sizes[i]++;
             used += g.k[f] * g.k[f];
         }
-    if (!memcmp(sizes, gLogSizes, sizeof sizes) || (gLogFrame && frame < gLogFrame + 1200))
+    double now = secondsNow();
+    if (!memcmp(sizes, gLogSizes, sizeof sizes) || now < gLogTime + 20.0)
         return;
     memcpy(gLogSizes, sizes, sizeof sizes);
-    gLogFrame = frame;
+    gLogTime = now;
     char line[160];
     snprintf(line, sizeof line, "renderer_shadows: light faces at 128/256/512/1024/2048: %u/%u/%u/%u/%u; local atlas %u%% full (%u), %u%% wanted",
              sizes[0], sizes[1], sizes[2], sizes[3], sizes[4], gSide ? used * 100 / (gSide * gSide) : 0, gSide * kCell,
@@ -707,7 +714,31 @@ bool shadows_prepare(uint64_t address)
     uint32_t cascades = clampu(settings.cascades, 1, RENDER_MAX_CASCADES);
     uint32_t res = pow2Floor(clampu(settings.sun_resolution, 512, 4096));
     uint32_t sunSize = cascades > 1 ? res * 2 : res;
-    uint32_t localSize = pow2Floor(clampu(settings.local_atlas_resolution, 1024, 8192));
+    // The lights' atlas sizes itself: from 4096 (or the knob, if smaller), doubled up to the knob once the faces have
+    // wanted more than fits for a second, as far as the card's memory allows (8192 on cards of 6 GB or more). It never
+    // shrinks while the game runs (only when the knob is lowered), so a light's detail doesn't come and go.
+    uint64_t vram = gRenderer->pGpu ? gRenderer->pGpu->mVRAM : 0;
+    uint32_t localMax = pow2Floor(clampu(settings.local_atlas_resolution, 1024, vram >= (6ull << 30) ? 8192 : 4096));
+    if (!gLocalAuto || gLocalAuto > localMax)
+        gLocalAuto = localMax < 4096 ? localMax : 4096;
+    double now = secondsNow();
+    if (gLocalAuto < localMax && gSide && gWanted > gSide * gSide * 9 / 10)
+    {
+        if (gOverSince < 0)
+            gOverSince = now;
+        else if (now - gOverSince >= 1.0)
+        {
+            char line[160];
+            snprintf(line, sizeof line, "renderer_shadows: the lights' atlas grows to %u (%u MB): its faces wanted %u%% of %u", gLocalAuto * 2,
+                     (gLocalAuto * 2 / 1024) * (gLocalAuto * 2 / 1024) * 4, gWanted * 100 / (gSide * gSide), gLocalAuto);
+            yea::log(line);
+            gLocalAuto *= 2;
+            gRedrawAll = true; // every light at once in the new atlas, so none is left without its shadow
+        }
+    }
+    else
+        gOverSince = -1;
+    uint32_t localSize = gLocalAuto;
     float    slope = settings.slope_bias;
     if (sunSize != gSunSize || localSize != gLocalSize || slope != gPipeSlope)
     {
@@ -925,7 +956,8 @@ bool shadows_prepare(uint64_t address)
     // shadows read them). A face's size changes only when the wanted one doubles or halves, so sizes don't pop as
     // lights move; the largest are halved until all fit 90% of the atlas, and only as many lights are moved to
     // new squares as are redrawn this frame, so none loses its shadow meanwhile.
-    uint32_t budget = clampu(settings.updates_per_frame, 1, kGroups);
+    uint32_t budget = gRedrawAll ? kGroups : clampu(settings.updates_per_frame, 1, kGroups);
+    gRedrawAll = false;
     uint32_t target[kGroups][6];
     float    need[kGroups][6]; // cells wanted
     {
@@ -1056,7 +1088,7 @@ bool shadows_prepare(uint64_t address)
             if (groupAlloc(g, faces, target[j]))
                 moved++;
         }
-    logAtlas(F->frameNumber);
+    logAtlas();
 
     uint64_t latestMove = 0;
     for (uint32_t i = 0; i < F->casterCount; ++i)
