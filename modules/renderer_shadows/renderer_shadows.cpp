@@ -47,6 +47,7 @@ bool           gReady;
 Shader *       gShader, *gClearShader;
 Pipeline *     gPipe, *gClearPipe;
 float          gPipeSlope = -1;
+float          gGuardKey = -1; // what the point lights' face margins were drawn for
 DescriptorSet* gSet;
 Buffer *       gViewBuf[kMaxFrames], *gStreamBuf[kMaxFrames];
 RenderTarget * gSunAtlas, *gLocalAtlas;
@@ -327,7 +328,16 @@ void buildLocalViews(Group& g, const RenderLight& l)
         float                  tanHalf;
         if (l.type == 1)
         {
-            tanHalf = 1.05f; // a little past 90 degrees, so filtering at a face's edge stays inside
+            // Past 90 degrees by the widest filter the shader may use at the face's edge (where it switches faces),
+            // so every tap lands in this face's own drawn texels: the PCF disk (softness, a quarter of it under
+            // contact-hardening, whose penumbra reaches min(24, 8% of the tile) texels and whose blocker search
+            // 12), plus 2 for the bilinear compare and the 2 x 2 gathers. A narrower margin clamps the taps to the
+            // tile's border texels, which draws a false shadow line along each face edge: a square around the
+            // light's foot that moves with it.
+            float guard = settings.contact_hardening && settings.light_size > 0
+                              ? maxf(minf(24.0f, 0.08f * tileRes) + 0.25f * settings.softness, 12.0f) + 2.0f
+                              : settings.softness + 2.0f;
+            tanHalf = tileRes / maxf(tileRes - 2.0f * guard, tileRes * 0.5f);
             perspective(v, p, kFaces[f], tanHalf, nearZ, l.range);
         }
         else
@@ -533,6 +543,14 @@ bool shadows_prepare(uint64_t address)
         }
     }
     gSunRes = res;
+    // The point lights' faces are drawn wider for wider filters (buildLocalViews): redraw them when those change.
+    float guardKey = settings.softness + (settings.contact_hardening && settings.light_size > 0 ? 1000.0f : 0.0f);
+    if (guardKey != gGuardKey)
+    {
+        for (Group& g : gGroups)
+            g.valid = 0;
+        gGuardKey = guardKey;
+    }
     if (!gSunAtlas || !gLocalAtlas || !gPipe)
         return false;
 
