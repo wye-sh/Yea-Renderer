@@ -189,7 +189,7 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
                 result = float2(0.0, max(RayQueryRayT(occluder), 1e-3));
         }
     }
-    Write3D(gRawOut, int3(p, int(s)), result);
+    Write3D(gRawOut, int3(p, int(s)), result.y); // the blocker's distance alone: x is 1 exactly where it is 0
     RETURN();
 }
 #endif
@@ -214,10 +214,13 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
     float z = d > 0.0 ? viewDepth(d) : 0.0;
     if (s == 0u)
         Write2D(gZOut, p, z);
-    float2 raw = LoadTex3D(gRaw, NO_SAMPLER, int3(p, int(s)), 0).xy;
+    float2 raw;
+    raw.y = LoadTex3D(gRaw, NO_SAMPLER, int3(p, int(s)), 0).x;
+    raw.x = raw.y > 0.0 ? 0.0 : 1.0;
     if (d <= 0.0)
     {
-        Write3D(gHistoryOut, int3(p, int(s)), float4(1.0, 0.0, 0.0, 0.0));
+        Write3D(gHistoryOut, int3(p, int(s)), float2(1.0, 0.0));
+        Write3D(gSamplesOut, int3(p, int(s)), 0.0);
         RETURN();
     }
     // This frame's rays around: their mean and spread, which the history must lie near.
@@ -226,7 +229,7 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
     {
         for (int x = -2; x <= 2; ++x)
         {
-            float v = LoadTex3D(gRaw, NO_SAMPLER, int3(clamp(p + int2(x, y), int2(0, 0), size - int2(1, 1)), int(s)), 0).x;
+            float v = LoadTex3D(gRaw, NO_SAMPLER, int3(clamp(p + int2(x, y), int2(0, 0), size - int2(1, 1)), int(s)), 0).x > 0.0 ? 0.0 : 1.0;
             m1 += v;
             m2 += v * v;
             n += 1.0;
@@ -247,7 +250,8 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
             // A surface was there last frame (as the reflections' test, by view depth).
             if (zPrev > 0.0 && abs(zPrev - z) < 0.04 * z + 0.02)
             {
-                float4 h = LoadTex3D(gHistory, NO_SAMPLER, int3(q, int(slot.y)), 0);
+                float4 h = float4(LoadTex3D(gHistory, NO_SAMPLER, int3(q, int(slot.y)), 0).xy,
+                                  LoadTex3D(gSamples, NO_SAMPLER, int3(q, int(slot.y)), 0).x, 0.0);
                 float  samples = min(h.z + 1.0, gSd.params.x);
                 // Held to this frame's spread: a light or caster that moved shows at once; there the count restarts.
                 float lo = mean - 1.5 * spread - 0.1, hi = mean + 1.5 * spread + 0.1;
@@ -266,7 +270,8 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
             }
         }
     }
-    Write3D(gHistoryOut, int3(p, int(s)), result);
+    Write3D(gHistoryOut, int3(p, int(s)), result.xy);
+    Write3D(gSamplesOut, int3(p, int(s)), result.z);
     RETURN();
 }
 #endif
@@ -283,7 +288,7 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
     int2  p = int2(id.xy);
     if (p.x >= size.x || p.y >= size.y)
         RETURN();
-    float4 c = LoadTex3D(gHistory, NO_SAMPLER, int3(p, int(s)), 0);
+    float3 c = float3(LoadTex3D(gHistory, NO_SAMPLER, int3(p, int(s)), 0).xy, LoadTex3D(gSamples, NO_SAMPLER, int3(p, int(s)), 0).x);
     float  d = LoadTex2D(gDepth, NO_SAMPLER, p, 0).r;
     if (d <= 0.0 || c.y <= 0.0)
     {
