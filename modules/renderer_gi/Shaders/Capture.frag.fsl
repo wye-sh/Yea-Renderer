@@ -18,8 +18,35 @@ STRUCT(VSOutput)
     DATA(float3, Normal, TEXCOORD1);
     DATA(float3, Eye, TEXCOORD2);
     DATA(FLAT(uint), Material, TEXCOORD3);
+    DATA(float2, Uv, TEXCOORD4);
+    DATA(float4, Color, TEXCOORD5);
 };
 
+float4 sampleMap(uint slot, float2 uv, float2 dx, float2 dy)
+{
+    float4 c = float4(1.0, 1.0, 1.0, 1.0);
+    uint   texSlot = slot - 1u;
+    BeginNonUniformResourceIndex(texSlot, MAX_TEXTURES);
+        c = SampleGradTex2D(gTextures[texSlot], gSamplerAnisotropic, uv, dx, dy);
+    EndNonUniformResourceIndex();
+    return c;
+}
+
+#if defined(SUN_SHADOW)
+// Cut-outs cut out of the sun's map as they are out of the scene; everything else casts whole.
+ROOT_SIGNATURE(DefaultRootSignature)
+void PS_MAIN(VSOutput In)
+{
+    INIT_MAIN;
+    GiMaterialMap mm = gMaterialMaps[In.Material & 0x7FFFFFFFu];
+    if (mm.misc.x > 0.0 && mm.misc.y > 0.5)
+    {
+        float4 base = mm.maps.x != 0u ? sampleMap(mm.maps.x, In.Uv, ddx(In.Uv), ddy(In.Uv)) : float4(1.0, 1.0, 1.0, 1.0);
+        clip(base.a * mm.baseFactor.a * In.Color.a - mm.misc.x);
+    }
+    RETURN();
+}
+#else
 float3 toAtlas(GiShadowView v, float3 P)
 {
     float4 q = float4(P, 1.0);
@@ -28,28 +55,20 @@ float3 toAtlas(GiShadowView v, float3 P)
     return float3(v.rect.xy + (ndc.xy * float2(0.5, -0.5) + float2(0.5, 0.5)) * v.rect.zw, ndc.z);
 }
 
-// The sun's visibility: the first cascade, from the one its view depth falls in, whose map holds P (a probe sees past
-// the camera's view, which the cascades cover); outside them all, lit.
+// The sun's visibility from renderer_gi's own map, which holds every shadow caster over every place a probe can see
+// (renderer_gi.cpp fitSun): a 2 x 2 filtered compare. Outside its rectangle no caster lies between P and the sun, and
+// past its far side every caster is nearer the sun than P (the depth clamped to 1 compares against them): both exact.
 float sunVisibility(float3 P)
 {
-    uint  count = uint(gGi.shadow.x);
-    float viewZ = dot(gGi.camZ, float4(P, 1.0));
-    uint  c = 0u;
-    while (c < count && viewZ > gGi.cascadeEnd[c])
-        c += 1u;
-    float t = gGi.shadow.y;
-    for (; c < count; ++c)
-    {
-        GiShadowView v = gViews[c];
-        float3 a = toAtlas(v, P);
-        float2 lo = v.rect.xy + t, hi = v.rect.xy + v.rect.zw - t;
-        if (a.x < lo.x || a.y < lo.y || a.x > hi.x || a.y > hi.y || a.z <= 0.0)
-            continue;
-        if (a.z >= 1.0)
-            return 1.0;
-        return CompareTex2D(gSunAtlas, gShadowCmp, a);
-    }
-    return 1.0;
+    if (gGi.shadow.x < 0.5)
+        return 1.0;
+    float4 q = float4(P, 1.0);
+    float3 a = float3(dot(gGi.sunView[0], q), dot(gGi.sunView[1], q), dot(gGi.sunView[2], q));
+    float2 uv = a.xy * float2(0.5, -0.5) + float2(0.5, 0.5);
+    float  t = gGi.shadow.y;
+    if (uv.x < t || uv.y < t || uv.x > 1.0 - t || uv.y > 1.0 - t || a.z <= 0.0)
+        return 1.0;
+    return CompareTex2D(gGiSun, gShadowCmp, float3(uv, min(a.z, 1.0)));
 }
 
 float localVisibility(GiLight l, float3 P)
@@ -73,7 +92,22 @@ ROOT_SIGNATURE(DefaultRootSignature)
 float4 PS_MAIN(VSOutput In)
 {
     INIT_MAIN;
-    GiMaterial m = gMaterials[In.Material & 0x7FFFFFFFu];
+    GiMaterial    m = gMaterials[In.Material & 0x7FFFFFFFu];
+    GiMaterialMap mm = gMaterialMaps[In.Material & 0x7FFFFFFFu];
+    if (mm.misc.y > 0.5)
+    {
+        // The base colour and emissive maps (as the forward pass reads them); cut-outs cut out.
+        float2 dx = ddx(In.Uv);
+        float2 dy = ddy(In.Uv);
+        float4 base = mm.maps.x != 0u ? sampleMap(mm.maps.x, In.Uv, dx, dy) : float4(1.0, 1.0, 1.0, 1.0);
+        if (mm.misc.x > 0.0)
+            clip(base.a * mm.baseFactor.a * In.Color.a - mm.misc.x);
+        if (mm.maps.x != 0u)
+            m.albedoRough.rgb = mm.baseFactor.rgb * base.rgb;
+        m.albedoRough.rgb *= In.Color.rgb;
+        if (mm.maps.w != 0u)
+            m.emissive.rgb *= sampleMap(mm.maps.w, In.Uv, dx, dy).rgb;
+    }
     float3 P = In.WorldPos;
     float3 toEye = In.Eye - P;
     float  dist = max(length(toEye), 1e-3);
@@ -134,3 +168,4 @@ float4 PS_MAIN(VSOutput In)
     c = giHeightFog(c, In.Eye, -V, dist);
     RETURN(float4(c, dist));
 }
+#endif

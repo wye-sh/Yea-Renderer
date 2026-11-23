@@ -243,9 +243,14 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   switches off those buried (over a quarter of rays hit backfaces) or with no surface within their cell (traced only
   every 8th frame, to wake). Without rays this frame (no ray tracing, TAA off, renderer_rt off), the raster fallback
   captures `quality`'s 4/8/16 probes a frame in turn instead: six 16x16 faces each into one RGBA16F strip
-  (`Capture.*.fsl`, both sides drawn, back faces of one-sided surfaces as negative distance), lit as renderer_rt lights
-  its hits (the sun through its cascades, lit outside them; up to 64 lights through their maps; last frame's probes for
-  the bounce; height fog), read back as the same rays (RASTER_RAYS), blended with at most 0.6 of history. The core
+  (`Capture.*.fsl`, both sides drawn, back faces of one-sided surfaces as negative distance; base colour and emissive
+  maps, cut-outs cut), lit as renderer_rt lights its hits (the sun through renderer_gi's own sun map; up to 64 lights
+  through their maps; last frame's probes for the bounce; height fog), read back as the same rays (RASTER_RAYS), blended
+  with at most 0.6 of history. The sun map (4.7.2, 2048² D32, `fitSun`): orthographic along the sun over the box round
+  the probe volume and every shadow caster (spheres over 200 m left out), so outside its rectangle no caster lies
+  between a point and the sun (lit, exactly) and past its far side the depth clamps to 1 (shadowed by whatever is
+  drawn there); every caster, both sides, cut-outs cut; drawn again only on a raster frame where the sun turned, a
+  caster moved, appeared or went, the probe box or the textures changed. The core
   reads the probes for diffuse ambient in the forward pass (FLAG_GI, frame grid in FrameData gi[4]: `irradiance` lerps
   from the sky's to `giIrradiance` by `inside`, which falls to 0 a cell outside the grid or where no probe round the
   point holds light; show_gi shows it alone); fog's froxels and particles take `giAmbient` (mean over up and down,
@@ -526,7 +531,8 @@ R8 render-size mask. With global illumination: probe rays (16 x 8 x 16 = 2048 pr
 frame), two blend dispatches (a group per probe, each texel over every ray), a classify dispatch, 2 atlases (128 x 64
 and 256 x 128 tiles: about 0.5 MB) and 4 MB of rays; in the forward pass 8 probes a pixel (two bilinear reads each).
 Without ray tracing instead: 6 x 16² faces for each of 4/8/16 probes a frame (the casters drawn into each face they
-reach, culled on the CPU) and one ray-gathering dispatch. The Model Viewer's preview costs
+reach, culled on the CPU), one ray-gathering dispatch, and the sun map (16 MB) redrawn with every caster only when
+something it holds changes. The Model Viewer's preview costs
 nothing unless its panel is open and showing a model: then, per frame, one 1024² shadow map pass and one 4-sample pass of
 that model at twice the canvas size, and a resolve (about 6 MB of targets at a 520 × 320 canvas). Texture maps: their mips
 in GPU memory (BC7/BC5, 1 byte a texel; a 2048² map about 5.6 MB with mips), read from file while loading (24 MB a

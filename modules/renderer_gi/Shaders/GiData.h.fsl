@@ -16,10 +16,20 @@ STRUCT(GiData)
     DATA(float4, skyGround, None);
     DATA(float4, fogMedium, None); // frame.h's height fog (x 0: none)
     DATA(float4, fogAlbedo, None); // rgb albedo, w the fog's range (m)
-    DATA(float4, shadow, None);    // x sun cascades with maps (0: unshadowed), y sun atlas texel, z local atlas texel
-    DATA(float4, camZ, None);      // the camera's view row z (world -> view depth), which picks the sun's cascade
-    DATA(float4, cascadeEnd, None);
+    DATA(float4, shadow, None);    // x 1: the sun's own map (gGiSun) holds the scene, y its texel (uv), z local atlas texel
+    DATA(float4, sunView[3], None); // rows, world -> the sun map's ndc x, y (-1..1) and depth (0 nearest the sun, 1 farthest)
 };
+
+// A material's texture maps (the core's MaterialMapData): slot + 1 in maps (x base colour, w emissive), the base colour
+// factor, misc.x the alpha cutoff (0: not cut out), misc.y 1 when maps were given (vertex colours count).
+STRUCT(GiMaterialMap)
+{
+    DATA(uint4, maps, None);
+    DATA(float4, baseFactor, None);
+    DATA(float4, factors, None);
+    DATA(float4, misc, None);
+};
+#define MAX_TEXTURES 1024
 
 // The core's layouts the raster capture reads (frame.h's RenderGpuInstance, RenderGpuLight, RenderGpuLightShape,
 // RenderGpuShadowView; renderer's Shaders/Common.h.fsl MaterialData).
