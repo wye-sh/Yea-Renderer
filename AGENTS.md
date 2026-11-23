@@ -928,7 +928,9 @@ for the decals in its tile and z-bin (a box test, then up to three map reads or 
   6.6.0 kept Direct3D 12's out of it, until Yea 151 serialised a cache's twins). On an older host, warming makes the
   rest 2 ms a frame, one at least. Either way no variant compiles on a frame that draws: until warmed, cut-outs wait (both passes, so depth and colour agree) and
   the full shader gives way to the lean one. A pipeline cache in Yea's data folder (`renderer_pipelines_d3d12.bin` or
-  `_vulkan.bin`; a Direct3D 12 library from another driver starts empty) is saved when warming ends (unless a compile was cancelled) and in `unload()`.
+  `_vulkan.bin`; a Direct3D 12 library from another driver starts empty, and so does one from other root signatures,
+  since none of its pipelines would load or store again: the file starts with a hash of Yea's two `.rootsig` files;
+  the start logs which) is saved when warming ends (unless a compile was cancelled) and in `unload()`.
   It logs "scene pipelines warmed in X ms over N frames (at most Y ms a frame); cut-outs held back K frames", and any
   pipeline still made on a drawing frame.
 

@@ -624,6 +624,41 @@ const char* const kPipeCacheFile = "renderer_pipelines_d3d12.bin";
 // d3d12.h's IIDs (its own are in dxguid, which modules don't link).
 const IID kIidDevice1 = { 0x77acce80, 0x638e, 0x4e65, { 0x88, 0x95, 0xc1, 0xf2, 0x33, 0x86, 0x86, 0x3e } };
 const IID kIidPipelineLibrary = { 0xc64226a8, 0x9201, 0x46af, { 0xb4, 0xcc, 0x53, 0xfb, 0x9f, 0xf7, 0x41, 0x4f } };
+// A library's pipelines are made with Yea's root signatures (its CompiledShaders' two .rootsig files). From other
+// ones, none of them loads and none stores again (their names are taken), so every start would compile cold: the
+// file starts with this magic and a hash of them, and one with another hash starts empty (the next save replaces it).
+const char kPipeCacheMagic[8] = { 'R', 'P', 'L', 'I', 'B', 'R', 'S', '1' };
+const long kPipeCacheHeader = 16;
+uint64_t   gPipeCacheKey;
+
+// 0 when neither file is there.
+uint64_t rootSignaturesKey()
+{
+    // Yea's folder: the host's, else (a Yea that doesn't say) the process's own.
+    char        exe[1024] = "";
+    const char* host = yea::host()->path("exe");
+    if (host && *host)
+        snprintf(exe, sizeof exe, "%s", host);
+    else if (DWORD n = GetModuleFileNameA(nullptr, exe, sizeof exe); n && n < sizeof exe)
+    {
+        char* slash = strrchr(exe, '\\');
+        *(slash ? slash : exe) = 0;
+    }
+    uint64_t h = 14695981039346656037ull; // FNV-1a
+    bool     any = false;
+    for (const char* name : { "default", "compute" })
+    {
+        char p[1100];
+        snprintf(p, sizeof p, "%s/CompiledShaders/DIRECT3D12/%s.rootsig", exe, name);
+        FILE* f = *exe ? fopen(p, "rb") : nullptr;
+        for (int c; f && (c = fgetc(f)) != EOF; any = true)
+            h = (h ^ (uint8_t)c) * 1099511628211ull;
+        if (f)
+            fclose(f);
+        h = (h ^ 0x100) * 1099511628211ull; // between the two files
+    }
+    return any ? h : 0;
+}
 #else
 const char* const kPipeCacheFile = "renderer_pipelines_vulkan.bin";
 #endif
@@ -649,18 +684,32 @@ void pipeCacheOpen()
             size = 0;
     }
 #if defined(_WIN32)
+    gPipeCacheKey = rootSignaturesKey();
+    const char* why = size > 0 ? "made for other root signatures; starting empty" : "none yet; starting empty";
+    if (size > kPipeCacheHeader && data && !memcmp(data, kPipeCacheMagic, 8) && !memcmp((char*)data + 8, &gPipeCacheKey, 8))
+    {
+        size -= kPipeCacheHeader;
+        memmove(data, (char*)data + kPipeCacheHeader, (size_t)size);
+        why = "in use";
+    }
+    else
+        size = 0;
     if (size > 0)
     {
         ID3D12Device1*         device = nullptr;
         ID3D12PipelineLibrary* library = nullptr;
         if (FAILED(gRenderer->mDx.pDevice->QueryInterface(kIidDevice1, (void**)&device)) ||
             FAILED(device->CreatePipelineLibrary(data, (SIZE_T)size, kIidPipelineLibrary, (void**)&library)))
-            size = 0;
+            size = 0, why = "refused by the driver; starting empty";
         if (library)
             library->Release();
         if (device)
             device->Release();
     }
+    char line[200];
+    snprintf(line, sizeof line, "renderer: the last run's pipeline library (%ld KB): %s%s", size / 1024, why,
+             gPipeCacheKey ? "" : " (Yea's root signatures not found: not keyed on them)");
+    yea::log(line);
 #endif
     PipelineCacheDesc desc = {};
     desc.pData = size > 0 ? data : nullptr;
@@ -687,7 +736,11 @@ void pipeCacheSave(bool unloading = false)
     char tmp[1040];
     snprintf(tmp, sizeof tmp, "%s.new", gPipeCachePath);
     FILE* f = fopen(tmp, "wb");
-    bool  ok = f && fwrite(data, 1, size, f) == size;
+#if defined(_WIN32)
+    bool ok = f && fwrite(kPipeCacheMagic, 1, 8, f) == 8 && fwrite(&gPipeCacheKey, 1, 8, f) == 8 && fwrite(data, 1, size, f) == size;
+#else
+    bool ok = f && fwrite(data, 1, size, f) == size;
+#endif
     if (f)
         ok = fclose(f) == 0 && ok;
     free(data);
