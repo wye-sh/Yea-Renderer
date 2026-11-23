@@ -1,5 +1,5 @@
-// The model cooker's textures (included by model_cook.cpp, after warn() and gDir): glTF images to rmodel.h's BC7 and
-// BC5 mip chains.
+// The model cooker's textures (included by model_cook.cpp, after warn() and gDir): images (files, or bytes inside a GLB or
+// FBX) to rmodel.h's BC7 and BC5 mip chains.
 // - Mips: each level a 2x2 box of the one above in linear light (sRGB decoded first for colour), clamped at odd edges;
 //   normal maps averaged as vectors and renormalised; ORM as data. The full chain to 1x1 is always kept: the source is
 //   never shrunk (--max-size names a top mip to start from, and the report says so).
@@ -12,6 +12,7 @@
 #include "vendor/bc7e/basisu_bc7e_scalar.h"
 
 #include <atomic>
+#include <deque>
 #include <thread>
 
 namespace cook
@@ -24,6 +25,27 @@ enum Kind : uint32_t
     KindEmissive, // BC7 sRGB
 };
 
+// An image a material reads: a file, or bytes inside the source (a GLB's buffer, an FBX's embedded texture).
+struct ImageRef
+{
+    std::string    path;
+    const uint8_t* data = nullptr;
+    size_t         size = 0;
+    std::string    label; // for the report
+};
+std::deque<ImageRef>                             gImages;
+std::unordered_map<const void*, const ImageRef*> gImageOf;
+
+// The importer's image (keyed by its own pointer, so each is read once), made from r the first time.
+const ImageRef* imageRef(const void* key, const ImageRef& r)
+{
+    auto it = gImageOf.find(key);
+    if (it != gImageOf.end())
+        return it->second;
+    gImages.push_back(r);
+    return gImageOf[key] = &gImages.back();
+}
+
 struct Image
 {
     int                  w = 0, h = 0;
@@ -32,8 +54,8 @@ struct Image
 
 struct Cooked
 {
-    const cgltf_image*   a;
-    const cgltf_image*   b; // ORM: the occlusion image merged into a's (nullptr: none or the same)
+    const ImageRef*      src[3]; // the image; ORM: occlusion's, roughness's and metallic's (nullptr: white)
+    int                  ch[3];  // ORM: the channel each is read from
     uint32_t             kind;
     float                cutoff; // KindBase of a masked material: its coverage kept per mip (0: opaque)
     RmodelTexture        t;
@@ -43,22 +65,17 @@ std::vector<Cooked> gTextures;
 uint32_t            gMaxSize = 0; // --max-size: the largest top mip written (0: the source's)
 uint32_t            gSkipped = 0; // top mips left out by --max-size, over every texture
 
-bool load(const cgltf_image* img, Image& out)
+bool load(const ImageRef* img, Image& out)
 {
     int      n = 0;
     uint8_t* px = nullptr;
-    if (img->buffer_view)
-        px = stbi_load_from_memory(cgltf_buffer_view_data(img->buffer_view), (int)img->buffer_view->size, &out.w, &out.h, &n, 4);
-    else if (img->uri && strncmp(img->uri, "data:", 5))
-    {
-        std::string path = gDir + img->uri;
-        cgltf_decode_uri(&path[gDir.size()]);
-        path.resize(strlen(path.c_str()));
-        px = stbi_load(path.c_str(), &out.w, &out.h, &n, 4);
-    }
+    if (img->data)
+        px = stbi_load_from_memory(img->data, (int)img->size, &out.w, &out.h, &n, 4);
+    else if (!img->path.empty())
+        px = stbi_load(img->path.c_str(), &out.w, &out.h, &n, 4);
     if (!px)
     {
-        warn("an image (%s) couldn't be read: its material draws without it", img->uri ? img->uri : img->name ? img->name : "embedded");
+        warn("an image (%s) couldn't be read: its material draws without it", img->label.c_str());
         return false;
     }
     out.rgba.assign(px, px + (size_t)out.w * out.h * 4);
@@ -256,47 +273,111 @@ void encode(const Level& l, uint32_t kind, uint8_t* out, const bc7e_scalar::bc7e
         t.join();
 }
 
-// A texture's index in gTextures (cooked once per image, kind and cutoff), or -1.
-int32_t cook(const cgltf_texture* texA, const cgltf_texture* texB, uint32_t kind, float cutoff)
+// The image's channel c at (x, y) of a w x h grid over it (bilinear, clamped at the edges).
+float sample(const Image& im, int c, int x, int y, int w, int h)
 {
-    const cgltf_image* a = texA ? texA->image : nullptr;
-    const cgltf_image* b = texB ? texB->image : nullptr;
-    if (b == a)
-        b = nullptr;
-    if (!a && kind == KindOrm && b) // occlusion alone: roughness and metallic white, their factors as they are
-        a = nullptr;
-    else if (!a)
+    float fx = ((x + 0.5f) * im.w / w) - 0.5f, fy = ((y + 0.5f) * im.h / h) - 0.5f;
+    int   x0 = (int)floorf(fx), y0 = (int)floorf(fy);
+    float tx = fx - x0, ty = fy - y0, v = 0;
+    for (int k = 0; k < 4; ++k)
+    {
+        int sx = x0 + (k & 1), sy = y0 + (k >> 1);
+        sx = sx < 0 ? 0 : (sx >= im.w ? im.w - 1 : sx), sy = sy < 0 ? 0 : (sy >= im.h ? im.h - 1 : sy);
+        v += im.rgba[((size_t)sy * im.w + sx) * 4 + c] * ((k & 1) ? tx : 1 - tx) * ((k >> 1) ? ty : 1 - ty);
+    }
+    return v;
+}
+
+int32_t encodeChain(Image& im, const ImageRef* const src[3], const int ch[3], uint32_t kind, float cutoff);
+
+// The mean of an image's channels (rgb sRGB-decoded when srgb), or false when it can't be read.
+bool mean(const ImageRef* img, bool srgb, float out[4])
+{
+    Image im;
+    if (!img || !load(img, im) || !im.w || !im.h)
+        return false;
+    double sum[4] = {};
+    for (size_t i = 0, n = (size_t)im.w * im.h; i < n; ++i)
+        for (int c = 0; c < 4; ++c)
+            sum[c] += c < 3 && srgb ? toLinear(im.rgba[i * 4 + c]) : im.rgba[i * 4 + c] / 255.0f;
+    for (int c = 0; c < 4; ++c)
+        out[c] = (float)(sum[c] / ((double)im.w * im.h));
+    return true;
+}
+
+// A texture's index in gTextures (cooked once per image, kind and cutoff), or -1: base colour, normal or emissive.
+int32_t cook(const ImageRef* img, uint32_t kind, float cutoff)
+{
+    if (!img)
+        return -1;
+    const ImageRef* src[3] = { img, nullptr, nullptr };
+    const int       ch[3] = { 0, 0, 0 };
+    for (size_t i = 0; i < gTextures.size(); ++i)
+        if (gTextures[i].src[0] == img && gTextures[i].kind == kind && gTextures[i].cutoff == cutoff)
+            return (int32_t)i;
+    Image im;
+    if (!load(img, im))
+        return -1;
+    return encodeChain(im, src, ch, kind, cutoff);
+}
+
+// The ORM texture (occlusion, roughness, metallic in red, green, blue), each from its own image's channel (glTF packs
+// roughness and metallic in green and blue of one image; FBX and OBJ give each its own), at the largest one's size; a
+// channel without an image is white (no occlusion; its factor as it is). -1 when it has none.
+int32_t cookOrm(const ImageRef* occ, int occCh, const ImageRef* rough, int roughCh, const ImageRef* metal, int metalCh)
+{
+    const ImageRef* src[3] = { occ, rough, metal };
+    const int       ch[3] = { occCh, roughCh, metalCh };
+    if (!occ && !rough && !metal)
         return -1;
     for (size_t i = 0; i < gTextures.size(); ++i)
-        if (gTextures[i].a == a && gTextures[i].b == b && gTextures[i].kind == kind && gTextures[i].cutoff == cutoff)
+        if (gTextures[i].kind == KindOrm && !memcmp(gTextures[i].src, src, sizeof src) && !memcmp(gTextures[i].ch, ch, sizeof ch))
             return (int32_t)i;
-    Image im, occ;
-    if (a && !load(a, im))
-        return -1;
-    if (b && !load(b, occ))
-        b = nullptr;
-    if (!a) // only an occlusion map: it is the ORM, green and blue white
+    Image in[3];
+    bool  ok[3] = {};
+    int   w = 0, h = 0;
+    for (int c = 0; c < 3; ++c)
     {
-        im = occ;
-        for (size_t i = 0; i < (size_t)im.w * im.h; ++i)
-            im.rgba[i * 4 + 1] = im.rgba[i * 4 + 2] = 255;
+        int same = -1;
+        for (int k = 0; k < c; ++k)
+            if (src[k] == src[c] && ok[k])
+                same = k;
+        if (src[c] && same >= 0)
+            in[c] = in[same], ok[c] = true;
+        else if (src[c])
+            ok[c] = load(src[c], in[c]);
+        if (ok[c] && (size_t)in[c].w * in[c].h > (size_t)w * h)
+            w = in[c].w, h = in[c].h;
     }
-    else if (b) // glTF's occlusion in its own image: into red, sampled at the ORM's size (bilinear)
-        for (int y = 0; y < im.h; ++y)
-            for (int x = 0; x < im.w; ++x)
-            {
-                float fx = ((x + 0.5f) * occ.w / im.w) - 0.5f, fy = ((y + 0.5f) * occ.h / im.h) - 0.5f;
-                int   x0 = (int)floorf(fx), y0 = (int)floorf(fy);
-                float tx = fx - x0, ty = fy - y0, v = 0;
-                for (int k = 0; k < 4; ++k)
-                {
-                    int sx = x0 + (k & 1), sy = y0 + (k >> 1);
-                    sx = sx < 0 ? 0 : (sx >= occ.w ? occ.w - 1 : sx), sy = sy < 0 ? 0 : (sy >= occ.h ? occ.h - 1 : sy);
-                    v += occ.rgba[((size_t)sy * occ.w + sx) * 4] * ((k & 1) ? tx : 1 - tx) * ((k >> 1) ? ty : 1 - ty);
-                }
-                im.rgba[((size_t)y * im.w + x) * 4] = (uint8_t)(v + 0.5f);
-            }
+    if (!w)
+        return -1;
+    Image im;
+    im.w = w, im.h = h;
+    im.rgba.assign((size_t)w * h * 4, 255);
+    for (int c = 0; c < 3; ++c)
+    {
+        if (!ok[c])
+            continue;
+        const Image& s = in[c];
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x)
+                im.rgba[((size_t)y * w + x) * 4 + c] =
+                    s.w == w && s.h == h ? s.rgba[((size_t)y * w + x) * 4 + ch[c]] : (uint8_t)(sample(s, ch[c], x, y, w, h) + 0.5f);
+    }
+    return encodeChain(im, src, ch, KindOrm, 0);
+}
 
+// How many images an ORM texture was merged from.
+int ormImages(const Cooked& c)
+{
+    int n = 0;
+    for (int i = 0; i < 3; ++i)
+        n += c.src[i] && (i == 0 || c.src[i] != c.src[0]) && (i < 2 || c.src[i] != c.src[1]);
+    return n;
+}
+
+int32_t encodeChain(Image& im, const ImageRef* const src[3], const int ch[3], uint32_t kind, float cutoff)
+{
     Level              top = decode(im, kind);
     const float        want = cutoff > 0 ? coverage(top, cutoff, 1) : 0;
     std::vector<Level> levels;
@@ -318,7 +399,7 @@ int32_t cook(const cgltf_texture* texA, const cgltf_texture* texB, uint32_t kind
     bc7e_scalar::bc7e_compress_block_params params;
     bc7e_scalar::bc7e_compress_block_params_init_basic(&params, kind == KindBase || kind == KindEmissive);
 
-    Cooked c = { a, b, kind, cutoff, {}, {} };
+    Cooked c = { { src[0], src[1], src[2] }, { ch[0], ch[1], ch[2] }, kind, cutoff, {}, {} };
     c.t.format = kind == KindNormal ? RmodelBC5 : (kind == KindOrm ? RmodelBC7Linear : RmodelBC7Srgb);
     c.t.width = levels[first].w, c.t.height = levels[first].h;
     c.t.mips = (uint32_t)(levels.size() - first);

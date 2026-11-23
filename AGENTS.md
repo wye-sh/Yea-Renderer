@@ -467,10 +467,17 @@ either way.
 Run by agents in their orb; never compiled into a module, kept out of `licenses.json` (they ship nothing). Each vendored
 library keeps its licence file beside its source, since the component's repository redistributes it.
 - `tools/ltc_fit.cpp`: fits the area-light LTC tables (`modules/renderer/Assets/ltc.bin`). Our own code.
-- `tools/model_cook/` (`build.sh` → `build/tools/model_cook in.glb out.rmodel`): glTF/GLB to `.rmodel` with a report. Our
+- `tools/model_cook/` (`build.sh` → `build/tools/model_cook in.glb out.rmodel`): glTF/GLB (Draco too), FBX and OBJ to
+  `.rmodel` with a report. Our
   own code plus `vendor/cgltf` (MIT, Johannes Kuhlmann; v1.15), `vendor/meshoptimizer` (MIT, Arseny Kapoulkine; v1.3),
   `vendor/stb` (stb_image v2.34, MIT or public domain, Sean Barrett) and `vendor/bc7e` (Basis Universal's bc7e scalar
-  port, Apache-2.0, Binomial LLC; its NOTICE beside it). Texture maps (rmodel v2) go in with full mips: BC7 for colour and
+  port, Apache-2.0, Binomial LLC; its NOTICE beside it), `vendor/ufbx` (ufbx v0.23.1, MIT or public domain, Samuli
+  Raivio: FBX and OBJ) and Google's Draco 1.5.9 (Apache-2.0: KHR_draco_mesh_compression), which `build.sh` fetches,
+  checks against its SHA-256 and builds under `build/tools/` (not kept in the repository). FBX and OBJ go into glTF's
+  space through ufbx (metres, +Y up), UVs flipped, tangents always generated, vertex colours left out; their materials
+  map to metallic-roughness (roughness, metallic and occlusion maps merged into the ORM), and an opacity map that is the
+  base colour's image cuts out. Each ORM channel comes from its own map; one without is white (glTF's lone
+  metallic-roughness image leaves red unused). A BLEND material's colour map keeps its painted alpha. Texture maps (rmodel v2) go in with full mips: BC7 for colour and
   ORM, BC5 for normals.
   It normalises units (node scales applied; warns past 500 m or under 1 cm) and axes (+Y up kept, Z negated into the
   renderer's left-handed space, triangle order flipped), generates flat normals and MikkTSpace-compatible tangents where

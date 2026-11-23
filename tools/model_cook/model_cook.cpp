@@ -1,17 +1,22 @@
-// The Renderer's model cooker: a glTF or GLB file in, a .rmodel (modules/renderer_models/rmodel.h) out, with a report.
-// Agents run it in their orb when a model arrives; it is never shipped or compiled into a module.
+// The Renderer's model cooker: a glTF/GLB, FBX or OBJ file in, a .rmodel (modules/renderer_models/rmodel.h) out, with a
+// report. Agents run it in their orb when a model arrives; it is never shipped or compiled into a module.
 //
-//   build.sh                                   (once: builds build/tools/model_cook)
-//   build/tools/model_cook in.glb out.rmodel
+//   build.sh                                   (once: builds build/tools/model_cook, fetching and building Draco)
+//   build/tools/model_cook in.glb out.rmodel   (or .gltf, .fbx, .obj)
 //
 // What it does, in order:
-// - Reads the default scene's mesh nodes (cgltf; EXT_meshopt_compression decoded), each primitive's triangles with its
-//   node's world transform, and normalises them: glTF is metres and +Y up (any node scale, a centimetre file's 0.01,
-//   is applied); the renderer is left-handed, so Z is negated (the model's front, glTF's +Z, faces -Z: towards a camera
-//   looking down +Z) and the triangles' order flipped, so they stay counter-clockwise around their outward normal.
-// - Missing normals: flat (as glTF says). Missing tangents: generated MikkTSpace-compatible (meshoptimizer), so normal
-//   maps baked against MikkTSpace shade right. Given tangents keep their handedness through the mirrors.
-// - Merges every primitive of one material into one part, welds equal vertices, orders for the vertex cache and fetch.
+// - glTF (cgltf): the default scene's mesh nodes, each primitive with its node's world transform (EXT_meshopt_compression
+//   decoded; KHR_draco_mesh_compression by Google's Draco decoder). glTF is metres and +Y up (node scales applied).
+// - FBX and OBJ (ufbx, vendor/ufbx, MIT or public domain): ufbx converts the file into glTF's space (right-handed, +Y up,
+//   metres, the geometry scaled) and reads its materials (an OBJ's .mtl too) as metallic-roughness; faces are
+//   triangulated, UVs flipped (their origin is the image's bottom left, glTF's its top left), vertex colours left out.
+//   A value the file doesn't give takes the map alone, or Blender's default without one; opacity 0 without a map (old
+//   exporters' OBJ d 0) is opaque; an opacity map that is the base colour's own image cuts out, other opacity blends.
+// - Then every mesh alike: the renderer is left-handed, so Z is negated (the model's front, glTF's +Z, faces -Z: towards
+//   a camera looking down +Z) and the triangles' order flipped, so they stay counter-clockwise around their outward normal.
+// - Missing normals: flat (as glTF says). Missing tangents (always for FBX and OBJ): generated MikkTSpace-compatible
+//   (meshoptimizer), so normal maps baked against MikkTSpace shade right. Given tangents keep their handedness.
+// - Merges every mesh of one material into one part, welds equal vertices, orders for the vertex cache and fetch.
 // - Builds each part's LOD chain with meshoptimizer's attribute-aware simplifier: normals and UVs weighted, so shading
 //   and texturing hold; UV and normal seams and hard edges (split vertices) collapse only along themselves; vertices on
 //   a border with another part (a material border) are locked, so parts never open a crack between them. Each level
@@ -19,12 +24,14 @@
 //   the chain stops when the simplifier can't take a tenth off, the error passes a quarter of the part's size, or a
 //   level has under 64 triangles.
 // - Writes the file and prints the report: units and axes, parts, triangles and error per LOD, what it generated or
-//   ignored. Skins, animations, Draco and other extensions come with later stages and are listed as ignored.
+//   ignored. Skins and animations come with a later stage and are listed as ignored.
 // - Texture maps (rmodel v2): each image used as base colour, ORM, normal or emissive is decoded (stb_image) and written
 //   with its full mip chain, BC7 (sRGB for colour) or BC5 for normals (bc7e, Apache-2.0).
 #define CGLTF_IMPLEMENTATION
 #include "vendor/cgltf/cgltf.h"
 #include "vendor/meshoptimizer/meshoptimizer.h"
+#include "vendor/ufbx/ufbx.h"
+#include <draco/compression/decode.h> // Google's Draco decoder: fetched and built by build.sh
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
 #define STBI_ONLY_JPEG
@@ -38,6 +45,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -71,6 +79,7 @@ struct Part
 };
 
 std::vector<std::string> gNotes, gWarnings;
+uint32_t                 gDraco; // primitives decoded from Draco
 
 void note(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 void note(const char* fmt, ...)
@@ -177,59 +186,24 @@ bool decodeMeshopt(cgltf_data* data)
     return true;
 }
 
-const cgltf_accessor* attribute(const cgltf_primitive& p, cgltf_attribute_type type, int index)
+// A mesh from any source, before it goes into the parts: glTF's space (right-handed, +Y up, metres; ufbx converts FBX
+// and OBJ into it), its world transform, counter-clockwise fronts.
+struct SrcMesh
 {
-    for (cgltf_size i = 0; i < p.attributes_count; ++i)
-        if (p.attributes[i].type == type && p.attributes[i].index == index)
-            return p.attributes[i].data;
-    return nullptr;
-}
+    float                 m[16];    // world transform, column-major
+    uint32_t              material; // index into the source's materials (their count: the default material)
+    std::vector<float>    pos, nor, tan, uv; // per vertex: 3, 3, 4 (w the bitangent's sign), 2; nor, tan, uv may be empty
+    std::vector<uint32_t> col;      // rgba8 per vertex; empty: white
+    std::vector<uint32_t> idx;      // a triangle list
+};
 
-// One primitive's triangles, in the renderer's space, appended to its material's part.
-void addPrimitive(const cgltf_data* data, const cgltf_primitive& prim, const float* m, std::vector<Part>& parts, bool& flatNormals,
-                  bool& madeTangents)
+// One mesh's triangles, in the renderer's space, appended to its material's part.
+void addMesh(const SrcMesh& src, std::vector<Part>& parts, bool& flatNormals, bool& madeTangents)
 {
-    if (prim.type != cgltf_primitive_type_triangles && prim.type != cgltf_primitive_type_triangle_strip &&
-        prim.type != cgltf_primitive_type_triangle_fan)
-    {
-        warn("points and lines are ignored (the renderer draws triangles)");
-        return;
-    }
-    if (prim.has_draco_mesh_compression)
-    {
-        warn("a Draco-compressed primitive was skipped (Draco comes with FBX and OBJ, a later stage)");
-        return;
-    }
-    const cgltf_accessor* pos = attribute(prim, cgltf_attribute_type_position, 0);
-    if (!pos || !pos->count)
-        return;
-    const cgltf_accessor* nor = attribute(prim, cgltf_attribute_type_normal, 0);
-    const cgltf_accessor* tan = attribute(prim, cgltf_attribute_type_tangent, 0);
-    const cgltf_accessor* uv0 = attribute(prim, cgltf_attribute_type_texcoord, 0);
-    const cgltf_accessor* col = attribute(prim, cgltf_attribute_type_color, 0);
-    if (attribute(prim, cgltf_attribute_type_joints, 0))
-        warn("skinning is ignored: the model is cooked in its bind pose (skinned models come with animation)");
-    if (prim.targets_count)
-        warn("morph targets are ignored");
-    if (attribute(prim, cgltf_attribute_type_texcoord, 1))
-        warn("a second UV set is ignored");
-
-    // Indices, as a triangle list.
-    std::vector<uint32_t> idx;
-    const cgltf_size      n = prim.indices ? prim.indices->count : pos->count;
-    std::vector<uint32_t> raw(n);
-    for (cgltf_size i = 0; i < n; ++i)
-        raw[i] = prim.indices ? (uint32_t)cgltf_accessor_read_index(prim.indices, i) : (uint32_t)i;
-    if (prim.type == cgltf_primitive_type_triangles)
-        idx.assign(raw.begin(), raw.end() - n % 3);
-    else
-        for (cgltf_size i = 2; i < n; ++i)
-        {
-            uint32_t a = prim.type == cgltf_primitive_type_triangle_fan ? raw[0] : raw[i - 2], b = raw[i - 1], c = raw[i];
-            if (prim.type == cgltf_primitive_type_triangle_strip && (i & 1))
-                std::swap(a, b);
-            idx.push_back(a), idx.push_back(b), idx.push_back(c);
-        }
+    const float* m = src.m;
+    const size_t vcount = src.pos.size() / 3;
+    const bool   nor = src.nor.size() == vcount * 3 && vcount, tan = src.tan.size() == vcount * 4 && vcount;
+    const bool   uv0 = src.uv.size() == vcount * 2 && vcount, col = src.col.size() == vcount && vcount;
 
     // The world transform (column-major), its normal matrix (inverse transpose, by cofactors over the determinant).
     const float a00 = m[0], a10 = m[1], a20 = m[2], a01 = m[4], a11 = m[5], a21 = m[6], a02 = m[8], a12 = m[9], a22 = m[10];
@@ -238,47 +212,47 @@ void addPrimitive(const cgltf_data* data, const cgltf_primitive& prim, const flo
                             { a01 * a12 - a02 * a11, a02 * a10 - a00 * a12, a00 * a11 - a01 * a10 } };
     const float det = a00 * c[0][0] + a01 * c[0][1] + a02 * c[0][2];
     const float ds = det < 0 ? -1.0f : 1.0f;
-    // glTF: a positive determinant keeps counter-clockwise fronts; negating Z mirrors once more. Order flips when det > 0.
+    // A positive determinant keeps counter-clockwise fronts; negating Z mirrors once more. Order flips when det > 0.
     const bool flip = det > 0;
 
-    const uint32_t mat = prim.material ? (uint32_t)(prim.material - data->materials) : (uint32_t)data->materials_count;
-    Part*          part = nullptr;
+    Part* part = nullptr;
     for (Part& p : parts)
-        if (p.material == mat)
+        if (p.material == src.material)
             part = &p;
     if (!part)
     {
         parts.push_back(Part{});
         part = &parts.back();
-        part->material = mat;
+        part->material = src.material;
     }
     const size_t first = part->corners.size();
-    for (size_t t = 0; t + 2 < idx.size(); t += 3)
+    for (size_t t = 0; t + 2 < src.idx.size(); t += 3)
     {
-        const uint32_t tri[3] = { idx[t], flip ? idx[t + 2] : idx[t + 1], flip ? idx[t + 1] : idx[t + 2] };
-        if (tri[0] >= pos->count || tri[1] >= pos->count || tri[2] >= pos->count)
+        const uint32_t tri[3] = { src.idx[t], flip ? src.idx[t + 2] : src.idx[t + 1], flip ? src.idx[t + 1] : src.idx[t + 2] };
+        if (tri[0] >= vcount || tri[1] >= vcount || tri[2] >= vcount)
         {
-            warn("a primitive indexes past its vertices: those triangles were dropped");
+            warn("a mesh indexes past its vertices: those triangles were dropped");
             continue;
         }
         for (uint32_t k = 0; k < 3; ++k)
         {
             const uint32_t v = tri[k];
             Vertex         o = {};
-            float          p[3] = {}, q[4] = { 0, 0, 0, 1 };
-            cgltf_accessor_read_float(pos, v, p, 3);
+            const float*   p = &src.pos[v * 3];
             o.p[0] = m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12];
             o.p[1] = m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13];
             o.p[2] = -(m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14]);
-            if (nor && cgltf_accessor_read_float(nor, v, p, 3))
+            if (nor)
             {
+                const float* n = &src.nor[v * 3];
                 for (int r = 0; r < 3; ++r)
-                    o.n[r] = (c[r][0] * p[0] + c[r][1] * p[1] + c[r][2] * p[2]) * ds;
+                    o.n[r] = (c[r][0] * n[0] + c[r][1] * n[1] + c[r][2] * n[2]) * ds;
                 o.n[2] = -o.n[2];
                 normalize3(o.n);
             }
-            if (tan && cgltf_accessor_read_float(tan, v, q, 4))
+            if (tan)
             {
+                const float* q = &src.tan[v * 4];
                 o.t[0] = m[0] * q[0] + m[4] * q[1] + m[8] * q[2];
                 o.t[1] = m[1] * q[0] + m[5] * q[1] + m[9] * q[2];
                 o.t[2] = -(m[2] * q[0] + m[6] * q[1] + m[10] * q[2]);
@@ -286,19 +260,8 @@ void addPrimitive(const cgltf_data* data, const cgltf_primitive& prim, const flo
                 o.t[3] = (q[3] < 0 ? -1.0f : 1.0f) * -ds; // two mirrors (Z, and the node's when det < 0) each flip it
             }
             if (uv0)
-                cgltf_accessor_read_float(uv0, v, o.uv, 2);
-            o.color = 0xFFFFFFFFu;
-            if (col)
-            {
-                float rgba[4] = { 1, 1, 1, 1 };
-                cgltf_accessor_read_float(col, v, rgba, col->type == cgltf_type_vec3 ? 3 : 4);
-                o.color = 0;
-                for (int ch = 0; ch < 4; ++ch)
-                {
-                    float x = rgba[ch] < 0 ? 0 : (rgba[ch] > 1 ? 1 : rgba[ch]);
-                    o.color |= (uint32_t)(x * 255.0f + 0.5f) << (8 * ch);
-                }
-            }
+                o.uv[0] = src.uv[v * 2], o.uv[1] = src.uv[v * 2 + 1];
+            o.color = col ? src.col[v] : 0xFFFFFFFFu;
             part->corners.push_back(o);
         }
     }
@@ -341,8 +304,155 @@ void addPrimitive(const cgltf_data* data, const cgltf_primitive& prim, const flo
     }
 }
 
-void visit(const cgltf_data* data, const cgltf_node* node, std::vector<Part>& parts, bool& flatNormals, bool& madeTangents,
-           uint32_t& meshNodes)
+uint32_t packColor(const float* rgba)
+{
+    uint32_t o = 0;
+    for (int ch = 0; ch < 4; ++ch)
+    {
+        float x = rgba[ch] < 0 ? 0 : (rgba[ch] > 1 ? 1 : rgba[ch]);
+        o |= (uint32_t)(x * 255.0f + 0.5f) << (8 * ch);
+    }
+    return o;
+}
+
+// A primitive's index list as triangles (strips and fans unrolled).
+void triangleList(cgltf_primitive_type type, const std::vector<uint32_t>& raw, std::vector<uint32_t>& idx)
+{
+    const size_t n = raw.size();
+    if (type == cgltf_primitive_type_triangles)
+        idx.assign(raw.begin(), raw.end() - n % 3);
+    else
+        for (size_t i = 2; i < n; ++i)
+        {
+            uint32_t a = type == cgltf_primitive_type_triangle_fan ? raw[0] : raw[i - 2], b = raw[i - 1], c = raw[i];
+            if (type == cgltf_primitive_type_triangle_strip && (i & 1))
+                std::swap(a, b);
+            idx.push_back(a), idx.push_back(b), idx.push_back(c);
+        }
+}
+
+// KHR_draco_mesh_compression: the primitive's attributes and indices from its Draco data (Google's decoder, fetched and
+// built by build.sh). cgltf leaves each attribute's Draco id as an index into the accessors.
+bool decodeDraco(const cgltf_data* data, const cgltf_primitive& prim, SrcMesh& out)
+{
+    const cgltf_draco_mesh_compression& dc = prim.draco_mesh_compression;
+    const uint8_t* bytes = dc.buffer_view ? (const uint8_t*)cgltf_buffer_view_data(dc.buffer_view) : nullptr;
+    if (!bytes)
+        return false;
+    draco::DecoderBuffer buf;
+    buf.Init((const char*)bytes, dc.buffer_view->size);
+    draco::Decoder dec;
+    auto           r = dec.DecodeMeshFromBuffer(&buf);
+    if (!r.ok())
+        return false;
+    std::unique_ptr<draco::Mesh> mesh = std::move(r).value();
+    const uint32_t               points = mesh->num_points();
+    auto read = [&](cgltf_attribute_type type, int index, int comps, std::vector<float>& dst) {
+        for (cgltf_size i = 0; i < dc.attributes_count; ++i)
+            if (dc.attributes[i].type == type && dc.attributes[i].index == index)
+            {
+                const draco::PointAttribute* a = mesh->GetAttributeByUniqueId((uint32_t)(dc.attributes[i].data - data->accessors));
+                if (!a)
+                    return false;
+                dst.assign((size_t)points * comps, 1.0f);
+                for (uint32_t v = 0; v < points; ++v)
+                    a->ConvertValue<float>(a->mapped_index(draco::PointIndex(v)), (int8_t)(comps < a->num_components() ? comps : a->num_components()),
+                                           &dst[(size_t)v * comps]);
+                return true;
+            }
+        return false;
+    };
+    if (!read(cgltf_attribute_type_position, 0, 3, out.pos))
+        return false;
+    read(cgltf_attribute_type_normal, 0, 3, out.nor);
+    read(cgltf_attribute_type_tangent, 0, 4, out.tan);
+    read(cgltf_attribute_type_texcoord, 0, 2, out.uv);
+    std::vector<float> col;
+    if (read(cgltf_attribute_type_color, 0, 4, col))
+        for (uint32_t v = 0; v < points; ++v)
+            out.col.push_back(packColor(&col[(size_t)v * 4]));
+    std::vector<uint32_t> raw;
+    raw.reserve((size_t)mesh->num_faces() * 3);
+    for (draco::FaceIndex f(0); f < mesh->num_faces(); ++f)
+        for (int k = 0; k < 3; ++k)
+            raw.push_back(mesh->face(f)[k].value());
+    triangleList(cgltf_primitive_type_triangles, raw, out.idx);
+    return true;
+}
+
+const cgltf_accessor* attribute(const cgltf_primitive& p, cgltf_attribute_type type, int index)
+{
+    for (cgltf_size i = 0; i < p.attributes_count; ++i)
+        if (p.attributes[i].type == type && p.attributes[i].index == index)
+            return p.attributes[i].data;
+    return nullptr;
+}
+
+// One glTF primitive as a SrcMesh (false: nothing to draw).
+bool gltfPrimitive(const cgltf_data* data, const cgltf_primitive& prim, const float* world, SrcMesh& out)
+{
+    if (prim.type != cgltf_primitive_type_triangles && prim.type != cgltf_primitive_type_triangle_strip &&
+        prim.type != cgltf_primitive_type_triangle_fan)
+    {
+        warn("points and lines are ignored (the renderer draws triangles)");
+        return false;
+    }
+    memcpy(out.m, world, sizeof out.m);
+    out.material = prim.material ? (uint32_t)(prim.material - data->materials) : (uint32_t)data->materials_count;
+    if (attribute(prim, cgltf_attribute_type_joints, 0))
+        warn("skinning is ignored: the model is cooked in its bind pose (skinned models come with animation)");
+    if (prim.targets_count)
+        warn("morph targets are ignored");
+    if (attribute(prim, cgltf_attribute_type_texcoord, 1))
+        warn("a second UV set is ignored");
+    if (prim.has_draco_mesh_compression)
+    {
+        if (!decodeDraco(data, prim, out))
+        {
+            warn("a Draco-compressed primitive didn't decode: it was skipped");
+            return false;
+        }
+        gDraco++;
+        return true;
+    }
+    const cgltf_accessor* pos = attribute(prim, cgltf_attribute_type_position, 0);
+    if (!pos || !pos->count)
+        return false;
+    auto read = [](const cgltf_accessor* a, int comps, std::vector<float>& dst) {
+        if (!a)
+            return false;
+        dst.assign(a->count * comps, 1.0f);
+        for (cgltf_size v = 0; v < a->count; ++v)
+            cgltf_accessor_read_float(a, v, &dst[v * comps], comps);
+        return true;
+    };
+    read(pos, 3, out.pos);
+    const cgltf_accessor* nor = attribute(prim, cgltf_attribute_type_normal, 0);
+    const cgltf_accessor* tan = attribute(prim, cgltf_attribute_type_tangent, 0);
+    if (nor && nor->count == pos->count)
+        read(nor, 3, out.nor);
+    if (tan && tan->count == pos->count)
+        read(tan, 4, out.tan);
+    const cgltf_accessor* uv0 = attribute(prim, cgltf_attribute_type_texcoord, 0);
+    if (uv0 && uv0->count == pos->count)
+        read(uv0, 2, out.uv);
+    const cgltf_accessor* col = attribute(prim, cgltf_attribute_type_color, 0);
+    if (col && col->count == pos->count)
+        for (cgltf_size v = 0; v < col->count; ++v)
+        {
+            float rgba[4] = { 1, 1, 1, 1 };
+            cgltf_accessor_read_float(col, v, rgba, col->type == cgltf_type_vec3 ? 3 : 4);
+            out.col.push_back(packColor(rgba));
+        }
+    const cgltf_size      n = prim.indices ? prim.indices->count : pos->count;
+    std::vector<uint32_t> raw(n);
+    for (cgltf_size i = 0; i < n; ++i)
+        raw[i] = prim.indices ? (uint32_t)cgltf_accessor_read_index(prim.indices, i) : (uint32_t)i;
+    triangleList(prim.type, raw, out.idx);
+    return true;
+}
+
+void visit(const cgltf_data* data, const cgltf_node* node, std::vector<SrcMesh>& meshes, uint32_t& meshNodes)
 {
     if (node->mesh)
     {
@@ -350,12 +460,79 @@ void visit(const cgltf_data* data, const cgltf_node* node, std::vector<Part>& pa
         cgltf_node_transform_world(node, m);
         ++meshNodes;
         for (cgltf_size i = 0; i < node->mesh->primitives_count; ++i)
-            addPrimitive(data, node->mesh->primitives[i], m, parts, flatNormals, madeTangents);
+        {
+            meshes.emplace_back();
+            if (!gltfPrimitive(data, node->mesh->primitives[i], m, meshes.back()))
+                meshes.pop_back();
+        }
     }
     if (node->skin)
         warn("skinning is ignored: the model is cooked in its bind pose (skinned models come with animation)");
     for (cgltf_size i = 0; i < node->children_count; ++i)
-        visit(data, node->children[i], parts, flatNormals, madeTangents, meshNodes);
+        visit(data, node->children[i], meshes, meshNodes);
+}
+
+// FBX and OBJ (ufbx): every mesh node's faces, triangulated, one SrcMesh per node and material. ufbx has already turned
+// the file into glTF's space (right-handed, +Y up, metres, geometry scaled). Their UVs start at the image's bottom left,
+// glTF's at its top left: v flipped. Tangents are always generated (MikkTSpace-compatible, as the renderer's normal maps
+// expect); vertex colours are left out (FBX files often keep other data in them).
+void ufbxMeshes(const ufbx_scene* scene, std::vector<SrcMesh>& meshes, uint32_t& meshNodes, bool& droppedColors)
+{
+    for (size_t ni = 0; ni < scene->nodes.count; ++ni)
+    {
+        const ufbx_node* node = scene->nodes.data[ni];
+        const ufbx_mesh* mesh = node->mesh;
+        if (!mesh || !mesh->num_triangles)
+            continue;
+        ++meshNodes;
+        if (mesh->skin_deformers.count)
+            warn("skinning is ignored: the model is cooked in its bind pose (skinned models come with animation)");
+        if (mesh->blend_deformers.count)
+            warn("blend shapes (morph targets) are ignored");
+        if (mesh->num_point_faces || mesh->num_line_faces)
+            warn("points and lines are ignored (the renderer draws triangles)");
+        if (mesh->uv_sets.count > 1)
+            warn("a second UV set is ignored");
+        droppedColors = droppedColors || mesh->vertex_color.exists;
+        const ufbx_matrix& g = node->geometry_to_world;
+        const float        world[16] = { (float)g.cols[0].x, (float)g.cols[0].y, (float)g.cols[0].z, 0, (float)g.cols[1].x, (float)g.cols[1].y,
+                                         (float)g.cols[1].z, 0, (float)g.cols[2].x, (float)g.cols[2].y, (float)g.cols[2].z, 0,
+                                         (float)g.cols[3].x, (float)g.cols[3].y, (float)g.cols[3].z, 1 };
+        std::vector<uint32_t> tri(mesh->max_face_triangles * 3);
+        const size_t          groups = mesh->materials.count ? mesh->materials.count : 1;
+        for (size_t mi = 0; mi < groups; ++mi)
+        {
+            SrcMesh out;
+            memcpy(out.m, world, sizeof out.m);
+            const ufbx_material* mat = mi < mesh->materials.count ? mesh->materials.data[mi] : nullptr;
+            out.material = mat ? mat->typed_id : (uint32_t)scene->materials.count;
+            for (size_t f = 0; f < mesh->faces.count; ++f)
+            {
+                if ((mesh->face_material.count ? mesh->face_material.data[f] : 0) != mi || mesh->faces.data[f].num_indices < 3)
+                    continue;
+                const uint32_t n = ufbx_triangulate_face(tri.data(), tri.size(), mesh, mesh->faces.data[f]);
+                for (uint32_t k = 0; k < n * 3; ++k)
+                {
+                    const uint32_t ix = tri[k];
+                    const ufbx_vec3 p = ufbx_get_vertex_vec3(&mesh->vertex_position, ix);
+                    out.pos.push_back((float)p.x), out.pos.push_back((float)p.y), out.pos.push_back((float)p.z);
+                    if (mesh->vertex_normal.exists)
+                    {
+                        const ufbx_vec3 q = ufbx_get_vertex_vec3(&mesh->vertex_normal, ix);
+                        out.nor.push_back((float)q.x), out.nor.push_back((float)q.y), out.nor.push_back((float)q.z);
+                    }
+                    if (mesh->vertex_uv.exists)
+                    {
+                        const ufbx_vec2 t = ufbx_get_vertex_vec2(&mesh->vertex_uv, ix);
+                        out.uv.push_back((float)t.x), out.uv.push_back(1.0f - (float)t.y);
+                    }
+                    out.idx.push_back((uint32_t)out.idx.size());
+                }
+            }
+            if (!out.idx.empty())
+                meshes.push_back(std::move(out));
+        }
+    }
 }
 
 // Each part's corners welded into vertices and indices, ordered for the GPU.
@@ -461,46 +638,177 @@ std::string gDir; // the source file's folder, for images beside a .gltf
 
 float srgbToLinear(float c) { return c <= 0.04045f ? c / 12.92f : powf((c + 0.055f) / 1.055f, 2.4f); }
 
-// The mean of a texture's channels over its whole image (rgb sRGB-decoded when srgb), or false when it can't be read.
-bool textureMean(const cgltf_texture* tex, bool srgb, float out[4])
-{
-    const cgltf_image* img = tex ? tex->image : nullptr;
-    if (!img)
-        return false;
-    int      w = 0, h = 0, n = 0;
-    uint8_t* px = nullptr;
-    if (img->buffer_view)
-        px = stbi_load_from_memory(cgltf_buffer_view_data(img->buffer_view), (int)img->buffer_view->size, &w, &h, &n, 4);
-    else if (img->uri && strncmp(img->uri, "data:", 5))
-    {
-        std::string path = gDir + img->uri;
-        cgltf_decode_uri(&path[gDir.size()]);
-        path.resize(strlen(path.c_str()));
-        px = stbi_load(path.c_str(), &w, &h, &n, 4);
-    }
-    if (!px)
-    {
-        warn("an image (%s) couldn't be read: its material's factors stand in", img->uri ? img->uri : img->name ? img->name : "embedded");
-        return false;
-    }
-    float lut[256];
-    for (int i = 0; i < 256; ++i)
-        lut[i] = srgb ? srgbToLinear(i / 255.0f) : i / 255.0f;
-    double sum[4] = {};
-    for (size_t i = 0, count = (size_t)w * h; i < count; ++i)
-        for (int c = 0; c < 4; ++c)
-            sum[c] += c < 3 ? lut[px[i * 4 + c]] : px[i * 4 + c] / 255.0f;
-    for (int c = 0; c < 4; ++c)
-        out[c] = (float)(sum[c] / ((double)w * h));
-    stbi_image_free(px);
-    return true;
-}
-
 } // namespace
 #include "cook_textures.h"
 namespace
 {
 size_t align16(size_t x) { return (x + 15) & ~(size_t)15; }
+
+// A material from any source: glTF's metallic-roughness model, its maps as images (ORM: occlusion, roughness and
+// metallic each from an image's channel).
+struct SrcMaterial
+{
+    std::string           name = "(default)";
+    float                 baseColor[4] = { 1, 1, 1, 1 };
+    float                 roughness = 1, metallic = 1;
+    float                 emissive[3] = {};
+    float                 emissiveStrength = 1;
+    uint32_t              alpha = RmodelOpaque;
+    float                 cutoff = 0.5f;
+    bool                  doubleSided = false;
+    float                 normalScale = 1, occlusionStrength = 1;
+    const cook::ImageRef* base = nullptr;
+    const cook::ImageRef* normal = nullptr;
+    const cook::ImageRef* emissiveMap = nullptr;
+    const cook::ImageRef* orm[3] = {};
+    int                   ormCh[3] = {};
+};
+
+const cook::ImageRef* gltfImage(const cgltf_texture* tex)
+{
+    const cgltf_image* img = tex ? tex->image : nullptr;
+    if (!img)
+        return nullptr;
+    cook::ImageRef r;
+    r.label = img->uri ? img->uri : img->name ? img->name : "embedded";
+    if (img->buffer_view)
+        r.data = (const uint8_t*)cgltf_buffer_view_data(img->buffer_view), r.size = img->buffer_view->size;
+    else if (img->uri && strncmp(img->uri, "data:", 5))
+    {
+        r.path = gDir + img->uri;
+        cgltf_decode_uri(&r.path[gDir.size()]);
+        r.path.resize(strlen(r.path.c_str()));
+    }
+    return cook::imageRef(img, r);
+}
+
+std::vector<SrcMaterial> gltfMaterials(const cgltf_data* data)
+{
+    std::vector<SrcMaterial> out(data->materials_count);
+    for (cgltf_size i = 0; i < data->materials_count; ++i)
+    {
+        const cgltf_material& m = data->materials[i];
+        SrcMaterial&          o = out[i];
+        o.name = m.name ? m.name : "";
+        if (m.has_pbr_metallic_roughness)
+        {
+            memcpy(o.baseColor, m.pbr_metallic_roughness.base_color_factor, 16);
+            o.roughness = m.pbr_metallic_roughness.roughness_factor;
+            o.metallic = m.pbr_metallic_roughness.metallic_factor;
+            o.base = gltfImage(m.pbr_metallic_roughness.base_color_texture.texture);
+            const cook::ImageRef* mr = gltfImage(m.pbr_metallic_roughness.metallic_roughness_texture.texture);
+            o.orm[1] = o.orm[2] = mr, o.ormCh[1] = 1, o.ormCh[2] = 2; // glTF: roughness in green, metallic in blue
+        }
+        else if (m.has_pbr_specular_glossiness)
+            warn("material %s uses specular-glossiness: cooked as a plain metallic-roughness material", o.name.c_str());
+        o.orm[0] = gltfImage(m.occlusion_texture.texture); // red; none: white (glTF leaves the red of a lone metallic-roughness image unused)
+        o.occlusionStrength = m.occlusion_texture.texture ? m.occlusion_texture.scale : 1;
+        memcpy(o.emissive, m.emissive_factor, 12);
+        if (m.has_emissive_strength)
+            o.emissiveStrength = m.emissive_strength.emissive_strength;
+        o.emissiveMap = gltfImage(m.emissive_texture.texture);
+        o.normal = gltfImage(m.normal_texture.texture);
+        o.normalScale = m.normal_texture.texture ? m.normal_texture.scale : 1;
+        o.alpha = m.alpha_mode == cgltf_alpha_mode_mask ? RmodelMask : (m.alpha_mode == cgltf_alpha_mode_blend ? RmodelBlend : RmodelOpaque);
+        o.cutoff = m.alpha_cutoff;
+        o.doubleSided = m.double_sided;
+        const cgltf_texture_view views[5] = { m.pbr_metallic_roughness.base_color_texture, m.pbr_metallic_roughness.metallic_roughness_texture,
+                                              m.occlusion_texture, m.normal_texture, m.emissive_texture };
+        for (const cgltf_texture_view& v : views)
+        {
+            if (v.texture && v.texcoord != 0)
+                warn("material %s reads a texture with UV set %d: the cooker keeps only the first set, so it reads that", o.name.c_str(), v.texcoord);
+            if (v.texture && v.has_transform)
+                warn("material %s moves a texture (KHR_texture_transform): ignored", o.name.c_str());
+        }
+    }
+    return out;
+}
+
+// An FBX or OBJ texture's image: embedded in the file, or a file found by its absolute path, its path relative to the
+// source, or its name beside the source (exported files often keep the author's own absolute paths).
+const cook::ImageRef* ufbxImage(const ufbx_texture* t)
+{
+    if (t && t->type != UFBX_TEXTURE_FILE && t->file_textures.count)
+        t = t->file_textures.data[0];
+    if (!t || (t->type != UFBX_TEXTURE_FILE && !t->content.size))
+        return nullptr;
+    cook::ImageRef r;
+    r.label = t->relative_filename.length ? t->relative_filename.data : t->filename.length ? t->filename.data : t->name.data;
+    if (t->content.size)
+    {
+        r.data = (const uint8_t*)t->content.data, r.size = t->content.size;
+        return cook::imageRef(t, r);
+    }
+    std::string name = t->filename.data;
+    name = name.substr(name.find_last_of("/\\") == std::string::npos ? 0 : name.find_last_of("/\\") + 1);
+    const std::string tries[3] = { t->absolute_filename.data, t->relative_filename.length ? gDir + t->relative_filename.data : "",
+                                   name.empty() ? "" : gDir + name };
+    for (const std::string& path : tries)
+        if (!path.empty() && !r.path.size())
+            if (FILE* f = fopen(path.c_str(), "rb"))
+                fclose(f), r.path = path;
+    if (r.path.empty())
+        r.path = tries[0].empty() ? tries[2] : tries[0]; // load() says it couldn't be read
+    for (const cook::ImageRef& i : cook::gImages) // one image per file, however many textures name it
+        if (!i.data && i.path == r.path)
+            return &i;
+    return cook::imageRef(t, r);
+}
+
+std::vector<SrcMaterial> ufbxMaterials(const ufbx_scene* scene)
+{
+    std::vector<SrcMaterial> out(scene->materials.count);
+    for (size_t i = 0; i < scene->materials.count; ++i)
+    {
+        const ufbx_material&         m = *scene->materials.data[i];
+        const ufbx_material_pbr_maps& p = m.pbr;
+        SrcMaterial&                 o = out[i];
+        auto tex = [](const ufbx_material_map& map) { return map.texture && map.texture_enabled ? ufbxImage(map.texture) : nullptr; };
+        o.name = m.name.data;
+        // A value the file doesn't give reads 0 in ufbx: with a map, the map alone (factor 1); without, Blender's defaults.
+        auto value = [](const ufbx_material_map& map, const cook::ImageRef* img, float none) {
+            return map.has_value ? (float)map.value_real : img ? 1.0f : none;
+        };
+        o.base = tex(p.base_color);
+        const float factor = p.base_factor.has_value ? (float)p.base_factor.value_real : 1.0f;
+        for (int c = 0; c < 3; ++c)
+            o.baseColor[c] = (p.base_color.has_value ? (float)p.base_color.value_vec4.v[c] : o.base ? 1.0f : 0.8f) * factor;
+        o.roughness = value(p.roughness, tex(p.roughness), 0.5f);
+        o.metallic = value(p.metalness, tex(p.metalness), 0.0f);
+        if (m.features.roughness_as_glossiness.enabled && p.glossiness.texture)
+            warn("material %s has a glossiness map: ignored (its roughness value stands)", o.name.c_str());
+        else
+            o.orm[1] = tex(p.roughness);
+        o.orm[2] = tex(p.metalness);
+        o.orm[0] = tex(p.ambient_occlusion);
+        o.emissiveMap = tex(p.emission_color);
+        const float ef = p.emission_factor.has_value ? (float)p.emission_factor.value_real : 1.0f;
+        for (int c = 0; c < 3; ++c)
+            o.emissive[c] = (p.emission_color.has_value ? (float)p.emission_color.value_vec3.v[c] : o.emissiveMap ? 1.0f : 0.0f) * ef;
+        o.normal = tex(p.normal_map);
+        o.doubleSided = m.features.double_sided.enabled;
+        // FBX and OBJ don't say mask or blend: an opacity map that is the base colour's own image cuts out (leaves and
+        // fences keep their alpha there); otherwise less than full opacity blends.
+        const cook::ImageRef* opacity = tex(p.opacity);
+        float                 alpha = p.opacity.has_value ? (float)p.opacity.value_real : 1.0f;
+        if (alpha <= 0.0f && !opacity)
+        {
+            warn("material %s says it is fully transparent: cooked opaque (old exporters write OBJ's d 0 by mistake)", o.name.c_str());
+            alpha = 1.0f;
+        }
+        if (opacity && opacity == o.base)
+            o.alpha = RmodelMask, o.cutoff = 0.5f;
+        else if (opacity || alpha < 0.999f)
+        {
+            o.alpha = RmodelBlend;
+            o.baseColor[3] = alpha < 0 ? 0 : alpha;
+            if (opacity)
+                warn("material %s has an opacity map of its own: ignored (the base colour's alpha stands)", o.name.c_str());
+        }
+    }
+    return out;
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -514,54 +822,114 @@ int main(int argc, char** argv)
     }
     gDir = argv[1];
     gDir.resize(gDir.find_last_of("/\\") == std::string::npos ? 0 : gDir.find_last_of("/\\") + 1);
-    cgltf_options options = {};
-    cgltf_data*   data = nullptr;
-    if (cgltf_parse_file(&options, argv[1], &data) != cgltf_result_success)
+    std::string ext = argv[1];
+    ext = ext.substr(ext.find_last_of('.') == std::string::npos ? ext.size() : ext.find_last_of('.') + 1);
+    for (char& ch : ext)
+        ch = (char)tolower((unsigned char)ch);
+    cgltf_data* data = nullptr;
+    ufbx_scene* scene = nullptr;
+    auto        done = [&](int code) {
+        if (data)
+            cgltf_free(data);
+        if (scene)
+            ufbx_free_scene(scene);
+        return code;
+    };
+
+    std::vector<SrcMesh>     meshes;
+    std::vector<SrcMaterial> srcMats;
+    uint32_t                 meshNodes = 0;
+    bool                     droppedColors = false;
+    const bool               isUfbx = ext == "fbx" || ext == "obj";
+    if (isUfbx)
     {
-        fprintf(stderr, "error: %s isn't a glTF or GLB file cgltf can read\n", argv[1]);
-        return 1;
+        // Into glTF's space: right-handed, +Y up, metres, with the geometry itself scaled (so node scales stay 1).
+        ufbx_load_opts opts = {};
+        opts.target_axes = ufbx_axes_right_handed_y_up;
+        opts.target_unit_meters = 1.0f;
+        opts.space_conversion = UFBX_SPACE_CONVERSION_MODIFY_GEOMETRY;
+        opts.obj_search_mtl_by_filename = true;
+        opts.load_external_files = true; // an OBJ's .mtl
+        ufbx_error error;
+        scene = ufbx_load_file(argv[1], &opts, &error);
+        if (!scene)
+        {
+            fprintf(stderr, "error: %s isn't an FBX or OBJ file ufbx can read: %s\n", argv[1], error.description.data);
+            return 1;
+        }
+        ufbxMeshes(scene, meshes, meshNodes, droppedColors);
+        srcMats = ufbxMaterials(scene);
+        if (scene->anim_curves.count)
+            warn("its animation is ignored (animation is a later stage)");
+        const double unit = scene->settings.original_unit_meters;
+        if (ext == "fbx" && unit > 0 && fabs(unit - 1.0) > 1e-6)
+            note("units: the file's %g m a unit scaled to metres", unit);
+        note("axes: the file's converted to +Y up, then Z negated into the renderer's left-handed space, triangle order flipped "
+             "to match; UVs flipped to start at the image's top");
+        if (droppedColors)
+            note("vertex colours: left out (FBX files often hold other data in them)");
     }
-    if (cgltf_load_buffers(&options, data, argv[1]) != cgltf_result_success || cgltf_validate(data) != cgltf_result_success)
+    else if (ext == "gltf" || ext == "glb")
     {
-        fprintf(stderr, "error: %s: its buffers are missing or it isn't valid glTF\n", argv[1]);
-        cgltf_free(data);
-        return 1;
+        cgltf_options options = {};
+        if (cgltf_parse_file(&options, argv[1], &data) != cgltf_result_success)
+        {
+            fprintf(stderr, "error: %s isn't a glTF or GLB file cgltf can read\n", argv[1]);
+            return 1;
+        }
+        if (cgltf_load_buffers(&options, data, argv[1]) != cgltf_result_success || cgltf_validate(data) != cgltf_result_success)
+        {
+            fprintf(stderr, "error: %s: its buffers are missing or it isn't valid glTF\n", argv[1]);
+            return done(1);
+        }
+        for (cgltf_size i = 0; i < data->extensions_required_count; ++i)
+            if (strcmp(data->extensions_required[i], "EXT_meshopt_compression") && strcmp(data->extensions_required[i], "KHR_mesh_quantization") &&
+                strcmp(data->extensions_required[i], "KHR_draco_mesh_compression"))
+                warn("it requires %s, which the cooker doesn't read yet", data->extensions_required[i]);
+        if (!decodeMeshopt(data))
+        {
+            fprintf(stderr, "error: its EXT_meshopt_compression data didn't decode\n");
+            return done(1);
+        }
+        const cgltf_scene* sc = data->scene ? data->scene : (data->scenes_count ? &data->scenes[0] : nullptr);
+        if (sc)
+            for (cgltf_size i = 0; i < sc->nodes_count; ++i)
+                visit(data, sc->nodes[i], meshes, meshNodes);
+        else
+            for (cgltf_size i = 0; i < data->nodes_count; ++i)
+                if (!data->nodes[i].parent)
+                    visit(data, &data->nodes[i], meshes, meshNodes);
+        srcMats = gltfMaterials(data);
+        if (data->animations_count)
+            warn("%zu animation%s ignored (animation is a later stage)", (size_t)data->animations_count, data->animations_count == 1 ? " is" : "s are");
+        note("units: metres, as glTF is; node scales applied");
+        note("axes: +Y up kept; Z negated into the renderer's left-handed space (its front, glTF's +Z, now faces -Z), triangle order flipped to match");
+        if (gDraco)
+            note("Draco: %u primitive%s decoded", gDraco, gDraco == 1 ? "" : "s");
     }
-    for (cgltf_size i = 0; i < data->extensions_required_count; ++i)
-        if (strcmp(data->extensions_required[i], "EXT_meshopt_compression") && strcmp(data->extensions_required[i], "KHR_mesh_quantization"))
-            warn("it requires %s, which the cooker doesn't read yet", data->extensions_required[i]);
-    if (!decodeMeshopt(data))
+    else
     {
-        fprintf(stderr, "error: its EXT_meshopt_compression data didn't decode\n");
-        cgltf_free(data);
-        return 1;
+        fprintf(stderr, "error: %s: the cooker reads .gltf, .glb, .fbx and .obj\n", argv[1]);
+        return 2;
     }
 
     std::vector<Part> parts;
     bool              flatNormals = false, madeTangents = false;
-    uint32_t          meshNodes = 0;
-    const cgltf_scene* scene = data->scene ? data->scene : (data->scenes_count ? &data->scenes[0] : nullptr);
-    if (scene)
-        for (cgltf_size i = 0; i < scene->nodes_count; ++i)
-            visit(data, scene->nodes[i], parts, flatNormals, madeTangents, meshNodes);
-    else
-        for (cgltf_size i = 0; i < data->nodes_count; ++i)
-            if (!data->nodes[i].parent)
-                visit(data, &data->nodes[i], parts, flatNormals, madeTangents, meshNodes);
+    for (const SrcMesh& m : meshes)
+        addMesh(m, parts, flatNormals, madeTangents);
+    meshes.clear();
     for (size_t i = parts.size(); i-- > 0;)
         if (parts[i].corners.empty())
             parts.erase(parts.begin() + i);
     if (parts.empty())
     {
         fprintf(stderr, "error: %s has no triangles in its scene\n", argv[1]);
-        cgltf_free(data);
-        return 1;
+        return done(1);
     }
     if (parts.size() > 64)
     {
         fprintf(stderr, "error: %zu materials; a model may have 64 (merge materials in the source)\n", parts.size());
-        cgltf_free(data);
-        return 1;
+        return done(1);
     }
     for (Part& p : parts)
         weld(p);
@@ -581,74 +949,40 @@ int main(int argc, char** argv)
     uint32_t                    textured = 0;
     for (const Part& p : parts)
     {
-        RmodelMaterial o = {};
-        o.baseColor[0] = o.baseColor[1] = o.baseColor[2] = o.baseColor[3] = 1;
-        o.roughness = o.metallic = 1;
-        o.emissiveStrength = 1;
+        const SrcMaterial src = p.material < srcMats.size() ? srcMats[p.material] : SrcMaterial{};
+        RmodelMaterial    o = {};
+        snprintf(o.name, sizeof o.name, "%s", src.name.c_str());
+        memcpy(o.baseColor, src.baseColor, 16);
+        o.roughness = src.roughness, o.metallic = src.metallic;
+        memcpy(o.emissive, src.emissive, 12);
+        o.emissiveStrength = src.emissiveStrength;
+        o.alpha = src.alpha;
+        o.alphaCutoff = src.cutoff;
+        o.doubleSided = src.doubleSided;
+        o.normalScale = src.normalScale;
+        o.occlusionStrength = src.occlusionStrength;
+        if (o.alpha == RmodelBlend)
+            warn("material %s is alpha blend: drawn opaque until the renderer has transparency", o.name);
+        // The flat look (each map averaged) for a renderer without the textures.
+        memcpy(o.flatColor, o.baseColor, 12);
+        o.flatRoughness = o.roughness, o.flatMetallic = o.metallic;
+        float mean[4];
+        if (cook::mean(src.base, true, mean))
+            for (int c = 0; c < 3; ++c)
+                o.flatColor[c] *= mean[c];
+        if (cook::mean(src.orm[1], false, mean))
+            o.flatRoughness *= mean[src.ormCh[1]];
+        if (cook::mean(src.orm[2], false, mean))
+            o.flatMetallic *= mean[src.ormCh[2]];
+        // Only a mask keeps its coverage in every mip; a blend's alpha is its opacity, as painted.
+        o.textures[0] = cook::cook(src.base, cook::KindBase, o.alpha == RmodelMask ? o.alphaCutoff : 0);
+        o.textures[1] = cook::cookOrm(src.orm[0], src.ormCh[0], src.orm[1], src.ormCh[1], src.orm[2], src.ormCh[2]);
+        o.textures[2] = cook::cook(src.normal, cook::KindNormal, 0);
+        o.textures[3] = cook::cook(src.emissiveMap, cook::KindEmissive, 0);
         for (int t = 0; t < 4; ++t)
-            o.textures[t] = -1;
-        if (p.material < data->materials_count)
-        {
-            const cgltf_material& m = data->materials[p.material];
-            snprintf(o.name, sizeof o.name, "%s", m.name ? m.name : "");
-            if (m.has_pbr_metallic_roughness)
-            {
-                memcpy(o.baseColor, m.pbr_metallic_roughness.base_color_factor, 16);
-                o.roughness = m.pbr_metallic_roughness.roughness_factor;
-                o.metallic = m.pbr_metallic_roughness.metallic_factor;
-                float mean[4];
-                memcpy(o.flatColor, o.baseColor, 12);
-                o.flatRoughness = o.roughness, o.flatMetallic = o.metallic;
-                if (textureMean(m.pbr_metallic_roughness.base_color_texture.texture, true, mean))
-                    for (int c = 0; c < 3; ++c)
-                        o.flatColor[c] *= mean[c];
-                if (textureMean(m.pbr_metallic_roughness.metallic_roughness_texture.texture, false, mean))
-                    o.flatRoughness *= mean[1], o.flatMetallic *= mean[2]; // glTF: roughness in green, metallic in blue
-            }
-            else if (m.has_pbr_specular_glossiness)
-                warn("material %s uses specular-glossiness: cooked as a plain metallic-roughness material", o.name);
-            memcpy(o.emissive, m.emissive_factor, 12);
-            if (m.has_emissive_strength)
-                o.emissiveStrength = m.emissive_strength.emissive_strength;
-            o.alpha = m.alpha_mode == cgltf_alpha_mode_mask ? RmodelMask : (m.alpha_mode == cgltf_alpha_mode_blend ? RmodelBlend : RmodelOpaque);
-            o.alphaCutoff = m.alpha_cutoff;
-            o.doubleSided = m.double_sided;
-            if (o.alpha == RmodelBlend)
-                warn("material %s is alpha blend: drawn as a mask at its cutoff (0.5) until transparency comes", o.name);
-            o.normalScale = m.normal_texture.texture ? m.normal_texture.scale : 1;
-            o.occlusionStrength = m.occlusion_texture.texture ? m.occlusion_texture.scale : 1;
-            const float cutoff = o.alpha == RmodelOpaque ? 0 : (o.alpha == RmodelBlend ? 0.5f : o.alphaCutoff);
-            const cgltf_texture_view views[5] = { m.pbr_metallic_roughness.base_color_texture, m.pbr_metallic_roughness.metallic_roughness_texture,
-                                                  m.occlusion_texture, m.normal_texture, m.emissive_texture };
-            for (const cgltf_texture_view& v : views)
-            {
-                if (v.texture && v.texcoord != 0)
-                    warn("material %s reads a texture with UV set %d: the cooker keeps only the first set, so it reads that", o.name, v.texcoord);
-                if (v.texture && v.has_transform)
-                    warn("material %s moves a texture (KHR_texture_transform): ignored", o.name);
-            }
-            if (m.has_pbr_metallic_roughness)
-            {
-                o.textures[0] = cook::cook(m.pbr_metallic_roughness.base_color_texture.texture, nullptr, cook::KindBase, cutoff);
-                o.textures[1] = cook::cook(m.pbr_metallic_roughness.metallic_roughness_texture.texture, m.occlusion_texture.texture,
-                                           cook::KindOrm, 0);
-            }
-            o.textures[2] = cook::cook(m.normal_texture.texture, nullptr, cook::KindNormal, 0);
-            o.textures[3] = cook::cook(m.emissive_texture.texture, nullptr, cook::KindEmissive, 0);
-            for (int t = 0; t < 4; ++t)
-                textured += o.textures[t] >= 0;
-        }
-        else
-            {
-            snprintf(o.name, sizeof o.name, "(default)");
-            o.normalScale = o.occlusionStrength = 1;
-        }
-        if (p.material >= data->materials_count || !data->materials[p.material].has_pbr_metallic_roughness)
-            memcpy(o.flatColor, o.baseColor, 12), o.flatRoughness = o.roughness, o.flatMetallic = o.metallic;
+            textured += o.textures[t] >= 0;
         mats.push_back(o);
     }
-    if (data->animations_count)
-        warn("%zu animation%s ignored (animation is a later stage)", (size_t)data->animations_count, data->animations_count == 1 ? " is" : "s are");
 
     // Layout.
     RmodelHeader h = {};
@@ -701,8 +1035,7 @@ int main(int argc, char** argv)
     if (at > 100u * 1024 * 1024)
     {
         fprintf(stderr, "error: the cooked model would be %.1f MB; Yea allows 100 MB a file\n", at / 1048576.0);
-        cgltf_free(data);
-        return 1;
+        return done(1);
     }
     h.fileBytes = (uint32_t)at;
     std::vector<uint8_t> file(at, 0);
@@ -730,20 +1063,18 @@ int main(int argc, char** argv)
         fprintf(stderr, "error: couldn't write %s\n", argv[2]);
         if (f)
             fclose(f);
-        cgltf_free(data);
-        return 1;
+        return done(1);
     }
     fclose(f);
 
     // The report.
     const float size[3] = { h.hi[0] - h.lo[0], h.hi[1] - h.lo[1], h.hi[2] - h.lo[2] };
     const float largest = fmaxf(size[0], fmaxf(size[1], size[2]));
-    note("units: metres, as glTF is; node scales applied. Size %.3g x %.3g x %.3g m (x, y, z)", size[0], size[1], size[2]);
+    note("size: %.3g x %.3g x %.3g m (x, y, z)", size[0], size[1], size[2]);
     if (largest > 500.0f)
         warn("it is %.0f m across: if it should be smaller, the file's units are off (set its Scale knob)", largest);
     else if (largest < 0.01f)
         warn("it is %.1f mm across: if it should be larger, the file's units are off (set its Scale knob)", largest * 1000.0f);
-    note("axes: +Y up kept; Z negated into the renderer's left-handed space (its front, glTF's +Z, now faces -Z), triangle order flipped to match");
     if (flatNormals)
         note("normals: some primitives had none, so they got flat normals (glTF's rule)");
     if (madeTangents)
@@ -770,7 +1101,8 @@ int main(int argc, char** argv)
                textured, textured == 1 ? "" : "s", bytes / 1048576.0);
         static const char* kinds[] = { "colour", "ORM", "normal", "emissive" };
         for (const cook::Cooked& c : cook::gTextures)
-            printf(" %s %ux%u%s;", kinds[c.kind], c.t.width, c.t.height, c.b ? " (occlusion merged)" : "");
+            printf(" %s %ux%u%s;", kinds[c.kind], c.t.width, c.t.height,
+                   cook::ormImages(c) > 1 ? " (merged from its maps)" : "");
         printf("\n");
         if (cook::gSkipped)
             note("--max-size %u: %u top mip level%s left out over all textures (the source images are unchanged)", cook::gMaxSize, cook::gSkipped,
@@ -780,6 +1112,5 @@ int main(int argc, char** argv)
         printf("%s\n", s.c_str());
     for (const std::string& s : gWarnings)
         printf("warning: %s\n", s.c_str());
-    cgltf_free(data);
-    return 0;
+    return done(0);
 }
