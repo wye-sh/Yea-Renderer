@@ -1150,6 +1150,7 @@ bool rt_prepare(uint64_t address)
     d.denoise[0] = 1.0f;
     d.denoise[1] = 1.5f;
     d.denoise[2] = settings.full_below < 0 ? 0.0f : settings.full_below;
+    d.denoise[3] = settings.moving_blur < 0 ? 0.0f : settings.moving_blur;
     // renderer_gi's probes: their rays (gi), and last frame's probes for the light bounced at every hit.
     memcpy(d.giGrid, F->giGrid, sizeof d.giGrid);
     memcpy(d.giRot, F->giRotation, sizeof d.giRot);

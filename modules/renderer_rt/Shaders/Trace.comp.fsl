@@ -992,7 +992,9 @@ void resolve(int2 p)
         samplesPrev = zn.y;
     }
     // A still glossy pixel whose history lay out of the box keeps its strikes in quarters of its sample count.
+    // A quarter of 3 marks a pixel that moved (for the filter): no strikes.
     float strikesPrev = round(frac(samplesPrev) * 4.0);
+    strikesPrev = strikesPrev > 2.5 ? 0.0 : strikesPrev;
     samplesPrev = floor(samplesPrev);
     float strikes = 0.0;
     if (valid && max(frames, still ? stillFrames : 1.0) > 1.0)
@@ -1041,7 +1043,8 @@ void resolve(int2 p)
     }
     // Alpha: the hit distance, averaged as the colour is (the filter sizes its footprint by it).
     Write2D(gOut, p, float4(max(expandColor(fromYCoCg(result)), float3(0.0, 0.0, 0.0)) / exposure, max(hitDist, 1e-3)));
-    Write2D(gOutZ, p, float2(z, samples + strikes * 0.25));
+    // Samples, plus strikes in quarters (3: it moved, for the filter).
+    Write2D(gOutZ, p, float2(z, samples + (still ? strikes : 3.0) * 0.25));
 }
 
 #if defined(TRACE_FILTER)
@@ -1064,7 +1067,10 @@ float3 positionAt(int2 q, float d)
 // denoise.y pixels (the grain is a pixel or a half-resolution block wide; more only blurred highlights). Neighbours
 // count by a fixed Gaussian (so the filter adds no flicker of its own), only where they share the pixel's plane,
 // its normal within half the lobe, its roughness and hit distance: edges on screen and in the reflection stay.
-// Mirror-like pixels (below full_below, traced at full resolution) are copied.
+// Mirror-like pixels (below full_below, traced at full resolution) are copied. Where the pixel moved (the resolve
+// marks it in gHistoryZ), its history is a few frames and its reflection mottles over a few pixels: there the cap
+// is denoise.w (moving_blur), with more taps, wider normals and no hit-distance stop. Still pixels are filtered as
+// before, bit for bit.
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(8, 8, 1)
 void CS_MAIN(SV_DispatchThreadID(uint3) id, SV_GroupID(uint3) gid)
@@ -1092,7 +1098,8 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id, SV_GroupID(uint3) gid)
     float3 P = positionAt(p, d);
     float  eye = length(P - gRt.camPos.xyz);
     float  pixelAngle = 2.0 / (gRt.up.w * gRt.screen.y);
-    float  radius = min(gRt.denoise.x * centre.a * alpha / ((eye + centre.a) * pixelAngle), gRt.denoise.y);
+    bool   moved = round(frac(LoadTex2D(gHistoryZ, NO_SAMPLER, p, 0).y) * 4.0) > 2.5;
+    float  radius = min(gRt.denoise.x * centre.a * alpha / ((eye + centre.a) * pixelAngle), moved ? max(gRt.denoise.w, gRt.denoise.y) : gRt.denoise.y);
     if (radius < 0.5)
     {
         Write2D(gOut, p, centre);
@@ -1100,12 +1107,16 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id, SV_GroupID(uint3) gid)
     }
     float3 N = normalize(surface.yzw);
     float  exposure = max(gExposure[1], 1e-8);
-    int    reach = radius < 1.5 ? 1 : 2;
+    int    reach = radius < 1.5 ? 1 : (radius < 3.0 ? 2 : 3);
     float  stride = radius / float(reach);
     float  sigma2 = 0.5 * radius * radius;
     float  planeTol = 0.01 * eye + 0.005;
     float  lobe = max(alpha, 0.02);
     float  normalTol = 0.125 * lobe * lobe; // a normal turned by half the lobe turns the reflection by all of it
+    // Where it moved, the normals it takes widen with the radius (as ReBLUR's do on a short history): on a curved
+    // surface the narrow ones left the filter a pixel wide however far it could reach.
+    float  widen = moved ? max(radius / gRt.denoise.y, 1.0) : 1.0;
+    normalTol *= widen * widen;
     float  roughTol = 0.15 * rough + 0.01;
     float4 sum = float4(compressColor(centre.rgb * exposure), 1.0);
     for (int y = -reach; y <= reach; ++y)
@@ -1123,8 +1134,10 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id, SV_GroupID(uint3) gid)
             float4 sq = LoadTex2D(gSurface, NO_SAMPLER, q, 0);
             float  plane = abs(dot(N, positionAt(q, dq) - P));
             float  bend = 1.0 - dot(N, normalize(sq.yzw));
-            float  w = exp(-dot(o, o) / sigma2 - plane / planeTol - bend / normalTol - abs(sq.x - rough) / roughTol -
-                           abs(h.a - centre.a) / (0.25 * min(h.a, centre.a) + 0.05 * eye));
+            // Where it moved, hit distances are a few frames' and noisy: told apart by them, neighbours were taken at
+            // random and the filter added grain of its own.
+            float  far = moved ? 0.0 : abs(h.a - centre.a) / (0.25 * min(h.a, centre.a) + 0.05 * eye);
+            float  w = exp(-dot(o, o) / sigma2 - plane / planeTol - bend / normalTol - abs(sq.x - rough) / roughTol - far);
             sum += float4(compressColor(h.rgb * exposure), 1.0) * w;
         }
     }

@@ -29,7 +29,8 @@ STRUCT(RtData)
     DATA(uint4, shadowMode, None);   // x filter taps, y how hits are shadowed (SHADOWS_*), z receiver-plane bias,
                                      // w 1 when the atlas is drawn this frame
     DATA(float4, denoise, None);     // the filter: x footprint scale, y largest radius (px), z roughness at or below
-                                     // which pixels are copied (full_below: mirror-like)
+                                     // which pixels are copied (full_below: mirror-like), w largest radius where
+                                     // the pixel moved (moving_blur)
     DATA(float4, taps[32], None);    // xy: the filters' Vogel disk, unturned (as the core's)
     DATA(float4, sky, None);         // x 1: renderer_sky's physical sky (gSkyEnv, gSkySh), y gSkyEnv's mips
     DATA(uint4, probe, None);        // TEMPORARY (probe_rays): x shadow rays per pixel to measure, 0 none

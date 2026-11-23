@@ -27,6 +27,9 @@ setting bool screen_colors true
 setting choice reflected_shadows Scene Scene Rays Off
 # Frames of history blended into rough reflections, so they hold still (mirrors take little, moving things less).
 setting int history_frames 12 1 inf
+# How far (pixels) the filter may spread a glossy reflection on what moves, where its history is short and it
+# would mottle: wider is softer. Still surfaces keep the narrow filter.
+setting float moving_blur 5 0 inf
 # The brightest a single ray's find may be (times white), so a stray ray onto a light can't sparkle.
 setting float brightest 8 1 inf
 # How far (metres) rays look for something to reflect.

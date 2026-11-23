@@ -239,6 +239,11 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   pixel's rays fall either side of a bright edge in what is reflected, its settled history was off by a fixed amount
   of its own, a frozen grain; on a glossy close-up it halved, below what one ray a frame accumulated without limit
   gives. Larger radii blurred small reflected highlights for no less grain).
+  Where the pixel moved (the resolve marks it with a quarter of 3 in the history's sample count), its history is a
+  few frames and mottles over 6-12 px: there the cap is `moving_blur` (5 px: 7x7 taps), the normals it takes widen with
+  the radius (as ReBLUR's do on a short history; on a curved surface the narrow ones kept it a pixel wide) and hit
+  distance, noisy on a short history, doesn't stop it (it randomised the weights into grain of its own). Still pixels
+  are filtered bit for bit as before; nothing is added to the history, so no lag.
   Without the accumulation, 1 spp reflections flickered (fireflies). The trace marks each 8x8 tile holding a pixel below
   `max_roughness` (`gTiles`, flag sets double-buffered so no thread reads a flag another rewrites); the resolve skips
   the rest and writes their zeros only when the history there isn't zero already. Every GPU object is freed
@@ -632,7 +637,7 @@ intensity, max_distance, show_contact. `renderer_probes`: enabled, resolution (6
 `renderer_ssr`: enabled, half_resolution, max_roughness, thickness, max_distance, steps, edge_fade, intensity,
 show_hits (tints where reflections were found). `renderer_vrs`: enabled, aggressiveness, motion (0), keep_curved, glossy_below, allow_4x4,
 show_rates (green half rate, blue 2x2, magenta coarser). `renderer_rt`: enabled, max_roughness, half_resolution, full_below, screen_colors,
-reflected_shadows (Scene, Rays, Off), history_frames, brightest, max_distance, show_hits (green: hit seen on screen, blue: lit at the hit, grey: sky),
+reflected_shadows (Scene, Rays, Off), history_frames, moving_blur (px, the filter on moving glossy pixels), brightest, max_distance, show_hits (green: hit seen on screen, blue: lit at the hit, grey: sky),
 probe_rays (temporary: 0 off; traces 1 sun ray plus k-1 local-light rays per pixel and discards them; retire it with a major
 version), shadows (ray-traced shadows), traced_lights (0-8, besides the sun).
 `renderer_fog`: fog, density, height_falloff, base_height, albedo, anisotropy, quality (Low, Medium, High), range,
