@@ -24,7 +24,7 @@
 #include <stdint.h>
 
 constexpr uint32_t kRmodelMagic = 0x4C444D52u; // "RMDL"
-constexpr uint32_t kRmodelVersion = 4;
+constexpr uint32_t kRmodelVersion = 5; // 5: RmodelCodecAcl clips
 constexpr uint32_t kRmodelOldest = 2; // the oldest version the loader still reads
 
 struct RmodelHeader
@@ -164,6 +164,7 @@ struct RmodelBone
 enum RmodelCodec : uint32_t
 {
     RmodelCodecQuantized = 0, // the Renderer's own (anim.h): uniformly resampled, smallest-three rotations, quantised tracks
+    RmodelCodecAcl = 1,       // v5: the Animation Compression Library's (anim.h AclClip)
 };
 
 // A clip: every node's local pose resampled at `rate` frames a second, `frames` of them, the first at 0 and the last at

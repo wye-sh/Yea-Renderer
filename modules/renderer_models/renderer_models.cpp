@@ -1127,25 +1127,12 @@ void loadCooked(Entry& e)
                     bad = "its file is damaged";
         }
         morphs = mo;
+        // Every clip inside the file and its data whole in its codec's layout (anim.h clipValid), and every bone a vertex
+        // names in the skeleton.
         for (uint32_t i = 0; !bad && i < sk->clipCount; ++i)
             if (clips[i].offset < h.skeleton || clips[i].offset + clips[i].bytes > h.textures || !clips[i].frames ||
-                clips[i].bytes < (uint64_t)(sk->nodeCount * 3 + nt) * sizeof(RmodelTrack))
+                !anim::clipValid(data + clips[i].offset, clips[i], sk->nodeCount, nt))
                 bad = "its file is damaged";
-        for (uint32_t i = 0; !bad && i < sk->clipCount; ++i)
-            for (uint32_t t = 0; !bad && t < nt; ++t)
-            {
-                const RmodelTrack& tr = ((const RmodelTrack*)(data + clips[i].offset))[sk->nodeCount * 3 + t];
-                if (tr.data != 0xFFFFFFFFu && tr.data + (uint64_t)clips[i].frames * 2 > clips[i].bytes)
-                    bad = "its file is damaged";
-            }
-        // Every track's samples inside its clip, and every bone a vertex names in the skeleton.
-        for (uint32_t i = 0; !bad && i < sk->clipCount; ++i)
-            for (uint32_t t = 0; !bad && t < sk->nodeCount * 3; ++t)
-            {
-                const RmodelTrack& tr = ((const RmodelTrack*)(data + clips[i].offset))[t];
-                if (tr.data != 0xFFFFFFFFu && tr.data + (uint64_t)clips[i].frames * 6 > clips[i].bytes)
-                    bad = "its file is damaged";
-            }
         const RmodelSkinVertex* sv = bad ? nullptr : (const RmodelSkinVertex*)(data + h.skin);
         for (uint32_t v = 0; !bad && v < h.vertexCount; ++v)
             for (int k = 0; k < 4; ++k)

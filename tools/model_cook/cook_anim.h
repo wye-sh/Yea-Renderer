@@ -13,6 +13,9 @@
 
 #include "../../modules/renderer_models/anim.h"
 
+#include <acl/compression/compress.h>
+#include <acl/core/ansi_allocator.h>
+
 #include <functional>
 #include <vector>
 
@@ -37,6 +40,8 @@ struct Encoded
     float                error = 0;   // the worst a vertex strays, metres
     float                tolerance = kMaxError;
     size_t               rawBytes = 0; // its frames as plain floats (t, r, s), for the report
+    size_t               quantizedBytes = 0; // ACL picked: what RmodelCodecQuantized took, and its error
+    float                quantizedError = 0;
 };
 
 // The skin posed by a palette: each vertex's position.
@@ -181,6 +186,96 @@ inline Encoded encodeAt(const char* name, float duration, float rate, uint32_t n
     return e;
 }
 
+// One clip at `rate` with ACL (RmodelCodecAcl): the same frames as encodeAt's, each node a qvvf track whose error ACL
+// keeps within `precision` metres at `shell[node]` (how far its skin reaches from it), morph weights a float1f track
+// each within `precision / reach`. Empty data when ACL refuses it.
+inline Encoded encodeAclAt(const char* name, float duration, float rate, const RmodelNode* nodes, uint32_t nodeCount,
+                           const std::function<void(float, anim::Pose*)>& source, uint32_t targetCount, const WeightSource& weights,
+                           const float* defaults, const float* shell, const float* reach, float precision)
+{
+    Encoded e;
+    const uint32_t frames = duration > 0 ? (uint32_t)ceilf(duration * rate - 1e-4f) + 1 : 1;
+    snprintf(e.clip.name, sizeof e.clip.name, "%s", name);
+    e.clip.duration = duration > 0 ? duration : 0;
+    e.clip.frames = frames;
+    e.clip.rate = frames > 1 ? (float)(frames - 1) / duration : 0;
+    e.clip.codec = RmodelCodecAcl;
+    e.rawBytes = (size_t)frames * (nodeCount * 40 + targetCount * 4);
+    const float aclRate = frames > 1 ? e.clip.rate : 30.0f;
+    acl::ansi_allocator       alloc;
+    acl::track_array_qvvf     list(alloc, nodeCount);
+    std::vector<anim::Pose>   poses((size_t)frames * nodeCount);
+    std::vector<float>        w((size_t)frames * targetCount);
+    for (uint32_t f = 0; f < frames; ++f)
+    {
+        const float t = frames > 1 ? duration * (float)f / (float)(frames - 1) : 0;
+        source(t, &poses[(size_t)f * nodeCount]);
+        if (targetCount)
+        {
+            if (weights)
+                weights(t, &w[(size_t)f * targetCount]);
+            else
+                memcpy(&w[(size_t)f * targetCount], defaults, targetCount * sizeof(float));
+        }
+    }
+    for (uint32_t n = 0; n < nodeCount; ++n)
+    {
+        acl::track_desc_transformf desc;
+        desc.output_index = n;
+        desc.parent_index = nodes[n].parent >= 0 ? (uint32_t)nodes[n].parent : acl::k_invalid_track_index;
+        desc.precision = precision;
+        desc.shell_distance = shell[n];
+        acl::track_qvvf track = acl::track_qvvf::make_reserve(desc, alloc, frames, aclRate);
+        for (uint32_t f = 0; f < frames; ++f)
+        {
+            const anim::Pose& p = poses[(size_t)f * nodeCount + n];
+            track[f] = rtm::qvv_set(rtm::quat_normalize(rtm::quat_load(p.r)), rtm::vector_load3(p.t), rtm::vector_load3(p.s));
+        }
+        list[n] = std::move(track);
+    }
+    acl::compression_settings settings = acl::get_default_compression_settings();
+    settings.optimize_loops = false; // the clip's last frame stays: sampled clamped, as RmodelCodecQuantized is
+    acl::qvvf_transform_error_metric metric;
+    settings.error_metric = &metric;
+    acl::output_stats       stats;
+    acl::compressed_tracks* out = nullptr;
+    if (acl::compress_track_list(alloc, list, settings, out, stats).any() || !out)
+        return e;
+    acl::compressed_tracks* outW = nullptr;
+    if (targetCount)
+    {
+        acl::track_array_float1f wl(alloc, targetCount);
+        for (uint32_t t = 0; t < targetCount; ++t)
+        {
+            acl::track_desc_scalarf desc;
+            desc.output_index = t;
+            desc.precision = fmaxf(1e-6f, precision / fmaxf(reach[t], 1e-3f));
+            acl::track_float1f track = acl::track_float1f::make_reserve(desc, alloc, frames, aclRate);
+            for (uint32_t f = 0; f < frames; ++f)
+                track[f] = w[(size_t)f * targetCount + t];
+            wl[t] = std::move(track);
+        }
+        acl::compression_settings ws = acl::get_default_compression_settings();
+        ws.optimize_loops = false;
+        if (acl::compress_track_list(alloc, wl, ws, outW, stats).any() || !outW)
+        {
+            alloc.deallocate(out, out->get_size());
+            return e;
+        }
+    }
+    anim::AclClip h = {};
+    h.transforms = sizeof h;
+    h.weights = outW ? (uint32_t)((sizeof h + out->get_size() + 15) & ~(size_t)15) : 0;
+    e.data.assign(((h.weights ? h.weights + outW->get_size() : h.transforms + out->get_size()) + 15) & ~(size_t)15, 0);
+    memcpy(e.data.data(), &h, sizeof h);
+    memcpy(e.data.data() + h.transforms, out, out->get_size());
+    if (outW)
+        memcpy(e.data.data() + h.weights, outW, outW->get_size()), alloc.deallocate(outW, outW->get_size());
+    alloc.deallocate(out, out->get_size());
+    e.clip.bytes = e.data.size();
+    return e;
+}
+
 // The worst a vertex strays between the decoded clip and the source, at every frame and quarters between them. Also
 // grows lo/hi (per part: `part[v]` names a vertex's part) by every decoded frame's pose, so culling bounds hold the motion.
 inline float measure(const Encoded& e, const RmodelNode* nodes, uint32_t nodeCount, const RmodelBone* bones, uint32_t boneCount,
@@ -235,7 +330,7 @@ inline Encoded encode(const char* name, float duration, const RmodelNode* nodes,
                       uint32_t boneCount, const std::vector<SkinnedVertex>& verts, const std::vector<uint32_t>& part,
                       std::vector<float>& lo, std::vector<float>& hi, const std::function<void(float, anim::Pose*)>& source,
                       float tolerance, bool stepped, float keyRate, uint32_t targetCount, const WeightSource& weights,
-                      const float* defaults, const float* reach, float* wlo, float* whi)
+                      const float* defaults, const float* reach, float* wlo, float* whi, const float* shell = nullptr)
 {
     std::vector<float> rates;
     if (stepped)
@@ -260,7 +355,49 @@ inline Encoded encode(const char* name, float duration, const RmodelNode* nodes,
         if (best.error <= tolerance || best.clip.frames <= 1)
             break;
     }
+    // ACL (with `shell`): at the same frames, the coarsest precision whose skin error matches or beats the quantised
+    // clip's; kept only then (and the quantised one otherwise).
+    for (float k : { 0.5f, 0.25f, 0.1f, 0.05f, 0.02f, 0.01f })
+    {
+        if (!shell || !have)
+            break;
+        Encoded a = encodeAclAt(name, duration, best.clip.rate, nodes, nodeCount, source, targetCount, weights, defaults, shell, reach,
+                                tolerance * k);
+        if (a.data.empty())
+            break;
+        std::vector<float> l = lo, h = hi;
+        a.tolerance = tolerance;
+        a.error = measure(a, nodes, nodeCount, bones, boneCount, verts, part, (float(*)[3])l.data(), (float(*)[3])h.data(), source, stepped,
+                          targetCount, weights, reach, wlo, whi);
+        if (a.error <= best.error)
+        {
+            a.quantizedBytes = best.data.size(), a.quantizedError = best.error;
+            best = std::move(a), bestLo = std::move(l), bestHi = std::move(h);
+            break;
+        }
+    }
     lo = bestLo, hi = bestHi;
     return best;
+}
+
+// How far each node's skin reaches from it at rest (ACL's shell distance; 1 cm at least).
+inline std::vector<float> shells(const RmodelNode* nodes, uint32_t nodeCount, const RmodelBone* bones, uint32_t boneCount,
+                                 const std::vector<SkinnedVertex>& verts)
+{
+    std::vector<anim::Pose> rest(nodeCount);
+    std::vector<float>      world(nodeCount * 12), pal(boneCount * 12), out(nodeCount, 0.01f);
+    anim::restPoses(nodes, nodeCount, rest.data());
+    anim::palette(nodes, nodeCount, bones, boneCount, rest.data(), world.data(), pal.data());
+    for (const SkinnedVertex& v : verts)
+        for (int k = 0; k < 4; ++k)
+        {
+            if (!v.weights[k] || v.bones[k] >= boneCount)
+                continue;
+            const uint32_t n = bones[v.bones[k]].node;
+            const float*   m = &world[n * 12];
+            const float    dx = v.p[0] - m[3], dy = v.p[1] - m[7], dz = v.p[2] - m[11];
+            out[n] = fmaxf(out[n], sqrtf(dx * dx + dy * dy + dz * dz));
+        }
+    return out;
 }
 } // namespace cook_anim

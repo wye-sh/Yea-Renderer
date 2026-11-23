@@ -30,7 +30,8 @@
 //   4 bones each (the strongest, renormalised); a mesh with no skin is bound whole to its own node, so it follows its
 //   node's animation. Every node of the file goes in the skeleton with its rest pose; every clip (glTF animations, FBX
 //   takes) is evaluated exactly from the file and encoded with the Renderer's own codec (cook_anim.h), at the lowest
-//   rate that keeps every vertex within a millimetre. Parts' bounds hold every frame of every clip. Morph targets are
+//   rate that keeps every vertex within a millimetre; then (rmodel v5, unless --codec quantized) with ACL at the same
+//   frames, kept where its skin error matches or beats ours. Parts' bounds hold every frame of every clip. Morph targets are
 //   ignored.
 // - Writes the file and prints the report: units and axes, parts, triangles and error per LOD, the skeleton and clips,
 //   what it generated or ignored.
@@ -1094,6 +1095,7 @@ void gltfSkeleton(const cgltf_data* data)
 
 // --hide: the node names whose meshes, and those of every node under them, are left out (the nodes stay, as bones).
 std::vector<std::string> gHide;
+bool                     gAcl = true; // --codec acl (the default) or quantized: ACL wherever it is at least as accurate
 std::vector<bool>        gHideUsed;
 bool hidden(const char* name)
 {
@@ -1635,6 +1637,8 @@ int main(int argc, char** argv)
         args = i + 1 < argc;
         if (args && !strcmp(argv[i], "--max-size"))
             args = (cook::gMaxSize = (uint32_t)atoi(argv[i + 1])) >= 4;
+        else if (args && !strcmp(argv[i], "--codec"))
+            args = !strcmp(argv[i + 1], "acl") || !strcmp(argv[i + 1], "quantized"), gAcl = !strcmp(argv[i + 1], "acl");
         else if (args && !strcmp(argv[i], "--hide"))
             gHide.push_back(argv[i + 1]), gHideUsed.push_back(false);
         else
@@ -1642,7 +1646,7 @@ int main(int argc, char** argv)
     }
     if (!args)
     {
-        fprintf(stderr, "usage: model_cook <in.gltf|in.glb> <out.rmodel> [--max-size <pixels, at least 4>] [--hide <node name>]...\n");
+        fprintf(stderr, "usage: model_cook <in.gltf|in.glb> <out.rmodel> [--max-size <pixels, at least 4>] [--hide <node name>]... [--codec acl|quantized]\n");
         return 2;
     }
     gDir = argv[1];
@@ -1842,10 +1846,11 @@ int main(int argc, char** argv)
                 reach[d.target] = fmaxf(reach[d.target], sqrtf(d.p[0] * d.p[0] + d.p[1] * d.p[1] + d.p[2] * d.p[2]));
         for (uint32_t t = 0; t < nt; ++t)
             defaults[t] = wlo[t] = whi[t] = gTargets[t].weight, gTargets[t].reach = reach[t];
+        const std::vector<float> shell = cook_anim::shells(gSkel.nodes.data(), nn, gSkel.bones.data(), nb, verts);
         for (const Clip& c : gSkel.clips)
             clips.push_back(cook_anim::encode(c.name.c_str(), c.duration, gSkel.nodes.data(), nn, gSkel.bones.data(), nb, verts, vpart, lo, hi,
                                               c.source, tolerance, c.stepped, c.keyRate, nt, c.weights, defaults.data(), reach.data(),
-                                              wlo.data(), whi.data()));
+                                              wlo.data(), whi.data(), gAcl ? shell.data() : nullptr));
         for (uint32_t t = 0; t < nt; ++t)
             gTargets[t].lo = wlo[t], gTargets[t].hi = whi[t];
         // Bounds: what the morphs can add at the weights they take (before the pose; bones rarely scale them up).
@@ -2132,9 +2137,19 @@ int main(int argc, char** argv)
         printf("skinned: %zu nodes, %zu bones, %zu clip%s (%.1f KB, %.1fx smaller than floats; the skin within %.2f mm of the file)%s\n",
                gSkel.nodes.size(), gSkel.bones.size(), clips.size(), clips.size() == 1 ? "" : "s", bytes / 1024.0, bytes ? (double)raw / bytes : 0.0,
                worst * 1000.0f, clips.empty() ? "" : ":");
+        size_t acl = 0, aclBytes = 0, ownBytes = 0;
         for (const cook_anim::Encoded& c : clips)
-            printf("  %s: %.2f s, %u frames at %.0f a second, %.1f KB, within %.2f mm\n", c.clip.name, c.clip.duration, c.clip.frames,
+        {
+            printf("  %s: %.2f s, %u frames at %.0f a second, %.1f KB, within %.2f mm", c.clip.name, c.clip.duration, c.clip.frames,
                    c.clip.frames > 1 ? c.clip.rate : 0.0f, c.data.size() / 1024.0, c.error * 1000.0f);
+            if (c.clip.codec == RmodelCodecAcl)
+                printf(" (ACL; our codec %.1f KB within %.2f mm)", c.quantizedBytes / 1024.0, c.quantizedError * 1000.0f), ++acl,
+                    aclBytes += c.data.size(), ownBytes += c.quantizedBytes;
+            printf("\n");
+        }
+        if (gAcl && !clips.empty())
+            printf("ACL: %zu of %zu clips (%.1f KB, where our codec took %.1f KB); the rest our codec, ACL no more accurate there\n", acl,
+                   clips.size(), aclBytes / 1024.0, ownBytes / 1024.0);
         if (!gTargets.empty())
         {
             printf("morph targets: %zu, %zu deltas over %zu vertices (%.1f KB):", gTargets.size(), deltas.size(), gMorphVerts.size(),

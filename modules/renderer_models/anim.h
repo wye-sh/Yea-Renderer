@@ -11,13 +11,35 @@
 //     from the other three), the other three are 15 bits each over +-1/sqrt(2), and the dropped one's index is the top
 //     bit of the first two words.
 // - Between frames, translations and scales are lerped and rotations nlerped (on the shorter arc).
-// A codec with better ratios (ACL) can sit beside it under another RmodelCodec, behind sampleClip.
+//
+// RmodelCodecAcl (rmodel v5): Nicholas Frechette's Animation Compression Library (MIT; acl/ and rtm/ here hold only its
+// decompression code and Realtime Math, unmodified): the clip's bytes start with an AclClip naming one ACL transform
+// track list (a qvvf track a node, its output index the node, sampled at the clip's rate and frames, not looping) and,
+// with morph targets, one float1f list (a track a target). The cooker picks it per clip where it is at least as
+// accurate at the skin as RmodelCodecQuantized, which stays for the rest. Its decoders allocate nothing.
 #pragma once
 
 #include "rmodel.h"
 
 #include <math.h>
 #include <string.h>
+
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#pragma GCC diagnostic ignored "-Wunused-but-set-variable"
+#pragma GCC diagnostic ignored "-Wsign-compare"
+#pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
+#endif
+#if defined(__clang__)
+#pragma clang diagnostic ignored "-Wunknown-warning-option"
+#pragma clang diagnostic ignored "-Wmissing-template-arg-list-after-template-kw"
+#endif
+#include <acl/decompression/decompress.h>
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
 namespace anim
 {
@@ -99,6 +121,76 @@ inline void frameAt(const RmodelClip& c, float time, bool loop, uint32_t& f0, ui
     f = f < 0 ? 0 : (f > 1 ? 1 : f);
 }
 
+// RmodelCodecAcl's clip data: offsets from the clip's data of its ACL buffers (16-byte aligned; weights 0: none).
+struct AclClip
+{
+    uint32_t transforms, weights, pad[2];
+};
+static_assert(sizeof(AclClip) == 16, "acl clip");
+
+// A clip's time as ACL is asked for it: wrapped when looping, inside the clip.
+inline float aclTime(const RmodelClip& c, float time, bool loop)
+{
+    if (!(c.duration > 0))
+        return 0;
+    if (loop)
+        time = fmodf(time, c.duration), time = time < 0 ? time + c.duration : time;
+    return time < 0 ? 0 : (time > c.duration ? c.duration : time);
+}
+
+struct AclPoses : acl::track_writer // ACL's decoded node poses into Pose[node - first]
+{
+    Pose*    out;
+    uint32_t first, count;
+    static constexpr acl::default_sub_track_mode get_default_scale_mode() { return acl::default_sub_track_mode::constant; }
+    bool skip(uint32_t i) const { return i < first || i - first >= count; }
+    void RTM_SIMD_CALL write_rotation(uint32_t i, rtm::quatf_arg0 q)
+    {
+        if (!skip(i))
+            rtm::quat_store(q, out[i - first].r);
+    }
+    void RTM_SIMD_CALL write_translation(uint32_t i, rtm::vector4f_arg0 v)
+    {
+        if (!skip(i))
+            rtm::vector_store3(v, out[i - first].t);
+    }
+    void RTM_SIMD_CALL write_scale(uint32_t i, rtm::vector4f_arg0 v)
+    {
+        if (!skip(i))
+            rtm::vector_store3(v, out[i - first].s);
+    }
+};
+
+struct AclWeights : acl::track_writer
+{
+    float*   out;
+    uint32_t count;
+    void RTM_SIMD_CALL write_float1(uint32_t i, rtm::scalarf_arg0 v)
+    {
+        if (i < count)
+            out[i] = rtm::scalar_cast(v);
+    }
+};
+
+// Nodes [first, first + count) of an ACL clip at `time`; one node alone when count is 1.
+inline bool aclPoses(const uint8_t* data, const RmodelClip& c, uint32_t nodeCount, uint32_t first, uint32_t count, float time, bool loop,
+                     Pose* out)
+{
+    const AclClip& h = *(const AclClip*)data;
+    const acl::compressed_tracks* tracks = acl::make_compressed_tracks(data + h.transforms);
+    acl::decompression_context<acl::default_transform_decompression_settings> ctx;
+    if (!tracks || tracks->get_num_tracks() != nodeCount || !ctx.initialize(*tracks))
+        return false;
+    ctx.seek(aclTime(c, time, loop), acl::sample_rounding_policy::none);
+    AclPoses w;
+    w.out = out, w.first = first, w.count = count;
+    if (count == 1)
+        ctx.decompress_track(first, w);
+    else
+        ctx.decompress_tracks(w);
+    return true;
+}
+
 // One node's local pose between two frames (frameAt's f0, f1, f).
 inline void sampleNode(const uint8_t* data, uint32_t node, uint32_t f0, uint32_t f1, float f, Pose& out)
 {
@@ -127,9 +219,40 @@ inline void sampleNode(const uint8_t* data, uint32_t node, uint32_t f0, uint32_t
     }
 }
 
+// A clip's data (`c.bytes` at `data`) whole in its codec's layout for nodeCount nodes and targetCount morph targets: every
+// quantised track's samples inside it, or ACL's buffers inside it, valid, of the right kind and track count.
+inline bool aclValid(const uint8_t* data, uint64_t bytes, uint32_t at, acl::track_type8 type, uint32_t tracks)
+{
+    if (at < sizeof(AclClip) || (at & 15) || ((uintptr_t)(data + at) & 15) || at + (uint64_t)sizeof(acl::compressed_tracks) > bytes)
+        return false;
+    const acl::compressed_tracks* t = acl::make_compressed_tracks(data + at);
+    return t && at + (uint64_t)t->get_size() <= bytes && !t->is_valid(false).any() && t->get_track_type() == type &&
+           t->get_num_tracks() == tracks;
+}
+inline bool clipValid(const uint8_t* data, const RmodelClip& c, uint32_t nodeCount, uint32_t targetCount)
+{
+    if (c.codec == RmodelCodecAcl)
+    {
+        if (c.bytes < sizeof(AclClip))
+            return false;
+        const AclClip& h = *(const AclClip*)data;
+        return aclValid(data, c.bytes, h.transforms, acl::track_type8::qvvf, nodeCount) &&
+               (!targetCount || aclValid(data, c.bytes, h.weights, acl::track_type8::float1f, targetCount));
+    }
+    if (c.codec != RmodelCodecQuantized || c.bytes < (uint64_t)(nodeCount * 3 + targetCount) * sizeof(RmodelTrack))
+        return false;
+    const RmodelTrack* tracks = (const RmodelTrack*)data;
+    for (uint32_t t = 0; t < nodeCount * 3 + targetCount; ++t)
+        if (tracks[t].data != 0xFFFFFFFFu && tracks[t].data + (uint64_t)c.frames * (t < nodeCount * 3 ? 6 : 2) > c.bytes)
+            return false;
+    return true;
+}
+
 // Every node's local pose at `time` (seconds) into `out` (nodeCount poses). `data` is the clip's bytes (file + offset).
 inline bool sampleClip(const uint8_t* data, const RmodelClip& c, uint32_t nodeCount, float time, bool loop, Pose* out)
 {
+    if (c.codec == RmodelCodecAcl)
+        return aclPoses(data, c, nodeCount, 0, nodeCount, time, loop, out);
     if (c.codec != RmodelCodecQuantized)
         return false;
     uint32_t f0, f1;
@@ -143,6 +266,11 @@ inline bool sampleClip(const uint8_t* data, const RmodelClip& c, uint32_t nodeCo
 // One node's local pose at `time` (root motion reads the motion node alone).
 inline bool sampleNodeAt(const uint8_t* data, const RmodelClip& c, uint32_t node, float time, bool loop, Pose& out)
 {
+    if (c.codec == RmodelCodecAcl)
+    {
+        const acl::compressed_tracks* tracks = acl::make_compressed_tracks(data + ((const AclClip*)data)->transforms);
+        return tracks && node < tracks->get_num_tracks() && aclPoses(data, c, tracks->get_num_tracks(), node, 1, time, loop, &out);
+    }
     if (c.codec != RmodelCodecQuantized)
         return false;
     uint32_t f0, f1;
@@ -156,6 +284,21 @@ inline bool sampleNodeAt(const uint8_t* data, const RmodelClip& c, uint32_t node
 inline bool sampleWeights(const uint8_t* data, const RmodelClip& c, uint32_t nodeCount, uint32_t targetCount, float time, bool loop,
                           float* out)
 {
+    if (c.codec == RmodelCodecAcl)
+    {
+        const AclClip& h = *(const AclClip*)data;
+        if (!h.weights)
+            return false;
+        const acl::compressed_tracks* tracks = acl::make_compressed_tracks(data + h.weights);
+        acl::decompression_context<acl::default_scalar_decompression_settings> ctx;
+        if (!tracks || tracks->get_num_tracks() != targetCount || !ctx.initialize(*tracks))
+            return false;
+        ctx.seek(aclTime(c, time, loop), acl::sample_rounding_policy::none);
+        AclWeights w;
+        w.out = out, w.count = targetCount;
+        ctx.decompress_tracks(w);
+        return true;
+    }
     if (c.codec != RmodelCodecQuantized)
         return false;
     uint32_t f0, f1;

@@ -463,7 +463,9 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   smoothstep over `fade`; `mdl::unlayer(h, slot, fade)` fades it out. Bone and clip names wait for the models to load;
   a layer whose bone, clip or placement is gone is dropped. Layers carry no root motion and no morph weights (the base
   clip's). Table `PlacementLayer` (8192: placement, slot, order, clip, mask, weight, time), emptied by Reset. Clips are sampled with
-  `anim.h` (shared with the cooker: smallest-three rotations, quantised tracks, `sampleClip`, `blendPoses`, `palette`)
+  `anim.h` (shared with the cooker: smallest-three rotations, quantised tracks, `sampleClip`, `blendPoses`, `palette`;
+  rmodel v5's `RmodelCodecAcl` clips through the Animation Compression Library, `acl/` and `rtm/` here holding only ACL
+  2.1.0's decompression headers and Realtime Math 2.2.0, MIT and unmodified; `clipValid` checks either layout at load)
   in `YEA_PHASE_LATE` into scratch made in load(), and each part instance gets the palette through `instance_pose`.
   Its tables: `Placement` (a row per
   placement, keyed by the model's owner and name), `PlacementAnim` (beside it: clip, time, speed, loop and the clip
@@ -677,7 +679,12 @@ library keeps its licence file beside its source, since the component's reposito
   Skins and clips (rmodel v3, `cook_anim.h`): up to 4 bones a vertex; meshes under animated nodes without a skin are
   bound whole to their node; every node's pose resampled at the file's key rate, else the lowest of 30 to 240 a second
   whose decoded skin stays within 1 mm of the source (or 2.5e-4 of the model's size); LODs keep influence borders.
-  glTF through cgltf, FBX through ufbx's evaluator; empty takes skipped. Morph targets (rmodel v4, glTF): position and
+  glTF through cgltf, FBX through ufbx's evaluator; empty takes skipped. Codec (rmodel v5, `--codec acl`, the default):
+  each clip is also compressed with ACL 2.1.0 (its full source and Realtime Math's fetched by `build.sh` at pinned
+  SHA-256s, MIT; never kept here) at the same frames, the coarsest precision (0.5 to 0.01 of the tolerance, at each
+  node's skin reach as its shell distance) whose skin error matches or beats our codec's, and kept only then (the
+  report says which, with both sizes); `--codec quantized` keeps ours throughout. On the Knight: 68 of 76 clips, 545
+  KB where ours took 1658, worst 0.79 mm against 1.13; single-frame poses stay ours (exact). Morph targets (rmodel v4, glTF): position and
   normal deltas (tangent deltas left out), merged by target name over the model's meshes, defaults from mesh.weights,
   one quantised weight track a target per clip, measured at the skin (weight error times the target's reach); bounds
   grow by what the morphs reach; how far a vertex morphs weighs in the simplifier. A model with targets cooks skinned.

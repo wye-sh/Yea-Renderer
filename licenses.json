@@ -174,5 +174,27 @@
       "example/renderer_example/Assets/models/Knight.rmodel"
     ],
     "notice": "KayKit : Adventurers Character Pack (1.0), created and distributed by Kay Lousberg (www.kaylousberg.com). Dedicated to the public domain (CC0 1.0); crediting Kay Lousberg is asked for, not required."
+  },
+  {
+    "name": "Animation Compression Library (decompression)",
+    "version": "2.1.0",
+    "license": "MIT",
+    "source": "https://github.com/nfrechette/acl/tree/v2.1.0",
+    "licenseUrl": "https://github.com/nfrechette/acl/blob/v2.1.0/LICENSE",
+    "usedBy": [
+      "modules/renderer_models/acl/"
+    ],
+    "notice": "Copyright (c) 2017 Nicholas Frechette & Animation Compression Library contributors. Only its core, decompression and math headers, unmodified (core/impl/debug_track_writer.h, a compression-side file, left out)."
+  },
+  {
+    "name": "Realtime Math",
+    "version": "2.2.0",
+    "license": "MIT",
+    "source": "https://github.com/nfrechette/rtm/tree/v2.2.0",
+    "licenseUrl": "https://github.com/nfrechette/rtm/blob/v2.2.0/LICENSE",
+    "usedBy": [
+      "modules/renderer_models/rtm/"
+    ],
+    "notice": "Copyright (c) 2018 Nicholas Frechette. Its headers, unmodified."
   }
 ]
