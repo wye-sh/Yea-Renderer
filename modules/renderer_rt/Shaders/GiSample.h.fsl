@@ -62,16 +62,22 @@ float3 giProbePosition(uint i, float3 offset, float4 g0, float4 g1, float4 g2)
     return g0.xyz + float3(giCoords(i, g2)) * g1.xyz + offset;
 }
 
-// Ray k of n: spherical Fibonacci directions, turned by this frame's rotation (frame.h giRotation, three rows).
+// Ray k of n. The first GI_FIXED_RAYS go the same ways every frame (spherical Fibonacci over them, unturned): renderer_gi
+// classifies and relocates probes by them alone, so a probe's state doesn't flicker with this frame's rotation (RTXGI's
+// fixed rays), and leaves them out of the blends. The rest, spherical Fibonacci over n - GI_FIXED_RAYS, are turned by
+// this frame's rotation (frame.h giRotation, three rows) and blended.
+#define GI_FIXED_RAYS 32u
 float3 giRayDirection(uint k, uint n, float4 r0, float4 r1, float4 r2)
 {
     const float golden = 0.61803398875;
-    float  fk = float(k);
+    bool   still = k < GI_FIXED_RAYS;
+    float  fk = float(still ? k : k - GI_FIXED_RAYS);
+    float  count = float(still ? GI_FIXED_RAYS : max(n, GI_FIXED_RAYS + 1u) - GI_FIXED_RAYS);
     float  phi = 2.0 * GI_PI * frac(fk * golden);
-    float  cosTheta = 1.0 - (2.0 * fk + 1.0) / float(n);
+    float  cosTheta = 1.0 - (2.0 * fk + 1.0) / count;
     float  sinTheta = sqrt(saturate(1.0 - cosTheta * cosTheta));
     float3 d = float3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
-    return normalize(float3(dot(r0.xyz, d), dot(r1.xyz, d), dot(r2.xyz, d)));
+    return still ? d : normalize(float3(dot(r0.xyz, d), dot(r1.xyz, d), dot(r2.xyz, d)));
 }
 
 float2 giOctEncode(float3 d)

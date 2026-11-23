@@ -95,7 +95,7 @@ void CS_MAIN(SV_GroupID(uint3) gid, SV_GroupThreadID(uint3) tid, SV_GroupIndex(u
         float3 dir = giOctDecode((float2(t - 1) + 0.5) / float(INNER) * 2.0 - 1.0);
         float4 sum = float4(0.0, 0.0, 0.0, 0.0);
         float  far = gGi.params.y;
-        for (uint k = 0u; k < rays; ++k)
+        for (uint k = GI_FIXED_RAYS; k < rays; ++k) // the fixed rays classify only (giRayDirection)
         {
             float4 r = gsRay[k];
             float  c = dot(dir, gsDir[k].xyz);
@@ -157,9 +157,12 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
     float  closeBack = GI_MISS, closeFront = GI_MISS, farFront = 0.0;
     float3 closeBackDir = float3(0.0, 0.0, 0.0), closeFrontDir = float3(0.0, 0.0, 0.0), farFrontDir = float3(0.0, 0.0, 0.0);
     bool   near = false;
+    // The fixed rays alone (giRayDirection): the same every frame, so a probe beside something moving or at a threshold
+    // keeps its state and place instead of flipping with the rotation.
+    rays = min(rays, GI_FIXED_RAYS);
     for (uint k = 0u; k < rays; ++k)
     {
-        float  d = gRaysRW[i * rays + k].w;
+        float  d = gRaysRW[i * gGi.counts.y + k].w;
         float3 dir = giRayDirection(k, rays, gGi.rotation[0], gGi.rotation[1], gGi.rotation[2]);
         if (d < 0.0)
         {

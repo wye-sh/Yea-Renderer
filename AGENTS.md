@@ -339,7 +339,11 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   probe blends the rays into its tiles (hysteresis, less where the light changed a lot; none for a probe not lit yet),
   copies the borders, then CLASSIFY moves each probe out of walls and off near surfaces (at most 45% of a cell) and
   switches off those buried (over a quarter of rays hit backfaces) or with no surface within their cell (traced only
-  every 8th frame, to wake). Without rays this frame (no ray tracing, TAA off, renderer_rt off), the raster fallback
+  every 8th frame, to wake). Classification and relocation read only the first 32 rays (`GI_FIXED_RAYS`), which go
+  the same unturned ways every frame and are left out of the blends (RTXGI's fixed rays; 6.2.1): from the rotated
+  rays, a probe by something moving (the example's spinning cubes) flipped on and off and jumped frame to frame, and
+  the light on those surfaces flickered. `giRayDirection` lives in `GiSample.h.fsl`, identical in renderer,
+  renderer_gi, renderer_rt, renderer_fog and renderer_particles. Without rays this frame (no ray tracing, TAA off, renderer_rt off), the raster fallback
   captures `quality`'s 4/8/16 probes a frame in turn instead: six 16x16 faces each into one RGBA16F strip
   (`Capture.*.fsl`, both sides drawn, back faces of one-sided surfaces as negative distance; base colour and emissive
   maps, cut-outs cut), lit as renderer_rt lights its hits (the sun through renderer_gi's own sun map; up to 64 lights
