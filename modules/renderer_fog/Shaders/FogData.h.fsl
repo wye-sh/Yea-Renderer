@@ -17,7 +17,8 @@ STRUCT(FogData)
     DATA(float4, ambient, None);   // rgb the sky's mean radiance (gradient sky), w: > 0 the strength of gSkySh's instead
     DATA(float4, cascadeEnd, None);
     DATA(float4, misc, None);      // x unused, y history weight (0: none), z sun atlas texel, w local atlas texel
-    DATA(uint4, counts, None);     // x lights, y volumes, z flags (1 local lights' shadow maps)
+    DATA(uint4, counts, None);     // x lights, y volumes, z flags (1 local lights' shadow maps, 2 renderer_gi's probes)
+    DATA(float4, gi[4], None);     // frame.h giGrid (flag 2)
 };
 
 STRUCT(FogLight)

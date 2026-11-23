@@ -35,6 +35,7 @@ struct FogData
     float    cascadeEnd[4];
     float    misc[4];
     uint32_t counts[4];
+    float    gi[4][4];
 };
 struct GpuVolume
 {
@@ -57,6 +58,7 @@ DescriptorSet* gPersistent, *gSet;
 Buffer*        gCb[kMaxFrames], *gVolumeBuf[kMaxFrames];
 Buffer*        gDummyViews, *gDummySh;
 RenderTarget*  gDummyAtlas;
+Texture*       gNoGi;
 Texture*       gLight[2], *gVolume; // this frame's and last frame's light (ping-pong), the integrated volume
 uint32_t       gGrid[3], gPixels, gCur;
 bool           gReady;
@@ -168,6 +170,25 @@ void setBox(Volume& v, yea_float3 center, yea_float3 half)
 }
 
 float fract(float v) { return v - floorf(v); }
+
+// A 2 x 2 RGBA16F stand-in for renderer_gi's atlases while GI is off (one texel high gets a 1D view on Vulkan).
+Texture* makeNoGi(const char* name)
+{
+    TextureDesc d = {};
+    d.mWidth = d.mHeight = 2;
+    d.mDepth = d.mArraySize = d.mMipLevels = 1;
+    d.mSampleCount = SAMPLE_COUNT_1;
+    d.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
+    d.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+    d.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+    d.pName = name;
+    Texture*        t = nullptr;
+    TextureLoadDesc l = {};
+    l.pDesc = &d;
+    l.ppTexture = &t;
+    addResource(&l, nullptr);
+    return t;
+}
 } // namespace
 
 int load(int reloaded)
@@ -213,6 +234,7 @@ int load(int reloaded)
         t.pName = "renderer_fog_no_atlas";
         addRenderTarget(gRenderer, &t, &gDummyAtlas);
     }
+    gNoGi = makeNoGi("renderer_fog_no_gi");
     gDummyViews = makeBuffer(sizeof(RenderGpuShadowView) * 4, sizeof(RenderGpuShadowView), DESCRIPTOR_TYPE_BUFFER, "renderer_fog_no_views");
     gDummySh = makeBuffer(9 * 16, 16, DESCRIPTOR_TYPE_BUFFER, "renderer_fog_no_sh");
     for (uint32_t i = 0; i < gFrames; ++i)
@@ -225,7 +247,7 @@ int load(int reloaded)
     DescriptorSetDesc perFrame = SRT_SET_DESC(FogSrt, PerFrame, gFrames * kPasses, 0);
     addDescriptorSet(gRenderer, &perFrame, &gSet);
     waitForAllResourceLoads();
-    bool ok = gShadowCmp && gDummyAtlas && gDummyAtlas->pTexture && gDummyViews && gDummySh && gPersistent && gSet;
+    bool ok = gNoGi && gShadowCmp && gDummyAtlas && gDummyAtlas->pTexture && gDummyViews && gDummySh && gPersistent && gSet;
     for (uint32_t i = 0; i < gFrames; ++i)
         ok = ok && gCb[i] && gCb[i]->pCpuMappedAddress && gVolumeBuf[i] && gVolumeBuf[i]->pCpuMappedAddress;
     if (!ok)
@@ -263,6 +285,9 @@ void unload()
     }
     if (gDummyAtlas)
         removeRenderTarget(gRenderer, gDummyAtlas);
+    if (gNoGi)
+        removeResource(gNoGi);
+    gNoGi = nullptr;
     gDummyAtlas = nullptr;
     if (gShadowCmp)
         removeSampler(gRenderer, gShadowCmp);
@@ -484,6 +509,13 @@ void fog_run(uint64_t address)
     Cmd*     cmd = F->cmd;
     Texture* before = gLight[gCur], *now = gLight[gCur ^ 1];
     gCur ^= 1;
+    // renderer_gi's probes (set by gi_prepare, after fog_prepare): last frame's, when they hold light.
+    const bool gi = F->giProbeCount && F->giIrradiance && F->giDistance && F->giProbeData;
+    FogData*   fd = (FogData*)gCb[F->frameIndex]->pCpuMappedAddress;
+    fd->counts[2] = (fd->counts[2] & ~2u) | (gi ? 2u : 0u);
+    memcpy(fd->gi, F->giGrid, sizeof fd->gi);
+    Texture* giIrr = gi ? F->giIrradiance : gNoGi, *giDist = gi ? F->giDistance : gNoGi;
+    Buffer*  giProbes = gi ? F->giProbeData : gDummySh;
     cmdBeginDebugMarker(cmd, 0.7f, 0.7f, 0.8f, "Renderer fog");
     for (uint32_t pass = 0; pass < kPasses; ++pass)
     {
@@ -491,7 +523,7 @@ void fog_run(uint64_t address)
         Texture*       in = pass == kLight ? before : now;
         Texture*       out = pass == kLight ? now : gVolume;
         Buffer*        volumes = gVolumeBuf[F->frameIndex];
-        DescriptorData p[10] = {};
+        DescriptorData p[13] = {};
         p[0].mIndex = SRT_RES_IDX(FogSrt, PerFrame, gFog);
         p[0].ppBuffers = &gCb[F->frameIndex];
         p[1].mIndex = SRT_RES_IDX(FogSrt, PerFrame, gLights);
@@ -512,7 +544,13 @@ void fog_run(uint64_t address)
         p[8].ppTextures = &in;
         p[9].mIndex = SRT_RES_IDX(FogSrt, PerFrame, gOut);
         p[9].ppTextures = &out;
-        updateDescriptorSet(gRenderer, index, gSet, 10, p);
+        p[10].mIndex = SRT_RES_IDX(FogSrt, PerFrame, gGiIrradiance);
+        p[10].ppTextures = &giIrr;
+        p[11].mIndex = SRT_RES_IDX(FogSrt, PerFrame, gGiDistance);
+        p[11].ppTextures = &giDist;
+        p[12].mIndex = SRT_RES_IDX(FogSrt, PerFrame, gGiProbes);
+        p[12].ppBuffers = &giProbes;
+        updateDescriptorSet(gRenderer, index, gSet, 13, p);
         barrierTex(cmd, out, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
         cmdBindPipeline(cmd, gPipe[pass]);
         cmdBindDescriptorSet(cmd, 0, gPersistent);

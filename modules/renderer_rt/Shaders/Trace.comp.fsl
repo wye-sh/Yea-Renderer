@@ -59,6 +59,11 @@ STRUCT(ShadowView)
 #include "Trace.srt.h"
 #include "Shadow.h.fsl"
 #include "Cutout.h.fsl"
+#define GI_IRRADIANCE gGiIrradiance
+#define GI_DISTANCE   gGiDistance
+#define GI_PROBES     gGiProbes
+#define GI_SAMPLER    gSamplerBilinearClamp
+#include "GiSample.h.fsl"
 
 #define PI 3.14159265
 #define RT_MISS 60000.0
@@ -72,6 +77,10 @@ STRUCT(ShadowView)
 #define MAX_HIT_LIGHTS 64u
 #define MAX_SHADOW_RAYS 8u
 // Triangles only: no procedural primitives to test for. Opacity comes from the instances (Cutout.h.fsl).
+// A GI probe ray's hit: rays for at most this many lights that cast in the scene but have no map (outside the view, or
+// over the budget; unshadowed they would leak light through walls into the probes), the sun's ray aside.
+#define GI_SHADOW_RAYS 2u
+// Every instance is opaque triangles: no procedural primitives to test for (only Direct3D 12 has the flag).
 #if defined(RAY_FLAG_SKIP_AABB)
 #define RT_RAY_FLAGS RAY_FLAG_SKIP_AABB
 #else
@@ -213,8 +222,10 @@ float lightVisible(float3 P, float3 L, float tMax)
 }
 
 // The hit lit where it is: emission, the sun (shadowed by a ray), local lights (those in view nearest first, then
-// the rest; shadowed by their maps or rays, shadowMode.y) and the sky's light. rot turns the maps' filter.
-float3 shadeHit(float3 P, float3 N, float3 V, MaterialData m, float2 rot)
+// the rest; shadowed by their maps or rays, shadowMode.y, at most maxRays rays) and the light around: the sky's, or
+// where renderer_gi's probes hold it, their bounced light (diffuse). rot turns the maps' filter. probe: a GI probe
+// ray's hit, which takes no specular from the surroundings (diffuse probes; the sky's would leak indoors).
+float3 shadeHit(float3 P, float3 N, float3 V, MaterialData m, float2 rot, uint maxRays, bool probe)
 {
     float  metallic = saturate(m.params.x);
     float3 albedo = m.albedoRough.rgb;
@@ -264,7 +275,7 @@ float3 shadeHit(float3 P, float3 N, float3 V, MaterialData m, float2 rot)
             bool rayAll = gRt.shadowMode.y == SHADOWS_RAYS;
             if (!rayAll && l.params.y >= 0.0 && gRt.shadowMode.w != 0u)
                 lit *= localShadow(l, P, N, d2 * invDist, NoL, rot);
-            else if ((rayAll || l.params.w > 0.5) && rays < MAX_SHADOW_RAYS)
+            else if ((rayAll || l.params.w > 0.5) && rays < maxRays)
             {
                 lit *= lightVisible(offset, L, max(d2 * invDist - 0.05, 0.0));
                 rays += 1u;
@@ -274,8 +285,16 @@ float3 shadeHit(float3 P, float3 N, float3 V, MaterialData m, float2 rot)
     }
     float  ambient = gRt.sunColor.w;
     float3 R = reflect(-V, N);
-    float3 skySeen = gRt.sky.x > 0.5 ? skyImage(R, rough) : lerp(skyRadiance(R), skyIrradiance(R), rough);
-    color += (diffuse * skyIrradiance(N) + f0 * skySeen) * ambient;
+    float3 skySeen = probe ? float3(0.0, 0.0, 0.0) : (gRt.sky.x > 0.5 ? skyImage(R, rough) : lerp(skyRadiance(R), skyIrradiance(R), rough));
+    if (gRt.giCounts.w == 0u)
+        color += (diffuse * skyIrradiance(N) + f0 * skySeen) * ambient;
+    else
+    {
+        // The probes already hold the sky's light (scaled by ambient where their rays missed): no ambient scale.
+        float  inside;
+        float3 bounce = giIrradiance(P, N, -V, gRt.giGrid[0], gRt.giGrid[1], gRt.giGrid[2], gRt.giGrid[3], inside);
+        color += diffuse * lerp(skyIrradiance(N) * ambient, bounce, inside) + f0 * skySeen * ambient;
+    }
     return color;
 }
 
@@ -326,6 +345,24 @@ float3 applyHeightFog(float3 color, float3 O, float3 d, float t)
         L += gRt.sunColor.rgb * ((1.0 - g * g) / (4.0 * PI * q * sqrt(q)));
     }
     return color * T + gRt.fogAlbedo.rgb * L * (1.0 - T);
+}
+
+// A hit's world normal (as stored, not yet turned towards the ray) and material: top-level instance index, its
+// triangle and barycentrics.
+float3 hitNormal(uint index, uint prim, float2 bary, out(uint) material)
+{
+    uint4        inst = gRtInstances[index]; // x instance row, y first index, z first vertex
+    InstanceData row = gInstances[inst.x];
+    uint         i0 = gIndices[inst.y + prim * 3u] + inst.z;
+    uint         i1 = gIndices[inst.y + prim * 3u + 1u] + inst.z;
+    uint         i2 = gIndices[inst.y + prim * 3u + 2u] + inst.z;
+    float3       n = vertexNormal(i0) * (1.0 - bary.x - bary.y) + vertexNormal(i1) * bary.x + vertexNormal(i2) * bary.y;
+    // Object to world through the cofactor matrix (right for non-uniform scale), as the forward pass.
+    float3 c0 = cross(row.row1.xyz, row.row2.xyz);
+    float3 c1 = cross(row.row2.xyz, row.row0.xyz);
+    float3 c2 = cross(row.row0.xyz, row.row1.xyz);
+    material = row.misc.x;
+    return normalize(float3(dot(c0, n), dot(c1, n), dot(c2, n)));
 }
 
 STRUCT(Hit)
@@ -439,17 +476,8 @@ Hit traceRay(int2 p, float4 surface, float d, uint seq)
         o.result = float4(clampSample(debug ? float3(0.0, 1.0, 0.0) : screenColor), max(t, 1e-3));
         return o;
     }
-    uint4        inst = gRtInstances[index]; // x instance row, y first index, z first vertex
-    InstanceData row = gInstances[inst.x];
-    uint         i0 = gIndices[inst.y + prim * 3u] + inst.z;
-    uint         i1 = gIndices[inst.y + prim * 3u + 1u] + inst.z;
-    uint         i2 = gIndices[inst.y + prim * 3u + 2u] + inst.z;
-    float3       n = vertexNormal(i0) * (1.0 - bary.x - bary.y) + vertexNormal(i1) * bary.x + vertexNormal(i2) * bary.y;
-    // Object to world through the cofactor matrix (right for non-uniform scale), as the forward pass.
-    float3 c0 = cross(row.row1.xyz, row.row2.xyz);
-    float3 c1 = cross(row.row2.xyz, row.row0.xyz);
-    float3 c2 = cross(row.row0.xyz, row.row1.xyz);
-    float3 Nh = normalize(float3(dot(c0, n), dot(c1, n), dot(c2, n)));
+    uint   material;
+    float3 Nh = hitNormal(index, prim, bary, material);
     if (dot(Nh, R) > 0.0)
         Nh = -Nh; // the side the ray came from
     o.result = float4(0.0, 0.0, 0.0, -1.0);
@@ -457,7 +485,7 @@ Hit traceRay(int2 p, float4 surface, float d, uint seq)
     o.normal = float4(Nh, 0.0);
     o.ray = float4(R, screenWeight);
     o.screen = float4(screenColor, 0.0);
-    o.material = row.misc.x;
+    o.material = material;
     return o;
 }
 
@@ -466,7 +494,7 @@ float4 lightHit(float4 pos, float4 normal, float4 ray, float3 screen, uint mater
 {
     // The maps' filter turned per pixel and frame, as the core's (TAA averages it).
     float  phi = noise2(float2(p) + float(gRt.counts.y % 64u) * 5.588238) * 2.0 * PI;
-    float3 lit = shadeHit(pos.xyz, normal.xyz, -ray.xyz, gMaterials[material], float2(cos(phi), sin(phi)));
+    float3 lit = shadeHit(pos.xyz, normal.xyz, -ray.xyz, gMaterials[material], float2(cos(phi), sin(phi)), MAX_SHADOW_RAYS, false);
     // The fog between the reflecting surface and the hit (what the screen shows of it already holds the camera's).
     lit = applyHeightFog(lit, pos.xyz - ray.xyz * pos.w, ray.xyz, pos.w);
     float3 color = lerp(lit, screen, ray.w);
@@ -1044,6 +1072,64 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
     }
     if (hits == gRt.counts.w + 100000u) // never: at most 9 hits
         Write2D(gOutHalf, int2(0, 0), float4(0.0, 0.0, 0.0, 0.0));
+    RETURN();
+}
+#endif
+
+#if defined(GI_PASS)
+// renderer_gi's probe rays (giCounts.x probes, giCounts.y rays each; a thread a ray, probe-major): ray k of probe i from
+// the probe's place along this frame's turned spherical Fibonacci direction k, against everything that casts a shadow
+// (mask 2: lights' own emitters and markers don't, so the probes don't count a light twice). A hit is lit where it is
+// as reflections' are (emission, the sun's ray, local lights through their maps, rays for at most GI_SHADOW_RAYS lights
+// without one, the probes' own bounced light from last frame), then fogged over its distance; a hit on a back face
+// writes no light and its distance negated (the probe is inside something); a miss the sky, fogged over the fog's range,
+// and GI_MISS. Probes not traced this frame (giProbeTraced) leave their rays unwritten.
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(64, 1, 1)
+void CS_MAIN(SV_GroupID(uint3) gid, SV_GroupThreadID(uint3) tid)
+{
+    INIT_MAIN;
+    uint rays = gRt.giCounts.y;
+    uint index = (gid.y * gRt.giCounts.z + gid.x) * 64u + tid.x;
+    uint probe = index / max(rays, 1u);
+    if (probe >= gRt.giCounts.x)
+        RETURN();
+    uint   k = index - probe * rays;
+    float4 data = gGiProbes[probe];
+    if (!giProbeTraced(probe, data.w, gRt.giGrid[0]))
+        RETURN();
+    RayDesc ray;
+    ray.Origin = giProbePosition(probe, data.xyz, gRt.giGrid[0], gRt.giGrid[1], gRt.giGrid[2]);
+    ray.Direction = giRayDirection(k, rays, gRt.giRot[0], gRt.giRot[1], gRt.giRot[2]);
+    ray.TMin = 0.0;
+    ray.TMax = RT_FAR;
+    RayQueryClosestHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RT_RAY_FLAGS, ray, 2u, hit)
+    RayQueryBeginForEachCandidate(hit)
+    {
+        if (!cutAway(RayQueryCandidateInstanceID(hit), RayQueryCandidatePrimitiveIndex(hit), RayQueryCandidateBarycentrics(hit)))
+            RayQueryCommitCandidate(hit);
+        RayQueryProceed(hit);
+    }
+    RayQueryEndForEachCandidate(hit)
+    float4 result;
+    if (!RayQueryIsHit(hit))
+        result = float4(applyHeightFog(skyRadiance(ray.Direction) * gRt.sunColor.w, ray.Origin, ray.Direction, gRt.fogAlbedo.w), GI_MISS);
+    else
+    {
+        float  t = RayQueryRayT(hit);
+        uint   material;
+        float3 N = hitNormal(RayQueryInstanceID(hit), RayQueryPrimitiveIndex(hit), RayQueryBarycentrics(hit), material);
+        if (dot(N, ray.Direction) > 0.0)
+            result = float4(0.0, 0.0, 0.0, -t);
+        else
+        {
+            float3 P = ray.Origin + ray.Direction * t;
+            float  phi = float(pcgHash(index ^ (gRt.counts.y * 2654435761u)) & 0xFFFFu) * (2.0 * PI / 65536.0);
+            float3 lit = shadeHit(P, N, -ray.Direction, gMaterials[material], float2(cos(phi), sin(phi)), GI_SHADOW_RAYS, true);
+            result = float4(clampSample(applyHeightFog(lit, ray.Origin, ray.Direction, t)), t);
+        }
+    }
+    gGiRayOut[index] = result;
     RETURN();
 }
 #endif

@@ -2,6 +2,11 @@
 // range (Drobot 2017), the sun with cascaded shadows, sky ambient with multiple scattering.
 #include "Common.h.fsl"
 #include "Scene.srt.h"
+#define GI_IRRADIANCE gGiIrradiance
+#define GI_DISTANCE   gGiDistance
+#define GI_PROBES     gGiProbes
+#define GI_SAMPLER    gSamplerBilinearClamp
+#include "GiSample.h.fsl"
 #include "Lighting.h.fsl"
 #include "Material.h.fsl"
 
@@ -370,6 +375,14 @@ float4 PS_MAIN(VSOutput In)
     float3 R = reflect(-V, N);
     float  horizon = saturate(1.0 + dot(R, normalize(In.Normal) * (dot(In.Normal, V) < 0.0 ? -1.0 : 1.0)));
     float3 irradiance = skyIrradiance(N) * ambient;
+    if ((gFrame.counts.z & FLAG_GI) != 0u)
+    {
+        // Dynamic diffuse GI (renderer_gi): the probes round the pixel hold the sky as it reaches here and the light
+        // bounced off everything, ambient strength included; the sky alone outside their volume.
+        float  inside;
+        float3 gi = giIrradiance(In.WorldPos, N, -V, gFrame.gi[0], gFrame.gi[1], gFrame.gi[2], gFrame.gi[3], inside);
+        irradiance = lerp(irradiance, gi, inside);
+    }
     float  r = sqrt(sqrt(a2));
     // Ray-traced (renderer_rt): what the reflected ray hit, or the sky; fading out towards the roughness limit, where
     // the probes' prefiltered reflections take over. Where it takes over fully (smooth surfaces, a ray traced), the
@@ -488,6 +501,8 @@ float4 PS_MAIN(VSOutput In)
     }
     if ((gFrame.counts.z & FLAG_AO_DEBUG) != 0u)
         color = float3(ao, ao, ao); // shown at exposure 1
+    if ((gFrame.counts.z & FLAG_GI_DEBUG) != 0u)
+        color = irradiance * diffuseAo; // the diffuse light from the sky and bounces on a white surface
     if ((gFrame.counts.z & FLAG_CONTACT_DEBUG) != 0u)
         color = float3(contact, contact, contact);
     if ((gFrame.counts.z & FLAG_RT_DEBUG) != 0u)

@@ -34,4 +34,8 @@ STRUCT(RtData)
     DATA(uint4, probe, None);        // TEMPORARY (probe_rays): x shadow rays per pixel to measure, 0 none
     DATA(float4, fogMedium, None);   // renderer_fog's height fog (frame.h fogMedium; x 0: none)
     DATA(float4, fogAlbedo, None);   // rgb albedo, w the fog's range (m)
+    DATA(float4, giGrid[4], None);   // renderer_gi's probes (frame.h giGrid; GiSample.h.fsl)
+    DATA(float4, giRot[3], None);    // this frame's rotation of their rays (frame.h giRotation, rows)
+    DATA(uint4, giCounts, None);     // x probes (0: none), y rays a probe, z the GI pass's groups across,
+                                     // w 1 when last frame's probes can be sampled (the bounce at hits)
 };

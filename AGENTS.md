@@ -97,7 +97,7 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   top-level structure per frame in flight, its instances rewritten with `setInstances` and rebuilt every frame
   (mask 1 every drawable, 2 shadow casters). Instances are forced opaque except alpha-tested ones
   (`RenderCaster.masked`, with the frame's material maps): those are non-opaque, and every ray query (reflections,
-  their shadow rays, traced shadows) loops over their candidates, cutting them out by base colour alpha at mip 0 as
+  their shadow rays, traced shadows, GI probe rays) loops over their candidates, cutting them out by base colour alpha at mip 0 as
   the raster passes do (`Shaders/Cutout.h.fsl`; the material + 1 rides in gRtInstances' w). The core's vertex and index buffers get the device-address and
   build-input flags and a uint view when the service exists. While it runs, the prepass writes `surface`
   (RGBA16F: x reflection roughness, yzw the normal; renderer_vrs reads x as its gloss). After the prepass, one
@@ -147,6 +147,14 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   `max_roughness` (`gTiles`, flag sets double-buffered so no thread reads a flag another rewrites); the resolve skips
   the rest and writes their zeros only when the history there isn't zero already. Every GPU object is freed
   in `unload()` (device-loss recovery unloads modules); nothing GPU-side is in tables.
+  renderer_gi's probe rays (frame.h giProbeCount > 0, with reflections and traced shadows on or off; needs what
+  renderer_rt needs, TAA included, else giTraced stays 0 and renderer_gi keeps its probes): after the top-level build,
+  `Trace.comp.fsl` GI_PASS traces a thread a ray into giRayOut (GiSample.h.fsl, copied unchanged from renderer_gi:
+  origins, rotated spherical Fibonacci directions, which probes trace), against mask 2 (casters: lights' own emitters
+  and markers don't, so the probes don't count a light twice); hits lit by `shadeHit` as reflections' are but with rays
+  for at most 2 mapless lights and no specular from the surroundings, back faces 0 and their distance negated, misses
+  the sky fogged over the fog's range and GI_MISS; then giTraced = 1. Every hit's diffuse surroundings (reflections'
+  too) come from last frame's probes (giIrradiance, blended to the sky's by `inside`) once renderer_gi has blended any.
   Ray-traced shadows (`shadows`, off until measured on the user's GPU; `traced_lights`, 4): `rt_pick` takes the sun and up to `traced_lights` visible
   casting lights, area lights first (their PCSS costs most, and rays give their real shape), needing TAA and no debug
   view. After the top-level build, `Shaders/Shadows.comp.fsl`'s three full-size passes, each over every traced shadow
@@ -216,6 +224,33 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   renderer_upscale's FSR reactive and DLSS bias masks read it (the upscaling agent's). Only at one sample (no MSAA).
   The core sets frame `keepShadowMaps` (v19's fogShadowMaps) while fog or particles run. Every GPU object is freed in
   `unload()`.
+- `renderer_gi`: dynamic diffuse global illumination (on by default, `gi`): DDGI (Majercik et al. 2019, JCGT; 2021's
+  relocation and classification; as NVIDIA's RTXGI). A grid of up to 16 x 8 x 16 probes over the box `gi_volume` sets
+  (state Volume), else one fitted round the shadow casters (snapped to whole metres, kept while the scene stays within
+  it; casters over 3x the median radius and 2 m count only a metre about their centre for height, so a floor's sphere
+  doesn't stretch it), spaced evenly from the longest side. Each probe holds an 8x8 irradiance tile (6x6 inside, rgb
+  irradiance / pi, as skyIrradiance) and a 16x16 distance tile (mean and mean squared, for Chebyshev visibility), both
+  octahedral with a one-texel border, in two RGBA16F atlases (frame v22: giIrradiance, giDistance, giProbeData; xyz
+  relocation, w state 0 off, 1 on, 2 on but not lit yet, which nothing reads). `Shaders/GiSample.h.fsl` holds the grid,
+  ray directions and sampling; copied identically into renderer, renderer_rt, renderer_fog and renderer_particles, and it
+  reads only what its includer passes (the grid as four float4, the textures through GI_* macros). `gi_prepare` (core,
+  before rt_prepare) fits the grid, picks this frame's random rotation of the spherical-Fibonacci rays (64/128/256 a
+  probe by `quality`) and sets giProbeCount (0 on a new grid's first frame, which INIT clears). renderer_rt traces them
+  in `rt_run` (its paragraph above): radiance with direct light, emission and last frame's probes at each hit, so bounces
+  add up without end. `gi_run` (core, after rt_run, before the forward pass; timed "gi", `Blend.comp.fsl`): a group per
+  probe blends the rays into its tiles (hysteresis, less where the light changed a lot; none for a probe not lit yet),
+  copies the borders, then CLASSIFY moves each probe out of walls and off near surfaces (at most 45% of a cell) and
+  switches off those buried (over a quarter of rays hit backfaces) or with no surface within their cell (traced only
+  every 8th frame, to wake). Without rays this frame (no ray tracing, TAA off, renderer_rt off), the raster fallback
+  captures `quality`'s 4/8/16 probes a frame in turn instead: six 16x16 faces each into one RGBA16F strip
+  (`Capture.*.fsl`, both sides drawn, back faces of one-sided surfaces as negative distance), lit as renderer_rt lights
+  its hits (the sun through its cascades, lit outside them; up to 64 lights through their maps; last frame's probes for
+  the bounce; height fog), read back as the same rays (RASTER_RAYS), blended with at most 0.6 of history. The core
+  reads the probes for diffuse ambient in the forward pass (FLAG_GI, frame grid in FrameData gi[4]: `irradiance` lerps
+  from the sky's to `giIrradiance` by `inside`, which falls to 0 a cell outside the grid or where no probe round the
+  point holds light; show_gi shows it alone); fog's froxels and particles take `giAmbient` (mean over up and down,
+  no visibility) the same way. The probes include the ambient strength (renderer_rt's misses carry it). Not under F1's
+  view modes. Every GPU object is freed in `unload()`.
 - `renderer_post`: post-processing on the resolved (TAA or upscaled) scene-linear HDR image at display size, before
   the core's tonemapper, so it works the same with every upscaler (NVIDIA's DLSS guide and UE5 place it there).
   `post_prepare` (after the core's composite constants, before its descriptors) returns the image the tonemap pass and
@@ -300,7 +335,7 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   the out target, and leaves everything in SHADER_RESOURCE; the panel shows it with `yea::canvasImage`. The core's
   preview pipelines and buffers are made in its own `load()` (`preview_core.h`); a failure turns only the preview off.
 - The core calls the others through optional imports with a `RenderFrame*` (as `u64`): `frame.h`, copied
-  identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes`, `renderer_ssr`, `renderer_vrs`, `renderer_rt`, `renderer_upscale`, `renderer_post`, `renderer_sky`, `renderer_fog` and `renderer_particles` (`mathx.h` into the
+  identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes`, `renderer_ssr`, `renderer_vrs`, `renderer_rt`, `renderer_upscale`, `renderer_post`, `renderer_sky`, `renderer_fog`, `renderer_particles` and `renderer_gi` (`mathx.h` into the
   first three). Change all copies together and raise `RENDER_FRAME_VERSION`. Geometry (frame v16): two vertex streams, `positions`
   (float3, `RENDER_POSITION_STRIDE`) and `attributes` (`RENDER_ATTRIBUTE_STRIDE`: octahedral normal and tangent snorm16x2,
   uv0, rgba8 colour; frame.h says how to decode), and u32 `indices`. They are GPU-only, made with half again as much room
@@ -414,12 +449,15 @@ temporal. Its exports: `fog_volume_add(shape, center, half_size)` (0 box, 1 elli
 burst)`, `_motion(e, speed, spread_deg, speed_jitter, gravity, drag, turbulence)`, `_life(e, min_s, max_s)`,
 `_look(e, color_start, color_end, size_start, size_end, opacity)`, `_light(e, emissive, anisotropy, additive)`,
 `_remove`, `_clear` (particles live out their lives).
+`renderer_gi`: gi, quality (Low, Medium, High: 64/128/256 rays a probe, or 4/8/16 probes captured a frame without ray
+tracing), hysteresis, show_gi (the diffuse light alone, on white). Its export: `gi_volume(center, size)` (size 0 0 0:
+fitted round the scene again).
 `renderer_models`: emissive_nits (a model's emissive 1 at strength 1, cd/m²); per MODEL line, in the Model Viewer only: scale, up_axis (Auto, Y, Z: Z up in the file turned to Y up),
 lod_quality, cast_shadows, double_sided.
 Players of a released game tune (`player` lines): upscaler, quality_mode, dlss_model, exposure_ev (brightness), lod_error, texture_detail,
 TAA's sharpen, shadows' sun_resolution, shadow_distance, pcss and light_shadows, and enabled for AO, contact shadows, SSR,
 ray-traced reflections, ray-traced shadows and VRS, with half_resolution for AO, SSR and ray-traced reflections, probes' resolution,
-fog with its quality, and particles.
+fog with its quality, particles, and global illumination (gi) with its quality.
 Debug views and show_ knobs never. renderer_rt's `enabled` needs `raytracing` and renderer_vrs' `shadingrate` (hidden and
 false without them); each still returns from `load()` before touching its service when that is nullptr, as `load()` runs
 either way.
@@ -446,7 +484,8 @@ library keeps its licence file beside its source, since the component's reposito
 
 All scene data is in `renderer`'s tables and state: Reset empties the scene; the feature's link module
 builds it again. renderer_fog's volumes and renderer_particles' emitters are in their tables: Reset removes them too (and starts the
-particle pool empty). renderer_models' placements go with it: a game places its models again whenever `mdl::placed(h)` is
+particle pool empty). renderer_gi's volume (state) goes back to fitted, and its probes start again from dark: they fill
+within a second or two traced, a few seconds rasterized. renderer_models' placements go with it: a game places its models again whenever `mdl::placed(h)` is
 false. GPU objects and shadow caches are rebuilt on load.
 
 ## Cost
@@ -475,7 +514,12 @@ with a compare each) and one per column, plus 3 RGBA16F froxel volumes (about 33
 and one bilinear volume read per pixel in the forward and sky passes. With particles alive: emit and simulate
 dispatches over the pool (one thread a slot), the sort (log² passes, only while blended particles live), and one
 draw of 6 vertices a listed particle (their overdraw is the main cost); 72 bytes a pool slot (2.4 MB at 32768) and an
-R8 render-size mask. The Model Viewer's preview costs
+R8 render-size mask. With global illumination: probe rays (16 x 8 x 16 = 2048 probes at most, 128 rays each on Medium,
+262 k rays traced in renderer_rt's pass, shaded with shadow maps and a sun ray; the probes switched off trace every 8th
+frame), two blend dispatches (a group per probe, each texel over every ray), a classify dispatch, 2 atlases (128 x 64
+and 256 x 128 tiles: about 0.5 MB) and 4 MB of rays; in the forward pass 8 probes a pixel (two bilinear reads each).
+Without ray tracing instead: 6 x 16² faces for each of 4/8/16 probes a frame (the casters drawn into each face they
+reach, culled on the CPU) and one ray-gathering dispatch. The Model Viewer's preview costs
 nothing unless its panel is open and showing a model: then, per frame, one 1024² shadow map pass and one 4-sample pass of
 that model at twice the canvas size, and a resolve (about 6 MB of targets at a 520 × 320 canvas). Texture maps: their mips
 in GPU memory (BC7/BC5, 1 byte a texel; a 2048² map about 5.6 MB with mips), read from file while loading (24 MB a

@@ -9,6 +9,11 @@
 //   camera to the far side of each slice.
 #include "FogData.h.fsl"
 #include "Fog.srt.h"
+#define GI_IRRADIANCE gGiIrradiance
+#define GI_DISTANCE   gGiDistance
+#define GI_PROBES     gGiProbes
+#define GI_SAMPLER    gSamplerBilinearClamp
+#include "GiSample.h.fsl"
 
 #define FOG_PI 3.14159265
 
@@ -177,6 +182,13 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id, SV_GroupID(uint3) gid, SV_GroupIndex
         float  g = gFog.height.w;
         // The sky's light from all round (any phase integrates to 1).
         float3 Lin = gFog.ambient.w > 0.0 ? max(gSkySh[0].rgb, float3(0.0, 0.0, 0.0)) * (0.282095 * gFog.ambient.w) : gFog.ambient.rgb;
+        if ((gFog.counts.z & 2u) != 0u)
+        {
+            // renderer_gi's probes: the sky as it reaches here and the light bounced off everything round (last frame's).
+            float  inside;
+            float3 gi = giAmbient(P, gFog.gi[0], gFog.gi[1], gFog.gi[2], gFog.gi[3], inside);
+            Lin = lerp(Lin, gi, inside);
+        }
         if (gFog.sunDir.w > 0.0)
             Lin += gFog.sunColor.rgb * (sunVisibility(P, viewZ) * phaseHG(dot(V, gFog.sunDir.xyz), g));
         bool maps = (gFog.counts.z & 1u) != 0u;

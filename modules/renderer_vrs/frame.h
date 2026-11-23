@@ -1,5 +1,5 @@
 // The frame contract between the renderer modules: renderer (the core) fills a RenderFrame each
-// frame and passes its address (as u64) to the other renderer modules (culling, shadows, taa, ao, contact, probes, ssr, vrs, rt, upscale, sky, fog, particles, post). The same
+// frame and passes its address (as u64) to the other renderer modules (culling, shadows, taa, ao, contact, probes, ssr, vrs, rt, upscale, sky, fog, particles, gi, post). The same
 // file sits in each of them; keep the copies identical and raise RENDER_FRAME_VERSION on any change.
 #pragma once
 #include <stdint.h>
@@ -10,7 +10,7 @@ struct Buffer;
 struct RenderTarget;
 struct Texture;
 
-#define RENDER_FRAME_VERSION 21u
+#define RENDER_FRAME_VERSION 22u
 #define RENDER_RT_MAX_TRACED 8u
 #define RENDER_MAX_CASCADES  4u
 #define RENDER_MAX_TEXTURES  1024u // texture maps the shaders' array holds (the core's Texture table)
@@ -332,5 +332,22 @@ struct RenderFrame
     Buffer*         materialMaps;
     Texture* const* textures;
     uint32_t        textureVersion;
+    // Dynamic diffuse GI (renderer_gi, frame v22; renderer_gi's Shaders/GiSample.h.fsl, copied identically into each
+    // module that reads or traces the probes, says how). gi_prepare runs before rt_prepare and sets everything here, or
+    // leaves giProbeCount 0 (no GI); renderer_rt's rt_run traces the rays right after its top-level build and sets
+    // giTraced; gi_run (after rt_run, before the forward pass) blends them into the probes, or, when nothing traced them
+    // (no ray tracing), captures a few probes a frame by rasterizing.
+    float    giGrid[4][4];      // GiSample.h.fsl: g0 origin and frame bits, g1 spacing and probes, g2 counts and rays, g3 atlas texels
+    float    giRotation[3][4];  // this frame's ray rotation (rows): ray k of n is giRayDirection(k, n, rows)
+    uint32_t giProbeCount, giRaysPerProbe;
+    Buffer*  giProbeData;       // float4 per probe (xyz relocation offset, w state: 0 off, 1 on, 2 on but not lit yet), SHADER_RESOURCE
+                                // outside gi_run
+    Buffer*  giRayOut;          // float4 per ray, probe-major (rgb radiance, a distance: negative a backface, 1e27 a miss), 16-byte
+                                // stride, SHADER_RESOURCE between passes; rays of probes not traced this frame are left unwritten
+    Texture* giIrradiance;      // RGBA16F octahedral tiles, SHADER_RESOURCE outside gi_run: rgb irradiance / pi; last frame's in rt_run
+                                // (nullptr: none yet)
+    Texture* giDistance;        // RGBA16F octahedral tiles: xy mean distance and its square
+    uint32_t giTraced;          // set by rt_run: this frame's rays are in giRayOut
+    uint32_t giDebug;           // show only the bounced light (the core)
 };
 #define RENDER_RT_MISS 60000.0f

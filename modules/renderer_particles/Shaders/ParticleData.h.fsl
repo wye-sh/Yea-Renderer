@@ -16,8 +16,9 @@ STRUCT(PartFrame)
     DATA(float4, texel, None);      // x sun atlas texel, y local atlas texel, z bins per metre, w frame number
     DATA(float4, fog, None);        // frame.h fogParams (x 0: no fog)
     DATA(float4, fog2, None);       // xy frame.h fogUv
-    DATA(uint4, counts, None);      // x lights, y bins, z flags (1 local lights' maps, 2 z-bins), w the pool's size
+    DATA(uint4, counts, None);      // x lights, y bins, z flags (1 local lights' maps, 2 z-bins, 4 renderer_gi's probes), w the pool's size
     DATA(uint4, spawn, None);       // x particles to emit this frame, y emitters in gSpawn, z the sort's size (power of 2), w seed
+    DATA(float4, gi[4], None);      // frame.h giGrid (flag 4)
 };
 
 // A particle in the pool.

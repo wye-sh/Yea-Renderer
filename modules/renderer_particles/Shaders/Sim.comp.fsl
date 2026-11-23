@@ -9,6 +9,11 @@
 //   group in shared memory, the strides past it a pass each.
 #include "ParticleData.h.fsl"
 #include "Particles.srt.h"
+#define GI_IRRADIANCE gGiIrradiance
+#define GI_DISTANCE   gGiDistance
+#define GI_PROBES     gGiProbes
+#define GI_SAMPLER    gSamplerBilinearClamp
+#include "GiSample.h.fsl"
 
 uint hashU(uint x)
 {
@@ -241,6 +246,13 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
     float3 V = normalize(P - gFrame.camPos.xyz);
     float  g = e.size.z;
     float3 L = gFrame.ambient.w > 0.0 ? max(gSkySh[0].rgb, float3(0.0, 0.0, 0.0)) * (0.282095 * gFrame.ambient.w) : gFrame.ambient.rgb;
+    if ((gFrame.counts.z & 4u) != 0u)
+    {
+        // renderer_gi's probes: the sky as it reaches here and the light bounced off everything round (last frame's).
+        float  inside;
+        float3 gi = giAmbient(P, gFrame.gi[0], gFrame.gi[1], gFrame.gi[2], gFrame.gi[3], inside);
+        L = lerp(L, gi, inside);
+    }
     if (gFrame.sunDir.w > 0.0)
         L += gFrame.sunColor.rgb * (sunVisibility(P, c.z) * phase4(dot(V, gFrame.sunDir.xyz), g));
     bool maps = (gFrame.counts.z & 1u) != 0u;

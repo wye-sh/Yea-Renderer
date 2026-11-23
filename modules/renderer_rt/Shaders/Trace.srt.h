@@ -39,5 +39,9 @@ BEGIN_SRT(RtSrt)
         DECL_BUFFER(PerFrame, Buffer(float4), gSkySh)            // and its ambient (9 SH)
         DECL_BUFFER(PerFrame, Buffer(MaterialMapData), gMaterialMaps) // cut-outs (Cutout.h.fsl): the core's material maps
         DECL_ARRAY_TEXTURES(PerFrame, Tex2D(float4), gTextures, MAX_TEXTURES) // and its texture maps (bound when they change)
+        DECL_BUFFER(PerFrame, Buffer(float4), gGiProbes)         // renderer_gi (giCounts.x): its probes' offsets and states
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gGiIrradiance)     // last frame's probes (giCounts.w): irradiance / pi
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gGiDistance)       // and their distances
+        DECL_RWBUFFER(PerFrame, RWBuffer(float4), gGiRayOut)     // the GI pass: each probe ray's radiance and distance
     END_SRT_SET(PerFrame)
 END_SRT(RtSrt)

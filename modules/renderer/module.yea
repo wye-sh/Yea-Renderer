@@ -239,6 +239,8 @@ import renderer_particles bool particles_prepare(u64 frame) = false
 import renderer_particles void particles_run(u64 frame)
 import renderer_particles void particles_draw(u64 frame)
 import renderer_post void post_run(u64 frame)
+import renderer_gi bool gi_prepare(u64 frame) = false
+import renderer_gi void gi_run(u64 frame)
 
 category Exposure
 setting float exposure_ev 0

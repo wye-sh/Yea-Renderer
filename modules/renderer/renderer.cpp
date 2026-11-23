@@ -68,6 +68,7 @@ struct GpuFrame
     float    fogMedium[4]; // frame.h's (x 0: no height fog)
     float    fogAlbedo[4];
     float    textures[4];    // x texture mip bias
+    float    gi[4][4];       // frame.h giGrid (FLAG_GI)
     float    taps[32][4]; // xy: the shadow filters' Vogel disk, unturned
 };
 // A material's texture maps (Shaders/Common.h.fsl MaterialMapData).
@@ -101,7 +102,8 @@ struct ExposureData
 const uint32_t kFlagCulled = 1, kFlagHeatmap = 2, kFlagCascades = 4, kFlagShadows = 8, kFlagAo = 16, kFlagAoDebug = 32, kFlagContact = 64,
                kFlagContactDebug = 128, kFlagUnlit = 256, kFlagSsr = 512, kFlagSsrDebug = 1024,
                kFlagReceiverPlane = 2048, kFlagRt = 4096, kFlagRtDebug = 8192, kFlagRtShadows = 16384,
-               kFlagRtSun = 32768, kFlagArea = 65536, kFlagSky = 131072, kFlagFog = 262144;
+               kFlagRtSun = 32768, kFlagArea = 65536, kFlagSky = 131072, kFlagFog = 262144,
+               kFlagGi = 524288, kFlagGiDebug = 1048576;
 const uint32_t kMaxFrames = 4;
 const uint32_t kMaxUnculledLights = 256;
 const uint32_t kHistogramBins = 128;
@@ -1017,8 +1019,8 @@ void barrierBuf(Cmd* cmd, Buffer* buf, ResourceState from, ResourceState to)
 // (that frame's fence has passed by then, so nothing waits), averaged and logged every 10 s.
 namespace
 {
-enum Timing : uint32_t { kTimeSky, kTimeShadows, kTimeProbes, kTimePrepass, kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeVrs, kTimeRt, kTimeFog, kTimeParticles, kTimeForward, kTimeParticlesDraw, kTimeExposure, kTimeTaa, kTimeUpscale, kTimePost, kTimeTonemap, kTimeComposite, kTimeTotal, kTimings };
-const char* const kTimingNames[kTimings] = { "sky", "shadows", "probes", "prepass", "culling", "ao", "contact", "ssr", "vrs", "rt", "fog", "particles", "forward+sky", "particles-draw", "exposure", "taa", "upscale", "post", "tonemap", "composite", "total" };
+enum Timing : uint32_t { kTimeSky, kTimeShadows, kTimeProbes, kTimePrepass, kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeVrs, kTimeRt, kTimeGi, kTimeFog, kTimeParticles, kTimeForward, kTimeParticlesDraw, kTimeExposure, kTimeTaa, kTimeUpscale, kTimePost, kTimeTonemap, kTimeComposite, kTimeTotal, kTimings };
+const char* const kTimingNames[kTimings] = { "sky", "shadows", "probes", "prepass", "culling", "ao", "contact", "ssr", "vrs", "rt", "gi", "fog", "particles", "forward+sky", "particles-draw", "exposure", "taa", "upscale", "post", "tonemap", "composite", "total" };
 QueryPool*        gTimePool[kMaxFrames];
 uint32_t          gTimeUsed[kMaxFrames]; // bits: what that frame recorded
 double            gTimeTicks;            // per second
@@ -1998,6 +2000,10 @@ void draw(uint32_t pass, const YeaFrame* yf)
     bool probes = renderer_probes::probes_prepare((uint64_t)(uintptr_t)&F) && F.probes && F.probeData && F.probeCount;
     // Ray-traced reflections where the GPU has ray queries; screen-space ones otherwise.
     F.surface = gSurface;
+    // Dynamic diffuse GI (renderer_gi): its probes and this frame's rays, before rt_prepare (renderer_rt traces them).
+    const bool giOn = !viewMode && renderer_gi::gi_prepare((uint64_t)(uintptr_t)&F);
+    // The forward pass reads the probes once they have light (the same images gi_run blends into later this frame).
+    const bool gi = giOn && F.giIrradiance && F.giDistance && F.giProbeData;
     // renderer_rt runs (its prepass target, rt_run) for its reflections, its traced shadows or both.
     const bool rtRun = rtGate && renderer_rt::rt_prepare((uint64_t)(uintptr_t)&F);
     bool       rt = rtRun && F.rtReflection;
@@ -2139,7 +2145,8 @@ void draw(uint32_t pass, const YeaFrame* yf)
                     (contact && F.contactDebug ? kFlagContactDebug : 0) |
                     ((viewMode & YEA_VIEW_WIREFRAME) ? kFlagUnlit : 0) | (ssr ? kFlagSsr : 0) | (ssr && F.ssrDebug ? kFlagSsrDebug : 0) |
                     (shadows && F.receiverPlane ? kFlagReceiverPlane : 0) | (rt ? kFlagRt : 0) | (rt && F.rtDebug ? kFlagRtDebug : 0) |
-                    (rtShadows ? kFlagRtShadows : 0) | (rtShadows && F.rtSunShadows ? kFlagRtSun : 0) | (anyShape ? kFlagArea : 0) | (sky ? kFlagSky : 0) | (fog ? kFlagFog : 0);
+                    (rtShadows ? kFlagRtShadows : 0) | (rtShadows && F.rtSunShadows ? kFlagRtSun : 0) | (anyShape ? kFlagArea : 0) | (sky ? kFlagSky : 0) | (fog ? kFlagFog : 0) |
+                    (gi ? kFlagGi : 0) | (gi && F.giDebug ? kFlagGiDebug : 0);
     if (ssr)
     {
         gf->ssr[0] = F.ssrMaxRoughness;
@@ -2203,6 +2210,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     }
     gf->misc[1] = settings.specular_aa;
     gf->textures[0] = F.mipBias;
+    memcpy(gf->gi, F.giGrid, sizeof gf->gi);
     gf->misc[2] = settings.sun_disk > 0 ? cosf(settings.sun_disk * 0.5f * 3.14159265f / 180.0f) : 1.0f;
     if (shadows)
     {
@@ -2311,7 +2319,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         Buffer*  masks = culled ? F.tileMasks : gDummyU32;
         Buffer*  bins = culled ? F.zbins : gDummyU32;
         Buffer*  views = shadows ? F.shadowViews : gDummyViews;
-        DescriptorData p[28] = {};
+        DescriptorData p[31] = {};
         Texture*       ssrDepth = ssr ? F.ssrDepth : gDummyDepth->pTexture;
         Texture*       previous = ssr ? F.previous->pTexture : gDummyColor->pTexture;
         Texture*       probeTex = probes ? F.probes->pTexture : gDummyArray->pTexture;
@@ -2380,14 +2388,23 @@ void draw(uint32_t pass, const YeaFrame* yf)
         p[26].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gMaterialMaps);
         p[26].ppBuffers = &gMaterialMapBuf[fi];
         // The texture array only when a slot changed since this frame's set last had it (1024 descriptors).
-        uint32_t bindings = 27;
+        Texture* giIrr = gi ? F.giIrradiance : gDummyColor->pTexture;
+        Texture* giDist = gi ? F.giDistance : gDummyColor->pTexture;
+        Buffer*  giProbes = gi ? F.giProbeData : gDummySh;
+        p[27].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gGiIrradiance);
+        p[27].ppTextures = &giIrr;
+        p[28].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gGiDistance);
+        p[28].ppTextures = &giDist;
+        p[29].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gGiProbes);
+        p[29].ppBuffers = &giProbes;
+        uint32_t bindings = 30;
         if (gTexturesBound[fi] != F.textureVersion)
         {
-            p[27].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gTextures);
-            p[27].ppTextures = (Texture**)F.textures;
-            p[27].mCount = RENDER_MAX_TEXTURES;
+            p[30].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gTextures);
+            p[30].ppTextures = (Texture**)F.textures;
+            p[30].mCount = RENDER_MAX_TEXTURES;
             gTexturesBound[fi] = F.textureVersion;
-            bindings = 28;
+            bindings = 31;
         }
         updateDescriptorSet(gRenderer, fi, gSceneFrame, bindings, p);
 
@@ -2496,7 +2513,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     // remade them); a variant warming hasn't reached yet never compiles on a frame that draws: the full forward shader
     // gives way to the lean one, and cut-outs wait (both for a frame or a few after load, before warming gets there).
     RenderTarget* second = rtRun ? gSurface : vrs && gGloss && gDepthGlossPipe[0] && gDepthGlossPipe[1] ? gGloss : nullptr;
-    bool full = (gf->counts[2] & (kFlagHeatmap | kFlagCascades | kFlagAoDebug | kFlagContactDebug | kFlagSsrDebug | kFlagRtDebug)) || (shadows && F.lightSize > 0);
+    bool full = (gf->counts[2] & (kFlagHeatmap | kFlagCascades | kFlagAoDebug | kFlagContactDebug | kFlagSsrDebug | kFlagRtDebug | kFlagGiDebug)) || (shadows && F.lightSize > 0);
     uint32_t forward = viewMode ? kForwardDepth : full ? kForwardFull : kForwardLean;
     if (forward == kForwardFull && (!gForwardFullPipe[0] || !gForwardFullPipe[1]) && gForwardPipe[0] && gForwardPipe[1])
         forward = kForwardLean;
@@ -2588,6 +2605,15 @@ void draw(uint32_t pass, const YeaFrame* yf)
             timeEnd(cmd, fi, which[k]);
         }
         barrierRt(cmd, gDepth, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_DEPTH_WRITE);
+    }
+    // renderer_gi blends what rt_run traced into its probes (or, without ray tracing, captures a few), for the forward
+    // pass to read.
+    if (giOn)
+    {
+        if (timed)
+            timeBegin(cmd, fi, kTimeGi);
+        renderer_gi::gi_run((uint64_t)(uintptr_t)&F);
+        timeEnd(cmd, fi, kTimeGi);
     }
 
     if (timed)

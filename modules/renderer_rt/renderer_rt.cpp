@@ -43,6 +43,8 @@ struct RtData
     float    sky[4]; // x 1: renderer_sky's physical sky, y its image's mips
     uint32_t probe[4]; // TEMPORARY (probe_rays)
     float    fogMedium[4], fogAlbedo[4]; // frame.h's height fog
+    float    giGrid[4][4], giRot[3][4];  // renderer_gi's probes and their rays' rotation
+    uint32_t giCounts[4];                // probes, rays a probe, groups across, 1: last frame's probes to sample
 };
 
 // Shaders/ShadowData.h.fsl
@@ -74,7 +76,7 @@ Queue*               gQueue;
 uint32_t             gFrames;
 const YeaRaytracing* gService;
 Raytracing*          gRay;
-enum { kTrace, kReconstruct, kResolve, kProbe, kFilter, kShaders };
+enum { kTrace, kReconstruct, kResolve, kProbe, kFilter, kGi, kShaders };
 Shader*              gShader[kShaders];
 Pipeline*            gPipe[kShaders];
 DescriptorSet*       gSet; // four per frame in flight: the trace, the reconstruction, the resolve and the filter
@@ -104,6 +106,10 @@ bool                 gReady;
 Sampler*             gShadowCmp, *gSkySampler;
 Texture*             gNoSky;   // 2 x 2 stand-in for renderer_sky's image
 Buffer*              gNoSkySh; // and its SH
+// renderer_gi's probe rays (frame.h giProbeCount): traced in rt_run right after the top-level build.
+DescriptorSet*       gGiSet;     // one per frame in flight: the trace set's bindings
+Buffer*              gNoGiRays;  // a writable stand-in for giRayOut while there are no probes
+uint64_t             gGiFrame;   // the frame rt_prepare took the probes for
 RenderTarget*        gDummyAtlas;  // as the core's gDummyDepth: a depth render target, 2 x 2
 DescriptorSet*       gPersistent;  // the sampler's set
 Buffer*              gDummyViews;
@@ -116,8 +122,8 @@ enum { kShadowTrace, kShadowTemporal, kShadowFilter, kShadowShaders };
 Shader*        gShShader[kShadowShaders];
 Pipeline*      gShPipe[kShadowShaders];
 DescriptorSet* gShSet; // three per frame in flight, a pass each
-// The textureVersion each set's texture maps hold (cut-outs; 0: none yet): gSet's, then gShSet's.
-uint32_t       gTexBound[kMaxFrames * 7];
+// The textureVersion each set's texture maps hold (cut-outs; 0: none yet): gSet's, gShSet's, then gGiSet's.
+uint32_t       gTexBound[kMaxFrames * 8];
 Buffer*        gShCb[kMaxFrames];
 Buffer*        gNoShapes; // bound while the core has no shape buffer (every light kind 0)
 // All SHADER_RESOURCE between frames.
@@ -412,7 +418,7 @@ int load(int reloaded)
     gInstCpu = new uint32_t[kMaxInstances * 4];
     gDescCapacity = kMaxInstances;
     const char* names[kShaders] = { "renderer_rt_trace.comp", "renderer_rt_reconstruct.comp", "renderer_rt_resolve.comp", "renderer_rt_probe.comp",
-                                    "renderer_rt_filter.comp" };
+                                    "renderer_rt_filter.comp", "renderer_rt_gi.comp" };
     for (uint32_t k = 0; k < kShaders; ++k)
     {
         ShaderLoadDesc sd = {};
@@ -474,6 +480,19 @@ int load(int reloaded)
     }
     gNoSkySh = makeMapped(9 * 16, 16, DESCRIPTOR_TYPE_BUFFER, "renderer_rt_no_sky_sh");
     {
+        BufferLoadDesc b = {};
+        b.mDesc.mDescriptors = DESCRIPTOR_TYPE_RW_BUFFER;
+        b.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+        b.mDesc.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+        b.mDesc.mSize = 16;
+        b.mDesc.mStructStride = 16;
+        b.mDesc.mElementCount = 1;
+        b.mDesc.pName = "renderer_rt_no_gi_rays";
+        b.ppBuffer = &gNoGiRays;
+        addResource(&b, nullptr);
+        waitForAllResourceLoads();
+    }
+    {
         // Made as the core makes its stand-in depth: on Direct3D 12 a depth format reads as a texture only through
         // a render target (typeless, with a depth view), and one texel high gets a 1D view on Vulkan.
         RenderTargetDesc t = {};
@@ -489,7 +508,7 @@ int load(int reloaded)
     gDummyViews = makeMapped(sizeof(RenderGpuShadowView) * 4, sizeof(RenderGpuShadowView), DESCRIPTOR_TYPE_BUFFER, "renderer_rt_no_views");
     DescriptorSetDesc persistent = SRT_SET_DESC(RtSrt, Persistent, 1, 0);
     addDescriptorSet(gRenderer, &persistent, &gPersistent);
-    if (!gShadowCmp || !gSkySampler || !gNoSky || !gNoSkySh || !gDummyAtlas || !gDummyAtlas->pTexture || !gDummyViews || !gPersistent)
+    if (!gShadowCmp || !gSkySampler || !gNoSky || !gNoSkySh || !gNoGiRays || !gDummyAtlas || !gDummyAtlas->pTexture || !gDummyViews || !gPersistent)
     {
         unload();
         return 1;
@@ -504,6 +523,8 @@ int load(int reloaded)
     }
     DescriptorSetDesc setDesc = SRT_SET_DESC(RtSrt, PerFrame, gFrames * 4, 0);
     addDescriptorSet(gRenderer, &setDesc, &gSet);
+    DescriptorSetDesc giDesc = SRT_SET_DESC(RtSrt, PerFrame, gFrames, 0);
+    addDescriptorSet(gRenderer, &giDesc, &gGiSet);
     for (uint32_t i = 0; i < gFrames; ++i)
         gCb[i] = makeMapped(sizeof(RtData) < 256 ? 256 : (sizeof(RtData) + 255) / 256 * 256, 0, DESCRIPTOR_TYPE_UNIFORM_BUFFER, "renderer_rt_cb");
     DescriptorSetDesc shadowSet = SRT_SET_DESC(ShadowSrt, PerFrame, gFrames * 3, 0);
@@ -514,7 +535,7 @@ int load(int reloaded)
     gNoShapes = makeMapped(sizeof(RenderGpuLightShape) * 4, sizeof(RenderGpuLightShape), DESCRIPTOR_TYPE_BUFFER, "renderer_rt_no_shapes");
     if (gNoShapes)
         memset(gNoShapes->pCpuMappedAddress, 0, sizeof(RenderGpuLightShape) * 4);
-    gReady = gSet != nullptr && gShSet != nullptr && gNoShapes != nullptr;
+    gReady = gSet != nullptr && gGiSet != nullptr && gShSet != nullptr && gNoShapes != nullptr;
     yea::log(gReady ? "renderer_rt: ray-traced reflections on" : "renderer_rt: the trace pipeline failed");
     return gReady ? 0 : 1;
 }
@@ -561,6 +582,12 @@ void unload()
     }
     if (gSet)
         removeDescriptorSet(gRenderer, gSet);
+    if (gGiSet)
+        removeDescriptorSet(gRenderer, gGiSet);
+    gGiSet = nullptr;
+    if (gNoGiRays)
+        removeResource(gNoGiRays);
+    gNoGiRays = nullptr;
     if (gShadowCmp)
         removeSampler(gRenderer, gShadowCmp);
     if (gSkySampler)
@@ -650,11 +677,19 @@ bool rt_pick(uint64_t address)
     return gPickCount > 0;
 }
 
+// The GI pass's groups (64 rays each) for `rays` in all, across: within a dispatch's limit (the rest go down).
+uint32_t giAcross(uint32_t rays)
+{
+    uint32_t groups = (rays + 63) / 64;
+    return groups <= 65535 ? groups : 4096;
+}
+
 bool rt_prepare(uint64_t address)
 {
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
     bool shadows = gPickCount && F && gPickFrame == F->frameNumber;
-    if (!gReady || (!settings.enabled && !shadows) || !F || F->version != RENDER_FRAME_VERSION || !F->width || !F->height || !F->taaOn)
+    bool gi = F && F->version == RENDER_FRAME_VERSION && F->giProbeCount && F->giRaysPerProbe && F->giProbeData && F->giRayOut;
+    if (!gReady || (!settings.enabled && !shadows && !gi) || !F || F->version != RENDER_FRAME_VERSION || !F->width || !F->height || !F->taaOn)
         return false;
     if (yea::viewMode() || !F->surface || !F->previous || !F->drawableCount || !F->positions || !F->attributes || !F->indices || !F->instances ||
         !F->materials || !F->lightBuffer || !F->exposure || !F->motion || F->frameIndex >= kMaxFrames)
@@ -752,6 +787,14 @@ bool rt_prepare(uint64_t address)
     d.denoise[0] = 1.0f;
     d.denoise[1] = 1.5f;
     d.denoise[2] = settings.full_below < 0 ? 0.0f : settings.full_below;
+    // renderer_gi's probes: their rays (gi), and last frame's probes for the light bounced at every hit.
+    memcpy(d.giGrid, F->giGrid, sizeof d.giGrid);
+    memcpy(d.giRot, F->giRotation, sizeof d.giRot);
+    d.giCounts[0] = gi ? F->giProbeCount : 0;
+    d.giCounts[1] = F->giRaysPerProbe;
+    d.giCounts[2] = giAcross(gi ? F->giProbeCount * F->giRaysPerProbe : 0);
+    d.giCounts[3] = F->giIrradiance && F->giDistance && F->giProbeData ? 1 : 0;
+    gGiFrame = gi ? F->frameNumber : 0;
     memcpy(gCb[F->frameIndex]->pCpuMappedAddress, &d, sizeof d);
 
     F->rtReflection = settings.enabled ? gTex : nullptr; // the filter writes it after the resolve; none: shadows only
@@ -995,11 +1038,6 @@ void rt_run(uint64_t address)
     ((RtData*)gCb[fi]->pCpuMappedAddress)->counts[0] = F->allLightCount;
     if (gPickCount && gPickFrame == F->frameNumber && F->rtShadows == gRtShadows)
         traceShadows(F, cmd, fi);
-    if (!F->rtReflection)
-    {
-        cmdEndDebugMarker(cmd);
-        return;
-    }
 
     Buffer*        instances = F->instances;
     Buffer*        materials = F->materials;
@@ -1013,7 +1051,20 @@ void rt_run(uint64_t address)
     bool           maps = F->localAtlas && F->localAtlas->pTexture && F->shadowViews;
     Texture*       atlas = maps ? F->localAtlas->pTexture : gDummyAtlas->pTexture;
     Buffer*        views = maps ? F->shadowViews : gDummyViews;
-    DescriptorData p[28] = {};
+    DescriptorData p[32] = {};
+    bool           gi = gGiFrame == F->frameNumber && F->giProbeCount && F->giProbeData && F->giRayOut;
+    Buffer*        giProbes = F->giProbeData ? F->giProbeData : gNoSkySh;
+    Texture*       giIrr = F->giIrradiance && F->giDistance ? F->giIrradiance : gNoSky;
+    Texture*       giDist = F->giIrradiance && F->giDistance ? F->giDistance : gNoSky;
+    Buffer*        giRays = gi ? F->giRayOut : gNoGiRays;
+    p[28].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gGiProbes);
+    p[28].ppBuffers = &giProbes;
+    p[29].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gGiIrradiance);
+    p[29].ppTextures = &giIrr;
+    p[30].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gGiDistance);
+    p[30].ppTextures = &giDist;
+    p[31].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gGiRayOut);
+    p[31].ppBuffers = &giRays;
     Texture*       skyEnv = F->skyEnv && F->skySh ? F->skyEnv : gNoSky;
     Buffer*        skySh = F->skyEnv && F->skySh ? F->skySh : gNoSkySh;
     p[26].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gSkyEnv);
@@ -1074,19 +1125,40 @@ void rt_run(uint64_t address)
     p[12].ppTextures = &gAccum[w ^ 1];
     p[13].ppTextures = &gAccum[w ^ 1];
     p[24].ppTextures = &gAccum[w ^ 1];
-    updateDescriptorSet(gRenderer, fi * 4, gSet, 28, p);
+    if (gi)
+    {
+        // renderer_gi's probe rays (a thread each; renderer_gi reads them in gi_run, after this).
+        updateDescriptorSet(gRenderer, fi, gGiSet, 32, p);
+        bindCutouts(F, gGiSet, fi, kMaxFrames * 7 + fi, SRT_RES_IDX(RtSrt, PerFrame, gMaterialMaps), SRT_RES_IDX(RtSrt, PerFrame, gTextures));
+        uint32_t       groups = (F->giProbeCount * F->giRaysPerProbe + 63) / 64, across = giAcross(F->giProbeCount * F->giRaysPerProbe);
+        BufferBarrier  rb = { F->giRayOut, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS };
+        cmdResourceBarrier(cmd, 1, &rb, 0, nullptr, 0, nullptr);
+        cmdBindPipeline(cmd, gPipe[kGi]);
+        cmdBindDescriptorSet(cmd, 0, gPersistent);
+        cmdBindDescriptorSet(cmd, fi, gGiSet);
+        cmdDispatch(cmd, across, (groups + across - 1) / across, 1);
+        rb = { F->giRayOut, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE };
+        cmdResourceBarrier(cmd, 1, &rb, 0, nullptr, 0, nullptr);
+        F->giTraced = 1;
+    }
+    if (!F->rtReflection)
+    {
+        cmdEndDebugMarker(cmd);
+        return;
+    }
+    updateDescriptorSet(gRenderer, fi * 4, gSet, 32, p);
     p[12].ppTextures = &gHalf;
     p[24].ppTextures = &gHalfRay;
-    updateDescriptorSet(gRenderer, fi * 4 + 1, gSet, 28, p);
+    updateDescriptorSet(gRenderer, fi * 4 + 1, gSet, 32, p);
     p[13].ppTextures = &gTex;
-    updateDescriptorSet(gRenderer, fi * 4 + 2, gSet, 28, p);
+    updateDescriptorSet(gRenderer, fi * 4 + 2, gSet, 32, p);
     // The filter reads this frame's accumulation and writes the trace texture, free by then, as rtReflection.
     p[13].ppTextures = &gAccum[w ^ 1];
     p[15].ppTextures = &gAccum[w];
     p[16].ppTextures = &gAccumZ[w];
     p[20].ppTextures = &gTex;
     p[21].ppTextures = &gAccumZ[w ^ 1];
-    updateDescriptorSet(gRenderer, fi * 4 + 3, gSet, 28, p);
+    updateDescriptorSet(gRenderer, fi * 4 + 3, gSet, 32, p);
     // Cut-outs, for the passes that trace: the trace (and the probe pass, on its set) and the reconstruction.
     for (uint32_t k = 0; k < 2; ++k)
         bindCutouts(F, gSet, fi * 4 + k, fi * 4 + k, SRT_RES_IDX(RtSrt, PerFrame, gMaterialMaps), SRT_RES_IDX(RtSrt, PerFrame, gTextures));

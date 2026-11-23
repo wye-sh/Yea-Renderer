@@ -24,6 +24,7 @@ struct PartFrame
     float    view[3][4];
     float    camPos[4], proj[4], screen[4], soft[4], sunDir[4], sunColor[4], cascadeEnd[4], ambient[4], texel[4], fog[4], fog2[4];
     uint32_t counts[4], spawn[4];
+    float    gi[4][4];
 };
 struct GpuEmitter
 {
@@ -53,6 +54,10 @@ Buffer*        gFrameCb[kMaxFrames], *gStepCb[kMaxFrames * kSlots], *gEmitterBuf
 Buffer*        gDummyViews, *gDummyBins, *gDummySh, *gDummyLights, *gDummyShapes;
 RenderTarget*  gDummyAtlas;
 Texture*       gDummyFog;
+Texture*       gNoGi;
+Texture*       gGiIrr;  // this frame's, or gNoGi
+Texture*       gGiDist;
+Buffer*        gGiProbes;
 // The pool: particles, their light, free slots, the draw list, counters ([0] free, [1] to draw). UNORDERED_ACCESS
 // between frames; SHADER_RESOURCE only while drawn.
 Buffer*        gPool, *gLit, *gDead, *gList, *gCounters;
@@ -193,6 +198,25 @@ void poolBarrier(Cmd* cmd, ResourceState from, ResourceState to)
 }
 
 // One compute pass in this frame's next slot (the whole set bound there; kj its sort step), then a barrier.
+// A 2 x 2 RGBA16F stand-in for renderer_gi's atlases while GI is off (one texel high gets a 1D view on Vulkan).
+Texture* makeNoGi(const char* name)
+{
+    TextureDesc d = {};
+    d.mWidth = d.mHeight = 2;
+    d.mDepth = d.mArraySize = d.mMipLevels = 1;
+    d.mSampleCount = SAMPLE_COUNT_1;
+    d.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
+    d.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+    d.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+    d.pName = name;
+    Texture*        t = nullptr;
+    TextureLoadDesc l = {};
+    l.pDesc = &d;
+    l.ppTexture = &t;
+    addResource(&l, nullptr);
+    return t;
+}
+
 void dispatch(const RenderFrame* F, Pass pass, uint32_t groups, uint32_t k, uint32_t j)
 {
     if (gSlot >= kSlots || !groups)
@@ -201,7 +225,7 @@ void dispatch(const RenderFrame* F, Pass pass, uint32_t groups, uint32_t k, uint
     uint32_t step[4] = { k, j, 0, 0 };
     memcpy(gStepCb[index]->pCpuMappedAddress, step, sizeof step);
     Buffer*        emitters = gEmitterBuf[F->frameIndex], *spawn = gSpawnBuf[F->frameIndex];
-    DescriptorData p[16] = {};
+    DescriptorData p[19] = {};
     p[0].mIndex = SRT_RES_IDX(PartSrt, PerFrame, gFrame);
     p[0].ppBuffers = &gFrameCb[F->frameIndex];
     p[1].mIndex = SRT_RES_IDX(PartSrt, PerFrame, gStep);
@@ -234,7 +258,13 @@ void dispatch(const RenderFrame* F, Pass pass, uint32_t groups, uint32_t k, uint
     p[14].ppBuffers = &gList;
     p[15].mIndex = SRT_RES_IDX(PartSrt, PerFrame, gCounters);
     p[15].ppBuffers = &gCounters;
-    updateDescriptorSet(gRenderer, index, gSet, 16, p);
+    p[16].mIndex = SRT_RES_IDX(PartSrt, PerFrame, gGiIrradiance);
+    p[16].ppTextures = &gGiIrr;
+    p[17].mIndex = SRT_RES_IDX(PartSrt, PerFrame, gGiDistance);
+    p[17].ppTextures = &gGiDist;
+    p[18].mIndex = SRT_RES_IDX(PartSrt, PerFrame, gGiProbes);
+    p[18].ppBuffers = &gGiProbes;
+    updateDescriptorSet(gRenderer, index, gSet, 19, p);
     Cmd* cmd = F->cmd;
     cmdBindPipeline(cmd, gPipe[pass]);
     cmdBindDescriptorSet(cmd, 0, gPersistent);
@@ -338,6 +368,7 @@ int load(int reloaded)
         l.ppTexture = &gDummyFog;
         addResource(&l, nullptr);
     }
+    gNoGi = makeNoGi("renderer_particles_no_gi");
     gDummyViews = makeMapped(sizeof(RenderGpuShadowView) * 4, sizeof(RenderGpuShadowView), DESCRIPTOR_TYPE_BUFFER, "renderer_particles_no_views");
     gDummyBins = makeMapped(16, 4, DESCRIPTOR_TYPE_BUFFER, "renderer_particles_no_bins");
     gDummySh = makeMapped(9 * 16, 16, DESCRIPTOR_TYPE_BUFFER, "renderer_particles_no_sh");
@@ -345,7 +376,7 @@ int load(int reloaded)
     gDummyShapes = makeMapped(sizeof(RenderGpuLightShape) * 2, sizeof(RenderGpuLightShape), DESCRIPTOR_TYPE_BUFFER, "renderer_particles_no_shapes");
     for (uint32_t i = 0; i < gFrames; ++i)
     {
-        gFrameCb[i] = makeMapped(256, 0, DESCRIPTOR_TYPE_UNIFORM_BUFFER, "renderer_particles_cb");
+        gFrameCb[i] = makeMapped(512, 0, DESCRIPTOR_TYPE_UNIFORM_BUFFER, "renderer_particles_cb");
         gEmitterBuf[i] = makeMapped(sizeof(GpuEmitter) * kMaxEmitters, sizeof(GpuEmitter), DESCRIPTOR_TYPE_BUFFER, "renderer_particles_emitters");
         gSpawnBuf[i] = makeMapped(16 * kMaxEmitters, 16, DESCRIPTOR_TYPE_BUFFER, "renderer_particles_spawn");
     }
@@ -358,7 +389,7 @@ int load(int reloaded)
     DescriptorSetDesc drawDesc = SRT_SET_DESC(DrawSrt, PerFrame, gFrames, 0);
     addDescriptorSet(gRenderer, &drawDesc, &gDrawSet);
     waitForAllResourceLoads();
-    bool ok = gShadowCmp && gDummyAtlas && gDummyAtlas->pTexture && gDummyFog && gDummyViews && gDummyBins && gDummySh && gDummyLights &&
+    bool ok = gNoGi && gShadowCmp && gDummyAtlas && gDummyAtlas->pTexture && gDummyFog && gDummyViews && gDummyBins && gDummySh && gDummyLights &&
               gDummyShapes && gPersistent && gSet && gDrawSet;
     for (uint32_t i = 0; i < gFrames; ++i)
         ok = ok && gFrameCb[i] && gEmitterBuf[i] && gSpawnBuf[i] && gFrameCb[i]->pCpuMappedAddress && gEmitterBuf[i]->pCpuMappedAddress &&
@@ -412,6 +443,9 @@ void unload()
     }
     if (gDummyFog)
         removeResource(gDummyFog);
+    if (gNoGi)
+        removeResource(gNoGi);
+    gNoGi = nullptr;
     gDummyFog = nullptr;
     if (gDummyAtlas)
         removeRenderTarget(gRenderer, gDummyAtlas);
@@ -716,6 +750,14 @@ void particles_run(uint64_t address)
     if (!gOn || !F)
         return;
     gSlot = 0;
+    // renderer_gi's probes (set by gi_prepare, after particles_prepare): last frame's, when they hold light.
+    const bool gi = F->giProbeCount && F->giIrradiance && F->giDistance && F->giProbeData;
+    PartFrame* pf = (PartFrame*)gFrameCb[F->frameIndex]->pCpuMappedAddress;
+    pf->counts[2] = (pf->counts[2] & ~4u) | (gi ? 4u : 0u);
+    memcpy(pf->gi, F->giGrid, sizeof pf->gi);
+    gGiIrr = gi ? F->giIrradiance : gNoGi;
+    gGiDist = gi ? F->giDistance : gNoGi;
+    gGiProbes = gi ? F->giProbeData : gDummySh;
     Cmd* cmd = F->cmd;
     cmdBeginDebugMarker(cmd, 0.9f, 0.8f, 0.6f, "Renderer particles");
     if (gInit)

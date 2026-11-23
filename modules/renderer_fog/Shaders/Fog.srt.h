@@ -15,6 +15,9 @@ BEGIN_SRT(FogSrt)
         DECL_BUFFER(PerFrame, Buffer(float4), gSkySh)
         DECL_TEXTURE(PerFrame, Depth2D(float), gSunAtlas)
         DECL_TEXTURE(PerFrame, Depth2D(float), gLocalAtlas)
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gGiIrradiance) // renderer_gi's probes (GiSample.h.fsl), when the GI flag is set
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gGiDistance)
+        DECL_BUFFER(PerFrame, Buffer(float4), gGiProbes)
         DECL_TEXTURE(PerFrame, Tex3D(float4), gIn)
         DECL_RWTEXTURE(PerFrame, RWTex3D(half4), gOut) // RGBA16F
     END_SRT_SET(PerFrame)

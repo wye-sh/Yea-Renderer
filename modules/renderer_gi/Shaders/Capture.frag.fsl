@@ -1,0 +1,136 @@
+// The raster fallback: what a probe sees in one direction, lit as renderer_rt lights its probe rays' hits: emission,
+// the sun through its cascades, the local lights through their shadow maps where they have one, and the diffuse
+// bounce from last frame's probes (so bounces add up over captures). rgb the radiance towards the probe, a the
+// distance (negative: the back of a one-sided surface; the clear value 0: nothing, the sky).
+#include "GiData.h.fsl"
+#include "Capture.srt.h"
+#define GI_IRRADIANCE gGiIrr
+#define GI_DISTANCE   gGiDist
+#define GI_PROBES     gGiProbes
+#define GI_SAMPLER    gSamplerBilinearClamp
+#include "GiSample.h.fsl"
+#include "GiLight.h.fsl"
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float3, WorldPos, TEXCOORD0);
+    DATA(float3, Normal, TEXCOORD1);
+    DATA(float3, Eye, TEXCOORD2);
+    DATA(FLAT(uint), Material, TEXCOORD3);
+};
+
+float3 toAtlas(GiShadowView v, float3 P)
+{
+    float4 q = float4(P, 1.0);
+    float4 c = float4(dot(v.row0, q), dot(v.row1, q), dot(v.row2, q), dot(v.row3, q));
+    float3 ndc = c.xyz / c.w;
+    return float3(v.rect.xy + (ndc.xy * float2(0.5, -0.5) + float2(0.5, 0.5)) * v.rect.zw, ndc.z);
+}
+
+// The sun's visibility: the first cascade, from the one its view depth falls in, whose map holds P (a probe sees past
+// the camera's view, which the cascades cover); outside them all, lit.
+float sunVisibility(float3 P)
+{
+    uint  count = uint(gGi.shadow.x);
+    float viewZ = dot(gGi.camZ, float4(P, 1.0));
+    uint  c = 0u;
+    while (c < count && viewZ > gGi.cascadeEnd[c])
+        c += 1u;
+    float t = gGi.shadow.y;
+    for (; c < count; ++c)
+    {
+        GiShadowView v = gViews[c];
+        float3 a = toAtlas(v, P);
+        float2 lo = v.rect.xy + t, hi = v.rect.xy + v.rect.zw - t;
+        if (a.x < lo.x || a.y < lo.y || a.x > hi.x || a.y > hi.y || a.z <= 0.0)
+            continue;
+        if (a.z >= 1.0)
+            return 1.0;
+        return CompareTex2D(gSunAtlas, gShadowCmp, a);
+    }
+    return 1.0;
+}
+
+float localVisibility(GiLight l, float3 P)
+{
+    uint view = uint(l.params.y);
+    if (l.color.w < 1.5)
+    {
+        // A cube: the face from where it was drawn (the core's localShadow). Faces go +x -x +y -y +z -z.
+        float3 d = P - gViews[view].info.yzw;
+        float3 ad = abs(d);
+        view += ad.x >= ad.y && ad.x >= ad.z ? (d.x > 0.0 ? 0u : 1u) : (ad.y >= ad.z ? (d.y > 0.0 ? 2u : 3u) : (d.z > 0.0 ? 4u : 5u));
+    }
+    GiShadowView v = gViews[view];
+    float3 a = toAtlas(v, P);
+    float  t = gGi.shadow.z;
+    float2 uv = clamp(a.xy, v.rect.xy + t, v.rect.xy + v.rect.zw - t);
+    return CompareTex2D(gLocalAtlas, gShadowCmp, float3(uv, a.z));
+}
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN(VSOutput In)
+{
+    INIT_MAIN;
+    GiMaterial m = gMaterials[In.Material & 0x7FFFFFFFu];
+    float3 P = In.WorldPos;
+    float3 toEye = In.Eye - P;
+    float  dist = max(length(toEye), 1e-3);
+    float3 V = toEye / dist;
+    float3 N = normalize(In.Normal);
+    if (dot(N, V) < 0.0)
+    {
+        if ((In.Material & 0x80000000u) == 0u)
+            RETURN(float4(0.0, 0.0, 0.0, -dist)); // the inside of something: classification moves or switches the probe
+        N = -N;
+    }
+    float3 diffuse = m.albedoRough.rgb * (1.0 - saturate(m.params.x));
+    float3 light = float3(0.0, 0.0, 0.0);
+    if (gGi.sunDir.w > 0.0)
+    {
+        float ndl = saturate(dot(N, gGi.sunDir.xyz));
+        if (ndl > 0.0)
+            light += gGi.sunColor.rgb * (ndl * sunVisibility(P + N * 0.05));
+    }
+    for (uint i = 0u; i < gGi.raster.z; ++i)
+    {
+        GiLight l = gLights[i];
+        float3  toLight = l.pos.xyz - P;
+        float   d2 = dot(toLight, toLight);
+        if (d2 >= l.pos.w * l.pos.w)
+            continue;
+        float3 L = toLight * rsqrt(max(d2, 1e-8));
+        float  ndl = saturate(dot(N, L));
+        if (ndl <= 0.0)
+            continue;
+        float f = d2 * l.params.z;
+        float window = saturate(1.0 - f * f);
+        // An area light is a point here, its candela as seen face-on, no nearer than its own size (as fog takes it).
+        GiLightShape sh = gShapes[i];
+        float  near = sh.ex.w > 2.5 ? 1.0 / (GI_PI * max(sh.ey.w, 1e-6)) : 1e-4;
+        float  atten = window * window / max(d2, near);
+        if (l.color.w > 1.5)
+        {
+            float cone = saturate(dot(-L, l.dir.xyz) * l.dir.w + l.params.x);
+            atten *= cone * cone;
+        }
+        if (sh.ex.w > 2.5 && sh.ex.w < 4.5)
+            atten *= max(dot(-L, l.dir.xyz), 0.0); // rects and discs: one side
+        if (atten <= 0.0)
+            continue;
+        if ((gGi.raster.w & 1u) != 0u && l.params.y >= 0.0)
+            atten *= localVisibility(l, P + N * 0.05);
+        light += l.color.rgb * (atten * ndl);
+    }
+    float3 bounce = giSkyIrradiance(N) * gGi.sunColor.w;
+    if ((gGi.raster.w & 2u) != 0u)
+    {
+        float  inside;
+        float3 gi = giIrradiance(P, N, -V, gGi.grid[0], gGi.grid[1], gGi.grid[2], gGi.grid[3], inside);
+        bounce = lerp(bounce, gi, inside);
+    }
+    float3 c = diffuse * (light * (1.0 / GI_PI) + bounce) + m.emissive.rgb;
+    c = giHeightFog(c, In.Eye, -V, dist);
+    RETURN(float4(c, dist));
+}
