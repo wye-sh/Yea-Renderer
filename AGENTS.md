@@ -23,7 +23,8 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   dual-source blending), a double-sided one's far side first. Lit as every surface (Forward.frag TRANSLUCENT: no AO,
   contact, traced shadows or traced reflections, which are the opaque scene's pixels; maps kept via keepShadowMaps;
   lights from `sideMasks` ANDed with the z-bin, as tileMasks for opaque ones), fog and aerial perspective kept exact (f(c) - T f(0)). With one sample a pixel they draw
-  in the see-through pass after the forward pass (timed "see-through"; BLEND_PASS: no depth target, the depth test
+  in the see-through pass after the forward pass (timed "see-through", with its parts "glass", "chain" (the scene colour chain's copies) and "runs" (particles
+  between the panes) summed from segments, `segSwitch`; BLEND_PASS: no depth target, the depth test
   against gSceneDepth in the shader) into hdr, `reactive` and `transparency` (R8, max-blended coverage; frame
   `reactive` is now the core's, particles and glass, `transparency` glass alone, for DLSS `transparency` and FSR's
   transparency-and-composition mask); with MSAA inside the forward pass, without particles or masks. The particles
@@ -770,8 +771,8 @@ for the decals in its tile and z-bin (a box test, then up to three map reads or 
   with safe defaults (6.1.1 put the real ones back). Its bisect (`modules/test_renderer_bisect`, every part on one
   step at a time) ran clean through VRS with everything else on, and died at DLSS with particles and glass on: DLSS
   given the see-through pass's masks (dlss.h version 2, Yea 148). renderer_upscale passes DLSS no masks until Yea's
-  service takes them (FSR keeps them). On Windows the core and renderer_particles compile on the main thread (no
-  `yea::pipelines()`) until Yea 149. The core keeps its last passes (`crumb`, at each timeEnd), logs them at unload and
+  service takes them (FSR keeps them). 6.6.1 (Yea 151) gave Windows `yea::pipelines()` back in the core and
+  renderer_particles. The core keeps its last passes (`crumb`, at each timeEnd), logs them at unload and
   logs the first frame with each pass and with VRS's rates bound. The forward pass binds renderer_vrs's rate image only
   when vrs_run's own guard holds: on frames it hadn't written it (no gloss target while its prepass pipelines warmed)
   the image was unwritten and, just made, in UNORDERED_ACCESS.
@@ -841,8 +842,8 @@ for the decals in its tile and z-bin (a box test, then up to three map reads or 
   modes make only `gForwardDepthPipe[0]` and `[1]` (cut-outs draw whole there, so [2] and [3] were the same pipelines,
   queued together on every warm-up) and draw [s & 1]; and `make` keys each queued desc (`descKey`: name, shaders,
   states, formats, layout), queuing one whose twin is still compiling only once it is in (made now on the main thread,
-  without the library, when a frame needs it). On Windows, until Yea's host survives a crash on its compile threads
-  (Yea 149), queued compiles skip the library (`kQueuedCache`): only main-thread compiles touch it. On an older host, warming makes the
+  without the library, when a frame needs it). Queued compiles use the library on every API (`kQueuedCache`; 6.1.0 to
+  6.6.0 kept Direct3D 12's out of it, until Yea 151 serialised a cache's twins). On an older host, warming makes the
   rest 2 ms a frame, one at least. Either way no variant compiles on a frame that draws: until warmed, cut-outs wait (both passes, so depth and colour agree) and
   the full shader gives way to the lean one. A pipeline cache in Yea's data folder (`renderer_pipelines_d3d12.bin` or
   `_vulkan.bin`; a Direct3D 12 library from another driver starts empty) is saved when warming ends (unless a compile was cancelled) and in `unload()`.

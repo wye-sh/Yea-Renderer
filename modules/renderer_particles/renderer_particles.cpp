@@ -407,9 +407,6 @@ int load(int reloaded)
     s.ppSamplers = &gShadowCmp;
     updateDescriptorSet(gRenderer, 0, gPersistent, 1, &s);
     gPipes = yea::pipelines();
-#if defined(_WIN32)
-    gPipes = nullptr; // 6.1.0, until Yea 149: Direct3D 12 compiles on the main thread (a crash on Yea's threads freezes 148)
-#endif
     gDrawPending = 0;
     gDrawPipe = nullptr;
     if (!gPipes)

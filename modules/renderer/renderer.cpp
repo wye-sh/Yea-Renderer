@@ -273,13 +273,9 @@ uint32_t    gPendingCount;
 PendingPipe gTainted[256];                       // descs cancelled this session (handle unused)
 uint32_t    gTaintedCount, gCancelledNow, gTaintedMade;
 bool        gCancelled;                          // a compile was cancelled: the cache is saved only at unload
-// Until Yea's host survives a crash on its compile threads (Yea 149), Direct3D 12's queued compiles skip the pipeline
-// library altogether: only main-thread compiles touch it, so no two threads ever load one pipeline from it.
-#if defined(_WIN32)
-const bool kQueuedCache = false;
-#else
+// Queued compiles use the pipeline cache on every API (6.6.1: Yea 151 serialises compiles of one desc on one cache; 6.1.0
+// to 6.6.0 kept Direct3D 12's queued ones out of its library).
 const bool kQueuedCache = true;
-#endif
 
 uint64_t keyBytes(uint64_t h, const void* p, size_t n)
 {
@@ -1752,6 +1748,18 @@ void chainUpdate(Cmd* cmd, uint32_t fi, uint32_t copy, const int32_t r[4])
     cmdResourceBarrier(cmd, 0, nullptr, ms ? 2 : 1, out, ms ? 2 : 1, back);
 }
 
+// GPU timings' passes (below). // glass, chain and runs: the see-through pass's parts (segments, below), never begun or ended themselves.
+enum Timing : uint32_t { kTimeSkin, kTimeSky, kTimeShadows, kTimeProbes, kTimePrepass, kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeVrs, kTimeRt, kTimeGi, kTimeFog, kTimeParticles, kTimeForward, kTimeBlend, kTimeGlass, kTimeChain, kTimeRuns, kTimeExposure, kTimeTaa, kTimeUpscale, kTimePost, kTimeTonemap, kTimeComposite, kTimeTotal, kTimings };
+// The see-through pass's parts, timed apart (gpu_timings): glass draws, chain copies and particle runs interleave, so each
+// switch between them closes a segment, a query of its own after the kTimings ones; the readback adds a frame's segments
+// up by part (kTimeGlass, kTimeChain, kTimeRuns). segSwitch(part) / segSwitch(0) to end; only while gSegOn.
+const uint32_t kSegs = 64;
+bool           gSegOn;
+uint32_t       gSegPart;                   // the open segment's part (Timing), 0 none
+uint32_t       gSegCount[kMaxFrames];      // segments recorded in that frame slot
+uint8_t        gSegParts[kMaxFrames][kSegs];
+void segSwitch(Cmd* cmd, uint32_t fi, uint32_t part);
+
 // See-through surfaces 0 to count of the sorted list, back to front, into the bound pass (`rebind` binds it again).
 // `before(j)` draws what goes just behind surface j (a particle run) and says whether it drew. Refraction: the scene colour
 // chain copied before the first glass that bends what is behind it, and again over what was drawn since (the dirty
@@ -1777,6 +1785,7 @@ void drawSeeThrough(Cmd* cmd, uint32_t fi, uint32_t count, bool refract, Rebind 
         if (copies && (!meets || copies >= kChainCopies))
             return;
         cmdBindRenderTargets(cmd, nullptr);
+        segSwitch(cmd, fi, kTimeChain);
         chainUpdate(cmd, fi, copies, copies ? dirty : whole);
         copies++;
         dirty[0] = w, dirty[1] = h, dirty[2] = dirty[3] = 0;
@@ -1794,14 +1803,19 @@ void drawSeeThrough(Cmd* cmd, uint32_t fi, uint32_t count, bool refract, Rebind 
             if (e.refract == 1 && e.twoSided)
             {
                 chainFor(e);
+                segSwitch(cmd, fi, kTimeGlass);
                 drawBlended(cmd, fi, j, 1);
                 grow(e.rect);
             }
             chainFor(e);
+            segSwitch(cmd, fi, kTimeGlass);
             drawBlended(cmd, fi, j, 2);
         }
         else
+        {
+            segSwitch(cmd, fi, kTimeGlass);
             drawBlended(cmd, fi, j);
+        }
         grow(e.rect);
     }
 }
@@ -1811,8 +1825,7 @@ void drawSeeThrough(Cmd* cmd, uint32_t fi, uint32_t count, bool refract, Rebind 
 // (that frame's fence has passed by then, so nothing waits), averaged and logged every 30 s.
 namespace
 {
-enum Timing : uint32_t { kTimeSkin, kTimeSky, kTimeShadows, kTimeProbes, kTimePrepass, kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeVrs, kTimeRt, kTimeGi, kTimeFog, kTimeParticles, kTimeForward, kTimeBlend, kTimeExposure, kTimeTaa, kTimeUpscale, kTimePost, kTimeTonemap, kTimeComposite, kTimeTotal, kTimings };
-const char* const kTimingNames[kTimings] = { "skin", "sky", "shadows", "probes", "prepass", "culling", "ao", "contact", "ssr", "vrs", "rt", "gi", "fog", "particles", "forward+sky", "see-through", "exposure", "taa", "upscale", "post", "tonemap", "composite", "total" };
+const char* const kTimingNames[kTimings] = { "skin", "sky", "shadows", "probes", "prepass", "culling", "ao", "contact", "ssr", "vrs", "rt", "gi", "fog", "particles", "forward+sky", "see-through", "glass", "chain", "runs", "exposure", "taa", "upscale", "post", "tonemap", "composite", "total" };
 QueryPool*        gTimePool[kMaxFrames];
 uint32_t          gTimeUsed[kMaxFrames]; // bits: what that frame recorded
 double            gTimeTicks;            // per second
@@ -1884,13 +1897,45 @@ void timeEnd(Cmd* cmd, uint32_t fi, uint32_t t)
     QueryDesc d = { t };
     cmdEndQuery(cmd, gTimePool[fi], &d);
 }
+void segSwitch(Cmd* cmd, uint32_t fi, uint32_t part)
+{
+    if (!gSegOn || !gTimePool[fi] || part == gSegPart)
+        return;
+    if (gSegPart)
+    {
+        QueryDesc d = { kTimings + gSegCount[fi] - 1 };
+        cmdEndQuery(cmd, gTimePool[fi], &d);
+        gSegPart = 0;
+    }
+    if (!part || gSegCount[fi] >= kSegs)
+        return; // past kSegs a frame: the rest untimed (the parts then read low)
+    QueryDesc d = { kTimings + gSegCount[fi] };
+    cmdBeginQuery(cmd, gTimePool[fi], &d);
+    gSegParts[fi][gSegCount[fi]++] = (uint8_t)part;
+    gSegPart = part;
+}
+
 // At the start of a frame's recording: what this slot measured last time, then a fresh start.
 void timeFrame(Cmd* cmd, uint32_t fi, bool on, const char* scene)
 {
     if (!on || !gTimePool[fi])
     {
-        gTimeUsed[fi] = 0;
+        gTimeUsed[fi] = gSegCount[fi] = 0;
         return;
+    }
+    double part[kTimings] = {};
+    for (uint32_t s = 0; s < gSegCount[fi]; ++s)
+    {
+        QueryData q = {};
+        getQueryData(gRenderer, gTimePool[fi], kTimings + s, &q);
+        if (q.mEndTimestamp > q.mBeginTimestamp)
+            part[gSegParts[fi][s]] += (double)(q.mEndTimestamp - q.mBeginTimestamp) * 1000.0 / gTimeTicks;
+    }
+    for (uint32_t t = kTimeGlass; t <= kTimeRuns && gSegCount[fi]; ++t)
+    {
+        gTimeSum[t] += part[t];
+        gTimeMax[t] = part[t] > gTimeMax[t] ? part[t] : gTimeMax[t];
+        gTimeCount[t]++;
     }
     for (uint32_t t = 0; t < kTimings; ++t)
     {
@@ -1905,12 +1950,12 @@ void timeFrame(Cmd* cmd, uint32_t fi, bool on, const char* scene)
         gTimeMax[t] = ms > gTimeMax[t] ? ms : gTimeMax[t];
         gTimeCount[t]++;
     }
-    cmdResetQuery(cmd, gTimePool[fi], 0, kTimings);
-    gTimeUsed[fi] = 0;
+    cmdResetQuery(cmd, gTimePool[fi], 0, kTimings + kSegs);
+    gTimeUsed[fi] = gSegCount[fi] = 0;
     double now = yea::host()->time();
     if (now - gTimeLogged >= 30.0 && gTimeCount[kTimeTotal]) // 30 s in 6.1.0: Yea takes 10 lines a minute
     {
-        char line[512];
+        char line[768];
         int  n = snprintf(line, sizeof line, "gpu ms avg/max over %u frames:", gTimeCount[kTimeTotal]);
         for (uint32_t t = 0; t < kTimings && n < (int)sizeof line - 40; ++t)
             if (gTimeCount[t])
@@ -2030,12 +2075,7 @@ int load(int reloaded)
     gQueue = (Queue*)host->queue;
     gFrames = host->framesInFlight < kMaxFrames ? host->framesInFlight : kMaxFrames;
     pipeCacheOpen();
-    gPipes = yea::pipelines();
-#if defined(_WIN32)
-    // 6.1.0, until Yea 149: Direct3D 12 compiles on the main thread alone (warming a few a frame), as a crash on Yea's
-    // compile threads freezes Yea 148.
-    gPipes = nullptr;
-#endif
+    gPipes = yea::pipelines(); // Direct3D 12 too again (6.6.1): Yea 151's service never freezes Yea and serialises a cache's twins
     gPipesFailed = false;
     gTaintedCount = gCancelledNow = gTaintedMade = 0;
     gCancelled = false;
@@ -2047,7 +2087,7 @@ int load(int reloaded)
         QueryPoolDesc qd = {};
         qd.pName = "renderer_timings";
         qd.mType = QUERY_TYPE_TIMESTAMP;
-        qd.mQueryCount = kTimings;
+        qd.mQueryCount = kTimings + kSegs;
         initQueryPool(gRenderer, &qd, &gTimePool[i]);
         gTimeUsed[i] = 0;
     }
@@ -3909,18 +3949,26 @@ void draw(uint32_t pass, const YeaFrame* yf)
             cmdSetScissor(cmd, 0, 0, w, h);
         };
         bindPass(true);
+        gSegOn = timed;
+        gSegPart = 0;
         const uint32_t surfaces = blendDraw ? gBlendCount : 0;
         const uint32_t split = surfaces - F.blendRuns;
         // Past RENDER_MAX_BLEND_RUNS surfaces the farthest ones come first, with no particles between them.
         drawSeeThrough(cmd, fi, surfaces, blendDraw && (gFrameCpu.counts[2] & kFlagRefraction), bindPass, [&](uint32_t j) {
             if (!runs || j < split)
                 return false;
+            segSwitch(cmd, fi, kTimeRuns);
             (gOk.particles ? renderer_particles::particles_draw((uint64_t)(uintptr_t)&F, j - split) : (void)0);
             return true;
         });
         // The runs nearer than every surface drawn (all of them while the see-through pipelines are still being made).
         for (uint32_t r = surfaces ? F.blendRuns : 0; runs && r <= F.blendRuns; ++r)
+        {
+            segSwitch(cmd, fi, kTimeRuns);
             (gOk.particles ? renderer_particles::particles_draw((uint64_t)(uintptr_t)&F, r) : (void)0);
+        }
+        segSwitch(cmd, fi, 0);
+        gSegOn = false;
         cmdBindRenderTargets(cmd, nullptr);
         RenderTargetBarrier back[3] = { { gHdr, RESOURCE_STATE_RENDER_TARGET, RESOURCE_STATE_SHADER_RESOURCE },
                                         { gReactive, RESOURCE_STATE_RENDER_TARGET, RESOURCE_STATE_SHADER_RESOURCE },
@@ -3990,6 +4038,8 @@ void draw(uint32_t pass, const YeaFrame* yf)
     for (uint32_t t = 0; t < kTimings; ++t)
         if (gTimeUsed[fi] & (1u << t))
             cmdResolveQuery(cmd, gTimePool[fi], t, 1);
+    if (gTimePool[fi] && gSegCount[fi])
+        cmdResolveQuery(cmd, gTimePool[fi], kTimings, gSegCount[fi]);
     gTimedFrame = timed;
 
     // Nothing is left bound (every pass above unbinds); YEA_PASS_WORLD composites.
