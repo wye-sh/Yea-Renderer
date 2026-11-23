@@ -17,6 +17,8 @@ MODEL(lantern, "models/Lantern.rmodel");
 MODEL(flight_helmet, "models/FlightHelmet.rmodel");
 MODEL(water_bottle, "models/WaterBottle.rmodel");
 MODEL(boom_box, "models/BoomBox.rmodel");
+// KayKit's Knight (CC0, Kay Lousberg): a skinned character with 76 clips, idling by the copper block.
+MODEL(knight, "models/Knight.rmodel");
 
 namespace
 {
@@ -219,7 +221,7 @@ void placeModels()
 {
     if (!settings.models)
     {
-        uint32_t* all[4] = { &models->lantern, &models->flightHelmet, &models->waterBottle, &models->boomBox };
+        uint32_t* all[5] = { &models->lantern, &models->flightHelmet, &models->waterBottle, &models->boomBox, &models->knight };
         for (uint32_t* p : all)
             if (mdl::placed(*p))
                 mdl::remove(*p);
@@ -234,6 +236,12 @@ void placeModels()
         models->waterBottle = mdl::place(water_bottle, { 7.4f, 0.52f, 4.4f }, toView);
     if (!mdl::placed(models->boomBox)) // on the copper block
         models->boomBox = mdl::place(boom_box, { 5.0f, 1.4f, 2.0f }, toView);
+    if (!mdl::placed(models->knight)) // on the floor between the shapes and the copper block, facing the start view
+        models->knight = mdl::place(knight, { 2.7f, 0.0f, 1.0f }, toView), models->knightSpeed = 0;
+    // It idles; Benchmark View holds it at the clip's first frame, as it holds the lights and shapes.
+    const uint32_t speed = settings.benchmark_view ? 1 : 2;
+    if (models->knightSpeed != speed && mdl::play(models->knight, "Idle", speed == 2 ? 1.0f : 0.0f))
+        models->knightSpeed = speed;
 }
 
 // Glass: a clear pane between the start view and the steam, a teal one behind it (the steam drawn between them), a frosted

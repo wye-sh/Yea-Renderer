@@ -367,6 +367,28 @@ Licence: CC0-1.0 for every model file, per each model's LICENSE.md and metadata.
 trademarks). Credit, as the authors give it (not required): Lantern by sbtron, Microsoft (2017), its Draco version by
 Frank Galligan (2018); Flight Helmet converted from Maya by Gary Hsu (2018); Water Bottle and Boom Box by Microsoft (2017).
 
+Knight (the example view only), under the same CC0 1.0 text below
+What uses it: example/renderer_example/Assets/models/Knight.rmodel, cooked by tools/model_cook (one sword and the badge
+shield kept) from Characters/gltf/Knight.glb of KayKit Character Pack: Adventures 1.0 at commit
+672074b73ba276876a19e8816ecdc5241817ab47 (sha256 60428e3abc09ba83e595d256e3af8c5c976b46cdae599f0802fc82b4a3445168;
+example/model_sources/fetch_and_cook.sh fetches and checks it). It ships in no game.
+Source: https://github.com/KayKit-Game-Assets/KayKit-Character-Pack-Adventures-1.0
+Its LICENSE.txt, as far as its licence goes:
+
+	KayKit : Adventurers Character Pack (1.0)
+
+	Created/distributed by Kay Lousberg (www.kaylousberg.com)
+	Creation date: 13/03/2023 09:00
+
+			------------------------------
+
+	License: (Creative Commons Zero, CC0)
+	http://creativecommons.org/publicdomain/zero/1.0/
+
+	This content is free to use in personal, educational and commercial projects.
+
+	Support me by using a brand resource provided in this pack or by crediting Kay Lousberg, www.kaylousberg.com (this is not mandatory)
+
 Creative Commons Legal Code
 
 CC0 1.0 Universal

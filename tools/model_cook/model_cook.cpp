@@ -3,6 +3,8 @@
 //
 //   build.sh                                   (once: builds build/tools/model_cook, fetching and building Draco)
 //   build/tools/model_cook in.glb out.rmodel   (or .gltf, .fbx, .obj)
+//   ... [--max-size <px>] [--hide <node>]...       (--hide: that node's meshes and those under it left out, such as the
+//                                                  props a character pack hangs on every hand slot at once)
 //
 // What it does, in order:
 // - glTF (cgltf): the default scene's mesh nodes, each primitive with its node's world transform (EXT_meshopt_compression
@@ -1090,8 +1092,21 @@ void gltfSkeleton(const cgltf_data* data)
     }
 }
 
+// --hide: the node names whose meshes, and those of every node under them, are left out (the nodes stay, as bones).
+std::vector<std::string> gHide;
+std::vector<bool>        gHideUsed;
+bool hidden(const char* name)
+{
+    for (size_t i = 0; name && i < gHide.size(); ++i)
+        if (gHide[i] == name)
+            return gHideUsed[i] = true;
+    return false;
+}
+
 void visit(const cgltf_data* data, const cgltf_node* node, std::vector<SrcMesh>& meshes, uint32_t& meshNodes)
 {
+    if (hidden(node->name))
+        return;
     if (node->mesh)
     {
         float m[16];
@@ -1203,7 +1218,10 @@ void ufbxMeshes(const ufbx_scene* scene, std::vector<SrcMesh>& meshes, uint32_t&
     {
         const ufbx_node* node = scene->nodes.data[ni];
         const ufbx_mesh* mesh = node->mesh;
-        if (!mesh || !mesh->num_triangles)
+        bool hide = false;
+        for (const ufbx_node* a = node; a && !hide; a = a->parent)
+            hide = hidden(a->name.data);
+        if (!mesh || !mesh->num_triangles || hide)
             continue;
         ++meshNodes;
         if (mesh->skin_deformers.count > 1)
@@ -1611,11 +1629,20 @@ std::vector<SrcMaterial> ufbxMaterials(const ufbx_scene* scene)
 
 int main(int argc, char** argv)
 {
-    if (argc == 5 && !strcmp(argv[3], "--max-size"))
-        cook::gMaxSize = (uint32_t)atoi(argv[4]);
-    if (argc != 3 && !(argc == 5 && cook::gMaxSize >= 4))
+    bool args = argc >= 3;
+    for (int i = 3; args && i < argc; i += 2)
     {
-        fprintf(stderr, "usage: model_cook <in.gltf|in.glb> <out.rmodel> [--max-size <pixels, at least 4>]\n");
+        args = i + 1 < argc;
+        if (args && !strcmp(argv[i], "--max-size"))
+            args = (cook::gMaxSize = (uint32_t)atoi(argv[i + 1])) >= 4;
+        else if (args && !strcmp(argv[i], "--hide"))
+            gHide.push_back(argv[i + 1]), gHideUsed.push_back(false);
+        else
+            args = false;
+    }
+    if (!args)
+    {
+        fprintf(stderr, "usage: model_cook <in.gltf|in.glb> <out.rmodel> [--max-size <pixels, at least 4>] [--hide <node name>]...\n");
         return 2;
     }
     gDir = argv[1];
@@ -1727,6 +1754,11 @@ int main(int argc, char** argv)
         return 2;
     }
 
+    for (size_t i = 0; i < gHide.size(); ++i)
+        if (gHideUsed[i])
+            note("--hide %s: its meshes and those under it left out", gHide[i].c_str());
+        else
+            warn("--hide %s: no such node", gHide[i].c_str());
     std::vector<Part> parts;
     bool              flatNormals = false, madeTangents = false;
     for (const SrcMesh& m : meshes)

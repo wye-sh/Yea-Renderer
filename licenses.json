@@ -163,5 +163,16 @@
       "example/renderer_example/Assets/models/BoomBox.rmodel"
     ],
     "notice": "Boom Box by Microsoft (2017). Dedicated to the public domain (CC0 1.0). Logos and trademarks excluded."
+  },
+  {
+    "name": "Knight (KayKit Character Pack: Adventures 1.0, cooked)",
+    "version": "KayKit-Character-Pack-Adventures-1.0 672074b",
+    "license": "CC0-1.0",
+    "source": "https://github.com/KayKit-Game-Assets/KayKit-Character-Pack-Adventures-1.0/blob/672074b73ba276876a19e8816ecdc5241817ab47/addons/kaykit_character_pack_adventures/Characters/gltf/Knight.glb",
+    "licenseUrl": "https://github.com/KayKit-Game-Assets/KayKit-Character-Pack-Adventures-1.0/blob/672074b73ba276876a19e8816ecdc5241817ab47/LICENSE.txt",
+    "usedBy": [
+      "example/renderer_example/Assets/models/Knight.rmodel"
+    ],
+    "notice": "KayKit : Adventurers Character Pack (1.0), created and distributed by Kay Lousberg (www.kaylousberg.com). Dedicated to the public domain (CC0 1.0); crediting Kay Lousberg is asked for, not required."
   }
 ]

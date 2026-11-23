@@ -661,8 +661,9 @@ library keeps its licence file beside its source, since the component's reposito
 - `tools/dfg_bake.cpp`: bakes the split-sum table (`modules/renderer/Assets/dfg.bin`, 128 x 128 at x sqrt(N.V), y roughness;
   visible-normal sampling) that `dfgLookup` reads; every copy of `dfgLookup` (core, renderer_rt, renderer_shadows) stays
   identical to Brdf.h.fsl's. Our own code.
-- `tools/model_cook/` (`build.sh` → `build/tools/model_cook in.glb out.rmodel`): glTF/GLB (Draco too), FBX and OBJ to
-  `.rmodel` with a report. Our
+- `tools/model_cook/` (`build.sh` → `build/tools/model_cook in.glb out.rmodel [--max-size px] [--hide node]...`): glTF/GLB
+  (Draco too), FBX and OBJ to `.rmodel` with a report; `--hide` leaves out a node's meshes and those under it (props a
+  character pack hangs on every hand slot at once), the nodes kept as bones. Our
   own code plus `vendor/cgltf` (MIT, Johannes Kuhlmann; v1.15), `vendor/meshoptimizer` (MIT, Arseny Kapoulkine; v1.3),
   `vendor/stb` (stb_image v2.34, MIT or public domain, Sean Barrett) and `vendor/bc7e` (Basis Universal's bc7e scalar
   port, Apache-2.0, Binomial LLC; its NOTICE beside it), `vendor/ufbx` (ufbx v0.23.1, MIT or public domain, Samuli
@@ -856,7 +857,9 @@ light_image, its panes glowing slabs in their colours, at twice `area_luminance`
 in `Assets/models/`, their sources fetched and checked at a pinned commit by `example/model_sources/fetch_and_cook.sh`,
 never kept in the repository): a street lamp by the white boxes, the flight helmet on the stone ledge, the water bottle
 in front, the boom box on the copper block, placed whole through renderer_models (`state Models`; their sizes are
-`default <model>_scale` lines), a free-look camera: holding its `look` action (left mouse button) after a press on the game
+`default <model>_scale` lines), and KayKit's Knight (CC0, Kay Lousberg; the same script fetches it at a pinned commit and
+cooks it with one sword and the badge shield, `--hide` the rest), a skinned character with 76 clips idling between the
+shapes and the copper block (`Idle`; Benchmark View holds it at the clip's first frame), in the Model Viewer too, a free-look camera: holding its `look` action (left mouse button) after a press on the game
 asks the host for the mouse each frame (`yea::captureMouse(true)`: hidden, kept in the window) and turns by
 `yea_mouse_dx`/`yea_mouse_dy` (`look_sensitivity`); the move keys fly (WASD, Q/E down/up, `move_speed`).
 The host lets go when the button is up (it is no longer asked), F1 opens, focus is lost, or on a view switch

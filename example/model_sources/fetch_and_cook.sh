@@ -7,6 +7,9 @@
 # domain: no conditions, credit not required). Their LICENSE.md and metadata.json files themselves are CC-BY-4.0 and
 # are not used. Credit, as metadata.json gives it: Lantern by sbtron (Microsoft, 2017); FlightHelmet converted by Gary
 # Hsu (2018); WaterBottle and BoomBox by Microsoft (2017). Logos and trademarks are excluded from the licence.
+# The Knight comes from KayKit Character Pack: Adventures 1.0 by Kay Lousberg at a pinned commit, CC0-1.0 per its
+# LICENSE.txt (credit asked for, not required). Its file carries every weapon and shield on its hand slots at once:
+# the cook keeps one sword and the badge shield.
 #
 #   example/model_sources/fetch_and_cook.sh          (from anywhere; builds the cooker when missing)
 set -euo pipefail
@@ -48,8 +51,15 @@ while read -r sum model path; do
     curl -sfL -o "$work/$model/$(basename "$path")" "$base/$model/$path"
     echo "$sum  $work/$model/$(basename "$path")" | sha256sum -c --quiet -
 done <<< "$files"
+knight_commit=672074b73ba276876a19e8816ecdc5241817ab47
+mkdir -p "$work/Knight"
+curl -sfL -o "$work/Knight/Knight.glb" \
+    "https://raw.githubusercontent.com/KayKit-Game-Assets/KayKit-Character-Pack-Adventures-1.0/$knight_commit/addons/kaykit_character_pack_adventures/Characters/gltf/Knight.glb"
+echo "60428e3abc09ba83e595d256e3af8c5c976b46cdae599f0802fc82b4a3445168  $work/Knight/Knight.glb" | sha256sum -c --quiet -
 mkdir -p "$out"
 "$root/build/tools/model_cook" "$work/Lantern/Lantern.glb" "$out/Lantern.rmodel"
 "$root/build/tools/model_cook" "$work/FlightHelmet/FlightHelmet.gltf" "$out/FlightHelmet.rmodel"
 "$root/build/tools/model_cook" "$work/WaterBottle/WaterBottle.glb" "$out/WaterBottle.rmodel"
 "$root/build/tools/model_cook" "$work/BoomBox/BoomBox.glb" "$out/BoomBox.rmodel"
+"$root/build/tools/model_cook" "$work/Knight/Knight.glb" "$out/Knight.rmodel" --hide 1H_Sword_Offhand --hide Rectangle_Shield \
+    --hide Round_Shield --hide Spike_Shield --hide 2H_Sword

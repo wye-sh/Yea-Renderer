@@ -61,6 +61,8 @@ state Models
   u32 flightHelmet
   u32 waterBottle
   u32 boomBox
+  u32 knight
+  u32 knightSpeed
 end
 # Their sizes: Lantern's file is about 26 m tall (3.1 m here), BoomBox's 2 cm wide (0.8 m), the bottle 26 cm (1 m);
 # the helmet is life size on its stand (0.72 m, 1 m here).
@@ -68,6 +70,8 @@ default lantern_scale 0.12
 default flight_helmet_scale 1.4
 default water_bottle_scale 4
 default boom_box_scale 40
+# The Knight's file is 2.3 m to the top of its head (without the helmet): 1.6 m here.
+default knight_scale 0.7
 
 # Hold to look around.
 action look MouseLeft
