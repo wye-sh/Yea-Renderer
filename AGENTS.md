@@ -930,10 +930,10 @@ for the decals in its tile and z-bin (a box test, then up to three map reads or 
   rest 2 ms a frame, one at least. The composite pipeline (made again on a frame-format change) is queued the same way,
   and the frame draws nothing till it is in. renderer_shadows queues its three pipelines (and a slope_bias change's) from its update(), drawing with
   the last slope's till all are in (3 tries at most, logged). Either way no variant compiles on a frame that draws: until warmed, cut-outs wait (both passes, so depth and colour agree) and
-  the full shader gives way to the lean one. A pipeline cache in Yea's data folder (`renderer_pipelines_d3d12.bin` or
-  `_vulkan.bin`; a Direct3D 12 library from another driver starts empty, and so does one from other root signatures,
-  since none of its pipelines would load or store again: the file starts with a hash of Yea's two `.rootsig` files;
-  the start logs which) is saved when warming ends (unless a compile was cancelled) and in `unload()`.
+  the full shader gives way to the lean one. A pipeline cache in Yea's data folder (`renderer_pipelines_d3d12_<key>.bin` or
+  `_vulkan_<key>.bin`, named for `yea::pipelineKey()`: another Yea's pipelines may not load or store again, so files
+  for another key are deleted, and none is kept on a Yea without a key; a Direct3D 12 library from another driver
+  starts empty; the start logs which) is saved when warming ends (unless a compile was cancelled) and in `unload()`.
   It logs "scene pipelines warmed in X ms over N frames (at most Y ms a frame); cut-outs held back K frames", and any
   pipeline still made on a drawing frame.
 

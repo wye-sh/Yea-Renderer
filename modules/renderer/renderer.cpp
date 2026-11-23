@@ -33,6 +33,7 @@
 #include "Shaders/LightCount.srt.h"
 #if !defined(_WIN32)
 #include <dlfcn.h>
+#include <dirent.h>
 #endif
 #undef SAMPLE_COUNT
 
@@ -617,59 +618,65 @@ double clockMs()
 }
 
 // The pipeline cache: Yea's data folder holds the driver's results from the last run (per graphics API), so a start
-// makes the pipelines from them. Direct3D 12 refuses a library from another driver or GPU: tried here first, it then
-// starts empty (The Forge would assert). Over 64 MB (pipelines of many shader versions gathered), it starts again.
+// makes the pipelines from them. Its file is named for yea::pipelineKey(): pipelines one Yea stored may not load in
+// another (its root signatures, The Forge, its shader compiler), and Direct3D 12's library then misses every one and
+// can't store it again, on every start. Files for another key are deleted; with no key (a Yea before SDK 178) none is
+// kept. Direct3D 12 refuses a library from another driver or GPU: tried here first, it then starts empty (The Forge
+// would assert). Over 64 MB (pipelines of many shader versions gathered), it starts again.
 #if defined(_WIN32)
-const char* const kPipeCacheFile = "renderer_pipelines_d3d12.bin";
+const char* const kPipeCacheStem = "renderer_pipelines_d3d12";
 // d3d12.h's IIDs (its own are in dxguid, which modules don't link).
 const IID kIidDevice1 = { 0x77acce80, 0x638e, 0x4e65, { 0x88, 0x95, 0xc1, 0xf2, 0x33, 0x86, 0x86, 0x3e } };
 const IID kIidPipelineLibrary = { 0xc64226a8, 0x9201, 0x46af, { 0xb4, 0xcc, 0x53, 0xfb, 0x9f, 0xf7, 0x41, 0x4f } };
-// A library's pipelines are made with Yea's root signatures (its CompiledShaders' two .rootsig files). From other
-// ones, none of them loads and none stores again (their names are taken), so every start would compile cold: the
-// file starts with this magic and a hash of them, and one with another hash starts empty (the next save replaces it).
-const char kPipeCacheMagic[8] = { 'R', 'P', 'L', 'I', 'B', 'R', 'S', '1' };
-const long kPipeCacheHeader = 16;
-uint64_t   gPipeCacheKey;
-
-// 0 when neither file is there.
-uint64_t rootSignaturesKey()
-{
-    // Yea's folder: the host's, else (a Yea that doesn't say) the process's own.
-    char        exe[1024] = "";
-    const char* host = yea::host()->path("exe");
-    if (host && *host)
-        snprintf(exe, sizeof exe, "%s", host);
-    else if (DWORD n = GetModuleFileNameA(nullptr, exe, sizeof exe); n && n < sizeof exe)
-    {
-        char* slash = strrchr(exe, '\\');
-        *(slash ? slash : exe) = 0;
-    }
-    uint64_t h = 14695981039346656037ull; // FNV-1a
-    bool     any = false;
-    for (const char* name : { "default", "compute" })
-    {
-        char p[1100];
-        snprintf(p, sizeof p, "%s/CompiledShaders/DIRECT3D12/%s.rootsig", exe, name);
-        FILE* f = *exe ? fopen(p, "rb") : nullptr;
-        for (int c; f && (c = fgetc(f)) != EOF; any = true)
-            h = (h ^ (uint8_t)c) * 1099511628211ull;
-        if (f)
-            fclose(f);
-        h = (h ^ 0x100) * 1099511628211ull; // between the two files
-    }
-    return any ? h : 0;
-}
 #else
-const char* const kPipeCacheFile = "renderer_pipelines_vulkan.bin";
+const char* const kPipeCacheStem = "renderer_pipelines_vulkan";
 #endif
 const long kPipeCacheMax = 64l << 20;
 
+// The data folder's cache files but keep (another key's, an unkeyed one from before 7.2.4, a save left halfway): deleted.
+uint32_t pipeCacheDropOthers(const char* dir, const char* keep)
+{
+    const size_t stem = strlen(kPipeCacheStem);
+    uint32_t     dropped = 0;
+    char         path[1100];
+    auto         drop = [&](const char* name) {
+        if (strncmp(name, kPipeCacheStem, stem) || !strcmp(name, keep))
+            return;
+        snprintf(path, sizeof path, "%s/%s", dir, name);
+        dropped += remove(path) == 0;
+    };
+#if defined(_WIN32)
+    snprintf(path, sizeof path, "%s/%s*", dir, kPipeCacheStem);
+    WIN32_FIND_DATAA found;
+    HANDLE           h = FindFirstFileA(path, &found);
+    if (h == INVALID_HANDLE_VALUE)
+        return 0;
+    do
+        if (!(found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+            drop(found.cFileName);
+    while (FindNextFileA(h, &found));
+    FindClose(h);
+#else
+    if (DIR* d = opendir(dir))
+    {
+        while (dirent* e = readdir(d))
+            drop(e->d_name);
+        closedir(d);
+    }
+#endif
+    return dropped;
+}
+
 void pipeCacheOpen()
 {
-    const char* dir = yea::host()->path("data");
+    const char*    dir = yea::host()->path("data");
+    const uint64_t key = yea::pipelineKey();
     gPipeCachePath[0] = 0;
-    if (dir && *dir)
-        snprintf(gPipeCachePath, sizeof gPipeCachePath, "%s/%s", dir, kPipeCacheFile);
+    char name[96];
+    snprintf(name, sizeof name, "%s_%016llx.bin", kPipeCacheStem, (unsigned long long)key);
+    const uint32_t dropped = dir && *dir ? pipeCacheDropOthers(dir, key ? name : "") : 0;
+    if (dir && *dir && key)
+        snprintf(gPipeCachePath, sizeof gPipeCachePath, "%s/%s", dir, name);
     void* data = nullptr;
     long  size = 0;
     if (FILE* f = gPipeCachePath[0] ? fopen(gPipeCachePath, "rb") : nullptr)
@@ -683,17 +690,8 @@ void pipeCacheOpen()
         if (size > kPipeCacheMax)
             size = 0;
     }
+    const char* why = !key ? "none kept (this Yea gives no pipeline key)" : size > 0 ? "in use" : "none for this Yea yet; starting empty";
 #if defined(_WIN32)
-    gPipeCacheKey = rootSignaturesKey();
-    const char* why = size > 0 ? "made for other root signatures; starting empty" : "none yet; starting empty";
-    if (size > kPipeCacheHeader && data && !memcmp(data, kPipeCacheMagic, 8) && !memcmp((char*)data + 8, &gPipeCacheKey, 8))
-    {
-        size -= kPipeCacheHeader;
-        memmove(data, (char*)data + kPipeCacheHeader, (size_t)size);
-        why = "in use";
-    }
-    else
-        size = 0;
     if (size > 0)
     {
         ID3D12Device1*         device = nullptr;
@@ -706,11 +704,11 @@ void pipeCacheOpen()
         if (device)
             device->Release();
     }
-    char line[200];
-    snprintf(line, sizeof line, "renderer: the last run's pipeline library (%ld KB): %s%s", size / 1024, why,
-             gPipeCacheKey ? "" : " (Yea's root signatures not found: not keyed on them)");
-    yea::log(line);
 #endif
+    char line[240];
+    snprintf(line, sizeof line, "renderer: the pipeline library for key %016llx (%ld KB): %s; %u other file%s deleted",
+             (unsigned long long)key, size / 1024, why, dropped, dropped == 1 ? "" : "s");
+    yea::log(line);
     PipelineCacheDesc desc = {};
     desc.pData = size > 0 ? data : nullptr;
     desc.mSize = size > 0 ? (size_t)size : 0;
@@ -736,11 +734,7 @@ void pipeCacheSave(bool unloading = false)
     char tmp[1040];
     snprintf(tmp, sizeof tmp, "%s.new", gPipeCachePath);
     FILE* f = fopen(tmp, "wb");
-#if defined(_WIN32)
-    bool ok = f && fwrite(kPipeCacheMagic, 1, 8, f) == 8 && fwrite(&gPipeCacheKey, 1, 8, f) == 8 && fwrite(data, 1, size, f) == size;
-#else
-    bool ok = f && fwrite(data, 1, size, f) == size;
-#endif
+    bool  ok = f && fwrite(data, 1, size, f) == size;
     if (f)
         ok = fclose(f) == 0 && ok;
     free(data);
