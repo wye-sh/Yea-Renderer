@@ -64,10 +64,13 @@ MaterialLook materialLook(MaterialData m, MaterialMapData mm, float2 uv, float2 
     return k;
 }
 
-// The normal map's normal (MikkTSpace: the interpolated normal and tangent as they come, unnormalised, the bitangent
-// from them and the tangent's sign), in world space. N, T: the vertex shader's world normal and tangent (w the sign).
+// The normal map's normal (MikkTSpace: each vertex's normal and tangent at unit length, interpolated as they come, the
+// bitangent from them and the tangent's sign), in world space. N, T: the vertex shader's world normal (its length the
+// instance's scale squared, for specular antialiasing) and unit tangent, T.w the sign times that length: N / |T.w| is
+// the unit-per-vertex normal interpolated, so a scaled instance's bumps keep their proportions.
 float3 mappedNormal(MaterialMapData mm, float3 N, float4 T, float2 uv, float2 dx, float2 dy)
 {
+    N /= max(abs(T.w), 1e-20);
     float2 xy = sampleMap(mm.maps.z, uv, dx, dy).xy * 2.0 - 1.0;
     float  z = sqrt(saturate(1.0 - dot(xy, xy)));
     xy *= mm.factors.z;

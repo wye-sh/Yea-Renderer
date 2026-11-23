@@ -26,7 +26,7 @@ STRUCT(VSOutput)
     DATA(float4, PrevClip, TEXCOORD4);
 #endif
     DATA(float2, Uv, TEXCOORD5);
-    DATA(float4, Tangent, TEXCOORD6); // world, w the bitangent's sign
+    DATA(float4, Tangent, TEXCOORD6); // world, unit length; w the bitangent's sign times Normal's length (Material.h.fsl)
     DATA(float4, Color, TEXCOORD7);
 };
 
@@ -53,7 +53,9 @@ VSOutput VS_MAIN(VSInput In)
     Out.Material = inst.misc.x;
     float2 tf = max(float2(In.Tangent) * (1.0 / 32767.0), float2(-1.0, -1.0));
     float3 t = octDecode(tf);
-    Out.Tangent = float4(dot(a, t), dot(b, t), dot(c, t), (In.Tangent.y & 1) != 0 ? -1.0 : 1.0);
+    // The normal stays as it comes (specular antialiasing reads its derivatives); the normal map's frame wants unit
+    // vectors per vertex (MikkTSpace), so the tangent is unit length and w carries the normal's length with the sign.
+    Out.Tangent = float4(normalize(float3(dot(a, t), dot(b, t), dot(c, t))), ((In.Tangent.y & 1) != 0 ? -1.0 : 1.0) * length(Out.Normal));
     Out.Uv = In.Uv;
     Out.Color = In.Color;
 #ifdef MOTION

@@ -102,7 +102,9 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   probe rays) read the material's maps as the forward pass does (base colour, ORM with its occlusion on the ambient,
   normal, emissive; `hitMaterial` in Trace.comp.fsl), each map's mip from the ray cone (Akenine-Moller 2021: a pixel at
   the surface, spreading by the pixel angle, twice the reflector's bend to its neighbours and the GGX alpha; a probe
-  ray by sqrt(4 pi / rays)) over the triangle's uv-to-world area, plus mipBias; positions are bound for that. The core's vertex and index buffers get the device-address and
+  ray by sqrt(4 pi / rays)) over the triangle's uv-to-world area, plus mipBias; positions are bound for that. Normal maps
+  use each vertex's world normal and tangent at unit length, as the core's Material.h.fsl mappedNormal does (the core's
+  vertex normal keeps the instance's scale for specular antialiasing; Tangent.w carries that length with the sign). The core's vertex and index buffers get the device-address and
   build-input flags and a uint view when the service exists. While it runs, the prepass writes `surface`
   (RGBA16F: x reflection roughness, yzw the normal; renderer_vrs reads x as its gloss). After the prepass, one
   full-size compute dispatch traces each pixel below `max_roughness` along one GGX visible-normal sample (R2

@@ -447,14 +447,19 @@ MaterialData hitMaterial(uint index, uint prim, float2 bary, float width, float3
         m.emissive.rgb *= sampleMapLod(mm.maps.w, uv, lod).rgb;
     if (mm.maps.z != 0u)
     {
-        // MikkTSpace: the interpolated normal and tangent as they come, the bitangent from them and the tangent's
-        // sign; the whole frame turned with the face the ray hit.
+        // MikkTSpace: each vertex's world normal and tangent at unit length (an instance's scale would otherwise
+        // weigh the map's x, y and z unevenly), interpolated as they come, the bitangent from them and the tangent's
+        // sign; the whole frame turned with the face the ray hit. As the core's Forward.vert and Material.h.fsl.
         float3 c0 = cross(c, d), c1 = cross(d, a), c2 = cross(a, c);
-        float3 n = vertexNormal(v0) * b.x + vertexNormal(v1) * b.y + vertexNormal(v2) * b.z;
-        n = float3(dot(c0, n), dot(c1, n), dot(c2, n));
+        float3 n0 = vertexNormal(v0), n1 = vertexNormal(v1), n2 = vertexNormal(v2);
+        float3 n = normalize(float3(dot(c0, n0), dot(c1, n0), dot(c2, n0))) * b.x +
+                   normalize(float3(dot(c0, n1), dot(c1, n1), dot(c2, n1))) * b.y +
+                   normalize(float3(dot(c0, n2), dot(c1, n2), dot(c2, n2))) * b.z;
         uint   w0 = gAttributes[v0 * 5u + 1u];
-        float3 t = octWord(w0) * b.x + octWord(gAttributes[v1 * 5u + 1u]) * b.y + octWord(gAttributes[v2 * 5u + 1u]) * b.z;
-        t = float3(dot(a, t), dot(c, t), dot(d, t));
+        float3 t0 = octWord(w0), t1 = octWord(gAttributes[v1 * 5u + 1u]), t2 = octWord(gAttributes[v2 * 5u + 1u]);
+        float3 t = normalize(float3(dot(a, t0), dot(c, t0), dot(d, t0))) * b.x +
+                   normalize(float3(dot(a, t1), dot(c, t1), dot(d, t1))) * b.y +
+                   normalize(float3(dot(a, t2), dot(c, t2), dot(d, t2))) * b.z;
         float  facing = dot(n, R) > 0.0 ? -1.0 : 1.0;
         float2 xy = sampleMapLod(mm.maps.z, uv, lod).xy * 2.0 - 1.0;
         float  z = sqrt(saturate(1.0 - dot(xy, xy)));

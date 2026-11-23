@@ -52,7 +52,7 @@ VSOutput VS_MAIN(VSInput In)
     Out.Normal = float3(dot(cross(b, c), n), dot(cross(c, a), n), dot(cross(a, b), n));
     Out.Material = inst.misc.x;
     float3 t = octDecode(max(float2(In.Tangent) * (1.0 / 32767.0), float2(-1.0, -1.0)));
-    Out.Tangent = float4(dot(a, t), dot(b, t), dot(c, t), (In.Tangent.y & 1) != 0 ? -1.0 : 1.0);
+    Out.Tangent = float4(normalize(float3(dot(a, t), dot(b, t), dot(c, t))), ((In.Tangent.y & 1) != 0 ? -1.0 : 1.0) * length(Out.Normal)); // as Forward.vert
     Out.Uv = In.Uv;
     Out.Color = In.Color;
 #endif
