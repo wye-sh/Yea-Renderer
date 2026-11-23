@@ -505,6 +505,103 @@ inline bool build(const Skel& t, const Skel& s, Map& m)
     return true;
 }
 
+// --- IK (pose() and footik.h) ------------------------------------------------------------------------------------
+// The least the pelvis must come down along `up` for the two-bone limb A-B-C to reach G: 0 when it already can.
+inline float reachDrop(const float* A, const float* B, const float* C, const float* G, const float* up)
+{
+    float ab[3], bc[3], v[3];
+    sub(B, A, ab), sub(C, B, bc), sub(G, A, v);
+    const float L = (len(ab) + len(bc)) * 0.9998f, vu = dot(v, up), vv = dot(v, v);
+    if (vv <= L * L)
+        return 0;
+    const float disc = vu * vu - (vv - L * L); // |v + d up| = L: the smaller root; none, the nearest point
+    return disc >= 0 ? -vu - sqrtf(disc) : -vu;
+}
+// `root` and everything under it moved by d along `up` (model space; world as worlds() made it), and root's local
+// position to match. At most 1024 nodes.
+inline void shift(const RmodelNode* nodes, uint32_t count, uint32_t root, const float* up, float d, float* world, anim::Pose* out)
+{
+    static const float id12[12] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0 };
+    uint8_t            under[1024]; // the root and everything under it
+    for (uint32_t n = 0; n < count && n < 1024; ++n)
+    {
+        const int32_t pa = nodes[n].parent;
+        under[n] = n == root || (pa >= 0 && under[pa]);
+        if (under[n])
+            for (int j = 0; j < 3; ++j)
+                world[n * 12 + j * 4 + 3] += d * up[j];
+    }
+    const int32_t pa = nodes[root].parent;
+    float         P[3];
+    at(world, root, P);
+    unplace(pa >= 0 ? &world[pa * 12] : id12, P, out[root].t);
+}
+// Two-bone IK: the upper a and lower b turned (their local turns in out) so the end c reaches G, c taking the
+// model-space turn endTurn (nullptr: keeping FK's); world and turn (model space) as FK left them, not updated. The knee or elbow bends in the plane FK
+// left it in, else (FK straight) to `bend` (model space at rest) turned as a's parent turned from its rest (parentRest;
+// nullptr: a has no parent). False: the limb has no length or no side to bend to, and stays as it was.
+inline bool limb(const RmodelNode* nodes, const float* world, const float* turn, uint32_t a, uint32_t b, uint32_t c, const float* G,
+                 const float* bend, const float* parentRest, anim::Pose* out, const float* endTurn = nullptr)
+{
+    static const float idq[4] = { 0, 0, 0, 1 };
+    float              A[3], B[3], C[3];
+    at(world, a, A), at(world, b, B), at(world, c, C);
+    float ab[3], bc[3], ag[3];
+    sub(B, A, ab), sub(C, B, bc), sub(G, A, ag);
+    const float lab = len(ab), lbc = len(bc), dg = len(ag);
+    if (!(lab > 1e-6f) || !(lbc > 1e-6f) || !(dg > 1e-6f))
+        return false;
+    float u[3] = { ag[0] / dg, ag[1] / dg, ag[2] / dg };
+    const float lo = fabsf(lab - lbc) * 1.001f + 1e-5f, hi = (lab + lbc) * 0.9999f;
+    const float d = dg < lo ? lo : (dg > hi ? hi : dg);
+    // the knee's side: where FK bent it (its knee off the line from its hip to its end), else, FK straight, the
+    // chain's front turned as its parent turned; then square to the line to the goal
+    float kd[3], ac[3];
+    sub(C, A, ac);
+    if (!unit(ac))
+        return false;
+    float du = dot(ab, ac);
+    for (int j = 0; j < 3; ++j)
+        kd[j] = ab[j] - du * ac[j];
+    const int32_t pa = nodes[a].parent, pb = nodes[b].parent;
+    if (len(kd) < 1e-3f * lab)
+    {
+        float q[4] = { 0, 0, 0, 1 }, cj[4];
+        if (pa >= 0 && parentRest)
+            qconj(parentRest, cj), qmul(&turn[pa * 4], cj, q);
+        qrot(q, bend, kd);
+    }
+    du = dot(kd, u);
+    for (int j = 0; j < 3; ++j)
+        kd[j] -= du * u[j];
+    if (!unit(kd))
+        return false;
+    float ca = (lab * lab + d * d - lbc * lbc) / (2 * lab * d);
+    ca = ca < -1 ? -1 : (ca > 1 ? 1 : ca);
+    const float sa = sqrtf(1 - ca * ca);
+    float       B2[3], T2[3], ab2[3], qa[4], qb[4], C1[3], cb[3], tb[3], v[3];
+    for (int j = 0; j < 3; ++j)
+        B2[j] = A[j] + lab * (ca * u[j] + sa * kd[j]), T2[j] = A[j] + d * u[j];
+    float abn[3] = { ab[0] / lab, ab[1] / lab, ab[2] / lab };
+    sub(B2, A, ab2), unit(ab2), arc(abn, ab2, qa);
+    sub(C, A, v), qrot(qa, v, C1);
+    for (int j = 0; j < 3; ++j)
+        C1[j] += A[j];
+    sub(C1, B2, cb), sub(T2, B2, tb);
+    if (!unit(cb) || !unit(tb))
+        return false;
+    arc(cb, tb, qb);
+    // new turns: the upper's subtree by qa, then the end's parent's subtree by qb
+    float ga[4], gbp[4], gb[4], cj[4], q[4];
+    qmul(qa, &turn[a * 4], ga);
+    qconj(pa >= 0 ? &turn[pa * 4] : idq, cj), qmul(cj, ga, out[a].r), qnorm(out[a].r);
+    qmul(qa, &turn[pb * 4], gbp); // b's parent, turned with the upper
+    qmul(qb, qa, q), qmul(q, &turn[b * 4], gb);
+    qconj(gbp, cj), qmul(cj, gb, out[b].r), qnorm(out[b].r);
+    qconj(gb, cj), qmul(cj, endTurn ? endTurn : &turn[c * 4], out[c].r), qnorm(out[c].r);
+    return true;
+}
+
 // Scratch for pose(), kMaxNodes of each (made in the module's load()).
 struct Scratch
 {
@@ -567,93 +664,22 @@ inline void pose(const Map& m, const Skel& t, const Skel& s, const anim::Pose* s
             const Ik& k = m.ik[i];
             if (!k.leg)
                 continue;
-            float A[3], B[3], C[3], G[3], ab[3], bc[3], v[3];
+            float A[3], B[3], C[3], G[3];
             at(sc.tw, k.a, A), at(sc.tw, k.b, B), at(sc.tw, k.c, C), goal(k, G);
-            sub(B, A, ab), sub(C, B, bc), sub(G, A, v);
-            const float L = (len(ab) + len(bc)) * 0.9998f, vu = dot(v, m.up), vv = dot(v, v);
-            if (vv <= L * L)
-                continue;
-            const float disc = vu * vu - (vv - L * L); // |v + d up| = L: the smaller root; none, the nearest point
-            const float d = disc >= 0 ? -vu - sqrtf(disc) : -vu;
+            const float d = reachDrop(A, B, C, G, m.up);
             drop = d > drop ? d : drop;
         }
         if (drop > 0)
-        {
-            uint8_t under[1024]; // the pelvis and everything under it
-            for (uint32_t n = 0; n < t.count; ++n)
-            {
-                const int32_t pa = t.nodes[n].parent;
-                under[n] = n == m.tRoot || (pa >= 0 && under[pa]);
-                if (under[n])
-                    for (int j = 0; j < 3; ++j)
-                        sc.tw[n * 12 + j * 4 + 3] -= drop * m.up[j];
-            }
-            const int32_t pa = t.nodes[m.tRoot].parent;
-            float         P[3];
-            at(sc.tw, m.tRoot, P);
-            unplace(pa >= 0 ? &sc.tw[pa * 12] : id12, P, out[m.tRoot].t);
-        }
+            shift(t.nodes, t.count, m.tRoot, m.up, -drop, sc.tw, out);
     }
     // IK: each limb's upper and lower turned so its end reaches the goal; its end keeps FK's turn.
     for (uint32_t i = 0; i < m.ikCount; ++i)
     {
-        const Ik& k = m.ik[i];
-        float     A[3], B[3], C[3], G[3];
-        at(sc.tw, k.a, A), at(sc.tw, k.b, B), at(sc.tw, k.c, C), goal(k, G);
-        float ab[3], bc[3], ag[3];
-        sub(B, A, ab), sub(C, B, bc), sub(G, A, ag);
-        const float lab = len(ab), lbc = len(bc), dg = len(ag);
-        if (!(lab > 1e-6f) || !(lbc > 1e-6f) || !(dg > 1e-6f))
-            continue;
-        float u[3] = { ag[0] / dg, ag[1] / dg, ag[2] / dg };
-        const float lo = fabsf(lab - lbc) * 1.001f + 1e-5f, hi = (lab + lbc) * 0.9999f;
-        const float d = dg < lo ? lo : (dg > hi ? hi : dg);
-        // the knee's side: where FK bent it (its knee off the line from its hip to its end), else, FK straight, the
-        // chain's front turned as its parent turned; then square to the line to the goal
-        float kd[3], ac[3];
-        sub(C, A, ac);
-        if (!unit(ac))
-            continue;
-        float du = dot(ab, ac);
-        for (int j = 0; j < 3; ++j)
-            kd[j] = ab[j] - du * ac[j];
-        if (len(kd) < 1e-3f * lab)
-        {
-            const int32_t pa = t.nodes[k.a].parent;
-            float         q[4] = { 0, 0, 0, 1 }, c[4];
-            if (pa >= 0)
-                qconj(&m.restT[pa * 4], c), qmul(&sc.tq[pa * 4], c, q);
-            qrot(q, k.bend, kd);
-        }
-        du = dot(kd, u);
-        for (int j = 0; j < 3; ++j)
-            kd[j] -= du * u[j];
-        if (!unit(kd))
-            continue;
-        float ca = (lab * lab + d * d - lbc * lbc) / (2 * lab * d);
-        ca = ca < -1 ? -1 : (ca > 1 ? 1 : ca);
-        const float sa = sqrtf(1 - ca * ca);
-        float       B2[3], T2[3], ab2[3], qa[4], qb[4], C1[3], cb[3], tb[3], v[3];
-        for (int j = 0; j < 3; ++j)
-            B2[j] = A[j] + lab * (ca * u[j] + sa * kd[j]), T2[j] = A[j] + d * u[j];
-        float abn[3] = { ab[0] / lab, ab[1] / lab, ab[2] / lab };
-        sub(B2, A, ab2), unit(ab2), arc(abn, ab2, qa);
-        sub(C, A, v), qrot(qa, v, C1);
-        for (int j = 0; j < 3; ++j)
-            C1[j] += A[j];
-        sub(C1, B2, cb), sub(T2, B2, tb);
-        if (!unit(cb) || !unit(tb))
-            continue;
-        arc(cb, tb, qb);
-        // new turns: the upper's subtree by qa, then the end's parent's subtree by qb
-        float ga[4], gbp[4], gb[4], c[4], q[4];
-        const int32_t pa = t.nodes[k.a].parent, pb = t.nodes[k.b].parent;
-        qmul(qa, &sc.tq[k.a * 4], ga);
-        qconj(pa >= 0 ? &sc.tq[pa * 4] : idq, c), qmul(c, ga, out[k.a].r), qnorm(out[k.a].r);
-        qmul(qa, &sc.tq[pb * 4], gbp); // b's parent, turned with the upper
-        qmul(qb, qa, q), qmul(q, &sc.tq[k.b * 4], gb);
-        qconj(gbp, c), qmul(c, gb, out[k.b].r), qnorm(out[k.b].r);
-        qconj(gb, c), qmul(c, &sc.tq[k.c * 4], out[k.c].r), qnorm(out[k.c].r);
+        const Ik&     k = m.ik[i];
+        const int32_t pa = t.nodes[k.a].parent;
+        float         G[3];
+        goal(k, G);
+        limb(t.nodes, sc.tw, sc.tq, k.a, k.b, k.c, G, k.bend, pa >= 0 ? &m.restT[pa * 4] : nullptr, out);
     }
 }
 // A source clip's root motion (model-space travel and turn) as the target's.

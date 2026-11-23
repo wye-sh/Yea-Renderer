@@ -28,6 +28,10 @@ YeaUiRow gFromRows[kMaxModels];
 uint32_t gFromIds[kMaxModels];
 char     gFromNames[kMaxModels][80], gFromRights[kMaxModels][24];
 char     gClipNames[kClipRows + 1][64], gClipRights[kClipRows + 1][16];
+YeaUiRow gLayerRows[kClipRows + 1];
+constexpr uint32_t kBoneRows = 1024; // renderer_models' kMaxNodes
+YeaUiRow gBoneRows[kBoneRows + 1];
+char     gBoneNames[kBoneRows + 1][64];
 
 // "old_chair": "Old Chair".
 void pretty(const char* in, char* out, size_t cap)
@@ -264,6 +268,36 @@ void panel_model_viewer()
                 }
                 if (u->button("Follow the Clip##morph", 0, 1))
                     memset(gPreview.morphHeld, 0, sizeof gPreview.morphHeld);
+            }
+        }
+        // A layer over its clip, as mdl::layer plays one: a clip of the models listed above, from a bone down (or the
+        // whole body), overriding or added (what it does since its first frame), at a weight.
+        u->fold("Layer##layer", &gPreview.layerOpen);
+        if (gPreview.layerOpen)
+        {
+            const bool own = gPreview.layerSource == fromKey; // the layer's clip is one of these
+            gLayerRows[0] = { "None", "", gPreview.layerClip == kNoClip };
+            for (uint32_t c = 0; c < clips; ++c)
+                gLayerRows[c + 1] = { gClipNames[c + 1], gClipRights[c + 1], own && gPreview.layerClip == c };
+            const int on = gPreview.layerClip == kNoClip ? 0 : own ? int(gPreview.layerClip + 1) : -1;
+            const int lp = u->dropdown("##layerClip", gLayerRows, int(clips + 1), on);
+            if (lp != on && lp >= 0 && lp <= int(clips))
+                gPreview.layerPick = uint32_t(lp) + 1; // 1 none, clip c at c + 2
+            if (gPreview.layerClip != kNoClip || gPreview.layerPick > 1)
+            {
+                const uint32_t nodes = sel->skel->nodeCount < kBoneRows ? sel->skel->nodeCount : kBoneRows;
+                gBoneRows[0] = { "Whole Body", "", 0 };
+                for (uint32_t b = 0; b < nodes; ++b)
+                {
+                    pretty(sel->nodes[b].name, gBoneNames[b + 1], sizeof gBoneNames[b + 1]);
+                    gBoneRows[b + 1] = { gBoneNames[b + 1], "", 0 };
+                }
+                const int bone = gPreview.layerBone == kNoClip ? 0 : int(gPreview.layerBone + 1);
+                const int bp = u->dropdown("From##layerBone", gBoneRows, int(nodes + 1), bone);
+                if (bp != bone && bp >= 0 && bp <= int(nodes))
+                    gPreview.layerBone = bp == 0 ? kNoClip : uint32_t(bp - 1);
+                u->slider("Weight##layer", &gPreview.layerWeight, 0.0f, 1.0f, 0);
+                u->toggle("Additive##layer", &gPreview.layerAdditive);
             }
         }
     }

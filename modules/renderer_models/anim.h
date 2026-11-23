@@ -332,6 +332,91 @@ inline void blendPoses(Pose* a, const Pose* b, uint32_t count, float f)
     }
 }
 
+// Inertialization (Bollo, GDC 2018; UE's Inertialization node): at a transition only the new clip plays, and each node
+// carries the old pose's offset from it, decayed to nothing by a quintic that ends with no speed or acceleration. Each
+// of a node's nine numbers (translation, rotation as axis times angle, scale) decays on its own with its own rate, so the
+// pose leaves the switch at the old pose's place and speed; a number heading for zero fast ends sooner, so none goes past
+// it, and one moving away carries on a little first (the old motion's momentum) instead of stopping dead.
+struct Inertial
+{
+    float x[9], v[9]; // t, log r (shorter arc, old * new⁻¹), s; and their rates at the switch
+};
+// x0 with rate v0 at the switch, after t seconds of t1 (in t1's own time, s = t / t1, so a tiny t1 stays finite).
+inline float inertialDecay(float x0, float v0, float t, float t1)
+{
+    const float sg = x0 != 0 ? (x0 < 0 ? -1.0f : 1.0f) : (v0 < 0 ? -1.0f : 1.0f);
+    x0 *= sg, v0 *= sg;
+    if (!(t1 > 0) || (x0 == 0 && v0 == 0))
+        return 0;
+    if (v0 * t1 < -5 * x0) // heading for zero fast: over sooner, or it would go past
+        t1 = -5 * x0 / v0;
+    if (!(t < t1))
+        return 0;
+    const float V = v0 * t1, a = -8 * V - 20 * x0, Ac = a > 0 ? a : 0; // V and Ac: v0 and a0 in s's time
+    const float A = -(Ac + 6 * V + 12 * x0) * 0.5f, B = (3 * Ac + 16 * V + 30 * x0) * 0.5f, C = -(3 * Ac + 12 * V + 20 * x0) * 0.5f;
+    const float u = t / t1;
+    return sg * (((((A * u + B) * u + C) * u + Ac * 0.5f) * u + V) * u + x0);
+}
+// A unit quaternion's log: axis times angle, on the shorter arc.
+inline void quatLog(const float* q, float* v)
+{
+    const float sg = q[3] < 0 ? -1.0f : 1.0f, sh = sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2]);
+    const float k = sh > 1e-9f ? 2 * atan2f(sh, sg * q[3]) / sh * sg : 2 * sg;
+    for (int i = 0; i < 3; ++i)
+        v[i] = q[i] * k;
+}
+inline void quatMul(const float* a, const float* b, float* o)
+{
+    const float r[4] = { a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1], a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+                         a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3], a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2] };
+    memcpy(o, r, 16);
+}
+// The offsets at a transition: src the old pose now and srcBefore h seconds before, dst the new now and dstAfter h after
+// (the new clip starts there, so its rate is taken forward and mirrored back).
+inline void inertialOffsets(const Pose* src, const Pose* srcBefore, const Pose* dst, const Pose* dstAfter, float h, uint32_t count,
+                            Inertial* out)
+{
+    for (uint32_t n = 0; n < count; ++n)
+    {
+        const Pose &s = src[n], &sb = srcBefore[n], &d = dst[n], &da = dstAfter[n];
+        Inertial&   o = out[n];
+        for (int i = 0; i < 3; ++i)
+        {
+            o.x[i] = s.t[i] - d.t[i], o.v[i] = (o.x[i] - (sb.t[i] - (2 * d.t[i] - da.t[i]))) / h;
+            o.x[6 + i] = s.s[i] - d.s[i], o.v[6 + i] = (o.x[6 + i] - (sb.s[i] - (2 * d.s[i] - da.s[i]))) / h;
+        }
+        // the new pose h before, mirrored from h after: d * da⁻¹ * d
+        const float di[4] = { -d.r[0], -d.r[1], -d.r[2], d.r[3] }, dai[4] = { -da.r[0], -da.r[1], -da.r[2], da.r[3] };
+        float       m[4], db[4], dbi[4], q[4], now[3], before[3];
+        quatMul(d.r, dai, m), quatMul(m, d.r, db);
+        dbi[0] = -db[0], dbi[1] = -db[1], dbi[2] = -db[2], dbi[3] = db[3];
+        quatMul(s.r, di, q), quatLog(q, now);
+        quatMul(sb.r, dbi, q), quatLog(q, before);
+        for (int i = 0; i < 3; ++i)
+            o.x[3 + i] = now[i], o.v[3 + i] = (now[i] - before[i]) / h;
+    }
+}
+// The offsets, `t` seconds into a transition of `t1`, put on the new pose (rotation as exp(offset) * pose).
+inline void inertialApply(Pose* pose, const Inertial* off, uint32_t count, float t, float t1)
+{
+    for (uint32_t n = 0; n < count; ++n)
+    {
+        Pose&           p = pose[n];
+        const Inertial& o = off[n];
+        float           v[9];
+        for (int i = 0; i < 9; ++i)
+            v[i] = inertialDecay(o.x[i], o.v[i], t, t1);
+        for (int i = 0; i < 3; ++i)
+            p.t[i] += v[i], p.s[i] += v[6 + i];
+        const float a = sqrtf(v[3] * v[3] + v[4] * v[4] + v[5] * v[5]);
+        if (a > 0)
+        {
+            const float k = sinf(a * 0.5f) / a, e[4] = { v[3] * k, v[4] * k, v[5] * k, cosf(a * 0.5f) };
+            quatMul(e, p.r, p.r);
+        }
+    }
+}
+
 // A pose as a 3x4 matrix (rows): T * R * S.
 inline void poseMatrix(const Pose& p, float* m)
 {

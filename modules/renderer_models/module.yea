@@ -33,6 +33,8 @@ import renderer void instance_pose(handle i, u64 palette, u32 bones)
 # Morph targets (renderer 4.13.0): a skinned mesh's deltas, and an instance's weights this frame.
 import renderer void mesh_morph(u32 mesh, u64 refs, u64 deltas, u32 delta_count)
 import renderer void instance_morph(handle i, u64 weights, u32 count)
+# A posed instance's bounds this frame (renderer 6.7.0): foot IK's reach past its cooked bounds, so it is never culled early.
+import renderer void instance_bounds(handle i, float3 lo, float3 hi)
 import renderer u32 scene_epoch() = 0
 import renderer bool preview_draw(u64 preview) = false
 import table renderer Mesh
@@ -105,6 +107,62 @@ table PlacementLayer none 8192
   float target
   float fade
 end
+# Foot IK (mdl::footIk; rows as Placement's): on, faded in and out over `fade` seconds (`weight` now); how far a foot
+# may move from where its clip puts it (`reach`, metres); the ground the game gave under each foot (a point and its
+# normal, world; `set` bits 1 left, 2 right) and the ground followed now (`seen` bits), which glides to a new one;
+# the pelvis's offset now (metres along +Y); and where its clip put each foot last frame (`at` bits), to trace from.
+table PlacementGround none 4096
+  u32 on
+  float weight
+  float reach
+  float fade
+  float pelvis
+  u32 set
+  u32 seen
+  u32 at
+  float3 pointL
+  float3 normalL
+  float3 pointR
+  float3 normalR
+  float3 planeL
+  float3 upL
+  float3 planeR
+  float3 upR
+  float3 footL
+  float3 footR
+end
+# Blend spaces (mdl::blendSpace; rows as Placement's): its samples now (`set`, 0 none) and those it fades from (`from`,
+# while its clip fades from its blend space), each's dimensions and point (x, y; fromX, fromY held at the hand-over), the
+# point the game asked for (tx, ty) followed over `smooth` seconds, the phase its samples share (0 to 1 a cycle;
+# fromPhase), the samples' hash (the same again keep their phase), and the number the next set takes.
+table PlacementBlend none 4096
+  u32 set
+  u32 from
+  u32 dims
+  u32 fromDims
+  u32 hash
+  u32 next
+  float x
+  float y
+  float tx
+  float ty
+  float smooth
+  float fromX
+  float fromY
+  float phase
+  float fromPhase
+end
+# A blend space's samples: its placement (handle) and set, the model whose clip it is (key; 0 its own), the clip (`want`
+# its name's hash while either model loads; 4294967295 none, left out), and where it stands in the space.
+table PlacementBlendSample none 16384
+  u32 placement
+  u32 set
+  u32 source
+  u32 clip
+  u32 want
+  float x
+  float y
+end
 # The renderer's instances a placement draws with, one per part of its model.
 table PartInstance none 65536
   u32 placement
@@ -135,6 +193,10 @@ category Models
 # How bright a model's glowing parts are: the luminance (cd/m2) of an emissive colour of 1 at strength 1 in its file
 # (glTF gives emission no unit).
 setting float emissive_nits 1000 0 inf
+# How a clip takes over from the one before (play()'s fade): Inertial goes on from the old pose's place and speed and
+# lets the difference die away over the fade (never past the new pose; only the new clip sampled); Crossfade blends the
+# two clips' poses.
+setting choice transitions Inertial Inertial Crossfade
 
 # Every model's knobs (ModelLink.h's mdl::Knobs, in that order): a module that imports this one gets them for each of its
 # MODEL lines (chair_scale), tuned only in the Model Viewer.

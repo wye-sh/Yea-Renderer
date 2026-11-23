@@ -447,7 +447,11 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   missing, damaged or of another version fails that model only, logged and shown in the Viewer; state `Format` rebuilds
   every model when `rmodel.h`'s kRmodelVersion changes (the loader reads kRmodelOldest up). Skinned models (rmodel v3,
   `Info.kind` 2) play their first clip, looping, once placed: `mdl::play(h, "Run", speed, loop, fade)` switches clip
-  (crossfaded, 0.2 s by default; nullptr or "" the rest pose; a name asked for while loading is taken once loaded),
+  (over `fade`, 0.2 s by default; nullptr or "" the rest pose; a name asked for while loading is taken once loaded;
+  knob `transitions`: Inertial, the default, plays only the new clip with the old pose's per-node offsets, nine numbers
+  a node and one a morph target, each decayed by Bollo's quintic from its place and rate at the switch (`anim.h`'s
+  `inertial*`), taken on the first pose after it (a transition cut short goes on from where it showed) into a pool made
+  in `load()`, and given back by animate() once the fade is over; a full pool crossfades; Crossfade blends both clips),
   `mdl::clipTime(h)`, `mdl::joint(h, "hand_r", m)` a joint's world 3x4 this frame (attach things to it); clips and joints
   are named as in the source. `ModelLink.h`'s `hasAnim(a)` says the module has them (Api's size). Morph targets
   (rmodel v4, `hasMorph(a)`): a clip's weight tracks play and crossfade with its pose; `mdl::morph(h, "Smile", w)` holds a
@@ -477,14 +481,39 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   layer too. The same clip again in a slot re-weighs it and keeps its time; another crossfades from it; weight eased by
   smoothstep over `fade`; `mdl::unlayer(h, slot, fade)` fades it out. Bone and clip names wait for the models to load;
   a layer whose bone, clip or placement is gone is dropped. Layers carry no root motion and no morph weights (the base
-  clip's). Table `PlacementLayer` (8192: placement, slot, order, clip, mask, weight, time), emptied by Reset. Clips are sampled with
+  clip's). Table `PlacementLayer` (8192: placement, slot, order, clip, mask, weight, time), emptied by Reset. Foot IK
+  (`hasFootIk(a)`; UE's foot placement): the renderer has no physics, so the game traces its own ground:
+  `mdl::footIk(h, true, reach, fade)` on, then each frame `mdl::footAt(h, f, &p)` (where the clip put foot f, 0 left,
+  last frame) and `mdl::footGround(h, f, point, normal)` (point nullptr: none). After the layers, `footIk` (in
+  renderer_models.cpp) brings each ankle to the ground straight below it, its clip's lift above its rest height kept,
+  the foot tilted to the ground (at most 45 degrees) while the clip has it down. The pelvis moves to the lower foot's
+  ground (followed at 15/s), then comes down by the least that brings both goals within reach (`retarget::reachDrop`).
+  Then `retarget::limb` runs the same two-bone IK as retargeting. A lifted foot glides to a new ground; a foot that is
+  down stands on it at once, so it lands exactly on a step. Ground more than `reach` from the clip's foot is left
+  alone, and on flat ground at the placement's height nothing changes. Legs are found from bone names as retargeting
+  finds them (`findLegs`, at load). While foot IK moves a placement, its parts get `instance_bounds`: each bone's box
+  (`boneBoxes`, at load: the vertices it skins on every part and LOD, with their morph targets' reach, in the mesh's
+  space), moved by its palette matrix (`poseBounds`). That holds every skinned vertex in any pose, so a pelvis dropped by
+  foot IK never culls the feet early. Table `PlacementGround` (rows as Placement's), emptied by Reset. Blend spaces
+  (`hasBlendSpaces(a)`; UE's Blend Space and Blend Space 1D): `mdl::blendSpace(h, [otherModel,] samples, count, dims,
+  fade)` (up to 16 clips at points in 1 or 2 dimensions) becomes the placement's clip, `PlacementAnim.clip` set to
+  `kBlendClip`, so `play()`'s crossfades go into and out of it (`leaveBlend`). The same samples again keep playing.
+  `mdl::blendAt(h, x, y, smooth)` sets the point, followed exponentially (most of the way in `smooth` s). Weights come
+  from `blend.h`: 1D linear between neighbours; 2D Delaunay (cocircular grids split without overlap, triangles cached
+  in `gBlendTris` per row and set) with barycentric weights, the nearest hull edge outside, 1D along the wider axis when
+  collinear. Every sample plays at one normalised phase (`PlacementBlend.phase`), moved on by dt over the weighted
+  length, as UE syncs blend spaces; `clipTime` is phase times that length. Poses are summed by weight (rotations to the
+  first's hemisphere, then normalised), morph weights and root motion likewise (`blendSample`, `blendMotion`), each
+  sample through `sampleAs` (so retargeted and in place). A new set from a blend space fades from the old one in step.
+  Sample names wait for their models; a missing one is left out, with a log line. Tables `PlacementBlend` (rows as
+  Placement's) and `PlacementBlendSample` (16384), emptied by Reset. Clips are sampled with
   `anim.h` (shared with the cooker: smallest-three rotations, quantised tracks, `sampleClip`, `blendPoses`, `palette`;
   rmodel v5's `RmodelCodecAcl` clips through the Animation Compression Library, `acl/` and `rtm/` here holding only ACL
   2.1.0's decompression headers and Realtime Math 2.2.0, MIT and unmodified; `clipValid` checks either layout at load)
   in `YEA_PHASE_LATE` into scratch made in load(), and each part instance gets the palette through `instance_pose`.
   Its tables: `Placement` (a row per
   placement, keyed by the model's owner and name), `PlacementAnim` (beside it: clip, time, speed, loop and the clip
-  it fades from), `PlacementMotion` (beside it: root motion on, and what it gathered), `PlacementRetarget` (beside it), `PlacementLayer` (a row per layer), `PartInstance` (the core's instances, one per part), `ModelPart` (each
+  it fades from), `PlacementMotion` (beside it: root motion on, and what it gathered), `PlacementRetarget` (beside it), `PlacementLayer` (a row per layer), `PlacementGround` (beside Placement: foot IK), `PlacementBlend` (beside it) and `PlacementBlendSample` (blend spaces), `PartInstance` (the core's instances, one per part), `ModelPart` (each
   model's meshes and materials in the core, found again after a reload), state `Scene` (the core's scene_epoch they belong
   to: when it changes, every part and instance is made again). It builds and syncs in `YEA_PHASE_LATE`, after the game's
   modules moved things. Each MODEL line gets the knobs of its each block (scale, up_axis, lod_quality, cast_shadows,
@@ -494,7 +523,9 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   a skinned model its clips (a dropdown with Rest Pose, play and pause, From the Start, Speed, Crossfade: the preview's
   own clip state in `gPreview.anim`, played in update and posed through `RenderPreview.palette`; a folding Morph
   Targets list, a slider each, dragging one holds it until Follow the Clip; v3's `weights`; Clips From, another skinned model whose clips it plays retargeted; In Place, on by default, for
-  a model with a motion node), the
+  a model with a motion node; a folding Layer: one of those clips over the preview's clip as `mdl::layer` plays it, From
+  a bone down or the Whole Body, Weight, Additive, in `gPreview.layer*`, applied by evaluate's `applyLayer` and reset
+  with the model), the
   model's knobs; Add Models (the header's +) and drops go to the agents. The preview: this module makes its targets in
   its own `update()` at twice the canvas size (RGBA16F and D32 at 4 samples, a 1024² D32 shadow map, an RGBA8 sRGB out),
   and in `draw(YEA_PASS_RENDER)`, only on frames the panel showed it, calls the core's `preview_draw` (a `RenderPreview*`,
@@ -566,7 +597,9 @@ surface's luminance is that over its area). Colours linear RGB.
 - Skins (renderer_models calls these): `mesh_skin(mesh, skin, lo, hi)` (per vertex u16x4 bones and unorm16x4 weights
   summing to 65535; lo and hi the bounds its clips reach, so culling never loses a limb), `instance_pose(i, palette,
   bones)` each frame it is posed (3 rows of 4 floats a bone, model space; an instance not posed this frame draws its
-  bind pose).
+  bind pose), and `instance_bounds(i, lo, hi)` (6.7.0, skin.cpp's `skinBounds`) on a frame its pose reaches past its
+  mesh's bounds: renderer.cpp then makes its sphere the smallest one that holds both the mesh's sphere and that box
+  (never smaller), for culling, shadows, reflections and LOD. Instances without the call keep their mesh's sphere.
 - Materials: `material_add(albedo, roughness, metallic)`, `material_set`, `material_emissive(m, color, nits)`,
   `material_reflections(m, on)`: off, the material shows no reflected image (probes or sky), only the sky's
   soft light, however shiny or metallic it is. `material_double_sided(m, on)` (off by default): drawn from
@@ -660,7 +693,7 @@ burst)`, `_motion(e, speed, spread_deg, speed_jitter, gravity, drag, turbulence)
 `renderer_gi`: gi, quality (Low, Medium, High: 64/128/256 rays a probe, or 4/8/16 probes captured a frame without ray
 tracing), hysteresis, show_gi (the diffuse light alone, on white). Its export: `gi_volume(center, size)` (size 0 0 0:
 fitted round the scene again).
-`renderer_models`: emissive_nits (a model's emissive 1 at strength 1, cd/m²); per MODEL line, in the Model Viewer only: scale, up_axis (Auto, Y, Z: Z up in the file turned to Y up),
+`renderer_models`: emissive_nits (a model's emissive 1 at strength 1, cd/m²), transitions (Inertial, Crossfade); per MODEL line, in the Model Viewer only: scale, up_axis (Auto, Y, Z: Z up in the file turned to Y up),
 lod_quality, cast_shadows, double_sided.
 Players of a released game tune (`player` lines): upscaler, quality_mode, dlss_model, exposure_ev (brightness), lod_error, texture_detail,
 TAA's sharpen, shadows' sun_resolution, shadow_distance, pcss and light_shadows, and enabled for AO, contact shadows, SSR,

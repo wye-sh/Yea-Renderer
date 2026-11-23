@@ -33,7 +33,21 @@
 // root motion: the game owns where the character is, so it can collide, follow a path or be networked):
 //   float m[4];
 //   if (mdl::takeRootMotion(h, m)) { pos += { m[0], m[1], m[2] }; yaw += m[3]; mdl::move(h, pos, yawQuat(yaw)); }
-//
+// Foot IK (UE's foot placement): mdl::footIk(h, true) plants its feet on the game's ground, on slopes and steps: each
+// leg bent so its foot stands on the ground under it, tilted to it while the clip has it down, and the pelvis lowered to
+// the lower foot. The renderer has no physics, so the game traces its own ground: each frame, for each foot (0 left,
+// 1 right), mdl::footAt says where its clip puts it, and mdl::footGround hands over the ground found below:
+//   for (int f = 0; f < 2; ++f)
+//       if (yea_float3 p; mdl::footAt(h, f, &p) && myTrace(p, &hit, &normal)) mdl::footGround(h, f, hit, normal);
+// Blend spaces (UE's Blend Space and Blend Space 1D): mdl::blendSpace(h, samples, n, dims) plays clips placed in a space
+// of one or two dimensions (speed; speed and direction) as a placement's clip, crossfaded from what it played as play()
+// does; each frame mdl::blendAt(h, x, y) says where in the space it is, and the clips nearest that point blend (1D:
+// the two either side; 2D: the three corners of its triangle), every one in step, so feet keep their rhythm as a
+// walk becomes a run. play() leaves it; root motion, retargeting, layers and foot IK work on it as on a clip:
+//   static const mdl::BlendSample kMove[] = { { "Idle", 0, 0 }, { "Walk", 0, 1.5f }, { "Run", 0, 4 },
+//                                             { "StrafeL", -1.5f, 0 }, { "StrafeR", 1.5f, 0 }, { "Back", 0, -1.5f } };
+//   mdl::blendSpace(h, kMove, 6, 2);            // once (the same samples again change nothing)
+//   mdl::blendAt(h, sideways, forward, 0.1f);   // each frame: metres a second, followed over 0.1 s
 // Placements are kept by renderer_models (through its reloads); Reset State empties them, so place again whenever
 // mdl::placed(h) is false. The handle is 0 while renderer_models isn't running.
 #pragma once
@@ -94,6 +108,13 @@ struct Info
     const char* error;
 };
 
+// One clip of a blend space: its name, and where it stands (x; and y in two dimensions).
+struct BlendSample
+{
+    const char* clip;
+    float       x, y;
+};
+
 struct Api
 {
     uint32_t version, size;
@@ -137,12 +158,26 @@ struct Api
     int (*layer)(uint32_t placement, uint32_t slot, uint32_t model, const char* clip, const char* bone, float weight, int additive,
                  float speed, int loop, float fade);
     void (*unlayer)(uint32_t placement, uint32_t slot, float fade);
+    // Foot IK (later in Api: check `size`). footIk: on or off, faded over `fade` seconds; `reach` metres the most a foot
+    // moves from its clip's place; 0 when it has no two legs. footGround: the ground under a foot (0 left, 1 right),
+    // world point and normal (point nullptr: none). footAt: where its clip put the foot last frame, world; 0 none yet.
+    int (*footIk)(uint32_t placement, int on, float reach, float fade);
+    int (*footGround)(uint32_t placement, uint32_t foot, const float* point, const float* normal);
+    int (*footAt)(uint32_t placement, uint32_t foot, float* out);
+    // Blend spaces (later in Api: check `size`). blendSpace: `count` samples (1 to 16; model 0: its own clips) in `dims`
+    // (1 or 2) dimensions as its clip, faded to over `fade` seconds; 0 when a clip isn't there. blendAt: the point it
+    // plays, followed over `smooth` seconds (0: at once).
+    int (*blendSpace)(uint32_t placement, uint32_t model, const BlendSample* samples, uint32_t count, uint32_t dims, float speed,
+                      int loop, float fade);
+    void (*blendAt)(uint32_t placement, float x, float y, float smooth);
 };
 inline bool hasAnim(const Api* a) { return a->size >= offsetof(Api, morph); }
 inline bool hasMorph(const Api* a) { return a->size >= offsetof(Api, rootMotion); }
 inline bool hasRootMotion(const Api* a) { return a->size >= offsetof(Api, playFrom); }
 inline bool hasRetarget(const Api* a) { return a->size >= offsetof(Api, layer); }
-inline bool hasLayers(const Api* a) { return a->size >= sizeof(Api); }
+inline bool hasLayers(const Api* a) { return a->size >= offsetof(Api, footIk); }
+inline bool hasFootIk(const Api* a) { return a->size >= offsetof(Api, blendSpace); }
+inline bool hasBlendSpaces(const Api* a) { return a->size >= sizeof(Api); }
 
 struct Model;
 namespace detail
@@ -357,6 +392,62 @@ inline bool takeRootMotion(uint32_t placement, float out[4])
     const Api* a = detail::api();
     out[0] = out[1] = out[2] = out[3] = 0;
     return a && placement && hasRootMotion(a) && a->takeMotion(placement, out);
+}
+// Foot IK on (faded in over `fade` seconds) or off: its feet planted on the ground footGround gives, never moved more
+// than `reach` metres from where its clip puts them (ground further off is left alone). False: it hasn't two legs.
+inline bool footIk(uint32_t placement, bool on, float reach = 0.5f, float fade = 0.2f)
+{
+    const Api* a = detail::api();
+    return a && placement && hasFootIk(a) && a->footIk(placement, on ? 1 : 0, reach, fade);
+}
+// The ground under `foot` (0 left, 1 right): a point on it and its normal, world, as the game's trace found it below
+// footAt. Kept until given again; a new one is followed smoothly (a step's edge never pops the foot).
+inline bool footGround(uint32_t placement, int foot, yea_float3 point, yea_float3 normal = { 0, 1, 0 })
+{
+    const Api*  a = detail::api();
+    const float p[3] = { point.x, point.y, point.z }, n[3] = { normal.x, normal.y, normal.z };
+    return a && placement && hasFootIk(a) && a->footGround(placement, (uint32_t)foot, p, n);
+}
+// No ground under `foot` (nothing below it): it follows its clip.
+inline void footNoGround(uint32_t placement, int foot)
+{
+    const Api* a = detail::api();
+    if (a && placement && hasFootIk(a))
+        a->footGround(placement, (uint32_t)foot, nullptr, nullptr);
+}
+// Where its clip put `foot` (its ankle, world) last frame, before foot IK: trace the ground below it. False before
+// foot IK's first frame.
+inline bool footAt(uint32_t placement, int foot, yea_float3* out)
+{
+    const Api* a = detail::api();
+    float      p[3];
+    if (!a || !placement || !hasFootIk(a) || !a->footAt(placement, (uint32_t)foot, p))
+        return false;
+    *out = { p[0], p[1], p[2] };
+    return true;
+}
+// A blend space as its clip: `count` samples in `dims` (1 or 2) dimensions, its own clips or `from`'s retargeted onto it,
+// faded to over `fade` seconds; the same samples again keep playing where they are. False: a clip isn't there (or no
+// blend spaces in this renderer_models).
+inline bool blendSpace(uint32_t placement, const BlendSample* samples, uint32_t count, int dims = 1, float fade = 0.2f, float speed = 1.0f,
+                       bool loop = true)
+{
+    const Api* a = detail::api();
+    return a && placement && hasBlendSpaces(a) && a->blendSpace(placement, 0, samples, count, (uint32_t)dims, speed, loop ? 1 : 0, fade);
+}
+inline bool blendSpace(uint32_t placement, const Model& from, const BlendSample* samples, uint32_t count, int dims = 1, float fade = 0.2f,
+                       float speed = 1.0f, bool loop = true)
+{
+    const Api* a = detail::api();
+    return a && placement && from.id && hasBlendSpaces(a) &&
+           a->blendSpace(placement, from.id, samples, count, (uint32_t)dims, speed, loop ? 1 : 0, fade);
+}
+// Where in its blend space it plays (y for two dimensions), followed over `smooth` seconds (0: at once).
+inline void blendAt(uint32_t placement, float x, float y = 0.0f, float smooth = 0.0f)
+{
+    const Api* a = detail::api();
+    if (a && placement && hasBlendSpaces(a))
+        a->blendAt(placement, x, y, smooth);
 }
 // A held target (nullptr: every one) back to its clip's weight.
 inline void unmorph(uint32_t placement, const char* target = nullptr)

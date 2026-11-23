@@ -40,6 +40,20 @@ struct Entry
     uint32_t motionNode;
     float    motionLin[9], motionInv[9], motionT[3];
     uint32_t animStamp; // counts its skeleton's reads (a retarget map made from it is made again after one)
+    // Foot IK: its legs (left, right; found from its bones' names as retargeting finds them), each its thigh, calf and
+    // foot, its foot's model-space place at rest and its thigh's parent's turn at rest; and the pelvis that carries both.
+    struct Leg
+    {
+        uint32_t a, b, c;
+        float    rest[3], parentRest[4];
+        uint32_t hasParent;
+    };
+    // Each bone's box (6 floats: lo, hi; lo above hi where it skins nothing): the vertices it skins in the mesh's space
+    // (every part and LOD, with their morph targets' reach), so a pose's bounds are these under its palette (foot IK's).
+    float*   boneBox;
+    uint32_t legs; // 1: both found
+    Leg      leg[2];
+    uint32_t pelvis;
 };
 // Every model the view's modules declared, in the order declared (made in load()).
 extern Entry*   gEntries;
@@ -73,6 +87,13 @@ struct Preview
     // Whose clips it plays: clipsFrom the model the panel picked (its id; 0 its own); srcClip and srcFrom the models
     // (keys; 0 its own) of `anim`'s clip and of the one it fades from, retargeted onto it.
     uint32_t      clipsFrom, srcClip, srcFrom;
+    // Its layer (the panel's Layer row), as mdl::layer plays one over a placement's clip: picked (layerPick: 1 none,
+    // clip c at c + 2; 0 nothing new), the clip (kNoClip none) of model layerSource (key; 0 its own), from layerBone
+    // down (kNoClip the whole body), at layerWeight, overriding or added; its time moves on with the preview's clip.
+    int           layerOpen;
+    uint32_t      layerPick, layerClip, layerSource, layerBone;
+    float         layerWeight, layerTime;
+    int           layerAdditive;
 };
 extern Preview gPreview;
 

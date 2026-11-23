@@ -5,6 +5,7 @@
 #include "yea_renderer_models.h"
 #include "models.h"
 #include "retarget.h"
+#include "blend.h"
 #include "rmodel.h"
 #include "anim.h"
 
@@ -41,11 +42,47 @@ float *            gWeights, *gFromWeights; // a placement's morph weights, and 
 // Retargeting (made in load()): a source's sampled poses and weights, pose()'s scratch, and the maps between two
 // skeletons (each made the first time a placement plays one's clips on the other, in this module's update).
 anim::Pose*        gSrcPoses;
-anim::Pose *       gLayerPoses, *gLayerRef; // a layer's clip as sampled, and its first frame (additive)
+anim::Pose*        gLayerPoses; // a layer's clip as sampled
+// Additive layers' first frames (made in load()): each clip's, sampled once and kept while its models stay as read.
+constexpr uint32_t kLayerRefs = 8;
+struct LayerRef
+{
+    uint32_t key, source, clip, still, stamp, live;
+};
+LayerRef           gLayerRefKey[kLayerRefs];
+anim::Pose*        gLayerRefs; // kLayerRefs x kMaxNodes
+uint32_t           gLayerRefNext;
 uint8_t*           gLayerMask;              // the nodes it covers
 constexpr uint32_t kMaskPending = 0xFFFFFFFEu; // a layer's bone named while its model loads
+constexpr uint32_t kBlendClip = 0xFFFFFFFDu;   // PlacementAnim's clip (or from): its blend space (PlacementBlend)
+anim::Pose*        gBlendPoses;   // a blend space's sample as sampled (made in load())
+float*             gBlendWeights; // and its morph weights
+// Blend spaces' triangulations, two a placement row (made in load()): kept while their samples stay the same.
+struct BlendTris
+{
+    uint32_t placement, set, n;
+    blend::Tris tris;
+};
+constexpr uint32_t kBlendRows = 4096;
+BlendTris*         gBlendTris;
 float*             gSrcWeights;
 retarget::Scratch  gRt;
+// Inertialized transitions (the transitions knob's Inertial; made in load()): a placement in one keeps its offsets
+// (anim::Inertial a node, then two floats a morph target: its offset and rate) in the pool, in a slot found by its
+// handle (0: the Model Viewer's), taken on its first pose after the switch and dropped once its fade is over.
+constexpr float    kInertStep = 1e-3f;     // seconds: how far either side of the switch its clips' rates are read
+constexpr uint32_t kInertFloats = 1u << 18; // 1 MB: about 14 thousand nodes in transitions at once
+constexpr uint32_t kInertSlots = 256;
+struct InertSlot
+{
+    uint32_t placement, clip, from, start, nodes, targets;
+    float    base, last, t1; // the fade's time when taken and when last posed; how long its offsets take to go
+};
+float*             gInertPool;
+InertSlot*         gInertSlot;
+uint32_t           gInertCount;
+anim::Pose *       gInertNew, *gInertOld; // the new clip a step on, the old a step before
+float *            gInertNewW, *gInertOldW;
 struct MapSlot
 {
     uint32_t      tKey, sKey, tStamp, sStamp, used, live, ok;
@@ -63,6 +100,9 @@ void freeAnim(Entry& e)
     e.skel = nullptr, e.nodes = nullptr, e.bones = nullptr, e.clips = nullptr, e.targets = nullptr;
     e.motionNode = kNoClip;
     e.animStamp = 0;
+    e.legs = 0;
+    free(e.boneBox);
+    e.boneBox = nullptr;
 }
 
 uint32_t fnv(const char* a, const char* b)
@@ -216,6 +256,14 @@ uint32_t apiPlace(uint32_t model, const float* pos, const float* rot, float scal
         ;
     if (row < PlacementRetargets.size())
         PlacementRetargets[row] = PlacementRetarget{};
+    while (PlacementGrounds.size() <= row && PlacementGrounds.add())
+        ;
+    if (row < PlacementGrounds.size())
+        PlacementGrounds[row] = PlacementGround{};
+    while (PlacementBlends.size() <= row && PlacementBlends.add())
+        ;
+    if (row < PlacementBlends.size())
+        PlacementBlends[row] = PlacementBlend{};
     return row | gen << 20;
 }
 void apiMove(uint32_t h, const float* pos, const float* rot, float scale)
@@ -276,6 +324,10 @@ void grow(uint32_t row)
         ;
     while (row != 0xFFFFFFFFu && PlacementRetargets.size() <= row && PlacementRetargets.add())
         ;
+    while (row != 0xFFFFFFFFu && PlacementGrounds.size() <= row && PlacementGrounds.add())
+        ;
+    while (row != 0xFFFFFFFFu && PlacementBlends.size() <= row && PlacementBlends.add())
+        ;
 }
 uint32_t clipHash(const char* name, size_t max)
 {
@@ -331,10 +383,13 @@ void advanceClip(const Entry* ce, const Entry* fe, PlacementAnim& a, float dt)
             a.from = kNoClip;
     }
 }
+void leaveBlend(uint32_t row, PlacementAnim& a);
 int apiPlay(uint32_t h, const char* clip, float speed, int loop, float fade)
 {
     PlacementAnim* a;
     Entry*         e = animOf(h, &a);
+    if (const uint32_t row = placementRow(h); row < PlacementAnims.size())
+        leaveBlend(row, PlacementAnims[row]);
     if (!e)
     {
         // Its model still loading: the clip is taken by name once it has (a placement of a static model ignores it).
@@ -375,6 +430,7 @@ int apiPlayFrom(uint32_t h, uint32_t model, const char* clip, float speed, int l
         return apiPlay(h, clip, speed, loop, fade);
     PlacementAnim&     a = PlacementAnims[row];
     PlacementRetarget& r = PlacementRetargets[row];
+    leaveBlend(row, a);
     if (t->state != 1 || s->state != 1) // either still loading: taken by name once both are
     {
         a.want = clip && clip[0] ? clipHash(clip, 48) : 0;
@@ -720,20 +776,549 @@ void motionOf(const Entry& e, const Entry* s, uint32_t clip, float from, float s
         out[0] = out[1] = out[2] = out[3] = 0;
 }
 
+// --- Blend spaces (mdl::blendSpace) ---------------------------------------------------------------------------------
+// One set of a placement's samples, weighed at a point: the rows that weigh, their weights and their clips' lengths.
+struct BlendSet
+{
+    uint32_t n;
+    uint32_t row[blend::kMaxSamples];
+    float    w[blend::kMaxSamples], dur[blend::kMaxSamples];
+    float    length; // its weighted length (seconds): one cycle of its phase at speed 1
+};
+// Set `set` of placement h (row `row`) weighed at (x, y), from e (whose clips its samples' sources are retargeted onto):
+// samples still waiting on their names, or whose clip isn't there, are left out. False: none to weigh.
+bool blendWeigh(const Entry& e, uint32_t row, uint32_t h, uint32_t set, uint32_t dims, float x, float y, BlendSet& b)
+{
+    b.n = 0, b.length = 0;
+    float p[blend::kMaxSamples * 2];
+    for (uint32_t i = 0; set && i < PlacementBlendSamples.size() && b.n < blend::kMaxSamples; ++i)
+    {
+        const PlacementBlendSample& S = PlacementBlendSamples[i];
+        if (S.placement != h || S.set != set || S.want)
+            continue;
+        const Entry* src = sourceOf(e, S.source);
+        if (!src || S.clip >= src->skel->clipCount)
+            continue;
+        b.row[b.n] = i, b.dur[b.n] = src->clips[S.clip].duration, p[b.n * 2] = S.x, p[b.n * 2 + 1] = S.y, ++b.n;
+    }
+    if (!b.n)
+        return false;
+    if (dims == 2 && gBlendTris && row < kBlendRows)
+    {
+        BlendTris& t = gBlendTris[row * 2 + (set & 1)];
+        if (t.placement != h || t.set != set || t.n != b.n)
+            t.placement = h, t.set = set, t.n = b.n, blend::triangulate(p, b.n, t.tris);
+        blend::weights2(p, b.n, t.tris, x, y, b.w);
+    }
+    else
+    {
+        float xs[blend::kMaxSamples];
+        for (uint32_t k = 0; k < b.n; ++k)
+            xs[k] = p[k * 2];
+        blend::weights1(xs, b.n, x, b.w);
+    }
+    for (uint32_t k = 0; k < b.n; ++k)
+        b.length += b.w[k] * b.dur[k];
+    return true;
+}
+// A blend space at `phase` (0 to 1) as e's local poses into out and morph weights into w (nullptr skips them): each
+// sample's clip at the phase times its own length, summed by weight (rotations turned to the first one's side, then
+// made unit), as UE's blend spaces sync their samples by normalised time. False: nothing to weigh (out untouched).
+bool blendSample(const Entry& e, const BlendSet& b, float phase, bool loop, bool still, anim::Pose* out, float* w)
+{
+    const uint32_t n = e.skel->nodeCount, nt = w && e.targets ? e.skel->targetCount : 0;
+    float          total = 0;
+    for (uint32_t k = 0; k < b.n; ++k)
+    {
+        const float wk = b.w[k];
+        if (!(wk > 1e-6f))
+            continue;
+        const PlacementBlendSample& S = PlacementBlendSamples[b.row[k]];
+        const bool                  first = total == 0;
+        anim::Pose*                 to = first ? out : gBlendPoses;
+        float*                      tw = first ? w : gBlendWeights;
+        sampleAs(e, sourceOf(e, S.source), S.clip, phase * b.dur[k], loop, still, to, nt ? tw : nullptr);
+        for (uint32_t j = 0; j < n; ++j)
+        {
+            anim::Pose& o = out[j];
+            if (first)
+            {
+                for (int c = 0; c < 3; ++c)
+                    o.t[c] *= wk, o.s[c] *= wk;
+                for (int c = 0; c < 4; ++c)
+                    o.r[c] *= wk;
+                continue;
+            }
+            const anim::Pose& q = gBlendPoses[j];
+            const float       side = o.r[0] * q.r[0] + o.r[1] * q.r[1] + o.r[2] * q.r[2] + o.r[3] * q.r[3] < 0 ? -wk : wk;
+            for (int c = 0; c < 3; ++c)
+                o.t[c] += wk * q.t[c], o.s[c] += wk * q.s[c];
+            for (int c = 0; c < 4; ++c)
+                o.r[c] += side * q.r[c];
+        }
+        for (uint32_t t = 0; t < nt; ++t)
+            w[t] = first ? w[t] * wk : w[t] + wk * gBlendWeights[t];
+        total += wk;
+    }
+    if (!(total > 0))
+        return false;
+    for (uint32_t j = 0; j < n; ++j)
+    {
+        anim::Pose& o = out[j];
+        for (int c = 0; c < 3; ++c)
+            o.t[c] /= total, o.s[c] /= total;
+        const float l = sqrtf(o.r[0] * o.r[0] + o.r[1] * o.r[1] + o.r[2] * o.r[2] + o.r[3] * o.r[3]);
+        for (int c = 0; c < 4; ++c)
+            o.r[c] = l > 0 ? o.r[c] / l : (c == 3 ? 1.0f : 0.0f);
+    }
+    for (uint32_t t = 0; t < nt; ++t)
+        w[t] /= total;
+    return true;
+}
+// What a blend space's samples do from `phase` over `step` of it (clipMotion's, each over its own length), summed by
+// weight, as e's: out[0..2] travel, out[3] turn.
+void blendMotion(const Entry& e, const BlendSet& b, float phase, float step, bool loop, float* out)
+{
+    out[0] = out[1] = out[2] = out[3] = 0;
+    float total = 0;
+    for (uint32_t k = 0; k < b.n; ++k)
+    {
+        if (!(b.w[k] > 1e-6f))
+            continue;
+        const PlacementBlendSample& S = PlacementBlendSamples[b.row[k]];
+        float                       m[4];
+        motionOf(e, sourceOf(e, S.source), S.clip, phase * b.dur[k], step * b.dur[k], loop, m);
+        for (int c = 0; c < 4; ++c)
+            out[c] += b.w[k] * m[c];
+        total += b.w[k];
+    }
+    for (int c = 0; total > 0 && c < 4; ++c)
+        out[c] /= total;
+}
+// The blend space a placement's clip (from: the one it fades from) is: its set and point now. False: not a blend space.
+bool blendOf(const PlacementAnim& a, uint32_t row, bool from, uint32_t& set, uint32_t& dims, float& x, float& y, float& phase)
+{
+    if ((from ? a.from : a.clip) != kBlendClip || row >= PlacementBlends.size())
+        return false;
+    const PlacementBlend& b = PlacementBlends[row];
+    set = from ? b.from : b.set, dims = from ? b.fromDims : b.dims, x = from ? b.fromX : b.x, y = from ? b.fromY : b.y;
+    phase = from ? b.fromPhase : b.phase;
+    return set != 0;
+}
+// What a placement's clip (from: the one it fades from) does over dt, as clipMotion says: a clip's, or its blend space's.
+void playMotion(const Entry& e, uint32_t row, const PlacementAnim& a, bool from, const Entry* src, float dt, float* out)
+{
+    uint32_t set, dims;
+    float    x, y, phase;
+    BlendSet b;
+    if (blendOf(a, row, from, set, dims, x, y, phase))
+    {
+        out[0] = out[1] = out[2] = out[3] = 0;
+        const uint32_t h = row | (Placements[row].gen & 0xFFFu) << 20;
+        if (blendWeigh(e, row, h, set, dims, x, y, b) && b.length > 0)
+            blendMotion(e, b, phase, dt * (from ? a.fromSpeed : a.speed) / b.length, from ? a.fromLoop : a.loop, out);
+        return;
+    }
+    if (from)
+        motionOf(e, src, a.from, a.fromTime, dt * a.fromSpeed, a.fromLoop, out);
+    else
+        motionOf(e, src, a.clip, a.time, dt * a.speed, a.loop, out);
+}
+// A placement leaving its blend space for a clip: the space kept as what it fades from (play()'s fade, if any).
+void leaveBlend(uint32_t row, PlacementAnim& a)
+{
+    if (a.clip != kBlendClip || row >= PlacementBlends.size())
+        return;
+    PlacementBlend& b = PlacementBlends[row];
+    b.from = b.set, b.fromDims = b.dims, b.fromX = b.x, b.fromY = b.y, b.fromPhase = b.phase;
+    b.set = 0, b.hash = 0;
+}
+
+// --- Foot IK (mdl::footIk) -----------------------------------------------------------------------------------------
+constexpr float kFootRate = 15.0f;      // 1/s: how fast a lifted foot's ground glides to a new one (a step's edge)
+constexpr float kFootTilt = 0.7853982f; // the most a foot tilts to its ground (45 degrees)
+bool gFootMoved; // foot IK moved the placement evaluate() posed last (its bounds then come from its bones' boxes)
+
+// Its legs, found from its bones' names as retargeting finds them (loadAnim, this module's update: it allocates).
+void findLegs(Entry& e)
+{
+    e.legs = 0, e.pelvis = kNoClip;
+    const uint32_t  n = e.skel->nodeCount;
+    retarget::Name* names = (retarget::Name*)malloc(n * sizeof(retarget::Name));
+    if (!names || !gLayerPoses || !gRt.tw)
+        return free(names);
+    for (uint32_t i = 0; i < n; ++i)
+        retarget::parse(e.nodes[i].name, names[i]);
+    retarget::Found f;
+    retarget::chains(e.nodes, n, names, f);
+    free(names);
+    anim::restPoses(e.nodes, n, gLayerPoses);
+    retarget::worlds(e.nodes, n, gLayerPoses, gRt.tw, gRt.tq);
+    for (int side = 0; side < 2; ++side)
+    {
+        const uint32_t  count = f.count[retarget::ChainLegL + side];
+        const uint32_t* chain = f.node[retarget::ChainLegL + side];
+        if (count < 3)
+            return;
+        Entry::Leg& L = e.leg[side];
+        L.c = chain[count - 1], L.b = (uint32_t)e.nodes[L.c].parent, L.a = chain[0];
+        if (L.b == L.a)
+            return;
+        retarget::at(gRt.tw, L.c, L.rest);
+        const int32_t pa = e.nodes[L.a].parent;
+        static const float idq[4] = { 0, 0, 0, 1 };
+        L.hasParent = pa >= 0 ? 1 : 0;
+        memcpy(L.parentRest, pa >= 0 ? &gRt.tq[pa * 4] : idq, 16);
+    }
+    // the pelvis both thighs hang from (its own bone, else their parent), the legs apart (neither inside the other)
+    const uint32_t pelvis = f.count[retarget::ChainPelvis] ? f.node[retarget::ChainPelvis][0] : (uint32_t)e.nodes[e.leg[0].a].parent;
+    uint32_t       tmp[retarget::kChainMax];
+    if (pelvis >= n || !retarget::path(e.nodes, pelvis, e.leg[0].a, tmp) || !retarget::path(e.nodes, pelvis, e.leg[1].a, tmp) ||
+        retarget::path(e.nodes, e.leg[0].a, e.leg[1].c, tmp) || retarget::path(e.nodes, e.leg[1].a, e.leg[0].c, tmp))
+        return;
+    e.pelvis = pelvis, e.legs = 1;
+}
+
+// Each bone's box from its model's vertices (positions, skin; morph refs and deltas, or nullptr), in this module's
+// update (it allocates). A vertex counts for every bone it weighs on, grown by what its morph targets can move it (each
+// delta at the larger of 1 and the furthest weight its clips reach).
+void boneBoxes(Entry& e, const float* positions, const RmodelSkinVertex* skin, uint32_t vertices, const uint32_t* refs,
+               const RmodelMorphDelta* deltas, uint32_t deltaCount)
+{
+    free(e.boneBox);
+    const uint32_t nb = e.skel->boneCount;
+    e.boneBox = nb ? (float*)malloc(nb * 6 * sizeof(float)) : nullptr;
+    if (!e.boneBox)
+        return;
+    for (uint32_t b = 0; b < nb; ++b)
+        for (int j = 0; j < 3; ++j)
+            e.boneBox[b * 6 + j] = 1e30f, e.boneBox[b * 6 + 3 + j] = -1e30f;
+    const uint32_t nt = e.targets ? e.skel->targetCount : 0;
+    for (uint32_t v = 0; v < vertices; ++v)
+    {
+        float lo[3], hi[3], ext[3] = { 0, 0, 0 };
+        if (refs && deltas)
+            for (uint32_t k = refs[v] & 0xFFFFFFu, end = k + (refs[v] >> 24); k < end && k < deltaCount; ++k)
+            {
+                const uint32_t t = deltas[k].packed & 0xFFu;
+                const float    w = t < nt ? fmaxf(1.0f, fmaxf(fabsf(e.targets[t].lo), fabsf(e.targets[t].hi))) : 1.0f;
+                for (int j = 0; j < 3; ++j)
+                    ext[j] += fabsf(deltas[k].p[j]) * w;
+            }
+        for (int j = 0; j < 3; ++j)
+            lo[j] = positions[v * 3 + j] - ext[j], hi[j] = positions[v * 3 + j] + ext[j];
+        for (int i = 0; i < 4; ++i)
+            if (skin[v].weights[i] && skin[v].bones[i] < nb)
+                for (int j = 0; j < 3; ++j)
+                {
+                    float* box = &e.boneBox[skin[v].bones[i] * 6];
+                    box[j] = fminf(box[j], lo[j]), box[3 + j] = fmaxf(box[3 + j], hi[j]);
+                }
+    }
+}
+// The bounds of a pose (its palette, bones of e): each bone's box under its matrix, together. False: no boxes.
+bool poseBounds(const Entry& e, const float* palette, float* lo, float* hi)
+{
+    for (int j = 0; j < 3; ++j)
+        lo[j] = 1e30f, hi[j] = -1e30f;
+    for (uint32_t b = 0; e.boneBox && b < e.skel->boneCount; ++b)
+    {
+        const float* box = &e.boneBox[b * 6];
+        const float* m = &palette[b * 12];
+        if (box[0] > box[3])
+            continue;
+        for (int c = 0; c < 8; ++c)
+        {
+            const float p[3] = { box[c & 1 ? 3 : 0], box[c & 2 ? 4 : 1], box[c & 4 ? 5 : 2] };
+            for (int r = 0; r < 3; ++r)
+            {
+                const float x = m[r * 4] * p[0] + m[r * 4 + 1] * p[1] + m[r * 4 + 2] * p[2] + m[r * 4 + 3];
+                lo[r] = fminf(lo[r], x), hi[r] = fmaxf(hi[r], x);
+            }
+        }
+    }
+    return lo[0] <= hi[0];
+}
+
+// Foot IK over a placement's pose in gPoses (local), as UE's foot placement does: each foot's ankle brought to where it
+// stands on the ground the game gave under it (the clip's lift above its rest height kept, so a swinging foot still
+// swings), the foot tilted to that ground while the clip has it down; the pelvis moved first to the lower foot's ground,
+// and lowered further where a foot is still out of reach; then two-bone IK on each leg. On flat ground at the
+// placement's height it changes nothing. dt < 0: as it stands (mdl::joint), its state left alone.
+void footIk(const Entry& e, uint32_t row, float dt)
+{
+    if (!e.legs || row >= PlacementGrounds.size())
+        return;
+    PlacementGround& g = PlacementGrounds[row];
+    const bool       step = dt >= 0;
+    if (step)
+    {
+        const float to = g.on ? 1.0f : 0.0f, d = to - g.weight;
+        g.weight = g.fade > 0 ? g.weight + (d > 0 ? 1.0f : -1.0f) * fminf(fabsf(d), dt / g.fade) : to;
+        if (g.weight <= 0 && !g.on)
+            g.weight = 0, g.pelvis = 0, g.seen = 0, g.at = 0;
+    }
+    if (g.weight <= 0 && !g.on)
+        return;
+    yea_float3 pos;
+    yea_float4 rot;
+    float      s;
+    placedNow(row, e, pos, rot, s);
+    if (!(s > 1e-6f))
+        return;
+    const uint32_t   n = e.skel->nodeCount;
+    const yea_float4 rc = { -rot.x, -rot.y, -rot.z, rot.w }, ut = upTurn(e), uc = { -ut.x, -ut.y, -ut.z, ut.w };
+    const float      P[3] = { pos.x, pos.y, pos.z }, Y[3] = { 0, 1, 0 }, back[3] = { 0, 0, -1 }, idq[4] = { 0, 0, 0, 1 };
+    float            upM[3], upR[3], front[3]; // the world's up in model space; the model's own up and front there
+    qrot(rc, Y, upM), qrot(uc, Y, upR), qrot(uc, back, front);
+    retarget::worlds(e.nodes, n, gPoses, gRt.tw, gRt.tq);
+    const float w = g.weight < 1 ? g.weight * g.weight * (3 - 2 * g.weight) : 1.0f; // eased, as clip fades
+    const float k = step ? 1 - expf(-kFootRate * dt) : 0.0f;
+    float* const gp[2] = { &g.pointL.x, &g.pointR.x }, *const gn[2] = { &g.normalL.x, &g.normalR.x };
+    float* const sp[2] = { &g.planeL.x, &g.planeR.x }, *const sn[2] = { &g.upL.x, &g.upR.x };
+    float* const at[2] = { &g.footL.x, &g.footR.x };
+    const uint32_t seenBefore = g.seen;
+    float          A[2][3], T[2][3], tilt[2][4];
+    bool           has[2] = { false, false };
+    for (int i = 0; i < 2; ++i)
+    {
+        const Entry::Leg& L = e.leg[i];
+        const uint32_t    bit = 1u << i;
+        float             Am[3];
+        retarget::at(gRt.tw, L.c, Am);
+        for (int j = 0; j < 3; ++j) // world
+        {
+            float v[3];
+            qrot(rot, Am, v);
+            A[i][j] = P[j] + s * v[j];
+        }
+        memcpy(T[i], A[i], 12), memcpy(tilt[i], idq, 16);
+        if (step)
+            memcpy(at[i], A[i], 12), g.at |= bit;
+        // its ankle's height above the ground at rest, and how far the clip lifts it from there (both model space)
+        const float h0 = fmaxf(s * retarget::dot(L.rest, upR), 0.0f), lift = s * retarget::dot(Am, upR) - h0;
+        const float band = h0 > 0.01f * s ? h0 : 0.05f * s, x = fminf(fmaxf(lift / band, 0.0f), 1.0f);
+        const float down = 1 - x * x * (3 - 2 * x); // 1 while the clip has the foot down, 0 once it lifts it an ankle's height
+        const float kf = k + (1 - k) * down;         // a new ground: glided to in the air, stood on at once when down
+        if (step && !(g.set & bit))
+            g.seen &= ~bit;
+        else if (step && !(g.seen & bit))
+            memcpy(sp[i], gp[i], 12), memcpy(sn[i], gn[i], 12), g.seen |= bit;
+        else if (step) // a new ground followed smoothly; the same plane, wherever its point is, stays the same plane
+            for (int j = 0; j < 3; ++j)
+                sp[i][j] += (gp[i][j] - sp[i][j]) * kf, sn[i][j] += (gn[i][j] - sn[i][j]) * kf;
+        float nn[3] = { sn[i][0], sn[i][1], sn[i][2] };
+        if (!(g.seen & bit) || !retarget::unit(nn) || nn[1] < 0.05f)
+            continue; // no ground under it, or a wall: it follows its clip
+        // the ground straight below the clip's ankle, and the foot's tilt to it (at most kFootTilt)
+        const float Qy = sp[i][1] - (nn[0] * (A[i][0] - sp[i][0]) + nn[2] * (A[i][2] - sp[i][2])) / nn[1];
+        float       nc[3] = { nn[0], nn[1], nn[2] };
+        if (nc[1] < cosf(kFootTilt))
+        {
+            const float f = sinf(kFootTilt) / sqrtf(nc[0] * nc[0] + nc[2] * nc[2]);
+            nc[0] *= f, nc[2] *= f, nc[1] = cosf(kFootTilt);
+        }
+        float       nb[3], t[3] = { A[i][0], Qy + lift, A[i][2] };
+        for (int j = 0; j < 3; ++j)
+            nb[j] = Y[j] + (nc[j] - Y[j]) * down;
+        retarget::unit(nb);
+        for (int j = 0; j < 3; ++j)
+            t[j] += nb[j] * h0;
+        if (!(fabsf(t[1] - A[i][1]) <= g.reach))
+            continue; // ground further off than it may reach: left alone
+        memcpy(T[i], t, 12);
+        retarget::arc(Y, nb, tilt[i]);
+        has[i] = true;
+    }
+    // the pelvis: to the lower foot's ground (followed smoothly; at once when the ground first comes)
+    float target = 0;
+    for (int i = 0, any = 0; i < 2; ++i)
+        if (has[i])
+            target = any++ ? fminf(target, T[i][1] - A[i][1]) : T[i][1] - A[i][1];
+    if (step)
+        g.pelvis = (seenBefore & 3) ? g.pelvis + (target - g.pelvis) * k : target;
+    if (!has[0] && !has[1] && g.pelvis == 0)
+        return;
+    gFootMoved = true;
+    float Gm[2][3], drop = 0;
+    retarget::shift(e.nodes, n, e.pelvis, upM, g.pelvis * w / s, gRt.tw, gPoses);
+    for (int i = 0; i < 2; ++i)
+    {
+        const Entry::Leg& L = e.leg[i];
+        float             G[3], a[3], b[3], c[3];
+        for (int j = 0; j < 3; ++j)
+            G[j] = (A[i][j] + (T[i][j] - A[i][j]) * w - P[j]) / s;
+        qrot(rc, G, Gm[i]);
+        retarget::at(gRt.tw, L.a, a), retarget::at(gRt.tw, L.b, b), retarget::at(gRt.tw, L.c, c);
+        const float x = retarget::reachDrop(a, b, c, Gm[i], upM);
+        drop = x > drop ? x : drop;
+    }
+    if (drop > 0) // a foot still out of reach: the pelvis lowered by the least that brings both within it
+        retarget::shift(e.nodes, n, e.pelvis, upM, -drop, gRt.tw, gPoses);
+    const float rq[4] = { rot.x, rot.y, rot.z, rot.w }, rcq[4] = { rc.x, rc.y, rc.z, rc.w };
+    for (int i = 0; i < 2; ++i)
+    {
+        const Entry::Leg& L = e.leg[i];
+        float             q[4], m[4], end[4];
+        retarget::qnlerp(idq, tilt[i], w, q);
+        retarget::qmul(rcq, q, m), retarget::qmul(m, rq, m); // the tilt in model space
+        retarget::qmul(m, &gRt.tq[L.c * 4], end), retarget::qnorm(end);
+        retarget::limb(e.nodes, gRt.tw, gRt.tq, L.a, L.b, L.c, Gm[i], front, L.hasParent ? L.parentRest : nullptr, gPoses, end);
+    }
+}
+
+// A layer over gPoses: clip `clip` of e's source `source` at `time`, from node `mask` down (kNoClip: every node),
+// overriding the pose there or added to it, at `weight` (eased, as a layer's fade is). False: no such clip.
+bool applyLayer(const Entry& e, uint32_t source, uint32_t clip, float time, bool loop, bool still, uint32_t mask, float weight,
+                bool additive)
+{
+    const uint32_t n = e.skel->nodeCount;
+    const Entry*   s = sourceOf(e, source);
+    if (!s || clip >= s->skel->clipCount || !sampleAs(e, s, clip, time, loop, still, gLayerPoses, nullptr))
+        return false;
+    const float w = weight < 1 ? weight * weight * (3 - 2 * weight) : 1.0f; // eased, as clip fades
+    anim::layerMask(e.nodes, n, mask, gLayerMask);
+    if (additive)
+    {
+        // (a retargeted clip's also by both models' Up Axis, as its map is)
+        const uint32_t up = s == &e ? 0u : uint32_t(e.knobs[mdl::KnobUpAxis]) * 3u + uint32_t(s->knobs[mdl::KnobUpAxis]) + 1u;
+        const LayerRef want = { e.key, source, clip, (still ? 1u : 0u) | up << 1, e.animStamp * 65599u ^ s->animStamp, 1 };
+        uint32_t       k = 0;
+        while (k < kLayerRefs && memcmp(&gLayerRefKey[k], &want, sizeof want))
+            ++k;
+        if (k == kLayerRefs) // not kept yet: sampled into the oldest slot
+        {
+            k = gLayerRefNext, gLayerRefNext = (gLayerRefNext + 1) % kLayerRefs;
+            gLayerRefKey[k] = LayerRef{};
+            if (!sampleAs(e, s, clip, 0, false, still, gLayerRefs + k * kMaxNodes, nullptr))
+                return true;
+            gLayerRefKey[k] = want;
+        }
+        anim::layerAdd(gPoses, gLayerPoses, gLayerRefs + k * kMaxNodes, gLayerMask, n, w);
+    }
+    else
+        anim::layerOverride(gPoses, gLayerPoses, gLayerMask, n, w);
+    return true;
+}
+
+// An inertialized transition's slot: a placement's (nullptr: none), or one taken for it with room for n nodes and nt
+// morph targets (nullptr: the pool or the slots are full, so it crossfades).
+InertSlot* inertFind(uint32_t placement)
+{
+    for (uint32_t i = 0; i < gInertCount; ++i)
+        if (gInertSlot[i].placement == placement)
+            return &gInertSlot[i];
+    return nullptr;
+}
+InertSlot* inertTake(uint32_t placement, uint32_t n, uint32_t nt)
+{
+    const uint32_t need = n * 18 + nt * 2;
+    if (!gInertPool || gInertCount >= kInertSlots || need > kInertFloats)
+        return nullptr;
+    uint32_t at = 0; // the first gap it fits in
+    for (bool moved = true; moved;)
+    {
+        moved = false;
+        for (uint32_t i = 0; i < gInertCount; ++i)
+        {
+            const InertSlot& o = gInertSlot[i];
+            if (at < o.start + o.nodes * 18 + o.targets * 2 && o.start < at + need)
+                at = o.start + o.nodes * 18 + o.targets * 2, moved = true;
+        }
+    }
+    if (at + need > kInertFloats)
+        return nullptr;
+    InertSlot& sl = gInertSlot[gInertCount++];
+    sl = InertSlot{ placement, kNoClip, kNoClip, at, n, nt, 0, 0, 0 };
+    return &sl;
+}
+
 // One placement's pose now into gPoses (its clip, faded from the one before), and its morph weights into gWeights
 // (the same, then what the game holds: `held` weights, `isHeld` where it does): false when it isn't skinned.
 // clipKey and fromKey: the models (keys; 0 its own) the clip and the one it fades from are of.
 bool evaluate(const Entry& e, const PlacementAnim& a, const float* held = nullptr, const uint8_t* isHeld = nullptr, uint32_t placement = 0,
-              bool still = false, uint32_t clipKey = 0, uint32_t fromKey = 0) // still: in place (root motion on)
+              bool still = false, uint32_t clipKey = 0, uint32_t fromKey = 0, float dt = -1,
+              const Preview* view = nullptr) // still: in place (root motion on); view: the Model Viewer's, with its layer
 {
     const uint32_t n = e.skel->nodeCount, nt = e.targets ? e.skel->targetCount : 0;
     const bool     fading = a.from != kNoClip && a.fade > 0 && a.faded < a.fade;
-    sampleAs(e, sourceOf(e, clipKey), a.clip, a.time, a.loop, still, gPoses, nt ? gWeights : nullptr);
-    if (fading)
-        sampleAs(e, sourceOf(e, fromKey), a.from, a.fromTime, a.fromLoop, still, gFrom, nt ? gFromWeights : nullptr);
+    const uint32_t row = placement ? placementRow(placement) : 0xFFFFFFFFu;
+    // its clip (or the one it fades from), or its blend space, `shift` seconds of it from now
+    auto side = [&](bool from, anim::Pose* out, float* w, float shift) {
+        uint32_t set, dims;
+        float    x, y, phase;
+        BlendSet b;
+        const float  speed = from ? a.fromSpeed : a.speed;
+        const bool   loop = from ? a.fromLoop : a.loop;
+        if (row != 0xFFFFFFFFu && blendOf(a, row, from, set, dims, x, y, phase))
+        {
+            const bool weighed = blendWeigh(e, row, placement, set, dims, x, y, b);
+            if (weighed && shift != 0 && b.length > 0)
+            {
+                phase += shift * speed / b.length;
+                phase = loop ? phase - floorf(phase) : (phase < 0 ? 0 : (phase > 1 ? 1 : phase));
+            }
+            if (!weighed || !blendSample(e, b, phase, loop, still, out, w))
+                sampleAs(e, nullptr, 0, 0, false, false, out, w); // nothing to weigh yet: the rest pose
+        }
+        else if (from)
+            sampleAs(e, sourceOf(e, fromKey), a.from, a.fromTime + shift * speed, loop, still, out, w);
+        else
+            sampleAs(e, sourceOf(e, clipKey), a.clip, a.time + shift * speed, loop, still, out, w);
+    };
+    side(false, gPoses, nt ? gWeights : nullptr, 0);
+    // Inertialized: the old pose's offsets from the new, taken on its first pose after the switch (the old one as it
+    // showed, a transition still under way included), then only the new clip sampled.
+    InertSlot* inert = nullptr;
+    if (fading && settings.transitions == Transitions::Inertial && gInertPool)
+    {
+        InertSlot* sl = inertFind(placement);
+        if (sl && (sl->nodes != n || sl->targets != nt)) // another model now: start afresh
+            *sl = gInertSlot[--gInertCount], sl = nullptr;
+        const bool fresh = !sl || sl->clip != a.clip || sl->from != a.from || a.faded < sl->last;
+        const InertSlot was = sl ? *sl : InertSlot{ 0xFFFFFFFFu };
+        if (!sl)
+            sl = inertTake(placement, n, nt);
+        if (sl && fresh)
+        {
+            const float h = kInertStep;
+            side(false, gInertNew, nt ? gInertNewW : nullptr, h);
+            side(true, gFrom, nt ? gFromWeights : nullptr, 0);
+            side(true, gInertOld, nt ? gInertOldW : nullptr, -h);
+            anim::Inertial* off = (anim::Inertial*)(gInertPool + sl->start);
+            float*          wo = gInertPool + sl->start + n * 18;
+            if (was.placement == placement && was.t1 > 0) // the transition it cut short, as it stood
+            {
+                const float t = was.last - was.base + a.faded;
+                anim::inertialApply(gFrom, off, n, t, was.t1);
+                anim::inertialApply(gInertOld, off, n, t - h, was.t1);
+                for (uint32_t k = 0; k < nt; ++k)
+                    gFromWeights[k] += anim::inertialDecay(wo[k * 2], wo[k * 2 + 1], t, was.t1),
+                        gInertOldW[k] += anim::inertialDecay(wo[k * 2], wo[k * 2 + 1], t - h, was.t1);
+            }
+            anim::inertialOffsets(gFrom, gInertOld, gPoses, gInertNew, h, n, off);
+            for (uint32_t k = 0; k < nt; ++k)
+            {
+                const float x = gFromWeights[k] - gWeights[k];
+                wo[k * 2] = x, wo[k * 2 + 1] = (x - (gInertOldW[k] - (2 * gWeights[k] - gInertNewW[k]))) / h;
+            }
+            sl->clip = a.clip, sl->from = a.from, sl->base = a.faded, sl->t1 = a.fade - a.faded;
+        }
+        if (sl)
+            sl->last = a.faded, inert = sl;
+    }
+    const bool cross = fading && !inert;
+    if (cross)
+        side(true, gFrom, nt ? gFromWeights : nullptr, 0);
     if (nt)
     {
-        if (fading)
+        if (inert)
+        {
+            const float* wo = gInertPool + inert->start + n * 18;
+            for (uint32_t t = 0; t < nt; ++t)
+                gWeights[t] += anim::inertialDecay(wo[t * 2], wo[t * 2 + 1], a.faded - inert->base, inert->t1);
+        }
+        if (cross)
         {
             float f = a.faded / a.fade;
             f = f * f * (3 - 2 * f);
@@ -747,13 +1332,15 @@ bool evaluate(const Entry& e, const PlacementAnim& a, const float* held = nullpt
             if (MorphOverrides[i].placement == placement && MorphOverrides[i].target < nt)
                 gWeights[MorphOverrides[i].target] = MorphOverrides[i].weight;
     }
-    if (fading)
+    if (cross)
     {
         float f = a.faded / a.fade;
         f = f * f * (3 - 2 * f); // eased
         anim::blendPoses(gFrom, gPoses, n, f);
         memcpy(gPoses, gFrom, sizeof(anim::Pose) * n);
     }
+    if (inert)
+        anim::inertialApply(gPoses, (const anim::Inertial*)(gInertPool + inert->start), n, a.faded - inert->base, inert->t1);
     // Its layers over that, in slot order (older first within a slot, so a slot's new clip crossfades over its old).
     uint32_t order[16], count = 0;
     for (uint32_t i = 0; placement && gLayerPoses && i < PlacementLayers.size() && count < 16; ++i)
@@ -774,19 +1361,14 @@ bool evaluate(const Entry& e, const PlacementAnim& a, const float* held = nullpt
     for (uint32_t k = 0; k < count; ++k)
     {
         const PlacementLayer& L = PlacementLayers[order[k]];
-        const Entry*          s = sourceOf(e, L.source);
-        if (!s || L.clip >= s->skel->clipCount || !sampleAs(e, s, L.clip, L.time, L.loop, still, gLayerPoses, nullptr))
-            continue;
-        const float w = L.weight < 1 ? L.weight * L.weight * (3 - 2 * L.weight) : 1.0f; // eased, as clip fades
-        anim::layerMask(e.nodes, n, L.mask, gLayerMask);
-        if (L.additive)
-        {
-            if (sampleAs(e, s, L.clip, 0, false, still, gLayerRef, nullptr))
-                anim::layerAdd(gPoses, gLayerPoses, gLayerRef, gLayerMask, n, w);
-        }
-        else
-            anim::layerOverride(gPoses, gLayerPoses, gLayerMask, n, w);
+        applyLayer(e, L.source, L.clip, L.time, L.loop, still, L.mask, L.weight, L.additive != 0);
     }
+    if (view && view->layerClip != kNoClip && view->layerWeight > 0 && gLayerPoses) // the Model Viewer's layer
+        applyLayer(e, view->layerSource, view->layerClip, view->layerTime, true, still, view->layerBone, view->layerWeight,
+                   view->layerAdditive != 0);
+    gFootMoved = false;
+    if (placement) // its feet on the game's ground (dt: moved on in animate(); -1 as it stands)
+        footIk(e, placementRow(placement), dt);
     anim::palette(e.nodes, n, e.bones, e.skel->boneCount, gPoses, gWorld, gPalette);
     return true;
 }
@@ -943,7 +1525,17 @@ int apiRootMotion(uint32_t h, int on)
     {
         const PlacementAnim& a = PlacementAnims[row];
         float                d[4];
-        motionOf(*e, sourceOf(*e, PlacementRetargets[row].clip), a.clip, 0, a.time, false, d);
+        uint32_t             set, dims;
+        float                x, y, phase;
+        BlendSet             b;
+        if (blendOf(a, row, false, set, dims, x, y, phase)) // a blend space: what its samples did since its phase's start
+        {
+            d[0] = d[1] = d[2] = d[3] = 0;
+            if (blendWeigh(*e, row, h, set, dims, x, y, b))
+                blendMotion(*e, b, 0, phase, false, d);
+        }
+        else
+            motionOf(*e, sourceOf(*e, PlacementRetargets[row].clip), a.clip, 0, a.time, false, d);
         m.acc = { d[0], d[1], d[2] }, m.yaw = d[3];
     }
     Placements[row].dirty = 1;
@@ -963,6 +1555,115 @@ int apiTakeMotion(uint32_t h, float* out)
     Placements[row].dirty = 1; // drawn where the game puts it now
     return 1;
 }
+int apiFootIk(uint32_t h, int on, float reach, float fade)
+{
+    // Taken while its model still loads; 0 once it has loaded without two legs.
+    const uint32_t row = placementRow(h);
+    grow(row);
+    const Entry* e = row != 0xFFFFFFFFu ? byKey(Placements[row].key) : nullptr;
+    if (!e || row >= PlacementGrounds.size() || e->state > 1 || (e->state == 1 && !e->legs))
+        return 0;
+    PlacementGround& g = PlacementGrounds[row];
+    g.on = on ? 1 : 0, g.reach = reach > 0 ? reach : 0.5f, g.fade = fade > 0 ? fade : 0.0f;
+    return 1;
+}
+int apiFootGround(uint32_t h, uint32_t foot, const float* point, const float* normal)
+{
+    const uint32_t row = placementRow(h);
+    grow(row);
+    if (row >= PlacementGrounds.size() || foot > 1)
+        return 0;
+    PlacementGround& g = PlacementGrounds[row];
+    if (!point)
+        return g.set &= ~(1u << foot), 1;
+    const float up[3] = { 0, 1, 0 };
+    const float* nr = normal ? normal : up;
+    (foot ? g.pointR : g.pointL) = { point[0], point[1], point[2] };
+    (foot ? g.normalR : g.normalL) = { nr[0], nr[1], nr[2] };
+    g.set |= 1u << foot;
+    return 1;
+}
+int apiFootAt(uint32_t h, uint32_t foot, float* out)
+{
+    const uint32_t row = placementRow(h);
+    if (row >= PlacementGrounds.size() || foot > 1 || !(PlacementGrounds[row].at & (1u << foot)))
+        return 0;
+    const yea_float3& f = foot ? PlacementGrounds[row].footR : PlacementGrounds[row].footL;
+    out[0] = f.x, out[1] = f.y, out[2] = f.z;
+    return 1;
+}
+int apiBlendSpace(uint32_t h, uint32_t model, const mdl::BlendSample* samples, uint32_t count, uint32_t dims, float speed, int loop,
+                  float fade)
+{
+    const uint32_t row = placementRow(h);
+    grow(row);
+    const Entry* t = row != 0xFFFFFFFFu ? byKey(Placements[row].key) : nullptr;
+    const Entry* s = model ? byId(model) : t;
+    if (!t || !s || !samples || !count || count > blend::kMaxSamples || (dims != 1 && dims != 2) || row >= PlacementAnims.size() ||
+        row >= PlacementBlends.size() || row >= PlacementRetargets.size() || t->state == 2 || s->state == 2 ||
+        (t->state == 1 && !t->anim) || (s->state == 1 && !s->anim))
+        return 0;
+    const bool     ready = t->state == 1 && s->state == 1;
+    const uint32_t key = s == t ? 0 : s->key;
+    uint32_t       clips[blend::kMaxSamples], hash = 2166136261u ^ key ^ dims * 16777619u;
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        if (!samples[i].clip || !samples[i].clip[0])
+            return 0;
+        clips[i] = ready ? clipNamed(*s, samples[i].clip) : kNoClip;
+        if (ready && clips[i] == kNoClip)
+            return 0;
+        uint32_t xy[2];
+        memcpy(xy, &samples[i].x, 4), memcpy(xy + 1, &samples[i].y, 4);
+        hash = ((hash ^ clipHash(samples[i].clip, 48)) * 16777619u ^ xy[0]) * 16777619u ^ xy[1];
+    }
+    hash = hash ? hash : 1;
+    PlacementAnim&     a = PlacementAnims[row];
+    PlacementBlend&    b = PlacementBlends[row];
+    PlacementRetarget& r = PlacementRetargets[row];
+    if (a.clip == kBlendClip && b.set && b.hash == hash) // the same samples: playing on, its phase kept
+    {
+        a.speed = speed, a.loop = loop ? 1 : 0;
+        return 1;
+    }
+    if (PlacementBlendSamples.size() + count > PlacementBlendSamples.capacity())
+        return 0;
+    const uint32_t set = ++b.next ? b.next : ++b.next;
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        PlacementBlendSample* S = PlacementBlendSamples.add();
+        *S = PlacementBlendSample{};
+        S->placement = h, S->set = set, S->source = key, S->clip = clips[i], S->want = ready ? 0 : clipHash(samples[i].clip, 48);
+        S->x = samples[i].x, S->y = samples[i].y;
+    }
+    if (a.clip == kBlendClip && b.set) // another blend space: faded from the old, in step with it
+    {
+        b.from = b.set, b.fromDims = b.dims, b.fromX = b.x, b.fromY = b.y, b.fromPhase = b.phase;
+        a.from = fade > 0 ? kBlendClip : kNoClip, a.fromSpeed = a.speed, a.fromLoop = a.loop, a.fade = fade, a.faded = 0, r.from = 0;
+    }
+    else // from a clip: faded from it (while the model still loads, nothing to fade from), the phase from the start
+    {
+        if (fade > 0 && ready && a.clip != kNoClip && !a.want)
+            a.from = a.clip, a.fromTime = a.time, a.fromSpeed = a.speed, a.fromLoop = a.loop, a.fade = fade, a.faded = 0, r.from = r.clip;
+        else
+            a.from = kNoClip;
+        b.phase = 0, b.x = b.tx, b.y = b.ty;
+    }
+    b.set = set, b.dims = dims, b.hash = hash;
+    a.clip = kBlendClip, a.want = 0, a.time = 0, a.speed = speed, a.loop = loop ? 1 : 0, r.clip = 0;
+    return 1;
+}
+void apiBlendAt(uint32_t h, float x, float y, float smooth)
+{
+    const uint32_t row = placementRow(h);
+    grow(row);
+    if (row >= PlacementBlends.size())
+        return;
+    PlacementBlend& b = PlacementBlends[row];
+    b.tx = x, b.ty = y, b.smooth = smooth > 0 ? smooth : 0.0f;
+    if (!(smooth > 0) || !b.set)
+        b.x = x, b.y = y; // at once (and where a blend space starts)
+}
 uint32_t apiClips(uint32_t model)
 {
     const Entry* e = byId(model);
@@ -980,7 +1681,8 @@ const char* apiClip(uint32_t model, uint32_t index, float* duration)
 mdl::Api gApi = { mdl::kApi, sizeof(mdl::Api), 0,       apiBegin, apiDefine, apiEnd,   apiKnobs, apiPlace, apiMove,
                   apiRemove, apiPlaced,        apiCount, apiInfo,  apiPlay,   apiTime,  apiJoint, apiClips, apiClip,
                   apiMorph,  apiUnmorph,       apiMorphs, apiMorphTarget, apiRootMotion, apiTakeMotion, apiPlayFrom,
-                  apiLayer,  apiUnlayer };
+                  apiLayer,  apiUnlayer,       apiFootIk, apiFootGround, apiFootAt,
+                  apiBlendSpace, apiBlendAt };
 
 // --- Building models in the renderer's scene (this module's own update) ------------------------------------------
 
@@ -1154,6 +1856,9 @@ void loadCooked(Entry& e)
                 e.clips = (const RmodelClip*)(e.anim + (e.skel->clips - h.skeleton));
                 e.targets = morphs ? (const RmodelMorphTarget*)(e.anim + (e.skel->targets - h.skeleton) + sizeof(RmodelMorphs)) : nullptr;
                 findMotion(e);
+                findLegs(e);
+                boneBoxes(e, (const float*)(data + h.positions), sv, h.vertexCount, morphs ? (const uint32_t*)(data + morphs->refs) : nullptr,
+                          morphs ? (const RmodelMorphDelta*)(data + morphs->deltas) : nullptr, morphs ? morphs->deltaCount : 0);
                 e.animStamp = ++gStamp;
             }
         }
@@ -1292,6 +1997,22 @@ void loadAnim(Entry& e)
                                  sk->targets + sizeof(RmodelMorphs) + (uint64_t)sk->targetCount * sizeof(RmodelMorphTarget) <= h.textures;
             e.targets = morphed ? (const RmodelMorphTarget*)(e.anim + (sk->targets - h.skeleton) + sizeof(RmodelMorphs)) : nullptr;
             findMotion(e);
+            findLegs(e);
+            // its bones' boxes, from its vertices (and morph deltas) read again
+            const RmodelMorphs* mo = e.targets ? (const RmodelMorphs*)(e.anim + (sk->targets - h.skeleton)) : nullptr;
+            const uint64_t      nv = h.vertexCount, nd = mo ? mo->deltaCount : 0;
+            const bool fits = h.positions + nv * 12 <= (uint64_t)size && h.skin + nv * sizeof(RmodelSkinVertex) <= (uint64_t)size &&
+                              (!mo || (mo->refs + nv * 4 <= (uint64_t)size && mo->deltas + nd * sizeof(RmodelMorphDelta) <= (uint64_t)size));
+            uint8_t* tmp = fits ? (uint8_t*)malloc(nv * (12 + sizeof(RmodelSkinVertex) + (mo ? 4 : 0)) + nd * sizeof(RmodelMorphDelta)) : nullptr;
+            float*            pos = (float*)tmp;
+            RmodelSkinVertex* sv = (RmodelSkinVertex*)(tmp + nv * 12);
+            uint32_t*         refs = mo ? (uint32_t*)(tmp + nv * (12 + sizeof(RmodelSkinVertex))) : nullptr;
+            RmodelMorphDelta* ds = mo ? (RmodelMorphDelta*)(tmp + nv * (16 + sizeof(RmodelSkinVertex))) : nullptr;
+            auto at = [&](uint64_t off, void* out, uint64_t bytes) { return !fseek(f, (long)off, SEEK_SET) && fread(out, 1, bytes, f) == bytes; };
+            if (tmp && at(h.positions, pos, nv * 12) && at(h.skin, sv, nv * sizeof(RmodelSkinVertex)) &&
+                (!mo || (at(mo->refs, refs, nv * 4) && at(mo->deltas, ds, nd * sizeof(RmodelMorphDelta)))))
+                boneBoxes(e, pos, sv, h.vertexCount, refs, ds, (uint32_t)nd);
+            free(tmp);
             e.animStamp = ++gStamp;
         }
     }
@@ -1442,6 +2163,38 @@ void animate(float dt)
 {
     ++gTick;
     const uint32_t rows = Placements.size() < PlacementAnims.size() ? Placements.size() : PlacementAnims.size();
+    // Blend spaces' samples (first, so a blend space asked for while its model loaded starts on the frame a clip would):
+    // names taken once their models load (and the maps of others' clips made), those of sets no
+    // longer played and of placements that are gone dropped.
+    for (uint32_t i = PlacementBlendSamples.size(); i-- > 0;)
+    {
+        PlacementBlendSample& S = PlacementBlendSamples[i];
+        const uint32_t        row = placementRow(S.placement);
+        const Entry*          e = row != 0xFFFFFFFFu ? byKey(Placements[row].key) : nullptr;
+        const bool live = e && row < PlacementBlends.size() && row < PlacementAnims.size() && e->state != 2 && (e->state != 1 || e->anim) &&
+                          ((S.set == PlacementBlends[row].set && PlacementAnims[row].clip == kBlendClip) ||
+                           (S.set == PlacementBlends[row].from && PlacementAnims[row].from == kBlendClip));
+        if (!live)
+        {
+            PlacementBlendSamples.remove(i);
+            continue;
+        }
+        const Entry* s = e->state == 1 ? sourceOf(*e, S.source) : nullptr;
+        if (!s)
+            continue; // either still loading
+        if (S.want)
+        {
+            S.clip = clipHashed(*s, S.want), S.want = 0;
+            if (S.clip == kNoClip)
+            {
+                char line[160];
+                snprintf(line, sizeof line, "renderer_models: %s has no clip a blend space of %s asked for: that sample is left out", s->name, e->name);
+                yea::log(line);
+            }
+        }
+        if (s != e)
+            mapFor(*e, *s, true);
+    }
     for (uint32_t row = 0; row < rows; ++row)
     {
         const Entry* e = Placements[row].alive ? byKey(Placements[row].key) : nullptr;
@@ -1464,12 +2217,12 @@ void animate(float dt)
         if (row < PlacementMotions.size() && PlacementMotions[row].on)
         {
             float to[4], from[4] = { 0, 0, 0, 0 }, m[4];
-            motionOf(*e, ce, a.clip, a.time, dt * a.speed, a.loop, to);
+            playMotion(*e, row, a, false, ce, dt, to);
             const bool fading = a.from != kNoClip && a.fade > 0 && a.faded < a.fade;
             float      f = fading ? a.faded / a.fade : 1.0f;
             f = f * f * (3 - 2 * f);
             if (fading)
-                motionOf(*e, fe, a.from, a.fromTime, dt * a.fromSpeed, a.fromLoop, from);
+                playMotion(*e, row, a, true, fe, dt, from);
             for (int k = 0; k < 4; ++k)
                 m[k] = from[k] + (to[k] - from[k]) * f;
             PlacementMotion& pm = PlacementMotions[row];
@@ -1481,6 +2234,31 @@ void animate(float dt)
             Placements[row].dirty = 1; // drawn moved on by it (syncPlacements, next)
         }
         advanceClip(ce, fe, a, dt);
+        // Its blend space: the point followed toward the game's, and the phase (its own, and that of the one it fades
+        // from) moved on by the weighted length of what plays, so every sample keeps step.
+        if (row < PlacementBlends.size())
+        {
+            PlacementBlend& b = PlacementBlends[row];
+            const float     k = b.smooth > 0 ? 1 - expf(-3.0f * dt / b.smooth) : 1.0f; // most of the way in `smooth` s
+            b.x += (b.tx - b.x) * k, b.y += (b.ty - b.y) * k;
+            if (a.clip != kBlendClip)
+                b.set = 0, b.hash = 0;
+            if (a.from != kBlendClip)
+                b.from = 0;
+            const uint32_t h = row | (Placements[row].gen & 0xFFFu) << 20;
+            BlendSet       w;
+            auto           step = [&](float& phase, float speed, uint32_t loop, uint32_t set, uint32_t dims, float x, float y) {
+                if (!set || !blendWeigh(*e, row, h, set, dims, x, y, w) || !(w.length > 0))
+                    return 0.0f;
+                phase += dt * speed / w.length;
+                phase = loop ? phase - floorf(phase) : fminf(fmaxf(phase, 0.0f), 1.0f);
+                return phase * w.length;
+            };
+            if (b.set)
+                a.time = step(b.phase, a.speed, a.loop, b.set, b.dims, b.x, b.y); // clipTime: its phase times its length
+            if (b.from)
+                step(b.fromPhase, a.fromSpeed, a.fromLoop, b.from, b.fromDims, b.fromX, b.fromY);
+        }
     }
     // The Model Viewer's own clip (its model's, whether placed or not), while it plays.
     if (const Entry* e = byId(gPreview.model); e && e->anim && e->state == 1)
@@ -1493,6 +2271,7 @@ void animate(float dt)
             memset(gPreview.morphHeld, 0, sizeof gPreview.morphHeld);
             gPreview.animModel = e->id;
             gPreview.clipsFrom = gPreview.srcClip = gPreview.srcFrom = 0;
+            gPreview.layerClip = gPreview.layerBone = kNoClip, gPreview.layerSource = 0, gPreview.layerTime = 0;
         }
         const Entry* from = gPreview.clipsFrom ? byId(gPreview.clipsFrom) : e; // whose clips the panel lists
         if (!from || !from->anim || from->state != 1)
@@ -1511,6 +2290,27 @@ void animate(float dt)
             mapFor(*e, *fe, true);
         a.speed = gPreview.speed;
         advanceClip(ce, fe, a, gPreview.playing ? dt : 0.0f);
+        // Its layer: picked in the panel (from the models whose clips it lists), its time moved on as its clip's.
+        if (gPreview.layerPick)
+        {
+            const uint32_t c = gPreview.layerPick - 2;
+            gPreview.layerClip = gPreview.layerPick >= 2 && c < from->skel->clipCount ? c : kNoClip;
+            gPreview.layerSource = from == e ? 0 : from->key, gPreview.layerTime = 0, gPreview.layerPick = 0;
+        }
+        if (gPreview.layerBone != kNoClip && gPreview.layerBone >= e->skel->nodeCount)
+            gPreview.layerBone = kNoClip;
+        if (const Entry* ls = gPreview.layerClip != kNoClip ? sourceOf(*e, gPreview.layerSource) : nullptr;
+            ls && gPreview.layerClip < ls->skel->clipCount)
+        {
+            if (ls != e)
+                mapFor(*e, *ls, true);
+            const float d = ls->clips[gPreview.layerClip].duration;
+            gPreview.layerTime += (gPreview.playing ? dt : 0.0f) * gPreview.speed;
+            if (d > 0)
+                gPreview.layerTime = fmodf(gPreview.layerTime, d) + (gPreview.layerTime < 0 ? d : 0);
+        }
+        else
+            gPreview.layerClip = kNoClip;
     }
     // Layers: names taken once their models load, times and weights moved on, faded-out ones and those of placements
     // that are gone dropped.
@@ -1559,23 +2359,38 @@ void animate(float dt)
     for (uint32_t i = MorphOverrides.size(); i-- > 0;)
         if (placementRow(MorphOverrides[i].placement) == 0xFFFFFFFFu)
             MorphOverrides.remove(i);
+    // Inertialized transitions that are over (or whose placement is gone) give back their room.
+    for (uint32_t i = gInertCount; i-- > 0;)
+    {
+        const uint32_t       h = gInertSlot[i].placement, r = h ? placementRow(h) : 0xFFFFFFFFu;
+        const PlacementAnim* pa = h ? (r < PlacementAnims.size() ? &PlacementAnims[r] : nullptr) : &gPreview.anim;
+        if (!pa || pa->from == kNoClip || !(pa->fade > 0) || pa->faded >= pa->fade)
+            gInertSlot[i] = gInertSlot[--gInertCount];
+    }
     uint32_t last = 0xFFFFFFFFu, bones = 0, targets = 0; // a placement's parts come together: posed once for all of them
+    bool     grown = false; // and foot IK moved it: its pose's bounds in lo, hi (the core keeps its mesh's sphere too)
+    float    lo[3], hi[3];
     for (uint32_t i = 0; i < PartInstances.size(); ++i)
     {
         const uint32_t row = PartInstances[i].placement;
         if (row != last)
         {
-            last = row, bones = 0, targets = 0;
+            last = row, bones = 0, targets = 0, grown = false;
             const Entry* e = row < rows && Placements[row].alive ? byKey(Placements[row].key) : nullptr;
             const bool re = row < PlacementRetargets.size();
             if (e && e->anim && e->state == 1 &&
                 evaluate(*e, PlacementAnims[row], nullptr, nullptr, row | (Placements[row].gen & 0xFFFu) << 20,
                          row < PlacementMotions.size() && PlacementMotions[row].on, re ? PlacementRetargets[row].clip : 0,
-                         re ? PlacementRetargets[row].from : 0))
+                         re ? PlacementRetargets[row].from : 0, dt))
+            {
                 bones = e->skel->boneCount, targets = e->targets ? e->skel->targetCount : 0;
+                grown = gFootMoved && poseBounds(*e, gPalette, lo, hi);
+            }
         }
         if (bones)
             renderer::instance_pose(PartInstances[i].instance, (uint64_t)(uintptr_t)gPalette, bones);
+        if (bones && grown)
+            renderer::instance_bounds(PartInstances[i].instance, { lo[0], lo[1], lo[2] }, { hi[0], hi[1], hi[2] });
         if (bones && targets)
             renderer::instance_morph(PartInstances[i].instance, (uint64_t)(uintptr_t)gWeights, targets);
     }
@@ -1677,9 +2492,18 @@ int load(int reloaded)
     gFromWeights = new float[kRmodelMaxTargets];
     gSrcPoses = new anim::Pose[kMaxNodes];
     gLayerPoses = new anim::Pose[kMaxNodes];
-    gLayerRef = new anim::Pose[kMaxNodes];
+    gLayerRefs = new anim::Pose[kLayerRefs * kMaxNodes];
+    memset(gLayerRefKey, 0, sizeof gLayerRefKey), gLayerRefNext = 0;
     gLayerMask = new uint8_t[kMaxNodes];
+    gBlendPoses = new anim::Pose[kMaxNodes];
+    gBlendWeights = new float[kRmodelMaxTargets];
+    gBlendTris = new BlendTris[kBlendRows * 2]();
     gSrcWeights = new float[kRmodelMaxTargets];
+    gInertPool = new float[kInertFloats];
+    gInertSlot = new InertSlot[kInertSlots];
+    gInertCount = 0;
+    gInertNew = new anim::Pose[kMaxNodes], gInertOld = new anim::Pose[kMaxNodes];
+    gInertNewW = new float[kRmodelMaxTargets], gInertOldW = new float[kRmodelMaxTargets];
     gRt = { new float[kMaxNodes * 12], new float[kMaxNodes * 4], new float[kMaxNodes * 12], new float[kMaxNodes * 4] };
     gMaps = new MapSlot[kMaps]();
     gPreview = Preview{};
@@ -1689,6 +2513,7 @@ int load(int reloaded)
     gPreview.lod = -1;
     gPreview.turntable = 1;
     gPreview.playing = 1, gPreview.speed = 1.0f, gPreview.fade = 0.2f, gPreview.inPlace = 1;
+    gPreview.layerClip = gPreview.layerBone = kNoClip, gPreview.layerWeight = 1.0f;
     gApi.instance = (uint64_t)host->frame() * 2654435761u ^ (uint64_t)(uintptr_t)gEntries; // models register again
     gInstance = gApi.instance;
     return 0;
@@ -1714,9 +2539,15 @@ void unload()
     delete[] gSrcPoses;
     delete[] gSrcWeights;
     delete[] gLayerPoses;
-    delete[] gLayerRef;
+    delete[] gLayerRefs;
     delete[] gLayerMask;
-    gLayerPoses = gLayerRef = nullptr, gLayerMask = nullptr;
+    delete[] gBlendPoses;
+    delete[] gBlendWeights;
+    delete[] gBlendTris;
+    delete[] gInertPool, delete[] gInertSlot, delete[] gInertNew, delete[] gInertOld, delete[] gInertNewW, delete[] gInertOldW;
+    gInertPool = nullptr, gInertSlot = nullptr, gInertNew = gInertOld = nullptr, gInertNewW = gInertOldW = nullptr, gInertCount = 0;
+    gBlendPoses = nullptr, gBlendWeights = nullptr, gBlendTris = nullptr;
+    gLayerPoses = gLayerRefs = nullptr, gLayerMask = nullptr;
     delete[] gRt.sw, delete[] gRt.sq, delete[] gRt.tw, delete[] gRt.tq;
     gMaps = nullptr, gSrcPoses = nullptr, gSrcWeights = nullptr, gRt = {};
     gPoses = gFrom = nullptr;
@@ -1854,7 +2685,7 @@ void draw(uint32_t pass, const YeaFrame* frame)
     p.lod = gPreview.lod;
     if (e->anim && gPreview.animModel == e->id &&
         evaluate(*e, gPreview.anim, gPreview.morph, gPreview.morphHeld, 0, gPreview.inPlace != 0, gPreview.srcClip,
-                 gPreview.srcFrom)) // posed as its clip is now
+                 gPreview.srcFrom, -1, &gPreview)) // posed as its clip (and its layer) is now
     {
         p.palette = (uint64_t)(uintptr_t)gPalette, p.bones = e->skel->boneCount;
         if (e->targets)

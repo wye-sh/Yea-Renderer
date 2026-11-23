@@ -32,6 +32,8 @@ struct Pose // an instance row's palette this frame
     uint64_t frame;
     uint32_t weights, targets; // its morph weights in gPoseCpu (floats, from a float4), when weightFrame is this frame
     uint64_t weightFrame;
+    float    lo[3], hi[3]; // instance_bounds', when boundsFrame is this frame
+    uint64_t boundsFrame;
 };
 struct Last // where an instance row drew from last frame
 {
@@ -132,6 +134,16 @@ void instance_pose(yea_handle h, uint64_t palette, uint32_t bones)
     memcpy(gPoseCpu + gPoseUsed, p, (size_t)bones * 12 * sizeof(float));
     gPose[row] = { gPoseUsed, bones, frame };
     gPoseUsed += bones * 12;
+}
+
+void instance_bounds(yea_handle h, yea_float3 lo, yea_float3 hi)
+{
+    const uint32_t row = rowOf(Instances, h);
+    if (row == 0xFFFFFFFFu || !gPose || !(lo.x <= hi.x && lo.y <= hi.y && lo.z <= hi.z))
+        return;
+    Pose& p = gPose[row];
+    p.lo[0] = lo.x, p.lo[1] = lo.y, p.lo[2] = lo.z, p.hi[0] = hi.x, p.hi[1] = hi.y, p.hi[2] = hi.z;
+    p.boundsFrame = yea::host()->frame();
 }
 
 void mesh_morph(uint32_t mesh, uint64_t refs, uint64_t deltas, uint32_t deltaCount)
@@ -375,6 +387,14 @@ void skinBegin(uint32_t base, uint32_t capacity)
     addResource(&d, nullptr);
     waitForAllResourceLoads();
     gSkinRows = gSkinBuf ? rows : 0;
+}
+
+bool skinBounds(uint32_t row, float* lo, float* hi)
+{
+    if (!gPose || !posed(row) || gPose[row].boundsFrame != gFrame)
+        return false;
+    memcpy(lo, gPose[row].lo, 12), memcpy(hi, gPose[row].hi, 12);
+    return true;
 }
 
 bool skinInstance(uint32_t row, uint32_t lod, SkinDraw& out)

@@ -254,6 +254,10 @@ export void instance_lod_quality(handle i, float quality)
 export void instance_pose(handle i, u64 palette, u32 bones)
 # Its morph targets' weights this frame (floats, one a target), with instance_pose. Without them it shows no morph.
 export void instance_morph(handle i, u64 weights, u32 count)
+# Its bounds this frame (model space, as its mesh's), with instance_pose, when its pose reaches past what its mesh's
+# bounds hold (renderer_models' foot IK): culling, shadows, reflections and LOD then use the smallest sphere holding both,
+# never less than its mesh's. Without them this frame, its mesh's alone.
+export void instance_bounds(handle i, float3 lo, float3 hi)
 export void instance_remove(handle i)
 export u32 instance_count()
 

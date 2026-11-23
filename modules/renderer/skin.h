@@ -32,6 +32,8 @@ uint32_t skinNeed();
 void     skinBegin(uint32_t base, uint32_t capacity);
 // In the instance loop: whether instance `row`, drawn with mesh version `lod`, is posed this frame, and where from.
 bool     skinInstance(uint32_t row, uint32_t lod, SkinDraw& out);
+// Before that: instance `row`'s instance_bounds this frame (model space), when it is posed and has them.
+bool     skinBounds(uint32_t row, float* lo, float* hi);
 // First in the frame's commands: the bones' buffer brought up to date, then every job, with the pool's buffers moved
 // from `state` to unordered access and back.
 void     skinRecord(Cmd* cmd, uint32_t fi, Buffer* positions, Buffer* attributes, uint32_t state);

@@ -2850,6 +2850,27 @@ void draw(uint32_t pass, const YeaFrame* yf)
         info.sphere[2] = g.row[2][0] * c.x + g.row[2][1] * c.y + g.row[2][2] * c.z + g.row[2][3];
         float scale = maxf(fabsf(in.scale.x), maxf(fabsf(in.scale.y), fabsf(in.scale.z)));
         info.sphere[3] = mesh.radius * scale;
+        // Posed past its mesh's bounds this frame (instance_bounds: foot IK): the smallest sphere holding its mesh's and
+        // theirs, so it is never culled sooner than its mesh's alone would be.
+        if (float blo[3], bhi[3]; gSkinOn && skinBounds(row, blo, bhi))
+        {
+            const v3 bc = V((blo[0] + bhi[0]) * 0.5f, (blo[1] + bhi[1]) * 0.5f, (blo[2] + bhi[2]) * 0.5f);
+            const v3 w = V(g.row[0][0] * bc.x + g.row[0][1] * bc.y + g.row[0][2] * bc.z + g.row[0][3],
+                           g.row[1][0] * bc.x + g.row[1][1] * bc.y + g.row[1][2] * bc.z + g.row[1][3],
+                           g.row[2][0] * bc.x + g.row[2][1] * bc.y + g.row[2][2] * bc.z + g.row[2][3]);
+            const v3 e = V(bhi[0] - blo[0], bhi[1] - blo[1], bhi[2] - blo[2]);
+            const float rb = 0.5f * length(e) * scale, ra = info.sphere[3];
+            const v3    ca = V(info.sphere[0], info.sphere[1], info.sphere[2]);
+            const float d = length(w - ca);
+            if (d + rb > ra) // else its mesh's holds them already
+            {
+                v3 c = w;
+                float r = rb;
+                if (d + ra > rb) // neither holds the other: the sphere through both's far sides
+                    r = 0.5f * (d + ra + rb), c = ca + (w - ca) * ((r - ra) / d);
+                info.sphere[0] = c.x, info.sphere[1] = c.y, info.sphere[2] = c.z, info.sphere[3] = r;
+            }
+        }
         info.moved = in.moved;
         v3 sc = V(info.sphere[0], info.sphere[1], info.sphere[2]);
         bool twoSided = in.material < Materials.size() && Materials[in.material].doubleSided;
