@@ -976,3 +976,10 @@ or Reset. Reset: lights, camera, dust and steam
 back to the start (the particle pool starts empty). `benchmark_view` holds the camera at its start view (field of view 55), or at the gold or
 mirror sphere's close-up (`benchmark_camera`, field of view 40), without moving the user's own, and holds the lights and shapes still, so GPU Timings compare between versions; the project's
 `modules/test_renderer_bench` (a test on the user's machine) drives it. Exports `picture` (a fixed angle).
+`scene` (7.3.0, category Scene): Full (all of the above), or a small scene for one part of the renderer: Shadows (sun,
+4 moving lights, shapes, spinners), Area Lights (the area lights alone, no sun, with shapes and sphere rows), Global
+Illumination (sun, shapes, rows), Reflections (sun, 4 lights, rows, spinners, shapes, decals), Glass (sun, glass,
+shapes, steam), Fog and Particles (sun, 4 lights, shapes, dust, steam, and a fog volume that shows with renderer_fog's
+fog on), Post and Upscaling (sun, 8 lights, rows, shapes, spinners), Models (sun, the models and the Knight, shapes).
+`kScenes` holds each one's parts (`kHas*`), its moving-light cap and its start view; a scene change builds the scene
+again and moves the camera to that start view, which Benchmark View holds too. The other knobs still switch parts off.

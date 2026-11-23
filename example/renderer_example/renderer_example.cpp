@@ -66,15 +66,68 @@ bool   gGlassBuilt, gDecalsBuilt; // the glass and decals knobs as the scene was
 bool   gLooking;
 bool   gPicture; // Yea is taking the card picture; a global so a reload never leaves it stuck on
 
-// Where the camera starts: 17 m from (0, 0.8, 0) at yaw 0.6 and 0.42 rad up, looking at it.
-const float kStartYaw = 0.6f, kStartPitch = 0.42f, kStartDist = 17.0f;
+// The Scene knob's scenes: the parts each holds, how many of the moving lights at most, and where its camera starts
+// (`dist` m from `target` at `yaw` and `pitch` rad up, looking at it). Full is the whole yard; each other one only what
+// its part of the renderer needs, so its passes can be judged and timed alone. Light Types and the other knobs still
+// switch their parts off in every scene.
+enum : uint32_t
+{
+    kHasSun = 1,     // the sun
+    kHasSpheres = 2, // the gold and red rows
+    kHasShapes = 4,  // the pillars, boxes, cones, drum, copper block and stone ledge
+    kHasSpin = 8,    // the spinning tori and box
+    kHasAreas = 16,  // the area lights and their fittings
+    kHasGlass = 32,
+    kHasDecals = 64,
+    kHasModels = 128, // the sample models
+    kHasKnight = 256,
+    kHasDust = 512,
+    kHasSteam = 1024,
+    kHasFog = 2048, // a fog volume over the floor (seen while renderer_fog's fog is on)
+    kHasAll = 2047,
+};
+struct SceneDef
+{
+    uint32_t   has, lights;
+    yea_float3 target;
+    float      yaw, pitch, dist;
+};
+// In the order of the scene knob's options.
+const SceneDef kScenes[] = {
+    { kHasAll, kMaxLights, { 0, 0.8f, 0 }, 0.6f, 0.42f, 17.0f },                                          // Full
+    { kHasSun | kHasShapes | kHasSpin, 4, { 0, 0.8f, 3.0f }, 1.2f, 0.5f, 12.0f },                          // Shadows
+    { kHasAreas | kHasShapes | kHasSpheres, 0, { 0, 1.0f, -2.0f }, 1.57f, 0.35f, 15.0f },                  // Area Lights
+    { kHasSun | kHasShapes | kHasSpheres, 0, { 0, 0.8f, 1.0f }, 0.6f, 0.42f, 14.0f },                      // Global Illumination
+    { kHasSun | kHasSpheres | kHasShapes | kHasSpin | kHasDecals, 4, { 0, 0.75f, -2.8f }, 1.3f, 0.3f, 10.0f }, // Reflections
+    { kHasSun | kHasGlass | kHasShapes | kHasSteam, 0, { 1.5f, 0.9f, 3.5f }, 0.6f, 0.3f, 9.0f },           // Glass
+    { kHasSun | kHasShapes | kHasDust | kHasSteam | kHasFog, 4, { 0, 1.0f, 1.0f }, 0.6f, 0.3f, 13.0f },    // Fog and Particles
+    { kHasSun | kHasSpheres | kHasShapes | kHasSpin, 8, { 0, 0.8f, 0 }, 0.6f, 0.42f, 17.0f },              // Post and Upscaling
+    { kHasSun | kHasModels | kHasKnight | kHasShapes, 0, { 2.0f, 1.0f, 0 }, 0.9f, 0.3f, 13.0f },           // Models
+};
+const uint32_t kSceneCount = sizeof kScenes / sizeof kScenes[0];
+uint32_t       sceneIndex()
+{
+    uint32_t i = static_cast<uint32_t>(settings.scene);
+    return i < kSceneCount ? i : 0;
+}
+const SceneDef& scene() { return kScenes[sceneIndex()]; }
+bool            has(uint32_t part) { return (scene().has & part) != 0; }
+uint32_t        gSceneBuilt = kNone; // the scene the renderer's scene was built as (kNone: none yet in this version)
+yea_handle      gFogVolume = kNone;  // the Fog and Particles scene's volume
+
+// Where the scene's camera starts.
+yea_float3 startEye()
+{
+    const SceneDef& d = scene();
+    return { d.target.x + cosf(d.yaw) * cosf(d.pitch) * d.dist, d.target.y + sinf(d.pitch) * d.dist,
+             d.target.z + sinf(d.yaw) * cosf(d.pitch) * d.dist };
+}
 
 void startCamera(State* s)
 {
-    const float yaw = kStartYaw, pitch = kStartPitch, dist = kStartDist;
-    s->eye = { cosf(yaw) * cosf(pitch) * dist, 0.8f + sinf(pitch) * dist, sinf(yaw) * cosf(pitch) * dist };
-    s->yaw = yaw + kPi;
-    s->pitch = -pitch;
+    s->eye = startEye();
+    s->yaw = scene().yaw + kPi;
+    s->pitch = -scene().pitch;
 }
 
 State* state()
@@ -219,7 +272,7 @@ void addProbes()
 // front, its file's +Z, faces -Z as cooked; each is turned towards the start view.
 void placeModels()
 {
-    if (!settings.models)
+    if (!settings.models || !has(kHasModels))
     {
         uint32_t* all[5] = { &models->lantern, &models->flightHelmet, &models->waterBottle, &models->boomBox, &models->knight };
         for (uint32_t* p : all)
@@ -236,7 +289,7 @@ void placeModels()
         models->waterBottle = mdl::place(water_bottle, { 7.4f, 0.52f, 4.4f }, toView);
     if (!mdl::placed(models->boomBox)) // on the copper block
         models->boomBox = mdl::place(boom_box, { 5.0f, 1.4f, 2.0f }, toView);
-    if (!settings.knight)
+    if (!settings.knight || !has(kHasKnight))
     {
         if (mdl::placed(models->knight))
             mdl::remove(models->knight); // its skinning and its shadow's redraw go with it
@@ -256,7 +309,7 @@ void placeModels()
 void addGlass()
 {
     gGlassBuilt = settings.glass;
-    if (!settings.glass)
+    if (!settings.glass || !has(kHasGlass))
         return;
     uint32_t         box = renderer::mesh_box(), sphere = renderer::mesh_sphere(128);
     const yea_float4 facing = axisAngle({ 0, 1, 0 }, 1.08f); // square to the start view, over the drum
@@ -284,7 +337,7 @@ void addGlass()
 void addDecals()
 {
     gDecalsBuilt = settings.decals;
-    if (!settings.decals)
+    if (!settings.decals || !has(kHasDecals))
         return;
     const yea_float4 up = axisAngle({ 1, 0, 0 }, -0.5f * kPi); // the box's z out of the floor
     const yea_float4 none = { 0, 0, 0, 1 };
@@ -321,6 +374,9 @@ void build(State* s)
     renderer_probes::probe_clear();
     renderer_particles::particle_emitter_clear();
     particles->dust = particles->steam = 0;
+    renderer_fog::fog_volume_clear();
+    gFogVolume = kNone;
+    gSceneBuilt = sceneIndex();
     s->lightCount = s->spinCount = 0;
     s->sun = kNone;
     // Segments so the silhouettes stay round in the close-ups (a sphere filling the screen at 2560x1356 is under a
@@ -341,7 +397,7 @@ void build(State* s)
     place(plane, floor, { 0, 0, 0 }, { 60, 1, 60 });
 
     // Roughness sweeps: gold metal at the back, red plastic in front of it.
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 8 && has(kHasSpheres); ++i)
     {
         float      r = 0.04f + 0.96f * (float)i / 7.0f;
         float      x = -7.0f + 2.0f * (float)i;
@@ -359,22 +415,28 @@ void build(State* s)
     yea_handle blue = renderer::material_add({ 0.08f, 0.2f, 0.7f }, 0.2f, 0);
     yea_handle green = renderer::material_add({ 0.1f, 0.5f, 0.15f }, 0.55f, 0);
 
-    for (int i = 0; i < 8; ++i)
+    if (has(kHasShapes))
     {
-        float a = (float)i / 8.0f * 2 * kPi;
-        place(cylinder, stone, { cosf(a) * 11.0f, 2.0f, sinf(a) * 11.0f }, { 0.8f, 4.0f, 0.8f });
+        for (int i = 0; i < 8; ++i)
+        {
+            float a = (float)i / 8.0f * 2 * kPi;
+            place(cylinder, stone, { cosf(a) * 11.0f, 2.0f, sinf(a) * 11.0f }, { 0.8f, 4.0f, 0.8f });
+        }
+        place(box, white, { -5.0f, 0.6f, 2.5f }, { 1.2f, 1.2f, 1.2f }, axisAngle({ 0, 1, 0 }, 0.4f));
+        place(box, white, { -5.2f, 1.6f, 2.4f }, { 0.8f, 0.8f, 0.8f }, axisAngle({ 0, 1, 0 }, 1.1f));
+        place(box, copper, { 5.5f, 0.5f, 2.0f }, { 3.0f, 1.0f, 1.0f });
+        place(cone, blue, { -2.0f, 0.75f, 3.5f }, { 1.2f, 1.5f, 1.2f });
+        place(cone, green, { 2.5f, 1.0f, 4.0f }, { 1.4f, 2.0f, 1.4f });
+        place(cylinder, steel, { 0.5f, 0.4f, 2.2f }, { 1.6f, 0.8f, 1.6f });
+        place(box, stone, { 0.0f, 0.25f, -7.5f }, { 18.0f, 0.5f, 1.5f });
     }
-    place(box, white, { -5.0f, 0.6f, 2.5f }, { 1.2f, 1.2f, 1.2f }, axisAngle({ 0, 1, 0 }, 0.4f));
-    place(box, white, { -5.2f, 1.6f, 2.4f }, { 0.8f, 0.8f, 0.8f }, axisAngle({ 0, 1, 0 }, 1.1f));
-    place(box, copper, { 5.5f, 0.5f, 2.0f }, { 3.0f, 1.0f, 1.0f });
-    place(cone, blue, { -2.0f, 0.75f, 3.5f }, { 1.2f, 1.5f, 1.2f });
-    place(cone, green, { 2.5f, 1.0f, 4.0f }, { 1.4f, 2.0f, 1.4f });
-    place(cylinder, steel, { 0.5f, 0.4f, 2.2f }, { 1.6f, 0.8f, 1.6f });
-    place(box, stone, { 0.0f, 0.25f, -7.5f }, { 18.0f, 0.5f, 1.5f });
-    addSpin(s, torus, steel, { 4.0f, 1.6f, 5.5f }, { 2.6f, 2.6f, 2.6f }, { 1, 0.3f, 0 });
-    addSpin(s, torus, copper, { -4.5f, 1.4f, 5.5f }, { 2.4f, 2.4f, 2.4f }, { 0, 1, 0.5f });
-    addSpin(s, box, blue, { 8.5f, 1.2f, -1.0f }, { 1.2f, 1.2f, 1.2f }, { 1, 1, 0 });
-    addSpin(s, torus, white, { -8.5f, 1.3f, -1.0f }, { 2.2f, 2.2f, 2.2f }, { 0, 0, 1 });
+    if (has(kHasSpin))
+    {
+        addSpin(s, torus, steel, { 4.0f, 1.6f, 5.5f }, { 2.6f, 2.6f, 2.6f }, { 1, 0.3f, 0 });
+        addSpin(s, torus, copper, { -4.5f, 1.4f, 5.5f }, { 2.4f, 2.4f, 2.4f }, { 0, 1, 0.5f });
+        addSpin(s, box, blue, { 8.5f, 1.2f, -1.0f }, { 1.2f, 1.2f, 1.2f }, { 1, 1, 0 });
+        addSpin(s, torus, white, { -8.5f, 1.3f, -1.0f }, { 2.2f, 2.2f, 2.2f }, { 0, 0, 1 });
+    }
 
     addProbes();
     addGlass();
@@ -383,12 +445,14 @@ void build(State* s)
     // The area lights' dark fittings: the softbox's backing and stand, the pendant's canopy and cord, the tube's
     // brackets. They stay when a type is switched off (a lamp turned off). Those beside an emitter cast no shadow (they
     // would shadow its light); the stand's pole and foot do.
-    s->glassImage = makeGlassImage();
+    s->glassImage = has(kHasAreas) ? makeGlassImage() : kNone;
     for (uint32_t i = 0; i < kAreas; ++i)
     {
         const AreaLight& a = kAreaLights[i];
         yea_float3       z = normalized(a.dir), x = normalized(a.across), y = cross(z, x);
         s->areas[i] = s->areaEmitters[i] = kNone;
+        if (!has(kHasAreas))
+            continue;
         s->areaMaterials[i] = renderer::material_add({ 0, 0, 0 }, 1, 0);
         if (a.glass)
             for (uint32_t k = 0; k < kPanes; ++k)
@@ -519,6 +583,8 @@ void addArea(State* s, uint32_t i)
 
 bool areaOn(uint32_t type)
 {
+    if (!has(kHasAreas))
+        return false;
     return type == 3 ? settings.rects : type == 4 ? settings.discs : type == 5 ? settings.spheres : settings.tubes;
 }
 
@@ -572,18 +638,19 @@ yea_handle makeSteam()
 // The lights the knobs ask for: switched-off types removed (not just dark, so their cost goes too).
 void syncLights(State* s)
 {
-    if (settings.sun && s->sun == kNone)
+    const bool sun = settings.sun && has(kHasSun);
+    if (sun && s->sun == kNone)
     {
         s->sun = renderer::light_add(0);
         renderer::light_shadow(s->sun, true);
     }
-    else if (!settings.sun && s->sun != kNone)
+    else if (!sun && s->sun != kNone)
     {
         renderer::light_remove(s->sun);
         s->sun = kNone;
     }
     uint32_t want = settings.light_count < 0 ? 0 : (uint32_t)settings.light_count;
-    want = want > kMaxLights ? kMaxLights : want;
+    want = want > scene().lights ? scene().lights : want;
     uint32_t slots = want > s->lightCount ? want : s->lightCount;
     for (uint32_t i = 0; i < slots; ++i)
     {
@@ -728,11 +795,7 @@ void moveCamera(State* s, float dt)
         else if (settings.benchmark_camera == BenchmarkCamera::Mirror_Closeup)
             renderer::camera({ -7.0f, 1.0f, -2.6f }, { -7.0f, 0.75f, -4.0f }, 40);
         else
-        {
-            const float yaw = kStartYaw, pitch = kStartPitch, dist = kStartDist;
-            yea_float3  eye = { cosf(yaw) * cosf(pitch) * dist, 0.8f + sinf(pitch) * dist, sinf(yaw) * cosf(pitch) * dist };
-            renderer::camera(eye, { 0, 0.8f, 0 }, 55);
-        }
+            renderer::camera(startEye(), scene().target, 55);
         return;
     }
     if (gPicture)
@@ -773,8 +836,11 @@ void update(uint32_t phase, float dt)
     // The renderer's scene must be the one this module built: after a renderer crash, revert or reload that lost or
     // replaced it (or one that came back while this module had built against stubs), every handle held here is stale
     // and nothing would move, so build it all again. Its scene_epoch says so, whatever other modules add to the scene.
-    if (!s->built || gFreshVersion || renderer::scene_epoch() != s->epoch || settings.glass != gGlassBuilt || settings.decals != gDecalsBuilt)
+    if (!s->built || gFreshVersion || renderer::scene_epoch() != s->epoch || settings.glass != gGlassBuilt || settings.decals != gDecalsBuilt ||
+        sceneIndex() != gSceneBuilt)
     {
+        if (gSceneBuilt != kNone && sceneIndex() != gSceneBuilt)
+            startCamera(s); // another scene: its own start view
         char line[160];
         snprintf(line, sizeof line, "renderer_example: building the scene (built %u; the renderer's scene %u, built in %u)", s->built,
                  renderer::scene_epoch(), s->epoch);
@@ -793,8 +859,16 @@ void update(uint32_t phase, float dt)
         s->t += dt; // Benchmark View holds the lights and shapes still, so timings repeat
     placeModels();
     syncLights(s);
-    syncEmitter(particles->dust, settings.dust, makeDust);
-    syncEmitter(particles->steam, settings.steam, makeSteam);
+    syncEmitter(particles->dust, settings.dust && has(kHasDust), makeDust);
+    syncEmitter(particles->steam, settings.steam && has(kHasSteam), makeSteam);
+    if (has(kHasFog) && gFogVolume == kNone)
+    {
+        // A soft bank of mist over the middle of the floor, in the beams of the sun and the lamps (tried again each frame
+        // till renderer_fog is up). It shows while renderer_fog's fog is on.
+        gFogVolume = renderer_fog::fog_volume_add(1, { -1.5f, 1.0f, 1.0f }, { 4.0f, 1.3f, 3.5f });
+        if (gFogVolume != kNone)
+            renderer_fog::fog_volume_medium(gFogVolume, 0.25f, { 1, 1, 1 }, 0.6f);
+    }
     animate(s);
     moveCamera(s, dt);
     s->epoch = renderer::scene_epoch();
