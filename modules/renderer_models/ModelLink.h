@@ -48,6 +48,10 @@
 //                                             { "StrafeL", -1.5f, 0 }, { "StrafeR", 1.5f, 0 }, { "Back", 0, -1.5f } };
 //   mdl::blendSpace(h, kMove, 6, 2);            // once (the same samples again change nothing)
 //   mdl::blendAt(h, sideways, forward, 0.1f);   // each frame: metres a second, followed over 0.1 s
+// Look-at and hand IK (UE's LookAt and Two Bone IK): mdl::lookAt(h, target) turns the head, neck and the top of the
+// spine toward a point, each a share of the turn within its own limit; mdl::handIk(h, 1, grip, gripTurn) brings the
+// right hand to a point (and turn), the elbow bending as the clip bends it, to hold a sword or grab a ledge:
+//   mdl::lookAt(h, enemyHead);   mdl::handIk(h, 0, ledgePoint);   mdl::stopHandIk(h, 0);
 // Placements are kept by renderer_models (through its reloads); Reset State empties them, so place again whenever
 // mdl::placed(h) is false. The handle is 0 while renderer_models isn't running.
 #pragma once
@@ -170,6 +174,13 @@ struct Api
     int (*blendSpace)(uint32_t placement, uint32_t model, const BlendSample* samples, uint32_t count, uint32_t dims, float speed,
                       int loop, float fade);
     void (*blendAt)(uint32_t placement, float x, float y, float smooth);
+    // Look-at and hand IK (later in Api: check `size`). lookAt: on or off, the target (world; nullptr keeps the last),
+    // faded to `weight` (0 to 1) over `fade` seconds, the head turned at most `limit` radians from where its clip points
+    // it; 0 when it has no spine, neck or head found. handIk: hand (0 left, 1 right) on or off, reaching `point` (world;
+    // nullptr keeps the last) and turned to `rot` there (world, x y z w; nullptr: the clip's), faded over `fade`
+    // seconds; 0 when it has no two arms.
+    int (*lookAt)(uint32_t placement, int on, const float* target, float weight, float limit, float fade);
+    int (*handIk)(uint32_t placement, uint32_t hand, int on, const float* point, const float* rot, float fade);
 };
 inline bool hasAnim(const Api* a) { return a->size >= offsetof(Api, morph); }
 inline bool hasMorph(const Api* a) { return a->size >= offsetof(Api, rootMotion); }
@@ -177,7 +188,8 @@ inline bool hasRootMotion(const Api* a) { return a->size >= offsetof(Api, playFr
 inline bool hasRetarget(const Api* a) { return a->size >= offsetof(Api, layer); }
 inline bool hasLayers(const Api* a) { return a->size >= offsetof(Api, footIk); }
 inline bool hasFootIk(const Api* a) { return a->size >= offsetof(Api, blendSpace); }
-inline bool hasBlendSpaces(const Api* a) { return a->size >= sizeof(Api); }
+inline bool hasBlendSpaces(const Api* a) { return a->size >= offsetof(Api, lookAt); }
+inline bool hasAim(const Api* a) { return a->size >= sizeof(Api); }
 
 struct Model;
 namespace detail
@@ -441,6 +453,44 @@ inline bool blendSpace(uint32_t placement, const Model& from, const BlendSample*
     const Api* a = detail::api();
     return a && placement && from.id && hasBlendSpaces(a) &&
            a->blendSpace(placement, from.id, samples, count, (uint32_t)dims, speed, loop ? 1 : 0, fade);
+}
+// Look-at: its head, neck and the top of its spine turned toward `target` (world), each bone a share of the turn and
+// never past its own limit, the head at most `limitDegrees` from where its clip points it; faded to `weight` over
+// `fade` seconds. Call it again as the target moves (it follows at once). False: no spine, neck or head found.
+inline bool lookAt(uint32_t placement, yea_float3 target, float weight = 1.0f, float limitDegrees = 70.0f, float fade = 0.2f)
+{
+    const Api*  a = detail::api();
+    const float t[3] = { target.x, target.y, target.z };
+    return a && placement && hasAim(a) && a->lookAt(placement, 1, t, weight, limitDegrees * 0.01745329f, fade);
+}
+// Look-at faded out over `fade` seconds: its clip's own head again.
+inline void stopLookAt(uint32_t placement, float fade = 0.2f)
+{
+    const Api* a = detail::api();
+    if (a && placement && hasAim(a))
+        a->lookAt(placement, 0, nullptr, 0, 0, fade);
+}
+// Hand IK: `hand` (0 left, 1 right) reaching `point` (world: its wrist there, as mdl::joint places it) with the elbow
+// bent the way its clip bends it, faded in over `fade` seconds; with `rotation` (world), the hand also turned to it (a
+// grip on a hilt, a palm on a ledge). Call it again as the point moves. False: no two arms found.
+inline bool handIk(uint32_t placement, int hand, yea_float3 point, float fade = 0.2f)
+{
+    const Api*  a = detail::api();
+    const float p[3] = { point.x, point.y, point.z };
+    return a && placement && hasAim(a) && a->handIk(placement, (uint32_t)hand, 1, p, nullptr, fade);
+}
+inline bool handIk(uint32_t placement, int hand, yea_float3 point, yea_float4 rotation, float fade = 0.2f)
+{
+    const Api*  a = detail::api();
+    const float p[3] = { point.x, point.y, point.z }, r[4] = { rotation.x, rotation.y, rotation.z, rotation.w };
+    return a && placement && hasAim(a) && a->handIk(placement, (uint32_t)hand, 1, p, r, fade);
+}
+// Hand IK faded out over `fade` seconds: the hand follows its clip again.
+inline void stopHandIk(uint32_t placement, int hand, float fade = 0.2f)
+{
+    const Api* a = detail::api();
+    if (a && placement && hasAim(a))
+        a->handIk(placement, (uint32_t)hand, 0, nullptr, nullptr, fade);
 }
 // Where in its blend space it plays (y for two dimensions), followed over `smooth` seconds (0: at once).
 inline void blendAt(uint32_t placement, float x, float y = 0.0f, float smooth = 0.0f)

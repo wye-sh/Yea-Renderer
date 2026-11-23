@@ -488,7 +488,15 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   finds them (`findLegs`, at load). While foot IK moves a placement, its parts get `instance_bounds`: each bone's box
   (`boneBoxes`, at load: the vertices it skins on every part and LOD, with their morph targets' reach, in the mesh's
   space), moved by its palette matrix (`poseBounds`). That holds every skinned vertex in any pose, so a pelvis dropped by
-  foot IK never culls the feet early. Table `PlacementGround` (rows as Placement's), emptied by Reset. Blend spaces
+  foot IK never culls the feet early. Table `PlacementGround` (rows as Placement's), emptied by Reset. Look-at and
+  hand IK (`hasAim(a)`; UE's LookAt and Two Bone IK), after foot IK: `mdl::lookAt(h, target, weight, limitDegrees,
+  fade)` turns the top two spine bones, then the neck to the head (`findUpper`, at load: shares 1, 1.5, head 2; limits
+  15, 30, head 50 degrees), each its share of what is left between the head's front (the feet's rest front in the
+  head's frame, `aimFwd`) and the target, the target first held within `limit` of where the clip faces (`aimIk`).
+  `mdl::handIk(h, hand, point, [rotation,] fade)` brings a wrist there by `retarget::limb` on the arm, the elbow
+  bending as the clip bends it, else to the back (`handIk`). Weights fade linearly, applied eased. Both set
+  `gFootMoved`, so the bones' boxes bound the pose. Tables `PlacementAim` and `PlacementHand` (rows as Placement's),
+  emptied by Reset. Blend spaces
   (`hasBlendSpaces(a)`; UE's Blend Space and Blend Space 1D): `mdl::blendSpace(h, [otherModel,] samples, count, dims,
   fade)` (up to 16 clips at points in 1 or 2 dimensions) becomes the placement's clip, `PlacementAnim.clip` set to
   `kBlendClip`, so `play()`'s crossfades go into and out of it (`leaveBlend`). The same samples again keep playing.

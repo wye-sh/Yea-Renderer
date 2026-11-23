@@ -131,6 +131,30 @@ table PlacementGround none 4096
   float3 footL
   float3 footR
 end
+# Look-at (mdl::lookAt; rows as Placement's): on, faded in and out over `fade` seconds to `most` (the game's weight;
+# `weight` now), the most the head turns from where its clip points it (`limit`, radians), and the target (world).
+table PlacementAim none 4096
+  u32 on
+  float weight
+  float most
+  float fade
+  float limit
+  float3 target
+end
+# Hand IK (mdl::handIk; rows as Placement's): each hand (bit 0 left, 1 right) on, and its turn given (`turned`), faded
+# in and out over its fade (weightL, weightR now); where it reaches (world) and the turn it takes there (world).
+table PlacementHand none 4096
+  u32 on
+  u32 turned
+  float weightL
+  float weightR
+  float fadeL
+  float fadeR
+  float3 pointL
+  float3 pointR
+  float4 rotL
+  float4 rotR
+end
 # Blend spaces (mdl::blendSpace; rows as Placement's): its samples now (`set`, 0 none) and those it fades from (`from`,
 # while its clip fades from its blend space), each's dimensions and point (x, y; fromX, fromY held at the hand-over), the
 # point the game asked for (tx, ty) followed over `smooth` seconds, the phase its samples share (0 to 1 a cycle;

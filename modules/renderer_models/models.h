@@ -57,6 +57,15 @@ struct Entry
     uint32_t legs; // 1: both found
     Leg      leg[2];
     uint32_t pelvis;
+    // Look-at and hand IK: its arms (left, right; upper arm, forearm, hand, as legs are) when both are found; its
+    // aiming chain, root first (the top of its spine, its neck, its head last), each bone's share of the turn and the
+    // most it turns (radians); its front (model space at rest: from its toes, else the cooker's -Z) and its head's
+    // forward in the head's own frame.
+    uint32_t arms;
+    Leg      arm[2];
+    uint32_t aimCount, aim[6];
+    float    aimShare[6], aimLimit[6];
+    float    front[3], aimFwd[3];
 };
 // Every model the view's modules declared, in the order declared (made in load()).
 extern Entry*   gEntries;

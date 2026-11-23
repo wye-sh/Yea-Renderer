@@ -100,7 +100,7 @@ void freeAnim(Entry& e)
     e.skel = nullptr, e.nodes = nullptr, e.bones = nullptr, e.clips = nullptr, e.targets = nullptr;
     e.motionNode = kNoClip;
     e.animStamp = 0;
-    e.legs = 0;
+    e.legs = 0, e.arms = 0, e.aimCount = 0;
     free(e.boneBox);
     e.boneBox = nullptr;
 }
@@ -264,6 +264,14 @@ uint32_t apiPlace(uint32_t model, const float* pos, const float* rot, float scal
         ;
     if (row < PlacementBlends.size())
         PlacementBlends[row] = PlacementBlend{};
+    while (PlacementAims.size() <= row && PlacementAims.add())
+        ;
+    if (row < PlacementAims.size())
+        PlacementAims[row] = PlacementAim{};
+    while (PlacementHands.size() <= row && PlacementHands.add())
+        ;
+    if (row < PlacementHands.size())
+        PlacementHands[row] = PlacementHand{};
     return row | gen << 20;
 }
 void apiMove(uint32_t h, const float* pos, const float* rot, float scale)
@@ -327,6 +335,10 @@ void grow(uint32_t row)
     while (row != 0xFFFFFFFFu && PlacementGrounds.size() <= row && PlacementGrounds.add())
         ;
     while (row != 0xFFFFFFFFu && PlacementBlends.size() <= row && PlacementBlends.add())
+        ;
+    while (row != 0xFFFFFFFFu && PlacementAims.size() <= row && PlacementAims.add())
+        ;
+    while (row != 0xFFFFFFFFu && PlacementHands.size() <= row && PlacementHands.add())
         ;
 }
 uint32_t clipHash(const char* name, size_t max)
@@ -993,12 +1005,71 @@ void stepBlend(const Entry& e, uint32_t row, uint32_t h, PlacementAnim& a, Place
 // --- Foot IK (mdl::footIk) -----------------------------------------------------------------------------------------
 constexpr float kFootRate = 15.0f;      // 1/s: how fast a lifted foot's ground glides to a new one (a step's edge)
 constexpr float kFootTilt = 0.7853982f; // the most a foot tilts to its ground (45 degrees)
-bool gFootMoved; // foot IK moved the placement evaluate() posed last (its bounds then come from its bones' boxes)
+bool gFootMoved; // foot IK, look-at or hand IK moved the placement evaluate() posed last (its bounds then come from its bones' boxes)
 
+// Its front, arms and aiming chain (findLegs, from the chains it found and its rest pose in gRt).
+void findUpper(Entry& e, const retarget::Found& f)
+{
+    static const float idq[4] = { 0, 0, 0, 1 }, Y[3] = { 0, 1, 0 }, back[3] = { 0, 0, -1 };
+    e.arms = 0, e.aimCount = 0;
+    const yea_float4 ut = upTurn(e);
+    const float      uc[4] = { -ut.x, -ut.y, -ut.z, ut.w };
+    float            upR[3], fr[3] = { 0, 0, 0 };
+    retarget::qrot(uc, Y, upR);
+    // its front: the way its toes point at rest (both feet, level), else the cooker's -Z
+    for (int side = 0; side < 2; ++side)
+        if (f.count[retarget::ChainToeL + side] && f.count[retarget::ChainLegL + side])
+        {
+            float a[3], b[3], d[3];
+            retarget::at(gRt.tw, f.node[retarget::ChainLegL + side][f.count[retarget::ChainLegL + side] - 1], a);
+            retarget::at(gRt.tw, f.node[retarget::ChainToeL + side][0], b);
+            retarget::sub(b, a, d);
+            const float u = retarget::dot(d, upR);
+            for (int j = 0; j < 3; ++j)
+                fr[j] += d[j] - u * upR[j];
+        }
+    if (!retarget::unit(fr))
+        retarget::qrot(uc, back, fr);
+    memcpy(e.front, fr, 12);
+    // its arms: upper arm, forearm (the hand's parent) and hand
+    bool arms = true;
+    for (int side = 0; side < 2 && arms; ++side)
+    {
+        const uint32_t  count = f.count[retarget::ChainArmL + side];
+        const uint32_t* chain = f.node[retarget::ChainArmL + side];
+        Entry::Leg&     L = e.arm[side];
+        arms = count >= 3;
+        if (!arms)
+            break;
+        L.c = chain[count - 1], L.b = (uint32_t)e.nodes[L.c].parent, L.a = chain[0];
+        arms = L.b != L.a;
+        retarget::at(gRt.tw, L.c, L.rest);
+        const int32_t pa = e.nodes[L.a].parent;
+        L.hasParent = pa >= 0 ? 1 : 0;
+        memcpy(L.parentRest, pa >= 0 ? &gRt.tq[pa * 4] : idq, 16);
+    }
+    e.arms = arms ? 1 : 0;
+    // its aiming chain: the top two of its spine, then its neck to its head (the head last), each a share of the turn
+    // (the head the most) and a limit (spine 15, neck 30, head 50 degrees)
+    const uint32_t cs = f.count[retarget::ChainSpine], ch = f.count[retarget::ChainHead];
+    if (!ch)
+        return;
+    for (uint32_t i = cs > 2 ? cs - 2 : 0; i < cs; ++i)
+        e.aim[e.aimCount] = f.node[retarget::ChainSpine][i], e.aimShare[e.aimCount] = 1.0f, e.aimLimit[e.aimCount++] = 0.2617994f;
+    for (uint32_t i = ch > 4 ? ch - 4 : 0; i < ch; ++i)
+    {
+        const bool head = i == ch - 1;
+        e.aim[e.aimCount] = f.node[retarget::ChainHead][i], e.aimShare[e.aimCount] = head ? 2.0f : 1.5f;
+        e.aimLimit[e.aimCount++] = head ? 0.8726646f : 0.5235988f;
+    }
+    // the head's forward in its own frame: the model's front, through its turn at rest
+    float hc[4];
+    retarget::qconj(&gRt.tq[e.aim[e.aimCount - 1] * 4], hc), retarget::qrot(hc, fr, e.aimFwd);
+}
 // Its legs, found from its bones' names as retargeting finds them (loadAnim, this module's update: it allocates).
 void findLegs(Entry& e)
 {
-    e.legs = 0, e.pelvis = kNoClip;
+    e.legs = 0, e.pelvis = kNoClip, e.arms = 0, e.aimCount = 0;
     const uint32_t  n = e.skel->nodeCount;
     retarget::Name* names = (retarget::Name*)malloc(n * sizeof(retarget::Name));
     if (!names || !gLayerPoses || !gRt.tw)
@@ -1010,6 +1081,7 @@ void findLegs(Entry& e)
     free(names);
     anim::restPoses(e.nodes, n, gLayerPoses);
     retarget::worlds(e.nodes, n, gLayerPoses, gRt.tw, gRt.tq);
+    findUpper(e, f);
     for (int side = 0; side < 2; ++side)
     {
         const uint32_t  count = f.count[retarget::ChainLegL + side];
@@ -1223,6 +1295,156 @@ void footIk(const Entry& e, uint32_t row, float dt)
     }
 }
 
+// --- Look-at and hand IK (mdl::lookAt, mdl::handIk) -------------------------------------------------------------
+// A weight faded toward `to` over `fade` seconds by dt (at once without a fade).
+float fadeTo(float w, float to, float fade, float dt)
+{
+    const float d = to - w;
+    return fade > 0 ? w + (d > 0 ? 1.0f : -1.0f) * fminf(fabsf(d), dt / fade) : to;
+}
+// The turn q scaled to `share` of its angle and kept within `most` radians.
+void turnPart(float* q, float share, float most)
+{
+    if (q[3] < 0)
+        for (int j = 0; j < 4; ++j)
+            q[j] = -q[j];
+    const float sh = sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2]);
+    if (!(sh > 1e-9f))
+    {
+        q[0] = q[1] = q[2] = 0, q[3] = 1;
+        return;
+    }
+    const float a = fminf(2 * atan2f(sh, q[3]) * share, most), k = sinf(a * 0.5f) / sh;
+    q[0] *= k, q[1] *= k, q[2] *= k, q[3] = cosf(a * 0.5f);
+}
+// gRt's worlds of `from` and the nodes down to `to`, from gPoses, after from's pose changed (the rest stay as they were).
+void chainWorlds(const Entry& e, uint32_t from, uint32_t to)
+{
+    uint32_t       p[retarget::kChainMax];
+    const uint32_t c = retarget::path(e.nodes, from, to, p);
+    if (!c)
+        return retarget::worlds(e.nodes, to + 1, gPoses, gRt.tw, gRt.tq);
+    for (uint32_t i = 0; i < c; ++i)
+    {
+        const uint32_t nd = p[i];
+        const int32_t  pa = e.nodes[nd].parent;
+        float          local[12];
+        anim::poseMatrix(gPoses[nd], local);
+        if (pa >= 0)
+            anim::mul34(&gRt.tw[pa * 12], local, &gRt.tw[nd * 12]), retarget::qmul(&gRt.tq[pa * 4], gPoses[nd].r, &gRt.tq[nd * 4]);
+        else
+            memcpy(&gRt.tw[nd * 12], local, sizeof local), memcpy(&gRt.tq[nd * 4], gPoses[nd].r, 16);
+        retarget::qnorm(&gRt.tq[nd * 4]);
+    }
+}
+// Look-at over a placement's pose in gPoses (local), as UE's LookAt spread down a chain: from the top of the spine to
+// the head, each bone turns its share of what is left between where the head faces and the target (the head the rest),
+// within its limit; the target first brought within `limit` of where the clip has the head face. dt < 0: as it stands.
+void aimIk(const Entry& e, uint32_t row, float dt)
+{
+    if (!e.aimCount || row >= PlacementAims.size())
+        return;
+    PlacementAim& g = PlacementAims[row];
+    if (dt >= 0)
+        g.weight = fadeTo(g.weight, g.on ? g.most : 0.0f, g.fade, dt);
+    if (!(g.weight > 0))
+        return;
+    yea_float3 pos;
+    yea_float4 rot;
+    float      s;
+    placedNow(row, e, pos, rot, s);
+    if (!(s > 1e-6f))
+        return;
+    const uint32_t head = e.aim[e.aimCount - 1];
+    const float    rc[4] = { -rot.x, -rot.y, -rot.z, rot.w }, v[3] = { (g.target.x - pos.x) / s, (g.target.y - pos.y) / s, (g.target.z - pos.z) / s };
+    float          T[3], keep[6][4], f0[3], remaining = 0;
+    retarget::qrot(rc, v, T); // the target, model space
+    retarget::worlds(e.nodes, head + 1, gPoses, gRt.tw, gRt.tq); // parents first: all the chain needs
+    retarget::qrot(&gRt.tq[head * 4], e.aimFwd, f0); // where the clip has the head face
+    for (uint32_t k = 0; k < e.aimCount; ++k)
+        memcpy(keep[k], gPoses[e.aim[k]].r, 16), remaining += e.aimShare[k];
+    for (uint32_t k = 0; k < e.aimCount; ++k)
+    {
+        float H[3], to[3], fw[3], q[4];
+        retarget::at(gRt.tw, head, H), retarget::sub(T, H, to), retarget::qrot(&gRt.tq[head * 4], e.aimFwd, fw);
+        if (!retarget::unit(to))
+            break;
+        // within the limit of where the clip faces
+        const float c = retarget::dot(to, f0);
+        if (c < cosf(g.limit))
+        {
+            float side[3];
+            for (int j = 0; j < 3; ++j)
+                side[j] = to[j] - c * f0[j];
+            static const float X[3] = { 1, 0, 0 }, Y[3] = { 0, 1, 0 };
+            if (!retarget::unit(side)) // straight behind: turn across it, level where it can
+                retarget::cross(f0, Y, side), retarget::unit(side) || (retarget::cross(f0, X, side), retarget::unit(side));
+            for (int j = 0; j < 3; ++j)
+                to[j] = cosf(g.limit) * f0[j] + sinf(g.limit) * side[j];
+        }
+        retarget::arc(fw, to, q);
+        turnPart(q, e.aimShare[k] / remaining, e.aimLimit[k]);
+        remaining -= e.aimShare[k];
+        const uint32_t nd = e.aim[k];
+        const int32_t  pa = e.nodes[nd].parent;
+        static const float idq[4] = { 0, 0, 0, 1 };
+        float          m[4], pc[4];
+        retarget::qmul(q, &gRt.tq[nd * 4], m);
+        retarget::qconj(pa >= 0 ? &gRt.tq[pa * 4] : idq, pc), retarget::qmul(pc, m, gPoses[nd].r), retarget::qnorm(gPoses[nd].r);
+        if (k + 1 < e.aimCount)
+            chainWorlds(e, nd, head);
+    }
+    const float w = g.weight < 1 ? g.weight * g.weight * (3 - 2 * g.weight) : 1.0f; // eased, as clip fades
+    for (uint32_t k = 0; w < 1 && k < e.aimCount; ++k)
+        retarget::qnlerp(keep[k], gPoses[e.aim[k]].r, w, gPoses[e.aim[k]].r);
+    gFootMoved = true;
+}
+// Hand IK over gPoses: each hand on brought (eased by its weight) from where the clip put it to its point, turned to
+// its turn if given, by two-bone IK on its arm (the elbow bending as the clip bends it, else to the model's back).
+void handIk(const Entry& e, uint32_t row, float dt)
+{
+    if (!e.arms || row >= PlacementHands.size())
+        return;
+    PlacementHand& g = PlacementHands[row];
+    if (dt >= 0)
+        g.weightL = fadeTo(g.weightL, g.on & 1 ? 1.0f : 0.0f, g.fadeL, dt), g.weightR = fadeTo(g.weightR, g.on & 2 ? 1.0f : 0.0f, g.fadeR, dt);
+    if (!(g.weightL > 0) && !(g.weightR > 0))
+        return;
+    yea_float3 pos;
+    yea_float4 rot;
+    float      s;
+    placedNow(row, e, pos, rot, s);
+    if (!(s > 1e-6f))
+        return;
+    const float    rc[4] = { -rot.x, -rot.y, -rot.z, rot.w };
+    const float    bend[3] = { -e.front[0], -e.front[1], -e.front[2] }; // elbows to its back
+    retarget::worlds(e.nodes, (e.arm[0].c > e.arm[1].c ? e.arm[0].c : e.arm[1].c) + 1, gPoses, gRt.tw, gRt.tq);
+    for (int i = 0; i < 2; ++i)
+    {
+        const float wt = i ? g.weightR : g.weightL;
+        if (!(wt > 0))
+            continue;
+        const float        w = wt < 1 ? wt * wt * (3 - 2 * wt) : 1.0f;
+        const Entry::Leg&  L = e.arm[i];
+        const yea_float3&  P = i ? g.pointR : g.pointL;
+        const yea_float4&  R = i ? g.rotR : g.rotL;
+        const float        v[3] = { (P.x - pos.x) / s, (P.y - pos.y) / s, (P.z - pos.z) / s };
+        float              G[3], C[3], end[4];
+        retarget::qrot(rc, v, G), retarget::at(gRt.tw, L.c, C);
+        for (int j = 0; j < 3; ++j)
+            G[j] = C[j] + (G[j] - C[j]) * w;
+        const bool turned = (g.turned >> i) & 1;
+        if (turned) // its world turn in model space, eased from the clip's
+        {
+            const float r[4] = { R.x, R.y, R.z, R.w };
+            float       m[4];
+            retarget::qmul(rc, r, m), retarget::qnorm(m), retarget::qnlerp(&gRt.tq[L.c * 4], m, w, end);
+        }
+        retarget::limb(e.nodes, gRt.tw, gRt.tq, L.a, L.b, L.c, G, bend, L.hasParent ? L.parentRest : nullptr, gPoses, turned ? end : nullptr);
+    }
+    gFootMoved = true;
+}
+
 // A layer over gPoses: clip `clip` of e's source `source` at `time`, from node `mask` down (kNoClip: every node),
 // overriding the pose there or added to it, at `weight` (eased, as a layer's fade is). False: no such clip.
 bool applyLayer(const Entry& e, uint32_t source, uint32_t clip, float time, bool loop, bool still, uint32_t mask, float weight,
@@ -1424,7 +1646,7 @@ bool evaluate(const Entry& e, const PlacementAnim& a, const float* held = nullpt
                    view->layerAdditive != 0);
     gFootMoved = false;
     if (placement) // its feet on the game's ground (dt: moved on in animate(); -1 as it stands)
-        footIk(e, placementRow(placement), dt);
+        footIk(e, placementRow(placement), dt), aimIk(e, placementRow(placement), dt), handIk(e, placementRow(placement), dt);
     anim::palette(e.nodes, n, e.bones, e.skel->boneCount, gPoses, gWorld, gPalette);
     return true;
 }
@@ -1623,6 +1845,41 @@ int apiFootIk(uint32_t h, int on, float reach, float fade)
     g.on = on ? 1 : 0, g.reach = reach > 0 ? reach : 0.5f, g.fade = fade > 0 ? fade : 0.0f;
     return 1;
 }
+int apiLookAt(uint32_t h, int on, const float* target, float weight, float limit, float fade)
+{
+    // Taken while its model still loads; 0 once it has loaded without a head chain.
+    const uint32_t row = placementRow(h);
+    grow(row);
+    const Entry* e = row != 0xFFFFFFFFu ? byKey(Placements[row].key) : nullptr;
+    if (!e || row >= PlacementAims.size() || e->state > 1 || (e->state == 1 && !e->aimCount))
+        return 0;
+    PlacementAim& g = PlacementAims[row];
+    g.on = on ? 1 : 0, g.fade = fade > 0 ? fade : 0.0f;
+    if (on)
+        g.most = weight > 0 ? (weight < 1 ? weight : 1.0f) : 0.0f, g.limit = limit > 0 ? fminf(limit, 3.1415926f) : 1.2217305f;
+    if (target)
+        g.target = { target[0], target[1], target[2] };
+    return 1;
+}
+int apiHandIk(uint32_t h, uint32_t hand, int on, const float* point, const float* rot, float fade)
+{
+    const uint32_t row = placementRow(h);
+    grow(row);
+    const Entry* e = row != 0xFFFFFFFFu ? byKey(Placements[row].key) : nullptr;
+    if (!e || hand > 1 || row >= PlacementHands.size() || e->state > 1 || (e->state == 1 && !e->arms))
+        return 0;
+    PlacementHand& g = PlacementHands[row];
+    const uint32_t bit = 1u << hand;
+    g.on = on ? g.on | bit : g.on & ~bit;
+    (hand ? g.fadeR : g.fadeL) = fade > 0 ? fade : 0.0f;
+    if (on && point)
+        (hand ? g.pointR : g.pointL) = { point[0], point[1], point[2] };
+    if (on && rot)
+        (hand ? g.rotR : g.rotL) = { rot[0], rot[1], rot[2], rot[3] }, g.turned |= bit;
+    else if (on)
+        g.turned &= ~bit;
+    return 1;
+}
 int apiFootGround(uint32_t h, uint32_t foot, const float* point, const float* normal)
 {
     const uint32_t row = placementRow(h);
@@ -1724,7 +1981,7 @@ mdl::Api gApi = { mdl::kApi, sizeof(mdl::Api), 0,       apiBegin, apiDefine, api
                   apiRemove, apiPlaced,        apiCount, apiInfo,  apiPlay,   apiTime,  apiJoint, apiClips, apiClip,
                   apiMorph,  apiUnmorph,       apiMorphs, apiMorphTarget, apiRootMotion, apiTakeMotion, apiPlayFrom,
                   apiLayer,  apiUnlayer,       apiFootIk, apiFootGround, apiFootAt,
-                  apiBlendSpace, apiBlendAt };
+                  apiBlendSpace, apiBlendAt, apiLookAt, apiHandIk };
 
 // --- Building models in the renderer's scene (this module's own update) ------------------------------------------
 
