@@ -67,8 +67,7 @@
       {
         "setting": "renderer_upscale.upscaler",
         "is": [
-          "FSR",
-          "DLSS"
+          "FSR"
         ]
       }
     ]
@@ -91,8 +90,7 @@
       {
         "setting": "renderer_upscale.upscaler",
         "is": [
-          "FSR",
-          "DLSS"
+          "FSR"
         ]
       }
     ]
@@ -114,8 +112,7 @@
       {
         "setting": "renderer_upscale.upscaler",
         "is": [
-          "FSR",
-          "DLSS"
+          "FSR"
         ]
       }
     ]

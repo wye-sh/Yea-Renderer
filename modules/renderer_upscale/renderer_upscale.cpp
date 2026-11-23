@@ -14,7 +14,6 @@
 #include <Common_3/Graphics/FSL/defaults.h>
 #include "Shaders/Exposure.srt.h"
 #include <yea/device.h>
-#include <yea/dlss.h>
 #include <yea/settings.h>
 
 #include <math.h>
@@ -606,19 +605,7 @@ bool fsrRun(const RenderFrame* F, RenderTarget* out, bool reset, float dtMs)
 }
 #endif
 
-// The other upscalers' state after one ran on the frame's cmd: The Forge's bound pipeline, layout and descriptor
-// tables are forgotten (and on Direct3D 12 its heaps and root signatures set again), so its next binds are made in full.
-void forgetForgeState(Cmd* cmd)
-{
-#if defined(_WIN32)
-    restoreForgeState(cmd);
-#else
-    cmd->mVk.pBoundPipeline = VK_NULL_HANDLE;
-    cmd->mVk.pBoundPipelineLayout = VK_NULL_HANDLE;
-#endif
-}
-
-// FSR ready for this display size (its files, its context): for FSR, and when DLSS stops at run time.
+// FSR ready for this display size (its files, its context).
 bool fsrReady(uint32_t dw, uint32_t dh)
 {
 #if defined(_WIN32)
@@ -642,107 +629,13 @@ void fsrLetGo(bool wanted)
 #endif
 }
 
-// --- DLSS: NVIDIA's, through Yea's host service (Windows, Direct3D 12, NVIDIA RTX); FSR where it can't run ----------
+// --- What runs: FSR where it can, else the core's TAA -----------------------------------------------------------
 enum class Active : uint32_t
 {
     Taa, // none: the core's own TAA
-    Fsr,
-    Dlss
+    Fsr
 };
-const YeaDlss* gDlss;      // taken in load(); nullptr off NVIDIA RTX, off Windows, or in an older Yea
-bool           gDlssUsed;  // its view was evaluated (released when DLSS is let go, and in unload())
-bool           gDlssFailed; // an evaluate failed: FSR (where it runs here) or TAA until the upscaler is picked again
-bool           gDlssToFsr;  // FSR runs on this machine, as Yea's needs lines decide it for the upscaler setting
-const YeaSettings* gSettingsApi;
-
-// Whether FSR runs on this machine, from Yea's own answer for the upscaler setting (its needs lines: the C++ runtime and
-// our offer), for DLSS's fallback when it fails at run time. An older host without the service: no.
-bool fsrRunsHere()
-{
-    YeaPlayerSetting s = {};
-    for (uint32_t i = 0, n = gSettingsApi ? gSettingsApi->playerCount() : 0; i < n; i++)
-        if (gSettingsApi->player(i, &s) && s.module && s.name && !strcmp(s.module, "renderer_upscale") && !strcmp(s.name, "upscaler"))
-            return (s.values >> (uint32_t)Upscaler::FSR) & 1;
-    return false;
-}
-Active         gActive, gLastActive;
-// The quality modes' DLSS modes: Native is DLAA.
-const uint32_t kDlssMode[5] = { YEA_DLSS_DLAA, YEA_DLSS_QUALITY, YEA_DLSS_BALANCED, YEA_DLSS_PERFORMANCE, YEA_DLSS_ULTRA_PERFORMANCE };
-// DLSS's models: CNN is NVIDIA's preset E, Transformer NVIDIA's own choice per mode (K for DLAA to Balanced, M for
-// Performance, L for Ultra Performance). A Yea from before the CNN preset refuses it: NVIDIA's own then, said once.
-bool           gDlssCnnRefused[6]; // per DLSS mode: E was refused there (the default retry ran): the default model there
-bool           gDlssCnnSaid[6];    // per DLSS mode: that CNN ran there, said once
-const char*    kDlssModeName[6] = { "", "Ultra Performance", "Performance", "Balanced", "Quality", "DLAA" };
-
-// The GPU runs FP8, where NVIDIA's transformer models are cheap (RTX 40 and later): Auto's Transformer. From yea::device(),
-// taken in load(); off on a Yea without it, so Auto is CNN there.
-bool           gFp8;
-
-void dlssLetGo()
-{
-    if (gDlss && gDlssUsed)
-    {
-        waitQueueIdle(gQueue);
-        gDlss->release(0);
-    }
-    gDlssUsed = false;
-}
-
-bool dlssRun(const RenderFrame* F, RenderTarget* out, bool reset, uint32_t q)
-{
-    YeaDlssInputs in = {};
-    in.colour = F->hdr->pTexture;
-    in.depth = F->depth->pTexture;
-    in.motion = F->motion->pTexture;
-    in.exposure = gExposureTex;
-    // No masks (dlss.h version 2). biasColour: with it set, presentation stalled after DLSS evaluate on an RTX 2080
-    // (6.6.2), under investigation by Yea. transparency: Streamline 2.14 takes its resource state wrong and leaves it in
-    // COMMON after NGX (Yea 152 ignores it; a device loss in 6.1.0). FSR keeps its reactive and transparency masks.
-    in.biasColour = nullptr;
-    in.transparency = nullptr;
-    in.output = out->pTexture;
-    in.renderWidth = F->width;
-    in.renderHeight = F->height;
-    in.jitterX = F->jitter[0];
-    in.jitterY = F->jitter[1];
-    // The core's motion is uv now - uv last frame; DLSS wants last minus now, in pixels.
-    in.motionScaleX = -(float)F->width;
-    in.motionScaleY = -(float)F->height;
-    in.preExposure = 1.0f;
-    in.mode = kDlssMode[q];
-    const bool transformer = settings.dlss_model == DlssModel::Transformer || (settings.dlss_model == DlssModel::Auto && gFp8);
-    const uint32_t m = in.mode < 6 ? in.mode : 0;
-    const bool     cnn = !transformer && !gDlssCnnRefused[m];
-    in.preset = cnn ? YEA_DLSS_PRESET_E : YEA_DLSS_PRESET_DEFAULT;
-    in.flags = YEA_DLSS_HDR | YEA_DLSS_DEPTH_INVERTED;
-    in.reset = reset ? 1u : 0u;
-    in.viewport = 0;
-    gDlssUsed = true;
-    bool ok = gDlss->evaluate(F->cmd, &in) != 0;
-    char line[160];
-    if (cnn && !ok)
-    {
-        // Refused with E: the same frame again with NVIDIA's default model. Only when that runs was it the preset (a
-        // Yea before E's, or a mode that won't take it): the default model in this mode from then on, said once.
-        in.preset = YEA_DLSS_PRESET_DEFAULT;
-        ok = gDlss->evaluate(F->cmd, &in) != 0;
-        if (ok)
-        {
-            gDlssCnnRefused[m] = true;
-            snprintf(line, sizeof line, "renderer_upscale: DLSS refused the CNN model at %s; NVIDIA's default model there instead",
-                     kDlssModeName[m]);
-            say(line);
-        }
-    }
-    else if (cnn && !gDlssCnnSaid[m])
-    {
-        snprintf(line, sizeof line, "renderer_upscale: DLSS runs NVIDIA's CNN model at %s", kDlssModeName[m]);
-        say(line, 0);
-        gDlssCnnSaid[m] = true;
-    }
-    forgetForgeState(F->cmd);
-    return ok;
-}
+Active gActive, gLastActive;
 } // namespace
 
 int load(int reloaded)
@@ -755,11 +648,9 @@ int load(int reloaded)
 #if !defined(_WIN32)
     gDevice = yea::device();
 #endif
-    gDlss = yea::dlss();
-    gSettingsApi = yea::settingsApi();
     // What only this module can tell for its needs lines' `offer`: FSR runs here. On Windows, Direct3D 12 with AMD's two
     // DLLs in this version's assets (only checked to be there: loading them waits till FSR is picked); on Linux, compiled
-    // in. Yea's own facts hide DLSS (dlss) and FSR on an older C++ runtime (msvc 14.40).
+    // in. Yea's own facts hide FSR on an older C++ runtime (msvc 14.40).
     {
         bool fsr = true;
 #if defined(_WIN32)
@@ -774,12 +665,7 @@ int load(int reloaded)
                 fsr = false;
         }
 #endif
-        yea::offer(settings.upscaler, 1u << (uint32_t)Upscaler::TAA | 1u << (uint32_t)Upscaler::DLSS |
-                                          (fsr ? 1u << (uint32_t)Upscaler::FSR : 0u));
-    }
-    {
-        const YeaDevice* device = yea::device();
-        gFp8 = device && (device->features & YEA_DEVICE_FP8);
+        yea::offer(settings.upscaler, 1u << (uint32_t)Upscaler::TAA | (fsr ? 1u << (uint32_t)Upscaler::FSR : 0u));
     }
 
     ShaderLoadDesc sd = {};
@@ -818,7 +704,6 @@ void unload()
     if (!gRenderer)
         return;
     waitQueueIdle(gQueue);
-    dlssLetGo();
 #if defined(_WIN32)
     fsrUnload();
 #else
@@ -846,7 +731,7 @@ void update(uint32_t phase, float dt)
         yea::host()->log(gSayLevel[i], gSay[i]);
     gSayCount = 0;
 #if !defined(_WIN32)
-    // FSR's working memory, in this module's own call: while FSR is picked (no DLSS on Linux).
+    // FSR's working memory, in this module's own call: while FSR is picked.
     if (gReady)
         fsrMemory(settings.upscaler == Upscaler::FSR && !yea::viewMode());
 #endif
@@ -885,35 +770,20 @@ bool upscale_prepare(uint64_t address)
     const uint32_t dw = F->displayWidth, dh = F->displayHeight;
     const uint32_t q = (uint32_t)settings.quality_mode < 5 ? (uint32_t)settings.quality_mode : 1;
     const bool     picked = settings.upscaler != Upscaler::TAA && !yea::viewMode(); // F1's view modes: plain frames
-    if (settings.upscaler != Upscaler::DLSS)
-        gDlssFailed = false; // a new pick tries DLSS again
 
-    // What's picked runs (Yea's needs lines hide what this machine can't). Only a failure at run time changes it: DLSS
-    // whose evaluate failed (a lost device it couldn't set up again, say) gives way to FSR where FSR runs here, else TAA;
-    // FSR that fails gives way to TAA.
+    // What's picked runs (Yea's needs lines hide what this machine can't); FSR that can't start gives way to TAA. Any
+    // other value (DLSS, saved before it was removed in 7.0.0) is TAA.
     uint32_t w = 0, h = 0;
     gActive = Active::Taa;
-    if (picked && settings.upscaler == Upscaler::DLSS && gDlss && !gDlssFailed && gDlss->available())
-    {
-        YeaDlssSize size = {};
-        if (gDlss->renderSize(kDlssMode[q], dw, dh, &size) && size.width && size.height)
-        {
-            gActive = Active::Dlss;
-            w = size.width;
-            h = size.height;
-        }
-    }
-    if (gActive != Active::Dlss)
-        dlssLetGo();
-    const bool dlssStopped = settings.upscaler == Upscaler::DLSS && gDlssFailed && gDlssToFsr;
-    if (picked && gActive == Active::Taa && (settings.upscaler == Upscaler::FSR || dlssStopped) && fsrReady(dw, dh))
+    const bool fsr = picked && settings.upscaler == Upscaler::FSR;
+    if (fsr && fsrReady(dw, dh))
     {
         gActive = Active::Fsr;
         w = (uint32_t)((float)dw / kRatio[q]);
         h = (uint32_t)((float)dh / kRatio[q]);
     }
     if (gActive != Active::Fsr)
-        fsrLetGo(picked && gActive == Active::Taa && (settings.upscaler == Upscaler::FSR || dlssStopped));
+        fsrLetGo(fsr);
     // Which upscaler runs, and its sizes: said when they change (what F1's knobs picked, and what could run).
     {
         static uint32_t said[6] = { ~0u, 0, 0, 0, 0, 0 };
@@ -921,13 +791,13 @@ bool upscale_prepare(uint64_t address)
         if (memcmp(said, now, sizeof now))
         {
             memcpy(said, now, sizeof now);
-            const char* names[3] = { "TAA", "FSR", "DLSS" };
+            const char* names[2] = { "TAA", "FSR" };
             char        line[192];
             if (gActive == Active::Taa)
-                snprintf(line, sizeof line, "renderer_upscale: %s picked; TAA runs at %ux%u", names[now[1] % 3], dw, dh);
+                snprintf(line, sizeof line, "renderer_upscale: %s picked; TAA runs at %ux%u", names[now[1] == 1], dw, dh);
             else
-                snprintf(line, sizeof line, "renderer_upscale: %s picked; %s renders %ux%u, upscaled to %ux%u", names[now[1] % 3],
-                         names[now[0] % 3], w, h, dw, dh);
+                snprintf(line, sizeof line, "renderer_upscale: %s picked; %s renders %ux%u, upscaled to %ux%u", names[now[1] == 1],
+                         names[now[0] == 1], w, h, dw, dh);
             say(line, 0);
         }
     }
@@ -1005,23 +875,7 @@ void upscale_run(uint64_t address)
     float  dtMs = gLastTime > 0 ? (float)((now - gLastTime) * 1000.0) : 16.7f;
     gLastTime = now;
     const bool reset = F->previous == nullptr;
-    bool       ok = false;
-    if (gActive == Active::Dlss)
-    {
-        ok = dlssRun(F, out, reset, gQuality);
-        if (!ok)
-        {
-            // DLSS refused this frame (a lost device it couldn't set up again, say): FSR takes over, this frame on, where
-            // it runs here; else TAA from the next frame.
-            gDlssFailed = true;
-            gDlssToFsr = fsrRunsHere();
-            say(gDlssToFsr ? "renderer_upscale: DLSS stopped; FSR instead" : "renderer_upscale: DLSS stopped; TAA instead");
-            gActive = gLastActive = Active::Fsr;
-            ok = gDlssToFsr && fsrReady(F->displayWidth, F->displayHeight) && fsrRun(F, out, true, dtMs);
-        }
-    }
-    else
-        ok = fsrRun(F, out, reset, dtMs);
+    const bool ok = fsrRun(F, out, reset, dtMs);
     barrierRt(cmd, out, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE);
     cmdEndDebugMarker(cmd);
     if (ok)

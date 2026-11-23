@@ -30,7 +30,7 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   in the see-through pass after the forward pass (timed "see-through", with its parts "glass", "chain" (the scene colour chain's copies) and "runs" (particles
   between the panes) summed from segments, `segSwitch`; BLEND_PASS: no depth target, the depth test
   against gSceneDepth in the shader) into hdr, `reactive` and `transparency` (R8, max-blended coverage; frame
-  `reactive` is now the core's, particles and glass, `transparency` glass alone, for DLSS `transparency` and FSR's
+  `reactive` is now the core's, particles and glass, `transparency` glass alone, for FSR's
   transparency-and-composition mask); with MSAA inside the forward pass, without particles or masks. The particles
   draw in the same pass: renderer_particles splits its sorted list at the surfaces' depths (frame `blendDepths`, the
   nearest RENDER_MAX_BLEND_RUNS), and the core calls `particles_draw(frame, run)` just before each surface, so steam
@@ -407,14 +407,12 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   frees its history and stands aside (its `sharpen` still applies, after the upscale). Not upscaling (native size, the
   default), it returns false and the frame is exactly as without it: no pass, copy or target added. Shadow tiles size
   by `displayHeight`. renderer_vrs reads last frame's image through `_up` shader variants only while upscaled.
-  Upscalers (`upscaler`: TAA, FSR, DLSS): DLSS through Yea's host service (`yea::dlss()`, Windows, NVIDIA RTX; the
-  `service dlss when upscaler DLSS` line ties NVIDIA's files, which are Yea's own licence entries), taken in `load()`,
-  evaluated from `upscale_run`, released in `unload()`; Native is DLAA. What a machine can't run is hidden by Yea's
-  `needs` lines (DLSS: `dlss`; FSR: `msvc 14.40`, as AMD builds with toolset 14.44 and its DLLs can crash in std::mutex
-  before 14.40, and `offer`, which `load()` says from FSR's files alone: Direct3D 12 and both DLLs in Assets/ on Windows,
-  always on Linux; Transformer: `fp8`), so what's picked runs; the code checks none of it. Only run-time failures
-  change it: a DLSS evaluate that fails gives way to FSR where Yea says FSR runs here (the upscaler's player setting's
-  `values`), else TAA; FSR's loader, context or dispatch failing gives way to TAA (logged once, with the reason).
+  Upscalers (`upscaler`: TAA, FSR). DLSS was a third option until 7.0.0, removed with its `service dlss` line, its
+  `dlss_model` knob and NVIDIA's licence ties (the project ships nothing with an end-user licence); a value saved as
+  DLSS runs TAA. What a machine can't run is hidden by Yea's `needs` lines (FSR: `msvc 14.40`, as AMD builds with
+  toolset 14.44 and its DLLs can crash in std::mutex before 14.40, and `offer`, which `load()` says from FSR's files
+  alone: Direct3D 12 and both DLLs in Assets/ on Windows, always on Linux), so what's picked runs; the code checks none
+  of it. FSR's loader, context or dispatch failing gives way to TAA (logged once, with the reason).
   FSR on Windows (Direct3D 12): AMD's signed FSR SDK 2.4 DLLs in `Assets/windows/` (a Yea from 133 puts them at the
   top of Assets/), loaded only while picked, upscaler first, each by its full path with backslashes and
   `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS` (Assets/ isn't on Windows' DLL search path, and
@@ -425,14 +423,10 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   `third_party/ffx_vk/generated`, made by `fsr_vk_shaders.py` (glslangValidator; run it after changing AMD's GLSL).
   Its 16-bit and wave64 shaders run only where `yea::device()` says the device has them on. Its working memory is
   allocated in this module's own `update()`, never in `upscale_prepare`. Jitter: Halton 2,3 over 8 x ratio² phases;
-  the render size is the vendors' ratio per quality mode (DLSS's own `renderSize` for DLSS); the core's exposure is copied into a 1x1 texture (one tiny
+  the render size is AMD's ratio per quality mode; the core's exposure is copied into a 1x1 texture (one tiny
   dispatch); the upscalers' own sharpening is off. Particles' and glass's coverage (frame.h `reactive`, when set) is FSR's
-  reactive mask; glass's alone (`transparency`) is FSR's transparency-and-composition mask. DLSS gets neither (6.6.3):
-  with `biasColour` set, presentation stalled after DLSS evaluate on an RTX 2080 (6.6.2; Yea is looking into it), and
-  Streamline 2.14 takes `transparency`'s resource state wrong (Yea 152 ignores it; a device loss in 6.1.0). DLSS was off
-  in 6.6.4 to 6.6.6 (a removed device hidden by Streamline's swap chain proxy); it is back from Yea 153, which sees a
-  loss through the proxy and skips the frame-latency wait that held DLSS at 10 to 17 fps. After one records, The Forge's bound state is forgotten so its next binds
-  are made in full. Lines said from `upscale_prepare` wait for this module's `update()`, so they are filed under
+  reactive mask; glass's alone (`transparency`) is FSR's transparency-and-composition mask. After FSR records on
+  Direct3D 12, The Forge's bound state is set again so its next binds are made in full. Lines said from `upscale_prepare` wait for this module's `update()`, so they are filed under
   renderer_upscale: which upscaler is picked and runs, its sizes, and why FSR can't run.
   Nothing of Microsoft's ships.
 - `renderer_models`: models, and the Model Viewer panel. A game's module declares each model with `MODEL(name, "source")`
@@ -673,10 +667,8 @@ heatmap. `renderer_shadows`: enabled (the sun's), cascades, shadow_distance, cas
 filter_taps, pcss, sun_size, normal_bias, slope_bias, receiver_plane, light_shadows, shadowed_lights, local_atlas_resolution,
 updates_per_frame, max_tile_resolution, contact_hardening, light_size (m), show_cascades, show_atlas (the light shadow atlas, top right),
 glass_shadows, glass_resolution (the tint maps' side). `renderer_taa`: enabled, history_weight, clamp_width, sharpen, jitter,
-jitter_phases. `renderer_upscale`: upscaler (TAA, FSR, DLSS), quality_mode (Native, Quality 67%, Balanced 59%,
-Performance 50%, Ultra_Performance 33%; for an upscaler only), dlss_model (Auto: Transformer where the GPU runs FP8, CNN
-elsewhere, CNN until Yea reports FP8; Transformer: NVIDIA's default per mode, K/M/L; CNN: preset E, two to five times cheaper on RTX 20 and 30, falling back to the default in a mode where it's refused and the default then runs, said once per mode; Transformer is
-hidden without FP8). `renderer_ao`: enabled, half_resolution (GTAO and its blur at half size, upsampled along edges in the forward pass), radius, intensity, falloff, slices, steps, denoise, specular_occlusion,
+jitter_phases. `renderer_upscale`: upscaler (TAA, FSR), quality_mode (Native, Quality 67%, Balanced 59%,
+Performance 50%, Ultra_Performance 33%; for FSR only). `renderer_ao`: enabled, half_resolution (GTAO and its blur at half size, upsampled along edges in the forward pass), radius, intensity, falloff, slices, steps, denoise, specular_occlusion,
 multi_bounce, show_ao. `renderer_contact`: enabled, surface_thickness (a part of the distance), edge_threshold, contrast, ignore_edges,
 intensity, max_distance, show_contact. `renderer_probes`: enabled, resolution (64-512), updates_per_frame, intensity, blend, parallax.
 `renderer_ssr`: enabled, half_resolution, max_roughness, thickness, max_distance, steps, edge_fade, intensity,
@@ -699,7 +691,7 @@ tracing), hysteresis, show_gi (the diffuse light alone, on white). Its export: `
 fitted round the scene again).
 `renderer_models`: emissive_nits (a model's emissive 1 at strength 1, cd/m²), transitions (Inertial, Crossfade); per MODEL line, in the Model Viewer only: scale, up_axis (Auto, Y, Z: Z up in the file turned to Y up),
 lod_quality, cast_shadows, double_sided.
-Players of a released game tune (`player` lines): upscaler, quality_mode, dlss_model, exposure_ev (brightness), lod_error, texture_detail,
+Players of a released game tune (`player` lines): upscaler, quality_mode, exposure_ev (brightness), lod_error, texture_detail,
 TAA's sharpen, shadows' sun_resolution, shadow_distance, pcss and light_shadows, and enabled for AO, contact shadows, SSR,
 ray-traced reflections, ray-traced shadows and VRS, with half_resolution for AO, SSR and ray-traced reflections, probes' resolution,
 fog with its quality, particles, and global illumination (gi) with its quality.
@@ -813,8 +805,8 @@ for the decals in its tile and z-bin (a box test, then up to three map reads or 
 - 6.1.0 was a diagnostic release for a lost Direct3D 12 device and a TheForge.dll access violation on an RTX 2080,
   with safe defaults (6.1.1 put the real ones back). Its bisect (`modules/test_renderer_bisect`, every part on one
   step at a time) ran clean through VRS with everything else on, and died at DLSS with particles and glass on: DLSS
-  given the see-through pass's masks (dlss.h version 2, Yea 148). renderer_upscale passes DLSS no masks until Yea's
-  service takes them (FSR keeps them). 6.6.1 (Yea 151) gave Windows `yea::pipelines()` back in the core and
+  given the see-through pass's masks (dlss.h version 2, Yea 148). DLSS has
+  since been removed (7.0.0); FSR keeps the masks. 6.6.1 (Yea 151) gave Windows `yea::pipelines()` back in the core and
   renderer_particles. The core keeps its last passes (`crumb`, at each timeEnd), logs them at unload and
   logs the first frame with each pass and with VRS's rates bound. The forward pass binds renderer_vrs's rate image only
   when vrs_run's own guard holds: on frames it hadn't written it (no gloss target while its prepass pipelines warmed)
