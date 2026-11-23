@@ -346,38 +346,73 @@ void buildLocalViews(Group& g, const RenderLight& l)
     }
 }
 
-// Draws the casters inside a view's frustum, one instanced draw per run of the same mesh.
+// The version of a caster to draw into a view: from the one the screen draws (never finer, so a caster never stands
+// proud of what the camera sees and shadows it), the simplest whose error stays under half a texel where the caster is
+// nearest the light. The sun's texels are one size (info.x); a light's grow with distance (info.x at 1 m, from info.yzw).
+uint32_t shadowVersion(const RenderCaster& c, bool sun, const RenderGpuShadowView& v)
+{
+    uint32_t m = c.mesh, rows = renderer::MeshLods.size() < renderer::Meshes.size() ? renderer::MeshLods.size() : renderer::Meshes.size();
+    if (m >= rows || renderer::MeshLods[m].next >= rows || renderer::Meshes[m].radius <= 0)
+        return m;
+    float texel = v.info[0];
+    if (!sun)
+        texel *= maxf(length(V(c.sphere[0] - v.info[1], c.sphere[1] - v.info[2], c.sphere[2] - v.info[3])) - c.sphere[3], 0.01f);
+    float allowed = 0.5f * texel * renderer::Meshes[m].radius / c.sphere[3]; // object units (radius: the finest's, as the core's sphere)
+    for (uint32_t n = renderer::MeshLods[m].next; n < rows && renderer::MeshLods[n].error <= allowed; n = renderer::MeshLods[n].next)
+        m = n;
+    return m;
+}
+
+// Draws the casters inside a view's frustum, one instanced draw per run of the same mesh version. The casters come
+// sorted by the version the screen draws; each such run is drawn once per version it takes here, simplest last.
 void drawCasters(Cmd* cmd, const RenderFrame* F, uint32_t view, const RenderGpuShadowView& v, uint32_t* stream, Buffer* streamBuf)
 {
     mx::Plane planes[6];
     clipPlanes(v.row, planes);
-    uint32_t runStart = gStreamUsed, runCount = 0;
-    const RenderCaster* run = nullptr;
-    auto flush = [&]() {
-        if (!runCount)
+    const bool sun = view < kSunViews;
+    auto draw = [&](uint32_t mesh, uint32_t first, uint32_t count) {
+        if (!count)
             return;
+        const renderer::Mesh& m = renderer::Meshes[mesh];
         Buffer*  bufs[2] = { F->vertices, streamBuf };
         uint32_t strides[2] = { F->vertexStride, 4 };
-        uint64_t offsets[2] = { 0, (uint64_t)runStart * 4 };
+        uint64_t offsets[2] = { 0, (uint64_t)first * 4 };
         cmdBindVertexBuffer(cmd, 2, bufs, strides, offsets);
-        cmdDrawIndexedInstanced(cmd, run->indexCount, run->firstIndex, runCount, (uint32_t)run->vertexOffset, 0);
+        cmdDrawIndexedInstanced(cmd, m.indexCount, m.firstIndex, count, m.firstVertex, 0);
     };
-    for (uint32_t i = 0; i < F->casterCount && gStreamUsed < kMaxEntries; ++i)
+    for (uint32_t i = 0; i < F->casterCount && gStreamUsed < kMaxEntries;)
     {
-        const RenderCaster& c = F->casters[i];
-        if (!sphereInside(planes, 6, V(c.sphere[0], c.sphere[1], c.sphere[2]), c.sphere[3]))
-            continue;
-        if (!run || run->firstIndex != c.firstIndex || run->vertexOffset != c.vertexOffset)
+        // The run of casters the screen draws with one version (the core sorts them by it).
+        uint32_t end = i + 1;
+        while (end < F->casterCount && F->casters[end].mesh == F->casters[i].mesh)
+            ++end;
+        // Each version this run takes, finest first: a pass finds the finest not drawn yet, then draws the casters taking it.
+        // Versions follow their finer ones in the Mesh table, so "not drawn yet" is a row past the last drawn.
+        uint32_t floor = F->casters[i].mesh;
+        for (;;)
         {
-            flush();
-            run = &c;
-            runStart = gStreamUsed;
-            runCount = 0;
+            uint32_t pick = 0xFFFFFFFFu;
+            for (uint32_t k = i; k < end; ++k)
+            {
+                const RenderCaster& c = F->casters[k];
+                uint32_t m = shadowVersion(c, sun, v);
+                if (m >= floor && m < pick && sphereInside(planes, 6, V(c.sphere[0], c.sphere[1], c.sphere[2]), c.sphere[3]))
+                    pick = m;
+            }
+            if (pick == 0xFFFFFFFFu)
+                break;
+            uint32_t first = gStreamUsed;
+            for (uint32_t k = i; k < end && gStreamUsed < kMaxEntries; ++k)
+            {
+                const RenderCaster& c = F->casters[k];
+                if (shadowVersion(c, sun, v) == pick && sphereInside(planes, 6, V(c.sphere[0], c.sphere[1], c.sphere[2]), c.sphere[3]))
+                    stream[gStreamUsed++] = c.instance | (view << RENDER_VIEW_SHIFT);
+            }
+            draw(pick, first, gStreamUsed - first);
+            floor = pick + 1;
         }
-        stream[gStreamUsed++] = c.instance | (view << RENDER_VIEW_SHIFT);
-        runCount++;
+        i = end;
     }
-    flush();
 }
 } // namespace
 

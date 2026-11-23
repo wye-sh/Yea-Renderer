@@ -6,6 +6,9 @@ export void shadows_render(u64 frame)
 # Whether point and spot lights get shadow maps this frame (light shadows on, a budget above 0), as decided
 # by the last shadows_prepare: the core marks shadow-casting lights for renderer_rt with it.
 export bool light_shadows_on()
+# The core's mesh versions (renderer's Mesh and MeshLod rows): casters draw the simplest within half a texel.
+import table renderer Mesh
+import table renderer MeshLod
 
 category Sun Shadows
 setting bool enabled true

@@ -138,10 +138,47 @@ uint32_t finish()
         r2 = d2 > r2 ? d2 : r2;
     }
     m->radius = sqrtf(r2);
+    // A MeshLod row per Mesh row (padded for meshes made before the table existed): one version until a chain links it.
+    while (MeshLods.size() < Meshes.size())
+    {
+        MeshLod* l = MeshLods.add();
+        if (!l)
+            break;
+        l->next = kNoMesh;
+        l->error = 0;
+    }
     return Meshes.size() - 1;
 }
 
 uint32_t clampSegments(uint32_t s, uint32_t lo, uint32_t hi) { return s < lo ? lo : (s > hi ? hi : s); }
+
+// A built-in shape's versions, the finest first (the row returned): make(segments) builds one, error(segments) is how far
+// its surface strays from the true shape at most (object units). Each next has about 1/sqrt(2) the segments (even counts,
+// down to lo), so its error doubles and the renderer can keep every instance within a factor of two of its budget.
+template<class Make, class Error> uint32_t chain(uint32_t seg, uint32_t lo, Make make, Error error)
+{
+    uint32_t first = make(seg);
+    if (first == kNoMesh || first >= MeshLods.size())
+        return first;
+    MeshLods[first].error = error(seg);
+    uint32_t prev = first;
+    while (seg > lo)
+    {
+        uint32_t next = 2 * (uint32_t)((float)seg / 2.828427f + 0.5f);
+        next = next >= seg ? seg - 2 : next;
+        seg = next < lo ? lo : next;
+        uint32_t m = make(seg);
+        if (m == kNoMesh || m >= MeshLods.size())
+            break; // the tables are full: the versions made so far still chain
+        MeshLods[m].error = error(seg);
+        MeshLods[prev].next = m;
+        prev = m;
+    }
+    return first;
+}
+
+// How far a polygon with n sides sits inside its circle of radius r (the sagitta of one side).
+float sag(float r, float n) { return r * (1.0f - cosf(3.14159265f / n)); }
 } // namespace
 
 // --- Meshes -----------------------------------------------------------------------------------
@@ -174,9 +211,10 @@ uint32_t mesh_box()
     return finish();
 }
 
-uint32_t mesh_sphere(uint32_t segments)
+namespace
 {
-    uint32_t seg = clampSegments(segments, 6, 256);
+uint32_t sphere(uint32_t seg)
+{
     uint32_t rings = seg / 2;
     if (!begin())
         return kNoMesh;
@@ -197,6 +235,13 @@ uint32_t mesh_sphere(uint32_t segments)
             quad(a, a + 1, b + 1, b);
         }
     return finish();
+}
+} // namespace
+
+uint32_t mesh_sphere(uint32_t segments)
+{
+    // Its quads span 2 pi / seg each way; the triangles' circumcentres, half a diagonal from their corners, stray most.
+    return chain(clampSegments(segments, 6, 256), 6, sphere, [](uint32_t s) { return sag(0.5f, (float)s / 1.41421356f); });
 }
 
 uint32_t mesh_plane()
@@ -268,23 +313,31 @@ uint32_t revolve(uint32_t segments, const float (*profile)[4], uint32_t count, b
 
 uint32_t mesh_cylinder(uint32_t segments)
 {
-    const float profile[2][4] = { { 0.5f, -0.5f, 1, 0 }, { 0.5f, 0.5f, 1, 0 } };
-    return revolve(segments, profile, 2, true, true);
+    auto make = [](uint32_t s) {
+        const float profile[2][4] = { { 0.5f, -0.5f, 1, 0 }, { 0.5f, 0.5f, 1, 0 } };
+        return revolve(s, profile, 2, true, true);
+    };
+    return chain(clampSegments(segments, 3, 256), 6, make, [](uint32_t s) { return sag(0.5f, (float)s); });
 }
 
 uint32_t mesh_cone(uint32_t segments)
 {
-    // Side normal of a cone with radius 0.5 and height 1: (1, 0.5) normalised.
-    const float nr = 0.894427f, ny = 0.447214f;
-    const float profile[2][4] = { { 0.5f, -0.5f, nr, ny }, { 0.0f, 0.5f, nr, ny } };
-    return revolve(segments, profile, 2, true, false);
+    auto make = [](uint32_t s) {
+        // Side normal of a cone with radius 0.5 and height 1: (1, 0.5) normalised.
+        const float nr = 0.894427f, ny = 0.447214f;
+        const float profile[2][4] = { { 0.5f, -0.5f, nr, ny }, { 0.0f, 0.5f, nr, ny } };
+        return revolve(s, profile, 2, true, false);
+    };
+    return chain(clampSegments(segments, 3, 256), 6, make, [](uint32_t s) { return sag(0.5f, (float)s); });
 }
 
-uint32_t mesh_torus(float thickness, uint32_t segments)
+namespace
 {
-    uint32_t seg = clampSegments(segments, 6, 256);
-    uint32_t sides = seg / 2 < 4 ? 4 : seg / 2;
-    float    minor = thickness < 0.01f ? 0.01f : (thickness > 0.49f ? 0.49f : thickness);
+uint32_t torusSides(uint32_t seg) { return seg / 2 < 4 ? 4 : seg / 2; }
+
+uint32_t torus(float minor, uint32_t seg)
+{
+    uint32_t sides = torusSides(seg);
     float    major = 0.5f - minor;
     if (!begin())
         return kNoMesh;
@@ -305,6 +358,16 @@ uint32_t mesh_torus(float thickness, uint32_t segments)
             quad(a, a + 1, b + 1, b);
         }
     return finish();
+}
+} // namespace
+
+uint32_t mesh_torus(float thickness, uint32_t segments)
+{
+    float minor = thickness < 0.01f ? 0.01f : (thickness > 0.49f ? 0.49f : thickness);
+    // The outer ring's sides and the tube's, which add up in a quad's middle.
+    return chain(
+        clampSegments(segments, 6, 256), 6, [minor](uint32_t s) { return torus(minor, s); },
+        [minor](uint32_t s) { return sag(0.5f, (float)s) + sag(minor, (float)torusSides(s)); });
 }
 
 bool mesh_begin() { return begin(); }
@@ -556,6 +619,7 @@ SceneState* sceneState() { return gScene; }
 void clear()
 {
     Meshes.clear();
+    MeshLods.clear();
     Vertexes.clear();
     Indexes.clear();
     Materials.clear();

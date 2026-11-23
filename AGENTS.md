@@ -148,6 +148,14 @@ Units: metres; sun intensity in lux, point and spot in candela. Colours linear R
   `mesh_vertex(pos, normal)` (returns a local index), `mesh_triangle`, `mesh_end` → mesh id. Meshes are
   uploaded when they change (a stall: build them up front). A triangle faces where cross(b - a, c - a)
   points (counter-clockwise around its outward normal); back faces are culled.
+- Mesh versions (LOD): the curved built-in shapes make a chain of simpler versions after the mesh they return
+  (`MeshLod` table: each row's `next` and its surface `error` in object units; ~1/sqrt(2) the segments each, so the
+  error doubles). Per instance the core draws the simplest within `lod_error` display pixels at its nearest point
+  (off screen: its nearest distance, which bounds reflections); casters, drawables, renderer_rt's BLAS (one per
+  version) and probes use that version. renderer_shadows goes coarser per view, within half a texel, never finer
+  than the screen's (a finer caster would shadow the screen's surface). A version change counts as a move for the
+  cached shadow maps. Custom meshes have one version. Request finer segments for close-ups freely: far away it costs
+  nothing.
 - Materials: `material_add(albedo, roughness, metallic)`, `material_set`, `material_emissive(m, color, nits)`,
   `material_reflections(m, on)`: off, the material shows no reflected image (probes or sky), only the sky's
   soft light, however shiny or metallic it is. `material_double_sided(m, on)` (off by default): drawn from
@@ -177,7 +185,7 @@ AgX (our own constants, in Tonemap.h.fsl), Hable_Filmic, Reinhard, None, ACES_Fi
 compiles only while the shader's TONEMAPPER_ACES_FITTED is 1, which a build baking another tonemapper sets to 0),
 Tony_McMapface (its table, Assets/tony_mc_mapface.dds, is read only while it is picked; Khronos PBR Neutral stands in
 when missing); the shader's mode is its index, so new options go at the end; both licences are tied to their options), msaa (1/2/4/8), specular_aa, sky/horizon/ground colours, sky_luminance, ambient,
-sun_disk (degrees), near_plane, gpu_timings (logs each pass's GPU time every 10 s: avg/max ms). `renderer_culling`: enabled, max_lights, tile_size (8/16/32), z_bins,
+sun_disk (degrees), near_plane, gpu_timings (logs each pass's GPU time every 10 s: avg/max ms), lod_error (display pixels; 0: always the finest). `renderer_culling`: enabled, max_lights, tile_size (8/16/32), z_bins,
 heatmap. `renderer_shadows`: enabled (the sun's), cascades, shadow_distance, cascade_split, sun_resolution, softness,
 filter_taps, pcss, sun_size, normal_bias, slope_bias, receiver_plane, light_shadows, shadowed_lights, local_atlas_resolution,
 updates_per_frame, max_tile_resolution, contact_hardening, light_size (m), show_cascades, show_atlas (the light shadow atlas, top right). `renderer_taa`: enabled, history_weight, clamp_width, sharpen, jitter,

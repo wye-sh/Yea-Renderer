@@ -10,6 +10,13 @@ table Mesh none 1024
   float3 center
   float radius
 end
+# Each mesh row's next simpler version (built-in shapes make a chain of them, the finest first, which is the
+# row they return), and how far this row's outline is off the true shape (object units): the renderer draws the
+# simplest whose error stays under lod_error on screen. Rows match Mesh's; a mesh with none has next 4294967295.
+table MeshLod none 1024
+  u32 next
+  float error
+end
 table Vertex none 262144
   float3 pos
   float3 normal
@@ -145,3 +152,6 @@ category Camera
 setting float near_plane 0.05 0.01 inf
 category Performance
 setting bool gpu_timings true
+# How far a mesh's outline may be off on screen (display pixels) before a simpler version of it is drawn; 0 always
+# draws the finest. Built-in shapes only: meshes made vertex by vertex have one version.
+setting float lod_error 0.5 0 inf

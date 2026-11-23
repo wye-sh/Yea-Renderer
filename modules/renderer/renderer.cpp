@@ -139,7 +139,8 @@ uint64_t        gUploadedMeshHash;
 // --- CPU scratch, made once in load() ----------------------------------------------------------
 struct InstanceInfo
 {
-    uint32_t mesh;
+    uint32_t mesh; // the version drawn
+    uint32_t row;  // in the Instance table
     uint32_t flags; // 1 visible, 2 casts shadow, 4 double-sided
     float    sphere[4];
     uint64_t moved;
@@ -168,6 +169,9 @@ struct PrevRows
     uint32_t gen;
 };
 PrevRows* gPrevRows;   // per Instance table row
+// Per Instance table row: the mesh version last drawn, and the frame that changed (cached shadows redraw it).
+uint32_t* gLodMesh;
+uint64_t* gLodChanged;
 float (*gPrevCpu)[3][4]; // per GPU instance, copied into gPrevBuf
 float    gPrevViewProj[4][4];
 uint64_t gPrevViewProjFrame;
@@ -1023,6 +1027,10 @@ int load(int reloaded)
     gOutside = new uint32_t[Lights.capacity()];
     gPrevRows = new PrevRows[Instances.capacity()];
     memset(gPrevRows, 0, sizeof(PrevRows) * Instances.capacity());
+    gLodMesh = new uint32_t[Instances.capacity()];
+    memset(gLodMesh, 0xFF, sizeof(uint32_t) * Instances.capacity());
+    gLodChanged = new uint64_t[Instances.capacity()];
+    memset(gLodChanged, 0, sizeof(uint64_t) * Instances.capacity());
     gPrevCpu = new float[Instances.capacity()][3][4];
     gPrevViewProjFrame = 0;
 
@@ -1239,6 +1247,10 @@ void draw(uint32_t pass, const YeaFrame* yf)
     uint32_t casterCount[1024], drawCount[2048];
     memset(casterCount, 0, sizeof casterCount);
     memset(drawCount, 0, sizeof drawCount);
+    // Mesh versions: display pixels per world unit at view depth 1, and the error allowed on screen (0: always the finest).
+    const float lodFocal = 0.5f * (float)dh * p11;
+    const float lodError = settings.lod_error;
+    const uint32_t lodRows = MeshLods.size() < meshCount ? MeshLods.size() : meshCount;
     for (uint32_t row = 0; row < Instances.size(); ++row)
     {
         const Instance& in = Instances[row];
@@ -1264,19 +1276,43 @@ void draw(uint32_t pass, const YeaFrame* yf)
         info.sphere[0] = g.row[0][0] * c.x + g.row[0][1] * c.y + g.row[0][2] * c.z + g.row[0][3];
         info.sphere[1] = g.row[1][0] * c.x + g.row[1][1] * c.y + g.row[1][2] * c.z + g.row[1][3];
         info.sphere[2] = g.row[2][0] * c.x + g.row[2][1] * c.y + g.row[2][2] * c.z + g.row[2][3];
-        info.sphere[3] = mesh.radius * maxf(fabsf(in.scale.x), maxf(fabsf(in.scale.y), fabsf(in.scale.z)));
-        info.mesh = in.mesh;
+        float scale = maxf(fabsf(in.scale.x), maxf(fabsf(in.scale.y), fabsf(in.scale.z)));
+        info.sphere[3] = mesh.radius * scale;
         info.moved = in.moved;
         v3 sc = V(info.sphere[0], info.sphere[1], info.sphere[2]);
         bool twoSided = in.material < Materials.size() && Materials[in.material].doubleSided;
-        info.flags = (sphereInside(frustum, 5, sc, info.sphere[3]) ? 1u : 0u) | (in.shadow ? 2u : 0u) | (twoSided ? 4u : 0u);
-        uint32_t key = in.mesh * 2 + (twoSided ? 1 : 0);
+        bool visible = sphereInside(frustum, 5, sc, info.sphere[3]);
+        info.flags = (visible ? 1u : 0u) | (in.shadow ? 2u : 0u) | (twoSided ? 4u : 0u);
+        // The simplest version whose error stays under lod_error display pixels where the instance is nearest the
+        // camera: at its nearest view depth, stretched by how far off-axis it is (a flat projection widens things
+        // towards the screen's edges). Off screen it is seen only in reflections, which are at least as far away, and
+        // shadows, which pick their own (renderer_shadows): its nearest distance then.
+        uint32_t lod = in.mesh;
+        if (lodError > 0 && in.mesh < lodRows && MeshLods[in.mesh].next < lodRows)
+        {
+            float d = length(sc - eye), r = info.sphere[3];
+            float z = view[2][0] * sc.x + view[2][1] * sc.y + view[2][2] * sc.z + view[2][3];
+            float perUnit = visible ? lodFocal * minf(d / maxf(z, nearZ), 2.0f) / maxf(z - r, nearZ) : lodFocal / maxf(d - r, nearZ);
+            float allowed = lodError / (perUnit * maxf(scale, 1e-6f)); // object units
+            for (uint32_t next = MeshLods[lod].next; next < lodRows && MeshLods[next].error <= allowed &&
+                                                     Meshes[next].firstIndex + Meshes[next].indexCount <= gUploadedIndices;
+                 next = MeshLods[next].next)
+                lod = next;
+        }
+        if (gLodMesh[row] != lod)
+        {
+            gLodMesh[row] = lod;
+            gLodChanged[row] = F.frameNumber;
+        }
+        info.mesh = lod;
+        info.row = row;
+        uint32_t key = lod * 2 + (twoSided ? 1 : 0);
         drawCount[key]++;
         if (info.flags & 1)
             gMeshCount[key]++;
         if (info.flags & 2)
         {
-            casterCount[in.mesh]++;
+            casterCount[lod]++;
             casterTotal++;
             const float s[3] = { sc.x, sc.y, sc.z };
             for (int k = 0; k < 3; ++k)
@@ -1335,7 +1371,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
             c.indexCount = mesh.indexCount;
             c.vertexOffset = (int32_t)mesh.firstVertex;
             memcpy(c.sphere, info.sphere, sizeof c.sphere);
-            c.moved = info.moved;
+            c.moved = info.moved > gLodChanged[info.row] ? info.moved : gLodChanged[info.row]; // a new version redraws cached maps
             c.mesh = info.mesh;
             c.vertexCount = mesh.vertexCount;
             c.castShadow = 1;

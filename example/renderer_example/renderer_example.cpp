@@ -119,7 +119,8 @@ void build(State* s)
     renderer_probes::probe_clear();
     s->lightCount = s->spotCount = s->spinCount = 0;
     // Segments so the silhouettes stay round in the close-ups (a sphere filling the screen at 2560x1356 is under a
-    // third of a pixel off a true circle at 128); the light orbs are small, so 32 keeps their triangles a useful size.
+    // third of a pixel off a true circle at 128); farther away the renderer draws simpler versions of each shape, so
+    // this costs only up close. The light orbs are small, so 32 keeps their triangles a useful size.
     uint32_t sphere = renderer::mesh_sphere(128);
     if (sphere == 0xFFFFFFFFu)
         return; // the renderer isn't loaded: try again next frame
