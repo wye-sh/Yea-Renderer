@@ -10,7 +10,8 @@ struct Buffer;
 struct RenderTarget;
 struct Texture;
 
-#define RENDER_FRAME_VERSION 14u
+#define RENDER_FRAME_VERSION 15u
+#define RENDER_RT_MAX_TRACED 8u
 #define RENDER_MAX_CASCADES  4u
 #define RENDER_VIEW_SHIFT    20u // shadow instance stream entry: instance | view << 20
 
@@ -28,8 +29,21 @@ struct RenderGpuLight
     float pos[4];    // xyz, w range
     float color[4];  // rgb * intensity (candela), w type (1 point, 2 spot)
     float dir[4];    // xyz spot direction, w spot scale
-    float params[4]; // x spot offset, y first shadow view (-1 none), z 1/range^2, w 1: casts shadows in the scene (it may still have no map)
+    float params[4]; // x spot offset, y first shadow view (-1 none), z 1/range^2, w 1: casts shadows in the scene (it may still have no map), 2 + n: ray-traced, its shadow in
+                     // rtShadows slice 1 + n
     float sphere[4]; // culling sphere: xyz centre, w radius
+};
+
+// Each light's shape, parallel to RenderGpuLight (lightShapes). Area lights are point lights to everything else
+// (color.w 1, a cube of shadow tiles, color the candela seen face-on); only their shading and shadow size read this.
+// Kinds: 0 point or spot, 3 rect, 4 disc (an ellipse), 5 sphere, 6 tube. Metres. A rect or disc emits along dir
+// (one side); a tube lies along dir.
+struct RenderGpuLightShape
+{
+    float ex[4]; // rect, disc: half the width along the light's tangent (a vector); tube: half its length along dir. w: kind
+    float ey[4]; // rect, disc: half the height (a vector, dir x tangent); tube: x its radius. w: kinds 3 to 6 1 / area
+                 // (luminance = color * w; a sphere's radius is sqrt(1 / (pi w)), the others' shadow radius the same);
+                 // kind 0 its source radius for shadows (0: none set, rtLightRadius and renderer_shadows' light_size)
 };
 
 struct RenderGpuShadowView
@@ -78,7 +92,12 @@ struct RenderLight
     uint32_t id;         // stable while the light exists (its handle)
     uint32_t castShadow;
     int32_t  shadow;     // set by renderer_shadows: first shadow view, or -1
+    int32_t  traced;     // set by renderer_rt's rt_pick: n, its shadow traced into rtShadows slice 1 + n; or -1 (renderer_shadows
+                         // gives it no tiles)
     uint32_t source;     // the core's own reference (its light row)
+    uint32_t kind;       // its shape, as RenderGpuLightShape's: 0 point or spot, 3 rect, 4 disc (both light only the side dir
+                         // points to), 5 sphere, 6 tube
+    float    size;       // its radius for contact-hardening shadows (an area light's: a disc of its area), or 0: light_size
 };
 
 struct RenderFrame
@@ -123,6 +142,7 @@ struct RenderFrame
     RenderTarget* depth;
     Buffer*       lightBuffer; // RenderGpuLight[], this frame's: lightCount visible ones, then the rest up to allLightCount
     uint32_t      allLightCount; // also the lights outside the view (no shadows), for what reflections see
+    Buffer*       lightShapes;   // RenderGpuLightShape[], in lightBuffer's order
 
     // Out from renderer_culling.
     Buffer*  tileMasks;     // u32[tilesX * tilesY * wordsPerTile], SHADER_RESOURCE after cull_run
@@ -144,7 +164,8 @@ struct RenderFrame
     uint32_t      showCascades; // bit 0: tint the cascades; bit 1: show the light shadow atlas
     float         sunTexel;     // 1 / sun atlas size
     float         localTexel;   // 1 / local atlas size
-    float         localLightSize; // point and spot lights' radius (m) for contact-hardening, 0: plain PCF
+    float         localLightSize; // point and spot lights' radius (m) for contact-hardening, 0: plain PCF; negative: contact-
+                                  // hardening on with no default radius (lights with their own size use it)
     uint32_t      receiverPlane;  // tilt each PCF tap's depth compare with the receiver's plane
 
     // TAA (renderer_taa). taa_prepare runs right after upscale_prepare, with only the fields above the camera set: it sets
@@ -153,7 +174,8 @@ struct RenderFrame
     uint32_t      taaOn;
     float         sharpen;    // composite sharpening, 0..1
     RenderTarget* hdr;        // the frame's HDR colour, SHADER_RESOURCE when taa_resolve runs
-    RenderTarget* motion;     // RG16F: uv now - uv last frame, SHADER_RESOURCE; depth too
+    RenderTarget* motion;     // RG16F: uv now - uv last frame, SHADER_RESOURCE; depth too. While renderer_rt runs the prepass
+                              // writes it (the sky 0), so it is this frame's in rt_run; the forward and sky passes write it again
     Buffer*       exposure;   // float[]: [1] the exposure in use
     RenderTarget* resolved;   // the target taa_resolve writes the anti-aliased HDR image to; SHADER_RESOURCE after
     RenderTarget* previous;   // last frame's resolved image (linear, like hdr), SHADER_RESOURCE all frame; or nullptr
@@ -226,6 +248,19 @@ struct RenderFrame
                               // sees, a its distance (0: not traced, RENDER_RT_MISS: the sky)
     float    rtMaxRoughness;  // traced below it, fading out over its last third
     uint32_t rtDebug;         // show where rays were traced (green: hit seen on screen, blue: shaded at the hit)
+    // Ray-traced shadows (renderer_rt). rt_pick runs just before shadows_prepare, with the visible lights sorted and taaOn
+    // known: it picks the lights (and the sun) whose shadows it traces, sets their `traced`, rtSunShadows, rtLightCount and
+    // rtLightSlots, and renderer_shadows then draws no cascades while rtSunShadows is set and no tiles for traced lights.
+    // rt_run fills rtShadows; the forward pass reads it only while rt_prepare also returned true and rtShadows is set.
+    Texture* rtShadows;       // R16F 2D array at width x height, at least 2 slices (a 1-slice texture gets a 2D view, which a
+                              // Tex2DArray slot rejects), SHADER_RESOURCE after rt_run: slice 0 the sun, slice 1 + n traced
+                              // light n (1 lit, 0 shadowed)
+    uint32_t rtSunShadows;    // 1: the first sun's shadow is traced (slice 0)
+    uint32_t rtLightCount;    // traced local lights
+    uint32_t rtLightSlots[RENDER_RT_MAX_TRACED]; // index in `lights` of traced light n
+    float    rtSunAngle;      // the sun's angular diameter (radians, renderer_shadows' sun_size), filled even without PCSS
+    float    rtLightRadius;   // point and spot lights' radius (m, renderer_shadows' light_size), filled even without
+                              // contact-hardening; both set by shadows_prepare (0 while renderer_shadows isn't loaded)
 
     // Upscaling (renderer_upscale). upscale_prepare runs first of all, before taa_prepare, with only the fields above the
     // camera set and width, height = displayWidth, displayHeight = the frame's size. When it upscales, it lowers width and

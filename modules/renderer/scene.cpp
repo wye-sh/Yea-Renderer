@@ -524,8 +524,10 @@ yea_handle light_add(uint32_t type)
     Light*   l = allocRow(Lights, &row);
     if (!l)
         return 0xFFFFFFFFu;
-    l->type = type > 2 ? 1 : type;
+    l->type = type > 6 ? 1 : type;
     l->dir = { 0, -1, 0 };
+    l->tangent = { 1, 0, 0 };
+    l->size = type == 5 ? yea_float2{ 0.1f, 0 } : type == 6 ? yea_float2{ 1.0f, 0.1f } : type >= 3 ? yea_float2{ 1.0f, 1.0f } : yea_float2{ 0, 0 };
     l->color = { 1, 1, 1 };
     l->intensity = type == 0 ? 10000.0f : 100.0f;
     l->range = 10.0f;
@@ -552,6 +554,17 @@ void light_color(yea_handle h, yea_float3 color, float intensity)
         return;
     Lights[row].color = color;
     Lights[row].intensity = intensity < 0 ? 0 : intensity;
+}
+
+void light_size(yea_handle h, float width, float height, yea_float3 across)
+{
+    uint32_t row = rowOf(Lights, h);
+    if (row == 0xFFFFFFFFu)
+        return;
+    Lights[row].size = { width < 0 ? 0 : width, height < 0 ? 0 : height };
+    float l = sqrtf(across.x * across.x + across.y * across.y + across.z * across.z);
+    if (l > 1e-6f)
+        Lights[row].tangent = { across.x / l, across.y / l, across.z / l };
 }
 
 void light_range(yea_handle h, float range)

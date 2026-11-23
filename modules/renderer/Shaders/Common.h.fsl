@@ -63,6 +63,9 @@ STRUCT(ProbeData)
 #define FLAG_RECEIVER_PLANE 2048u
 #define FLAG_RT       4096u
 #define FLAG_RT_DEBUG 8192u
+#define FLAG_RT_SHADOWS 16384u // renderer_rt traces shadows into gRtShadows: lights with params.w >= 2, and the sun with FLAG_RT_SUN
+#define FLAG_RT_SUN   32768u
+#define FLAG_AREA     65536u // gLightShapes is filled: some light has a shape or its own size (area lights take LTC terms)
 #define RT_MISS       60000.0
 
 STRUCT(InstanceData)
@@ -95,6 +98,15 @@ STRUCT(LightData)
     DATA(float4, dir, None);          // xyz spot direction, w spot scale
     DATA(float4, params, None);       // x spot offset, y first shadow view or -1, z 1/range^2, w 1 casts shadows in the scene
     DATA(float4, sphere, None);       // culling sphere
+};
+
+// A light's shape, beside its LightData (frame.h's RenderGpuLightShape): ex.w kind (0 point or spot, 3 rect, 4 disc,
+// 5 sphere, 6 tube); rect and disc half-extent vectors ex, ey; tube half-length ex, radius ey.x; ey.w 1 / area for
+// area kinds (luminance = color * ey.w), a point or spot light's source radius for shadows otherwise.
+STRUCT(LightShape)
+{
+    DATA(float4, ex, None);
+    DATA(float4, ey, None);
 };
 
 STRUCT(ShadowView)

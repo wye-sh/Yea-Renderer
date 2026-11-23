@@ -31,6 +31,13 @@ STRUCT(Surface)
     DATA(float, NoV, None);
     DATA(float, smithV, None);   // sqrt(NoV^2 (1 - a2) + a2): the view's half of the Smith term, the same for every light
     DATA(float2, rot, None);     // (cos, sin) of the pixel's noise angle: turns the shadow filters' disk
+    DATA(int2, pixel, None);     // the pixel, for renderer_rt's traced shadows
+    // Area lights (FLAG_AREA): the LTC frame (x towards V, z = N), the inverse transform's m00 m02 m20 m22 and the
+    // specular's scale (its Fresnel-weighted norm with the multiple-scattering compensation).
+    DATA(float3, ltcX, None);
+    DATA(float3, ltcY, None);
+    DATA(float4, ltcInv, None);
+    DATA(float3, ltcSpec, None);
 };
 
 // Radiance reflected towards V from a light of illuminance E (lux) arriving along L: GGX D, the
@@ -156,6 +163,27 @@ float localPcf(float3 c, float2 g, float radius, float4 bounds, uint taps, float
     return sum / float(taps);
 }
 
+// A wide kernel (a soft light's penumbra, `wide` texels across in radius): taps on a golden-angle spiral, as many as keep
+// them as dense as the table's `taps` over 8 texels (up to 48), so a soft penumbra is no noisier than a small light's.
+// The outermost four first decide fully lit or umbra, as localPcf's do.
+float localPcfWide(float3 c, float2 g, float radius, float4 bounds, uint taps, float2 rot, float wide)
+{
+    uint   n = min(48u, uint(float(taps) * wide * wide / 64.0));
+    float  inv = 1.0 / float(n);
+    float2 dir = rot;
+    float  sum = 0.0;
+    for (uint i = 0u; i < n; ++i, dir = vogelTurn(dir))
+    {
+        // From the rim inwards: tap i at radius sqrt((n - i - 0.5) / n).
+        float2 uv = clamp(c.xy + dir * (sqrt((float(n - i) - 0.5) * inv) * radius), bounds.xy, bounds.zw);
+        float  lit = CompareTex2D(gLocalAtlas, gShadowCmp, float3(uv, c.z + dot(g, uv - c.xy)));
+        sum += lit;
+        if (i == 3u && (sum == 0.0 || sum == 4.0))
+            return sum * 0.25;
+    }
+    return sum * inv;
+}
+
 float sunCascade(uint cascade, float3 P, float3 N, float2 rot)
 {
     ShadowView v = gShadowViews[cascade];
@@ -234,7 +262,8 @@ float sunShadow(float3 P, float3 N, float viewZ, float2 rot, float dither)
 }
 
 // dist: the light's distance; NoL: N.L towards it (both from the caller, which has them).
-float localShadow(LightData l, float3 P, float3 N, float dist, float NoL, float2 rot)
+// size: the light's radius for contact-hardening (0: none).
+float localShadow(LightData l, float3 P, float3 N, float dist, float NoL, float2 rot, float size)
 {
     if (l.params.y < 0.0)
         return 1.0;
@@ -256,7 +285,6 @@ float localShadow(LightData l, float3 P, float3 N, float dist, float NoL, float2
     float4 bounds = float4(v.rect.xy + texel, v.rect.xy + v.rect.zw - texel);
     float2 g = receiverSlope(v, Pb, N, NoL);
     float  radius = gFrame.shadow.y * texel;
-    float  size = gFrame.shadow2.w;
     if (size > 0.0)
     {
         // Contact-hardening (PCSS, Fernando 2005) for a light of radius `size`: the blockers' average
@@ -266,6 +294,11 @@ float localShadow(LightData l, float3 P, float3 N, float dist, float NoL, float2
         float b = v.row2.w - a * v.row3.w;
         float dR = dot(v.row3, float4(Pb, 1.0));
         float nearZ = -b / a;
+        // The penumbra's widest: at most 24 texels (localPcfWide's spiral keeps them dense, so a wide one is no noisier)
+        // and a share of the tile that grows with the light, 8% to 25% (renderer_shadows widens a soft light's face
+        // margin to match, so every tap stays in the face's own texels).
+        float tile = v.rect.z / texel;
+        float widest = min(24.0, tile * clamp(size * 0.5, 0.08, 0.25));
         float search = clamp(size * (dR - nearZ) / (dR * nearZ * v.info.x), 1.0, 12.0) * texel;
         // The search disk's rim first: its last four taps, each a gather of the 2 x 2 texels there, compared with
         // the receiver. When none is a blocker the pixel is lit (the same test as four filtered compares, at the
@@ -301,11 +334,190 @@ float localShadow(LightData l, float3 P, float3 N, float dist, float NoL, float2
             count += dot(inFront, float4(1.0, 1.0, 1.0, 1.0));
         }
         float dB = b / min(blockers / count - a, -1e-7);
-        float tile = v.rect.z / texel;
         float pen = size * max(dR - dB, 0.0) / (max(dB, 1e-4) * dR * v.info.x);
-        radius = clamp(pen, 1.0, min(24.0, tile * 0.08)) * texel + radius * 0.25;
+        radius = clamp(pen, 1.0, widest) * texel + radius * 0.25;
     }
+    float wide = radius / texel;
+    if (wide > 8.0)
+        return localPcfWide(c, g, radius, bounds, gFrame.counts.w, rot, wide);
     return localPcf(c, g, radius, bounds, gFrame.counts.w, rot);
+}
+
+// --- Area lights: linearly transformed cosines --------------------------------------------------
+// LTC (Heitz, Dupuy, Hill and Neubelt, "Real-Time Polygonal-Light Shading with Linearly Transformed Cosines", 2016),
+// fitted to this renderer's own GGX by components/renderer/tools/ltc_fit.cpp (Assets/ltc.bin): the specular lobe is a
+// clamped cosine carried through a 3 x 3 transform M, so its integral over a light is the cosine's over the light
+// carried through M^-1, a form factor. Polygons by their edges' vector form factor, clipped to the horizon by the
+// sphere approximation (Hill and Heitz, "Real-Time Area Lighting: a Journey From Research to Production", 2016);
+// discs by the cone through them (Heitz and Hill, "Real-Time Line- and Disk-Light Shading", 2017); spheres as the disc
+// that fills their outline, tubes as the rectangle along them that faces the point, to their round ends' tips.
+// gLtc: 64 x 64 inverse transforms (m00 m02 m20 m22), then 64 x 64 of (norm, Fresnel-weighted norm, horizon, 0).
+
+void ltcSetup(inout Surface s)
+{
+    float  x = sqrt(sqrt(s.a2)) * 63.0; // perceptual roughness
+    float  y = sqrt(saturate(1.0 - s.NoV)) * 63.0;
+    uint   x0 = min(uint(x), 62u);
+    uint   y0 = min(uint(y), 62u);
+    float  fx = x - float(x0);
+    float  fy = y - float(y0);
+    uint   i = y0 * 64u + x0;
+    s.ltcInv = lerp(lerp(gLtc[i], gLtc[i + 1u], fx), lerp(gLtc[i + 64u], gLtc[i + 65u], fx), fy);
+    i += 4096u;
+    float2 n = lerp(lerp(gLtc[i].xy, gLtc[i + 1u].xy, fx), lerp(gLtc[i + 64u].xy, gLtc[i + 65u].xy, fx), fy);
+    s.ltcSpec = (s.f0 * (n.x - n.y) + float3(n.y, n.y, n.y)) * s.energy;
+    float3 t = s.V - s.N * s.NoV;
+    float  t2 = dot(t, t);
+    t = t2 > 1e-10 ? t * rsqrt(t2) : (abs(s.N.z) < 0.999 ? normalize(cross(s.N, float3(0.0, 0.0, 1.0))) : float3(1.0, 0.0, 0.0));
+    s.ltcX = t;
+    s.ltcY = cross(s.N, t);
+}
+
+// A world vector into the lobe's frame (x towards V, z = N), then through M^-1 (m: m00 m02 m20 m22; m11 is 1).
+float3 ltcTo(Surface s, float3 w, float4 m)
+{
+    float3 l = float3(dot(w, s.ltcX), dot(w, s.ltcY), dot(w, s.N));
+    return float3(m.x * l.x + m.y * l.z, l.y, m.z * l.x + m.w * l.z);
+}
+
+// The clamped cosine's integral over a cone or polygon of vector form factor F (length: its form factor unclipped, as
+// it would be all above the horizon), clipped to the horizon by a sphere cap of the same form factor and direction.
+float ltcHorizon(float3 F)
+{
+    float f = length(F);
+    if (f <= 1e-7)
+        return 0.0;
+    float x = saturate(f) * 63.0;
+    float y = (F.z / f * 0.5 + 0.5) * 63.0;
+    uint  x0 = min(uint(x), 62u);
+    uint  y0 = min(uint(y), 62u);
+    float fx = x - float(x0);
+    float fy = y - float(y0);
+    uint  i = 4096u + y0 * 64u + x0;
+    return max(lerp(lerp(gLtc[i].z, gLtc[i + 1u].z, fx), lerp(gLtc[i + 64u].z, gLtc[i + 65u].z, fx), fy), 0.0);
+}
+
+// An edge's share of a polygon's vector form factor (a and b unit): the arc between them times the unit normal of
+// their plane, as acos(a.b) / |a x b| times a x b.
+float3 ltcEdge(float3 a, float3 b)
+{
+    float c = clamp(dot(a, b), -1.0, 1.0);
+    float k = c > 0.9999 ? 1.0 + (1.0 - c) * (1.0 / 3.0) : acos(c) * rsqrt(max(1.0 - c * c, 1e-12));
+    return cross(a, b) * k;
+}
+
+// A quad (its corners from the shading point, in the lobe's space), seen from its own lit side.
+float ltcQuad(float3 p0, float3 p1, float3 p2, float3 p3)
+{
+    float3 a = normalize(p0);
+    float3 b = normalize(p1);
+    float3 c = normalize(p2);
+    float3 d = normalize(p3);
+    float3 F = (ltcEdge(a, b) + ltcEdge(b, c) + ltcEdge(c, d) + ltcEdge(d, a)) * (0.5 / PI);
+    return ltcHorizon(dot(F, a + b + c + d) < 0.0 ? -F : F);
+}
+
+// An ellipse (centre C, semi-axes e1 and e2 from the shading point, in the lobe's space): the cone through it, whose
+// axis and half-angles s1, s2 give its form factor sin s1 sin s2 (Heitz and Hill 2017). The cone is v^T Q v = 0 with
+// Q = B^-T diag(1, 1, -1) B^-1, B = [e1 e2 C]; its eigenvalues l1, l2 > 0 > l3 give tan^2 si = -l3 / li. Solved as
+// D u = l G u (v = B u, G = B^T B, D = diag(1, 1, -1)), the eigenvalues mu = 1 / l of D G, whose dominant one is
+// 1 / l3: l3 nears 0 as the ellipse turns edge-on, and taken from Q it is lost to cancellation (noise along the
+// disc's plane), while 1 / l3 grows and stays exact. The other two only enter as their sum and product, which the
+// invariants give.
+float ltcEllipse(float3 C, float3 e1, float3 e2)
+{
+    float k = rsqrt(max(dot(C, C), 1e-12)); // the cone is the same at any scale: keep the numbers near 1
+    C *= k;
+    e1 *= k;
+    e2 *= k;
+    // Seen edge-on (the point in its plane, to within a thousandth of a radian), it shows nothing.
+    float3 n = cross(e1, e2);
+    if (abs(dot(n, C)) < 1e-3 * length(n))
+        return 0.0;
+    float g00 = dot(e1, e1), g11 = dot(e2, e2), g22 = dot(C, C), g01 = dot(e1, e2), g02 = dot(e1, C), g12 = dot(e2, C);
+    // D G is G with its last row negated: its trace, principal minors and determinant.
+    float detG = g00 * (g11 * g22 - g12 * g12) - g01 * (g01 * g22 - g12 * g02) + g02 * (g01 * g12 - g11 * g02);
+    float tr = g00 + g11 - g22;
+    float c2 = (g00 * g11 - g01 * g01) - (g00 * g22 - g02 * g02) - (g11 * g22 - g12 * g12);
+    // mu^3 - tr mu^2 + c2 mu + detG = 0, by its trigonometric roots (all real); the negative one.
+    float a = -tr;
+    float p = c2 - a * a * (1.0 / 3.0);
+    float q = a * a * a * (2.0 / 27.0) - a * c2 * (1.0 / 3.0) + detG;
+    float m = sqrt(max(-p * (1.0 / 3.0), 1e-30));
+    float th = acos(clamp(-q / (2.0 * m * m * m), -1.0, 1.0)) * (1.0 / 3.0);
+    float mu3 = 2.0 * m * min(min(cos(th), cos(th - 2.0943951)), cos(th + 2.0943951)) - a * (1.0 / 3.0);
+    if (mu3 >= 0.0)
+        return 0.0;
+    float tSum = (mu3 - tr) / mu3;      // t1 + t2 = -(mu1 + mu2) / mu3
+    float tProd = -detG / (mu3 * mu3 * mu3); // t1 t2 = mu1 mu2 / mu3^2, mu1 mu2 mu3 = -det G
+    // The axis: D G - mu3 I's null vector (the longest cross product of two of its rows), carried by B.
+    float3 r0 = float3(g00 - mu3, g01, g02);
+    float3 r1 = float3(g01, g11 - mu3, g12);
+    float3 r2 = float3(-g02, -g12, -g22 - mu3);
+    float3 c0 = cross(r0, r1);
+    float3 c1 = cross(r1, r2);
+    float3 c3 = cross(r2, r0);
+    float3 u = dot(c0, c0) > dot(c1, c1) ? c0 : c1;
+    u = dot(u, u) > dot(c3, c3) ? u : c3;
+    float3 axis = e1 * u.x + e2 * u.y + C * u.z;
+    float  al = dot(axis, axis);
+    if (!(al > 1e-30))
+        return 0.0;
+    axis *= rsqrt(al);
+    axis = dot(axis, C) < 0.0 ? -axis : axis;
+    return ltcHorizon(axis * sqrt(max(tProd / (1.0 + tSum + tProd), 0.0)));
+}
+
+// The light's shape as a quad or an ellipse from the shading point (world, relative to P): its diffuse form factor (x)
+// and its specular lobe's (y).
+float2 areaTerms(Surface s, LightShape sh, float3 C, float kind)
+{
+    float4 id = float4(1.0, 0.0, 0.0, 1.0);
+    float3 e1 = sh.ex.xyz;
+    float3 e2 = sh.ey.xyz;
+    if (kind > 5.5)
+    {
+        // A tube: the rectangle along it facing the point, as wide as the tube and reaching to its round ends' tips
+        // (tools/ltc_fit.cpp checks it against a capsule: within the rects' error).
+        float  len = length(e1);
+        float3 along = e1 / max(len, 1e-6);
+        float3 w = cross(along, -C);
+        float  w2 = dot(w, w);
+        w = w2 > 1e-12 ? w * rsqrt(w2) : normalize(cross(along, abs(along.y) < 0.99 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0)));
+        e1 = along * (len + sh.ey.x);
+        e2 = w * sh.ey.x;
+    }
+    else if (kind > 4.5)
+    {
+        // A sphere: the disc facing the point that fills its outline (its tangent cone).
+        float  d = length(C);
+        float  r = rsqrt(PI * sh.ey.w);
+        float  re = r * rsqrt(max(1.0 - r * r / max(d * d, 1e-8), 1e-3));
+        float3 n = C / max(d, 1e-6);
+        float3 t = normalize(cross(n, abs(n.y) < 0.99 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0)));
+        e1 = t * re;
+        e2 = cross(n, t) * re;
+    }
+    if (kind > 3.5 && kind < 5.5)
+    {
+        // Discs and spheres: ellipses.
+        return float2(ltcEllipse(ltcTo(s, C, id), ltcTo(s, e1, id), ltcTo(s, e2, id)),
+                      ltcEllipse(ltcTo(s, C, s.ltcInv), ltcTo(s, e1, s.ltcInv), ltcTo(s, e2, s.ltcInv)));
+    }
+    float3 p0 = C - e1 - e2, p1 = C + e1 - e2, p2 = C + e1 + e2, p3 = C - e1 + e2;
+    return float2(ltcQuad(ltcTo(s, p0, id), ltcTo(s, p1, id), ltcTo(s, p2, id), ltcTo(s, p3, id)),
+                  ltcQuad(ltcTo(s, p0, s.ltcInv), ltcTo(s, p1, s.ltcInv), ltcTo(s, p2, s.ltcInv), ltcTo(s, p3, s.ltcInv)));
+}
+
+// A light's radius for contact-hardening: its own size, else light_size (shadow2.w, negative when it is 0); 0 while
+// contact-hardening is off (shadow2.w 0).
+float lightShadowSize(LightShape sh)
+{
+    if (gFrame.shadow2.w == 0.0)
+        return 0.0;
+    if (sh.ex.w > 2.5)
+        return rsqrt(PI * max(sh.ey.w, 1e-8)); // the radius of a disc of its area
+    return sh.ey.w > 0.0 ? sh.ey.w : max(gFrame.shadow2.w, 0.0);
 }
 
 // --- Lights ----------------------------------------------------------------------------------
@@ -321,21 +533,49 @@ float3 shadeLocalLight(uint i, Surface s)
     float3 L = toLight * invDist;
     float  f = d2 * l.params.z;
     float  window = saturate(1.0 - f * f);
-    float  atten = window * window / max(d2, 1e-4);
+    float  NoL = dot(s.N, L);
+    float3 lit;
+    float  size = max(gFrame.shadow2.w, 0.0);
+    if ((gFrame.counts.z & FLAG_AREA) != 0u)
+    {
+        LightShape sh = gLightShapes[i];
+        size = lightShadowSize(sh);
+        if (sh.ex.w > 2.5)
+        {
+            // Rects and discs light one side only (along dir).
+            if (sh.ex.w < 4.5 && dot(toLight, l.dir.xyz) >= 0.0)
+                return float3(0.0, 0.0, 0.0);
+            float2 ff = areaTerms(s, sh, toLight, sh.ex.w);
+            lit = (s.diffuse * ff.x + s.ltcSpec * ff.y) * (l.color.rgb * (sh.ey.w * window * window));
+            if (max(lit.r, max(lit.g, lit.b)) <= 0.0)
+                return lit;
+            NoL = max(NoL, 0.1); // part of the light may be in view when its centre isn't
+            bool tracedA = l.params.w > 1.5;
+            if ((!tracedA && (gFrame.counts.z & FLAG_SHADOWS) == 0u) || max(lit.r, max(lit.g, lit.b)) * gExposure[1] < 1.0 / 4096.0)
+                return lit;
+            if (tracedA)
+                return lit * LoadTex3D(gRtShadows, NO_SAMPLER, int3(s.pixel, int(l.params.w - 1.0)), 0).r;
+            return lit * localShadow(l, s.P, s.N, d2 * invDist, NoL, s.rot, size);
+        }
+    }
+    float atten = window * window / max(d2, 1e-4);
     if (l.color.w > 1.5)
     {
         float cone = saturate(dot(-L, l.dir.xyz) * l.dir.w + l.params.x);
         atten *= cone * cone;
     }
-    float NoL = dot(s.N, L);
     if (atten <= 0.0 || NoL <= 0.0)
         return float3(0.0, 0.0, 0.0);
-    float3 lit = brdfLight(s, L, l.color.rgb * atten);
+    lit = brdfLight(s, L, l.color.rgb * atten);
     // Where the light adds under one 8-bit step on screen even in the darkest areas (the edge of its
     // range; sRGB steepens darks 12.92x), its shadow can't be seen: the lookup is skipped.
-    if ((gFrame.counts.z & FLAG_SHADOWS) == 0u || max(lit.r, max(lit.g, lit.b)) * gExposure[1] < 1.0 / 4096.0)
+    // A traced light (params.w 2 + n, only while renderer_rt traces) reads its slice instead of a map.
+    bool traced = l.params.w > 1.5;
+    if ((!traced && (gFrame.counts.z & FLAG_SHADOWS) == 0u) || max(lit.r, max(lit.g, lit.b)) * gExposure[1] < 1.0 / 4096.0)
         return lit;
-    return lit * localShadow(l, s.P, s.N, d2 * invDist, NoL, s.rot);
+    if (traced)
+        return lit * LoadTex3D(gRtShadows, NO_SAMPLER, int3(s.pixel, int(l.params.w - 1.0)), 0).r;
+    return lit * localShadow(l, s.P, s.N, d2 * invDist, NoL, s.rot, size);
 }
 
 #endif

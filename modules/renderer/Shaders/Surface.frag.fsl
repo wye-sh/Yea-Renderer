@@ -1,7 +1,8 @@
 // The depth prepass's second output while renderer_rt runs: per pixel, x the roughness its reflections
 // have (with specular antialiasing, as the forward pass widens it; 1 for materials with reflections off,
 // and the clear, 1, for the sky), yzw the shading normal turned towards the viewer. The ray-traced
-// reflections start from it; renderer_vrs reads x as it reads the gloss output.
+// reflections start from it; renderer_vrs reads x as it reads the gloss output. Its second output is the motion
+// vectors, as the forward pass writes them, so they are final when renderer_rt runs (its shadow denoiser reprojects by them).
 #include "Common.h.fsl"
 #include "Scene.srt.h"
 
@@ -15,8 +16,14 @@ STRUCT(VSOutput)
     DATA(float4, PrevClip, TEXCOORD4);
 };
 
+STRUCT(PSOutput)
+{
+    DATA(float4, Surface, SV_Target0);
+    DATA(float2, Motion, SV_Target1); // uv now - uv last frame
+};
+
 ROOT_SIGNATURE(DefaultRootSignature)
-float4 PS_MAIN(VSOutput In)
+PSOutput PS_MAIN(VSOutput In)
 {
     INIT_MAIN;
     MaterialData m = gMaterials[In.Material];
@@ -32,5 +39,8 @@ float4 PS_MAIN(VSOutput In)
     float  variance = 0.25 * gFrame.misc.y * (dot(dndx, dndx) + dot(dndy, dndy));
     a2 = saturate(a2 + min(2.0 * variance, 0.18));
     float r = m.params.z > 0.5 ? sqrt(sqrt(a2)) : 1.0;
-    RETURN(float4(r, N));
+    PSOutput Out;
+    Out.Surface = float4(r, N);
+    Out.Motion = (In.CurrClip.xy / In.CurrClip.w - In.PrevClip.xy / max(In.PrevClip.w, 1e-6)) * float2(0.5, -0.5);
+    RETURN(Out);
 }

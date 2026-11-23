@@ -81,7 +81,8 @@ struct ExposureData
 
 const uint32_t kFlagCulled = 1, kFlagHeatmap = 2, kFlagCascades = 4, kFlagShadows = 8, kFlagAo = 16, kFlagAoDebug = 32, kFlagContact = 64,
                kFlagContactDebug = 128, kFlagUnlit = 256, kFlagSsr = 512, kFlagSsrDebug = 1024,
-               kFlagReceiverPlane = 2048, kFlagRt = 4096, kFlagRtDebug = 8192;
+               kFlagReceiverPlane = 2048, kFlagRt = 4096, kFlagRtDebug = 8192, kFlagRtShadows = 16384,
+               kFlagRtSun = 32768, kFlagArea = 65536;
 const uint32_t kMaxFrames = 4;
 const uint32_t kMaxUnculledLights = 256;
 const uint32_t kHistogramBins = 128;
@@ -121,6 +122,8 @@ bool           gTonyTried;    // read the table since Tony McMapface was picked 
 const YeaShadingRate* gShadingRate; // nullptr: no variable-rate shading on this GPU
 Buffer *       gFrameCb[kMaxFrames], *gInstanceBuf[kMaxFrames], *gMaterialBuf[kMaxFrames], *gLightBuf[kMaxFrames], *gStreamBuf[kMaxFrames];
 Buffer *       gCompositeCb[kMaxFrames], *gExposureCb[kMaxFrames];
+Buffer *       gLtc, *gShapeBuf[kMaxFrames];
+RenderGpuLightShape* gShapeCpu;
 Buffer *       gDfg, *gExposure, *gHistogram, *gDummyU32, *gDummyViews, *gDummyProbes;
 Buffer *       gVertexBuf, *gIndexBuf;
 Buffer *       gPrevBuf[kMaxFrames]; // last frame's instance rows, for motion vectors
@@ -380,9 +383,9 @@ void createScenePipelines(uint32_t samples, bool motion)
     }
     if (motion && gSurfaceShader)
     {
-        TinyImageFormat surfaceFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
-        g.mRenderTargetCount = 1;
-        g.pColorFormats = &surfaceFormat;
+        TinyImageFormat surfaceFormats[2] = { TinyImageFormat_R16G16B16A16_SFLOAT, TinyImageFormat_R16G16_SFLOAT }; // surface, motion
+        g.mRenderTargetCount = 2;
+        g.pColorFormats = surfaceFormats;
         g.pShaderProgram = gSurfaceShader;
         desc.pName = "renderer_depth_surface";
         for (uint32_t s = 0; s < 2; ++s)
@@ -927,6 +930,8 @@ int load(int reloaded)
                                      cpu, sr, "renderer_materials");
         gLightBuf[i] = makeBuffer((uint64_t)Lights.capacity() * sizeof(RenderGpuLight), sizeof(RenderGpuLight), DESCRIPTOR_TYPE_BUFFER,
                                   cpu, sr, "renderer_lights");
+        gShapeBuf[i] = makeBuffer((uint64_t)Lights.capacity() * sizeof(RenderGpuLightShape), sizeof(RenderGpuLightShape),
+                                  DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_light_shapes");
         gStreamBuf[i] = makeBuffer((uint64_t)Instances.capacity() * 4, 0, DESCRIPTOR_TYPE_VERTEX_BUFFER, cpu,
                                    RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, "renderer_stream");
         gPrevBuf[i] = makeBuffer((uint64_t)Instances.capacity() * 48, 48, DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_prev_instances");
@@ -941,6 +946,25 @@ int load(int reloaded)
     gDfg = makeBuffer(32 * 32 * 8, 8, DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_dfg");
     if (gDfg && gDfg->pCpuMappedAddress)
         memcpy(gDfg->pCpuMappedAddress, dfg, 32 * 32 * 8);
+    // The area lights' tables (tools/ltc_fit.cpp): 64 x 64 inverse transforms, then 64 x 64 norms and the horizon
+    // table, float4 each. Missing, area lights stay dark.
+    gLtc = makeBuffer(2 * 64 * 64 * 16, 16, DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_ltc");
+    if (gLtc && gLtc->pCpuMappedAddress)
+    {
+        char  path[1024];
+        FILE* f = yea::asset("ltc.bin", path, sizeof path) ? fopen(path, "rb") : nullptr;
+        char  magic[4] = {};
+        int   n = 0;
+        bool  ok = f && fread(magic, 1, 4, f) == 4 && !memcmp(magic, "LTC1", 4) && fread(&n, 4, 1, f) == 1 && n == 64 &&
+                  fread(gLtc->pCpuMappedAddress, 16, 2 * 64 * 64, f) == 2 * 64 * 64;
+        if (f)
+            fclose(f);
+        if (!ok)
+        {
+            memset(gLtc->pCpuMappedAddress, 0, 2 * 64 * 64 * 16);
+            yea::host()->log(1, "renderer: Assets/ltc.bin is missing or not the area lights' tables; area lights are dark");
+        }
+    }
     gExposure = makeBuffer(16, 4, DESCRIPTOR_TYPE_BUFFER | DESCRIPTOR_TYPE_RW_BUFFER, RESOURCE_MEMORY_USAGE_GPU_ONLY,
                            RESOURCE_STATE_UNORDERED_ACCESS, "renderer_exposure", nullptr, true);
     gHistogram = makeBuffer(kHistogramBins * 4, 4, DESCRIPTOR_TYPE_BUFFER | DESCRIPTOR_TYPE_RW_BUFFER, RESOURCE_MEMORY_USAGE_GPU_ONLY,
@@ -983,25 +1007,27 @@ int load(int reloaded)
 
     // Every buffer and texture made above, before anything uses them: a GPU or driver that refuses one stops the
     // module cleanly instead of crashing on it later.
-    bool made = gDfg && gExposure && gHistogram && gDummyU32 && gDummyViews && gDummyProbes && gDummyDepth && gDummyColor &&
+    bool made = gDfg && gLtc && gExposure && gHistogram && gDummyU32 && gDummyViews && gDummyProbes && gDummyDepth && gDummyColor &&
                 gDummyRates && gDummyArray && gScenePersistent && gSceneFrame && gCompositeSet && gExposureSet && gTonemapSet && gShadowSampler;
     for (uint32_t i = 0; i < gFrames; ++i)
-        made = made && gFrameCb[i] && gCompositeCb[i] && gExposureCb[i] && gInstanceBuf[i] && gMaterialBuf[i] && gLightBuf[i] &&
+        made = made && gFrameCb[i] && gCompositeCb[i] && gExposureCb[i] && gInstanceBuf[i] && gMaterialBuf[i] && gLightBuf[i] && gShapeBuf[i] &&
                gStreamBuf[i] && gPrevBuf[i] && gFrameCb[i]->pCpuMappedAddress && gCompositeCb[i]->pCpuMappedAddress &&
                gExposureCb[i]->pCpuMappedAddress && gInstanceBuf[i]->pCpuMappedAddress && gMaterialBuf[i]->pCpuMappedAddress &&
-               gLightBuf[i]->pCpuMappedAddress && gStreamBuf[i]->pCpuMappedAddress && gPrevBuf[i]->pCpuMappedAddress;
+               gLightBuf[i]->pCpuMappedAddress && gShapeBuf[i]->pCpuMappedAddress && gStreamBuf[i]->pCpuMappedAddress && gPrevBuf[i]->pCpuMappedAddress;
     if (!made)
     {
         yea::host()->log(2, "renderer: the GPU refused one of its buffers or textures; the Renderer is off");
         unload();
         return 1;
     }
-    DescriptorData p[2] = {};
+    DescriptorData p[3] = {};
     p[0].mIndex = SRT_RES_IDX(SceneSrt, Persistent, gShadowCmp);
     p[0].ppSamplers = &gShadowSampler;
     p[1].mIndex = SRT_RES_IDX(SceneSrt, Persistent, gDfg);
     p[1].ppBuffers = &gDfg;
-    updateDescriptorSet(gRenderer, 0, gScenePersistent, 2, p);
+    p[2].mIndex = SRT_RES_IDX(SceneSrt, Persistent, gLtc);
+    p[2].ppBuffers = &gLtc;
+    updateDescriptorSet(gRenderer, 0, gScenePersistent, 3, p);
 
     PipelineDesc cdesc = {};
     cdesc.mType = PIPELINE_TYPE_COMPUTE;
@@ -1020,6 +1046,7 @@ int load(int reloaded)
     gInstCpu = new RenderGpuInstance[Instances.capacity()];
     gStream = new uint32_t[Instances.capacity()];
     gLightCpu = new RenderGpuLight[Lights.capacity()];
+    gShapeCpu = new RenderGpuLightShape[Lights.capacity()];
     gMaterialCpu = new GpuMaterial[Materials.capacity()];
     gCasters = new RenderCaster[Instances.capacity()];
     gDrawables = new RenderCaster[Instances.capacity()];
@@ -1069,6 +1096,7 @@ void unload()
         freeBuffer(gInstanceBuf[i]);
         freeBuffer(gMaterialBuf[i]);
         freeBuffer(gLightBuf[i]);
+        freeBuffer(gShapeBuf[i]);
         freeBuffer(gStreamBuf[i]);
         freeBuffer(gPrevBuf[i]);
     }
@@ -1076,6 +1104,7 @@ void unload()
     freeBuffer(gDummyViews);
     freeBuffer(gDummyProbes);
     freeBuffer(gDfg);
+    freeBuffer(gLtc);
     freeBuffer(gExposure);
     freeBuffer(gHistogram);
     freeBuffer(gVertexBuf);
@@ -1415,7 +1444,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         o.dir[0] = dir.x;
         o.dir[1] = dir.y;
         o.dir[2] = dir.z;
-        o.type = l.type;
+        o.type = l.type >= 3 ? 1 : l.type; // area lights are point lights to every other module
         o.cosOuter = cosf(l.outer * 3.14159265f / 180.0f);
         v3    p = V(l.pos.x, l.pos.y, l.pos.z);
         v3    c = p;
@@ -1435,6 +1464,12 @@ void draw(uint32_t pass, const YeaFrame* yf)
                 r = range * sqrtf(maxf(1 - co * co, 0));
             }
         }
+        else if (l.type == 3 || l.type == 4)
+        {
+            // One-sided: the half ball in front, inside the sphere through its rim, centred 3/8 of the range out.
+            c = p + dir * (range * 0.375f);
+            r = range * 1.068f;
+        }
         if (!sphereInside(frustum, 5, c, r))
         {
             gOutside[outsideCount++] = row;
@@ -1449,7 +1484,16 @@ void draw(uint32_t pass, const YeaFrame* yf)
         o.id = row | ((l.gen & 0xFFFu) << 20);
         o.castShadow = l.shadow;
         o.shadow = -1;
+        o.traced = -1;
         o.source = row;
+        // Its shape for renderer_shadows: one-sided rects and discs, and a radius for its penumbra (an area light's: a
+        // disc of its area, as the forward pass takes it).
+        o.kind = l.type >= 3 ? l.type : 0;
+        {
+            float w = maxf(l.size.x, 1e-3f), h = maxf(l.size.y, 1e-3f);
+            float area = l.type == 3 ? w * h : l.type == 4 ? 3.14159265f * w * h * 0.25f : l.type == 5 ? 3.14159265f * w * w : w * 2.0f * h;
+            o.size = l.type >= 3 ? sqrtf(area / 3.14159265f) : maxf(l.size.x, 0.0f);
+        }
         localCount++;
     }
     sortLights(gLocal, localCount);
@@ -1488,6 +1532,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     F.lightCount = localCount;
     F.depth = gDepth;
     F.lightBuffer = gLightBuf[fi];
+    F.lightShapes = gShapeBuf[fi];
     F.taps = 16;
     F.softness = 1.5f;
     F.hdr = gHdr;
@@ -1498,6 +1543,15 @@ void draw(uint32_t pass, const YeaFrame* yf)
     bool culled = renderer_culling::cull_prepare((uint64_t)(uintptr_t)&F) && F.tileMasks && F.zbins && F.wordsPerTile;
     if (!culled && F.lightCount > kMaxUnculledLights)
         F.lightCount = kMaxUnculledLights;
+    // Ray-traced shadows (renderer_rt): its pick comes first, so renderer_shadows draws nothing for what it traces.
+    const bool rtGate = taa && !viewMode && gRaytracing && gSurface && gDepthSurfacePipe[0] && gDepthSurfacePipe[1] && F.previous;
+    const bool rtPicked = rtGate && renderer_rt::rt_pick((uint64_t)(uintptr_t)&F);
+    if (!rtPicked)
+    {
+        for (uint32_t i = 0; i < F.lightCount; ++i)
+            F.lights[i].traced = -1;
+        F.rtSunShadows = F.rtLightCount = 0;
+    }
     bool shadows = renderer_shadows::shadows_prepare((uint64_t)(uintptr_t)&F) && F.shadowViews && F.sunAtlas && F.localAtlas;
     bool ao = renderer_ao::ao_prepare((uint64_t)(uintptr_t)&F) && F.aoOn && F.ao;
     // Contact shadows refine the sun's: off with them.
@@ -1515,8 +1569,10 @@ void draw(uint32_t pass, const YeaFrame* yf)
     bool probes = renderer_probes::probes_prepare((uint64_t)(uintptr_t)&F) && F.probes && F.probeData && F.probeCount;
     // Ray-traced reflections where the GPU has ray queries; screen-space ones otherwise.
     F.surface = gSurface;
-    bool rt = taa && !viewMode && gRaytracing && gSurface && gDepthSurfacePipe[0] && gDepthSurfacePipe[1] && F.previous &&
-              renderer_rt::rt_prepare((uint64_t)(uintptr_t)&F) && F.rtReflection;
+    // renderer_rt runs (its prepass target, rt_run) for its reflections, its traced shadows or both.
+    const bool rtRun = rtGate && renderer_rt::rt_prepare((uint64_t)(uintptr_t)&F);
+    bool       rt = rtRun && F.rtReflection;
+    const bool rtShadows = rtRun && rtPicked && F.rtShadows;
     bool ssr = !rt && taa && !viewMode && renderer_ssr::ssr_prepare((uint64_t)(uintptr_t)&F) && F.ssrOn && F.ssrDepth && F.previous;
     bool vrs = taa && !viewMode && renderer_vrs::vrs_prepare((uint64_t)(uintptr_t)&F) && F.rateImage && F.rateCopy;
 
@@ -1524,6 +1580,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     // (renderer_rt), the lights outside the view, without shadows.
     RenderGpuLight* gl = gLightCpu;
     const bool      lightShadows = shadows && renderer_shadows::light_shadows_on();
+    bool            anyShape = false;
     for (uint32_t i = 0; i < F.lightCount + outsideCount; ++i)
     {
         bool         inside = i < F.lightCount;
@@ -1542,7 +1599,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         g.color[0] = l.color.x * l.intensity;
         g.color[1] = l.color.y * l.intensity;
         g.color[2] = l.color.z * l.intensity;
-        g.color[3] = (float)l.type;
+        g.color[3] = l.type >= 3 ? 1.0f : (float)l.type;
         g.dir[0] = dir.x;
         g.dir[1] = dir.y;
         g.dir[2] = dir.z;
@@ -1550,7 +1607,49 @@ void draw(uint32_t pass, const YeaFrame* yf)
         g.params[0] = -cosOuter * scale;
         g.params[1] = shadows && inside ? (float)gLocal[i].shadow : -1.0f;
         g.params[2] = 1.0f / (range * range);
-        g.params[3] = lightShadows && l.shadow ? 1.0f : 0.0f; // casts in the scene (renderer_rt: a map, else a ray)
+        // Casts in the scene (renderer_rt: a map, else a ray); 2 + n: traced into rtShadows slice 1 + n.
+        g.params[3] = rtShadows && inside && gLocal[i].traced >= 0 ? 2.0f + (float)gLocal[i].traced : lightShadows && l.shadow ? 1.0f : 0.0f;
+        // Its shape (frame.h's RenderGpuLightShape).
+        RenderGpuLightShape& sh = gShapeCpu[i];
+        memset(&sh, 0, sizeof sh);
+        if (l.type >= 3)
+        {
+            v3    t = normalize(V(l.tangent.x, l.tangent.y, l.tangent.z));
+            t = normalize(t - dir * dot(t, dir)); // across, square to dir
+            if (fabsf(dot(t, dir)) > 0.999f || dot(t, t) < 0.5f)
+            {
+                v3 up;
+                basis(dir, &t, &up);
+            }
+            v3    b = cross(dir, t);
+            float w = maxf(l.size.x, 1e-3f), h = maxf(l.size.y, 1e-3f), area = 1.0f;
+            sh.ex[3] = (float)l.type;
+            if (l.type <= 4)
+            {
+                for (int k = 0; k < 3; ++k)
+                {
+                    sh.ex[k] = (&t.x)[k] * w * 0.5f;
+                    sh.ey[k] = (&b.x)[k] * h * 0.5f;
+                }
+                area = l.type == 3 ? w * h : 3.14159265f * w * h * 0.25f;
+            }
+            else if (l.type == 5)
+                area = 3.14159265f * w * w;
+            else
+            {
+                for (int k = 0; k < 3; ++k)
+                    sh.ex[k] = (&dir.x)[k] * w * 0.5f;
+                sh.ey[0] = h;
+                area = w * 2.0f * h;
+            }
+            sh.ey[3] = 1.0f / maxf(area, 1e-6f);
+            anyShape = true;
+        }
+        else if (l.size.x > 0)
+        {
+            sh.ey[3] = l.size.x;
+            anyShape = true;
+        }
         if (inside)
             memcpy(g.sphere, gLocal[i].sphere, sizeof g.sphere);
         else
@@ -1607,7 +1706,8 @@ void draw(uint32_t pass, const YeaFrame* yf)
                     (ao && F.aoDebug ? kFlagAoDebug : 0) | (contact ? kFlagContact : 0) |
                     (contact && F.contactDebug ? kFlagContactDebug : 0) |
                     ((viewMode & YEA_VIEW_WIREFRAME) ? kFlagUnlit : 0) | (ssr ? kFlagSsr : 0) | (ssr && F.ssrDebug ? kFlagSsrDebug : 0) |
-                    (shadows && F.receiverPlane ? kFlagReceiverPlane : 0) | (rt ? kFlagRt : 0) | (rt && F.rtDebug ? kFlagRtDebug : 0);
+                    (shadows && F.receiverPlane ? kFlagReceiverPlane : 0) | (rt ? kFlagRt : 0) | (rt && F.rtDebug ? kFlagRtDebug : 0) |
+                    (rtShadows ? kFlagRtShadows : 0) | (rtShadows && F.rtSunShadows ? kFlagRtSun : 0) | (anyShape ? kFlagArea : 0);
     if (ssr)
     {
         gf->ssr[0] = F.ssrMaxRoughness;
@@ -1679,6 +1779,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     memcpy(gInstanceBuf[fi]->pCpuMappedAddress, gInstCpu, (size_t)count * sizeof(RenderGpuInstance));
     memcpy(gStreamBuf[fi]->pCpuMappedAddress, gStream, (size_t)visibleTotal * 4);
     memcpy(gLightBuf[fi]->pCpuMappedAddress, gLightCpu, (size_t)F.allLightCount * sizeof(RenderGpuLight));
+    memcpy(gShapeBuf[fi]->pCpuMappedAddress, gShapeCpu, (size_t)F.allLightCount * sizeof(RenderGpuLightShape));
     memcpy(gMaterialBuf[fi]->pCpuMappedAddress, gMaterialCpu, (size_t)Materials.size() * sizeof(GpuMaterial));
     memcpy(gFrameCb[fi]->pCpuMappedAddress, &gFrameCpu, sizeof gFrameCpu);
     if (taa)
@@ -1754,7 +1855,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         Buffer*  masks = culled ? F.tileMasks : gDummyU32;
         Buffer*  bins = culled ? F.zbins : gDummyU32;
         Buffer*  views = shadows ? F.shadowViews : gDummyViews;
-        DescriptorData p[18] = {};
+        DescriptorData p[20] = {};
         Texture*       ssrDepth = ssr ? F.ssrDepth : gDummyDepth->pTexture;
         Texture*       previous = ssr ? F.previous->pTexture : gDummyColor->pTexture;
         Texture*       probeTex = probes ? F.probes->pTexture : gDummyArray->pTexture;
@@ -1762,6 +1863,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         Texture*       contactTex = contact ? F.contact : gDummyDepth->pTexture;
         Texture*       aoTex = ao ? F.ao : gDummyDepth->pTexture;
         Texture*       rtTex = rt ? F.rtReflection : gDummyColor->pTexture;
+        Texture*       rtShadowTex = rtShadows ? F.rtShadows : gDummyArray->pTexture;
         p[0].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gFrame);
         p[0].ppBuffers = &gFrameCb[fi];
         p[1].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gInstances);
@@ -1798,7 +1900,11 @@ void draw(uint32_t pass, const YeaFrame* yf)
         p[16].ppTextures = &previous;
         p[17].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gRtReflection);
         p[17].ppTextures = &rtTex;
-        updateDescriptorSet(gRenderer, fi, gSceneFrame, 18, p);
+        p[18].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gRtShadows);
+        p[18].ppTextures = &rtShadowTex;
+        p[19].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gLightShapes);
+        p[19].ppBuffers = &gShapeBuf[fi];
+        updateDescriptorSet(gRenderer, fi, gSceneFrame, 20, p);
 
         DescriptorData c[7] = {};
         c[0].mIndex = SRT_RES_IDX(CompositeSrt, PerFrame, gComposite);
@@ -1891,34 +1997,43 @@ void draw(uint32_t pass, const YeaFrame* yf)
     bind.mDepthStencil = { gDepth, LOAD_ACTION_CLEAR };
     bind.mDepthStencil.mStoreAction = STORE_ACTION_STORE;
     // With renderer_vrs, also each pixel's reflection roughness, so glossy surfaces keep full rate.
-    // With renderer_rt, each pixel's reflection roughness and normal instead (renderer_vrs reads its roughness too).
-    RenderTarget* second = rt ? gSurface : vrs && gGloss && gDepthGlossPipe[0] && gDepthGlossPipe[1] ? gGloss : nullptr;
+    // With renderer_rt, each pixel's reflection roughness and normal instead (renderer_vrs reads its roughness too), and the
+    // motion vectors, final for rt_run (the forward pass writes the same again, as its own shading rate has them).
+    RenderTarget* second = rtRun ? gSurface : vrs && gGloss && gDepthGlossPipe[0] && gDepthGlossPipe[1] ? gGloss : nullptr;
     if (second)
     {
         barrierRt(cmd, second, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_RENDER_TARGET);
         bind.mRenderTargetCount = 1;
         bind.mRenderTargets[0] = { second, LOAD_ACTION_CLEAR };
     }
+    if (rtRun)
+    {
+        barrierRt(cmd, gMotion, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_RENDER_TARGET);
+        bind.mRenderTargetCount = 2;
+        bind.mRenderTargets[1] = { gMotion, LOAD_ACTION_CLEAR }; // the sky's 0 until the sky pass
+    }
     cmdBindRenderTargets(cmd, &bind);
     cmdSetViewport(cmd, 0, 0, (float)w, (float)h, 0, 1);
     cmdSetScissor(cmd, 0, 0, w, h);
     if (geometry)
     {
-        drawVisible(cmd, fi, rt ? gDepthSurfacePipe : second ? gDepthGlossPipe : gDepthPipe);
+        drawVisible(cmd, fi, rtRun ? gDepthSurfacePipe : second ? gDepthGlossPipe : gDepthPipe);
     }
     cmdBindRenderTargets(cmd, nullptr);
     if (second)
         barrierRt(cmd, second, RESOURCE_STATE_RENDER_TARGET, RESOURCE_STATE_SHADER_RESOURCE);
+    if (rtRun)
+        barrierRt(cmd, gMotion, RESOURCE_STATE_RENDER_TARGET, RESOURCE_STATE_SHADER_RESOURCE);
     F.gloss = second;
     cmdEndDebugMarker(cmd);
     }
 
     timeEnd(cmd, fi, kTimePrepass);
-    if (culled || ao || contact || ssr || vrs || rt)
+    if (culled || ao || contact || ssr || vrs || rtRun)
     {
         barrierRt(cmd, gDepth, RESOURCE_STATE_DEPTH_WRITE, RESOURCE_STATE_SHADER_RESOURCE);
         const uint32_t which[6] = { kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeVrs, kTimeRt };
-        const bool     run[6] = { culled, ao, contact, ssr, vrs, rt };
+        const bool     run[6] = { culled, ao, contact, ssr, vrs, rtRun };
         for (uint32_t k = 0; k < 6; ++k)
         {
             if (!run[k])

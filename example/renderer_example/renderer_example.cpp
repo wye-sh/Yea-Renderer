@@ -1,6 +1,6 @@
 // The Renderer component's example view: a floor, a metal and a plastic sphere row sweeping
-// roughness, assorted shapes, a sun, many moving coloured point lights, sweeping spot lights, two
-// reflection probes, and a free-look camera (hold the mouse button to look, the move keys to fly).
+// roughness, assorted shapes, a sun, many moving coloured point lights, sweeping spot lights, four area lights (a
+// softbox, a pendant disc, a fluorescent tube and a glowing sphere), two reflection probes, and a free-look camera (hold the mouse button to look, the move keys to fly).
 // Reset: the scene is rebuilt with the lights and camera where they start.
 #include "yea_renderer_example.h"
 
@@ -11,7 +11,7 @@ namespace renderer_example
 {
 namespace
 {
-const uint32_t kMaxLights = 512, kMaxSpots = 16, kMaxSpin = 16;
+const uint32_t kMaxLights = 512, kMaxSpots = 16, kMaxSpin = 16, kAreas = 4;
 const float    kPi = 3.14159265f;
 
 struct State
@@ -40,6 +40,8 @@ struct State
     uint32_t   cylinderMesh;           // the spot lamps' housings and lenses
     yea_handle housingMaterial;
     yea_handle spotHousings[kMaxSpots];
+    yea_handle areas[kAreas];          // the area lights and their emitters' materials
+    yea_handle areaMaterials[kAreas];
 };
 State* gState;
 bool   gFreshVersion; // this version of the module hasn't built its scene yet: build it once (new meshes reach a running game)
@@ -65,7 +67,7 @@ State* state()
     if (!gState)
     {
         int fresh = 0;
-        gState = (State*)yea::host()->state("renderer_example", 5, sizeof(State), &fresh);
+        gState = (State*)yea::host()->state("renderer_example", 6, sizeof(State), &fresh);
         if (fresh)
             startCamera(gState);
     }
@@ -88,6 +90,64 @@ yea_float4 axisAngle(yea_float3 a, float angle)
 }
 
 const yea_float4 kNoRotation = { 0, 0, 0, 1 };
+
+yea_float3 cross(yea_float3 a, yea_float3 b) { return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; }
+yea_float3 normalized(yea_float3 a)
+{
+    float l = sqrtf(a.x * a.x + a.y * a.y + a.z * a.z);
+    return { a.x / l, a.y / l, a.z / l };
+}
+
+// The rotation taking the mesh's x, y and z to these (orthonormal, right-handed) axes.
+yea_float4 basis(yea_float3 x, yea_float3 y, yea_float3 z)
+{
+    float tr = x.x + y.y + z.z;
+    if (tr > 0)
+    {
+        float k = 0.5f / sqrtf(tr + 1);
+        return { (y.z - z.y) * k, (z.x - x.z) * k, (x.y - y.x) * k, 0.25f / k };
+    }
+    if (x.x > y.y && x.x > z.z)
+    {
+        float k = 2 * sqrtf(1 + x.x - y.y - z.z);
+        return { 0.25f * k, (y.x + x.y) / k, (z.x + x.z) / k, (y.z - z.y) / k };
+    }
+    if (y.y > z.z)
+    {
+        float k = 2 * sqrtf(1 + y.y - x.x - z.z);
+        return { (y.x + x.y) / k, 0.25f * k, (z.y + y.z) / k, (z.x - x.z) / k };
+    }
+    float k = 2 * sqrtf(1 + z.z - x.x - y.y);
+    return { (z.x + x.z) / k, (z.y + y.z) / k, 0.25f * k, (x.y - y.x) / k };
+}
+
+// The area lights: type (3 rect, 4 disc, 5 sphere, 6 tube), centre, facing (a tube's axis), the rect's or disc's width
+// axis, width and height as light_size takes them, range and colour.
+struct AreaLight
+{
+    uint32_t   type;
+    yea_float3 pos, dir, across;
+    float      width, height, range;
+    yea_float3 color;
+};
+const AreaLight kAreaLights[kAreas] = {
+    { 3, { -9.3f, 1.8f, -3.2f }, { 1, -0.15f, 0.1f }, { 0.1f, 0, -1 }, 1.4f, 0.9f, 10, { 1.0f, 0.95f, 0.88f } }, // softbox
+    { 4, { -5.1f, 3.4f, 2.5f }, { 0, -1, 0 }, { 1, 0, 0 }, 0.9f, 0.9f, 9, { 1.0f, 0.8f, 0.55f } },               // pendant
+    { 6, { 0.0f, 0.65f, -6.85f }, { 1, 0, 0 }, { 0, 1, 0 }, 4.0f, 0.03f, 8, { 0.8f, 0.92f, 1.0f } },              // tube
+    { 5, { 0.5f, 1.2f, 2.2f }, { 0, -1, 0 }, { 1, 0, 0 }, 0.3f, 0, 8, { 0.4f, 0.8f, 1.0f } },                     // sphere
+};
+
+// The emitting surface's area as light_color's candela count it (seen face-on: a tube's and a sphere's outline).
+float areaOf(const AreaLight& a)
+{
+    switch (a.type)
+    {
+    case 3: return a.width * a.height;
+    case 4: return kPi * 0.25f * a.width * a.height;
+    case 5: return kPi * a.width * a.width;
+    default: return a.width * 2 * a.height;
+    }
+}
 
 void place(uint32_t mesh, yea_handle material, yea_float3 pos, yea_float3 scale, yea_float4 rot = kNoRotation)
 {
@@ -154,8 +214,6 @@ void build(State* s)
     yea_handle copper = renderer::material_add({ 0.95f, 0.64f, 0.54f }, 0.3f, 1);
     yea_handle blue = renderer::material_add({ 0.08f, 0.2f, 0.7f }, 0.2f, 0);
     yea_handle green = renderer::material_add({ 0.1f, 0.5f, 0.15f }, 0.55f, 0);
-    yea_handle glow = renderer::material_add({ 0.05f, 0.05f, 0.05f }, 0.5f, 0);
-    renderer::material_emissive(glow, { 0.4f, 0.8f, 1.0f }, 40);
 
     for (int i = 0; i < 8; ++i)
     {
@@ -168,7 +226,6 @@ void build(State* s)
     place(cone, blue, { -2.0f, 0.75f, 3.5f }, { 1.2f, 1.5f, 1.2f });
     place(cone, green, { 2.5f, 1.0f, 4.0f }, { 1.4f, 2.0f, 1.4f });
     place(cylinder, steel, { 0.5f, 0.4f, 2.2f }, { 1.6f, 0.8f, 1.6f });
-    place(sphere, glow, { 0.5f, 1.2f, 2.2f }, { 0.6f, 0.6f, 0.6f });
     place(box, stone, { 0.0f, 0.25f, -7.5f }, { 18.0f, 0.5f, 1.5f });
     addSpin(s, torus, steel, { 4.0f, 1.6f, 5.5f }, { 2.6f, 2.6f, 2.6f }, { 1, 0.3f, 0 });
     addSpin(s, torus, copper, { -4.5f, 1.4f, 5.5f }, { 2.4f, 2.4f, 2.4f }, { 0, 1, 0.5f });
@@ -176,6 +233,66 @@ void build(State* s)
     addSpin(s, torus, white, { -8.5f, 1.3f, -1.0f }, { 2.2f, 2.2f, 2.2f }, { 0, 0, 1 });
 
     addProbes();
+
+    // Area lights, each with an emitter of its exact shape that casts no shadow (it would shadow its own light, as the
+    // orbs would), and dark fittings: the softbox's backing and stand, the pendant's canopy and cord, the tube's
+    // brackets. The fittings beside an emitter cast none either; the stand's pole and foot do.
+    for (uint32_t i = 0; i < kAreas; ++i)
+    {
+        const AreaLight& a = kAreaLights[i];
+        yea_float3       z = normalized(a.dir), x = normalized(a.across), y = cross(z, x);
+        s->areas[i] = renderer::light_add(a.type);
+        renderer::light_place(s->areas[i], a.pos, z);
+        renderer::light_size(s->areas[i], a.width, a.height, x);
+        renderer::light_range(s->areas[i], a.range);
+        renderer::light_shadow(s->areas[i], true);
+        s->areaMaterials[i] = renderer::material_add({ 0, 0, 0 }, 1, 0);
+        yea_float3 behind = { a.pos.x - z.x * 0.006f, a.pos.y - z.y * 0.006f, a.pos.z - z.z * 0.006f };
+        yea_handle e;
+        if (a.type == 3) // a thin slab, its face on the light's plane
+        {
+            e = renderer::instance_add(box, s->areaMaterials[i]);
+            renderer::instance_place(e, behind, basis(x, y, z), { a.width, a.height, 0.01f });
+            yea_handle back = renderer::instance_add(box, s->housingMaterial);
+            renderer::instance_place(back, { a.pos.x - z.x * 0.065f, a.pos.y - z.y * 0.065f, a.pos.z - z.z * 0.065f }, basis(x, y, z),
+                                     { a.width + 0.12f, a.height + 0.12f, 0.1f });
+            renderer::instance_shadow(back, false);
+            yea_float3 foot = { a.pos.x - z.x * 0.25f, 0, a.pos.z - z.z * 0.25f };
+            place(cylinder, s->housingMaterial, { foot.x, a.pos.y * 0.5f, foot.z }, { 0.05f, a.pos.y, 0.05f });
+            place(cylinder, s->housingMaterial, { foot.x, 0.02f, foot.z }, { 0.5f, 0.04f, 0.5f });
+        }
+        else if (a.type == 4) // a thin disc, under a canopy hung from a cord
+        {
+            yea_float4 q = basis(x, z, cross(x, z));
+            e = renderer::instance_add(cylinder, s->areaMaterials[i]);
+            renderer::instance_place(e, behind, q, { a.width, 0.01f, a.height });
+            yea_handle canopy = renderer::instance_add(cylinder, s->housingMaterial);
+            renderer::instance_place(canopy, { a.pos.x - z.x * 0.05f, a.pos.y - z.y * 0.05f, a.pos.z - z.z * 0.05f }, q,
+                                     { a.width + 0.08f, 0.08f, a.height + 0.08f });
+            renderer::instance_shadow(canopy, false);
+            yea_handle cord = renderer::instance_add(cylinder, s->housingMaterial);
+            renderer::instance_place(cord, { a.pos.x, a.pos.y + 2.09f, a.pos.z }, kNoRotation, { 0.015f, 4.0f, 0.015f });
+            renderer::instance_shadow(cord, false);
+        }
+        else if (a.type == 5)
+        {
+            e = renderer::instance_add(sphere, s->areaMaterials[i]);
+            renderer::instance_place(e, a.pos, kNoRotation, { 2 * a.width, 2 * a.width, 2 * a.width });
+        }
+        else // a tube on two brackets
+        {
+            e = renderer::instance_add(cylinder, s->areaMaterials[i]);
+            renderer::instance_place(e, a.pos, basis(x, z, cross(x, z)), { 2 * a.height, a.width, 2 * a.height });
+            for (int side = -1; side <= 1; side += 2)
+            {
+                yea_float3 b = { a.pos.x + z.x * a.width * 0.4f * side, a.pos.y - 0.075f, a.pos.z + z.z * a.width * 0.4f * side };
+                yea_handle bracket = renderer::instance_add(box, s->housingMaterial);
+                renderer::instance_place(bracket, b, kNoRotation, { 0.04f, 0.15f, 0.04f });
+                renderer::instance_shadow(bracket, false);
+            }
+        }
+        renderer::instance_shadow(e, false);
+    }
 
     s->sun = renderer::light_add(0);
     renderer::light_shadow(s->sun, true);
@@ -270,6 +387,13 @@ void animate(State* s)
         renderer::instance_place(s->spotHousings[i], { p.x - d.x * 0.16f, p.y - d.y * 0.16f, p.z - d.z * 0.16f }, q, { 0.26f, 0.3f, 0.26f });
         renderer::instance_place(s->spotMarkers[i], { p.x + d.x * 0.0f, p.y + d.y * 0.0f, p.z + d.z * 0.0f }, q, { 0.2f, 0.02f, 0.2f });
         renderer::light_range(s->spots[i], 20); // reaches the far edge of the sweep (11.9 m) at 77% of the inverse square
+    }
+    for (uint32_t i = 0; i < kAreas; ++i)
+    {
+        // One luminance for every emitter: each light's candela is it times the emitter's area.
+        const AreaLight& a = kAreaLights[i];
+        renderer::light_color(s->areas[i], a.color, settings.area_luminance * areaOf(a));
+        renderer::material_emissive(s->areaMaterials[i], a.color, settings.area_luminance);
     }
     for (uint32_t i = 0; i < s->spinCount; ++i)
         renderer::instance_place(s->spin[i], s->spinPos[i], axisAngle(s->spinAxis[i], t * 0.6f + (float)i), s->spinScale[i]);

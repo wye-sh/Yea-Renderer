@@ -22,7 +22,8 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   the most over-served face is halved until all fit 90% of the atlas. It logs the sizes, the atlas fill and what the
   faces wanted when they change (at most every 20 s, by the clock). The atlas sizes itself: it starts at 4096 (or
   local_atlas_resolution, if smaller) and doubles, up to that knob, once the faces have wanted more than fits for a
-  second, on cards of 6 GB or more (total VRAM, until Yea reports the free budget); never smaller while running, and
+  second, when the driver's free budget (yea::deviceMemory, asked only then) holds the growth plus an eighth of the
+  budget (at least 512 MB), or, where the driver can't say, on cards of 6 GB or more (total VRAM); refused, it asks again in 10 s; never smaller while running, and
   every light is redrawn on the frame it grows. Up to 64 lights are shadowed (shadowed_lights), the most important on
   screen first (intensity times their reach's size on screen).
   Sampling (in the core's Lighting.h.fsl): every filter tap compares against the receiver's own depth
@@ -30,7 +31,9 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   columns of its inverse, `inv` in the shadow view, three dot products; no screen derivatives, as lights are
   shaded in loops), so the normal offset can stay small. Point and spot lights harden at contact (PCSS: 4 gathers on
   the search disk's rim first, 16 depths that decide fully lit or umbra; only penumbrae gather 4 more, the 32
-  depths averaged raw and turned into the blockers' distance with one divide, giving a penumbra from `light_size`;
+  depths averaged raw and turned into the blockers' distance with one divide, giving a penumbra from each light's own
+  size, else `light_size`, at most 24 texels and 8–25% of the tile with the light's size; past 8 texels a golden-angle
+  spiral of up to 48 taps keeps it smooth. Soft lights' tiles are sized by screen footprint like every other's;
   keep divides out of the rim, which every pixel runs). With TAA, cascade transitions
   pick one cascade per pixel (dithered) and the filters' noise turns each frame.
 - `renderer_taa`: temporal antialiasing. Picks a Halton sub-pixel jitter each frame; the core then renders
@@ -157,12 +160,17 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   Nothing of Microsoft's ships.
 - The core calls the others through optional imports with a `RenderFrame*` (as `u64`): `frame.h`, copied
   identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes`, `renderer_ssr`, `renderer_vrs`, `renderer_rt` and `renderer_upscale` (`mathx.h` into the
-  first three). Change all copies together and raise `RENDER_FRAME_VERSION`. `upscale_prepare`, then `taa_prepare` run first,
+  first three). Change all copies together and raise `RENDER_FRAME_VERSION`. Ray-traced shadows (frame v15): renderer_rt's `rt_pick`, called just
+  before `shadows_prepare`, marks the lights (`RenderLight.traced`) and the sun (`rtSunShadows`) it traces; renderer_shadows
+  then draws no cascades for a traced sun and no tiles for traced lights, the core writes LightData params.w = 2 + n for
+  them, and the forward pass reads `rtShadows` (slice 0 the sun, 1 + n light n) instead of their maps. While renderer_rt
+  runs, the surface prepass also writes the motion vectors, so they are this frame's in `rt_run`. `upscale_prepare`, then `taa_prepare` run first,
   before the camera, so the jitter reaches the projection.
 
 ## Hook-up points (exports of `renderer`)
 
-Units: metres; sun intensity in lux, point and spot in candela. Colours linear RGB.
+Units: metres; sun intensity in lux, point, spot and area lights in candela (an area light's seen face-on; its
+surface's luminance is that over its area). Colours linear RGB.
 - Meshes: `mesh_box/sphere/plane/cylinder/cone/torus` (unit size, centred), or `mesh_begin`,
   `mesh_vertex(pos, normal)` (returns a local index), `mesh_triangle`, `mesh_end` → mesh id. Meshes are
   uploaded when they change (a stall: build them up front). A triangle faces where cross(b - a, c - a)
@@ -182,9 +190,15 @@ Units: metres; sun intensity in lux, point and spot in candela. Colours linear R
 - Instances: `instance_add(mesh, material)`, `instance_place(i, pos, quat, scale)`, `instance_material`,
   `instance_shadow(i, cast)`, `instance_remove`. Only call `instance_place` when it moved: a move redraws
   local shadows near it.
-- Lights: `light_add(type)` (0 sun, 1 point, 2 spot), `light_place(l, pos, dir)`, `light_color(l, rgb,
-  intensity)`, `light_range`, `light_cone(inner°, outer°)`, `light_shadow(l, cast)`, `light_remove`. The
-  first sun gets the cascades; up to 4 suns.
+- Lights: `light_add(type)` (0 sun, 1 point, 2 spot; area lights 3 rect, 4 disc, 5 sphere, 6 tube),
+  `light_place(l, pos, dir)`, `light_size(l, width, height, across)` (rect: width along `across` by height; disc:
+  its diameters the same way; sphere: radius in width; tube: length along dir in width, radius in height; point and
+  spot: a source radius for soft shadows), `light_color(l, rgb, intensity)`, `light_range`, `light_cone(inner°,
+  outer°)`, `light_shadow(l, cast)`, `light_remove`. The first sun gets the cascades; up to 4 suns. Rects and discs
+  light the side dir points to. Area lights shade by LTC (our own fit to the renderer's GGX, `tools/ltc_fit.cpp` →
+  `Assets/ltc.bin`; Heitz et al. 2016, 2017); to every other module they are point lights (a cube of shadow tiles)
+  whose `RenderLight.kind` and `size` (the radius of a disc of their area) give their penumbra and face margin.
+  Give an area light an emitter of its exact shape that casts no shadow.
 - `camera(eye, target, fov°)`, `clear()` (removes everything but probes).
 - Reflection probes (exports of `renderer_probes`): `probe_add(pos, box_min, box_max)` (capture point and
   the world box where it is used and reflections are projected onto; put the box's bottom just under the
@@ -308,7 +322,9 @@ for screen reflections (a quarter of it at half resolution).
 Floor, gold and red sphere rows sweeping roughness, pillars and assorted shapes, spinning tori, a sun,
 `light_count` moving coloured point lights (markers glow in their colour; the first `shadowed_points` cast
 shadows; all of them by default), `spot_count` sweeping shadowed spots (each a lamp: a dark body aimed along the beam,
-its lens glowing in the light's colour; neither casts shadows), two reflection probes (the sphere rows, the whole yard), a free-look camera: holding its `look` action (left mouse button) after a press on the game
+its lens glowing in the light's colour; neither casts shadows), four area lights at `area_luminance` (cd/m²): a
+softbox on a stand by the sphere rows, a pendant disc over the white boxes, a fluorescent tube on the stone ledge,
+the glowing sphere on the steel drum, two reflection probes (the sphere rows, the whole yard), a free-look camera: holding its `look` action (left mouse button) after a press on the game
 asks the host for the mouse each frame (`yea::captureMouse(true)`: hidden, kept in the window) and turns by
 `yea_mouse_dx`/`yea_mouse_dy` (`look_sensitivity`); the move keys fly (WASD, Q/E down/up, `move_speed`).
 The host lets go when the button is up (it is no longer asked), F1 opens, focus is lost, or on a view switch

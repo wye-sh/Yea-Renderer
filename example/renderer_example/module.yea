@@ -18,6 +18,7 @@ import renderer handle light_add(u32 type) = 4294967295
 import renderer void light_place(handle l, float3 pos, float3 dir)
 import renderer void light_color(handle l, float3 color, float intensity)
 import renderer void light_range(handle l, float range)
+import renderer void light_size(handle l, float width, float height, float3 across)
 import renderer void light_cone(handle l, float inner_deg, float outer_deg)
 import renderer void light_shadow(handle l, bool cast)
 import renderer void light_remove(handle l)
@@ -40,6 +41,8 @@ setting float light_speed 0.4 0 inf
 setting int shadowed_points 512 0 512
 setting int spot_count 4 0 16
 setting float spot_intensity 40000 0 inf
+# The area lights' surface brightness (cd/m2): the softbox, the pendant, the tube and the glowing sphere.
+setting float area_luminance 6000 0 inf
 category Sun
 setting float sun_intensity 400 0 inf
 setting color sun_color 1 0.82 0.65

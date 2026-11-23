@@ -6,6 +6,7 @@
 #include "frame.h"
 #include "mathx.h"
 
+#include <yea/device.h>
 #include <stdio.h>
 #include <chrono>
 
@@ -36,7 +37,7 @@ struct Group
     uint32_t              used; // this frame
     uint64_t              rendered;
     uint64_t              seen;
-    float                 key[9];
+    float                 key[10];
     RenderGpuShadowView views[6];
     uint8_t               k[6];   // each face's square, in cells per side (sized by its own footprint on screen)
     uint32_t              nfaces; // squares held (0: none)
@@ -322,7 +323,17 @@ void perspective(RenderGpuShadowView& v, v3 eye, v3 f, float tanHalf, float near
 
 const v3 kFaces[6] = { { 1, 0, 0 }, { -1, 0, 0 }, { 0, 1, 0 }, { 0, -1, 0 }, { 0, 0, 1 }, { 0, 0, -1 } };
 
-void lightKey(const RenderLight& l, float key[9])
+// A light's penumbra reaches a share of its tile, 8% to 25% with its radius (the forward pass's lightShadowSize and
+// localShadow take the same): 0 without contact-hardening.
+float penumbraShare(const RenderLight& l)
+{
+    if (!settings.contact_hardening)
+        return 0.0f;
+    float size = l.size > 0 ? l.size : settings.light_size;
+    return size > 0 ? clampf(size * 0.5f, 0.08f, 0.25f) : 0.0f;
+}
+
+void lightKey(const RenderLight& l, float key[10])
 {
     key[0] = l.pos[0];
     key[1] = l.pos[1];
@@ -333,6 +344,7 @@ void lightKey(const RenderLight& l, float key[9])
     key[6] = l.range;
     key[7] = l.cosOuter;
     key[8] = (float)l.type;
+    key[9] = penumbraShare(l);
 }
 
 // When the faces' sizes change, at most every 20 s: how many faces hold each size, and how full the atlas is.
@@ -340,6 +352,7 @@ double   gLogTime = -1e9; // when the faces were last logged (s)
 uint32_t gLogSizes[5];
 uint32_t gWanted; // cells the faces wanted this frame, before they were fitted into the atlas
 uint32_t gLocalAuto;      // the lights' atlas size it has grown to (0: not yet chosen)
+bool     gRefusedLogged; // the last growth asked for was refused and logged (log the next refusal only after a growth)
 double   gOverSince = -1; // since when the faces have wanted more than fits (s), or -1
 bool     gRedrawAll;      // the atlas was just made larger: every light is redrawn this frame
 double secondsNow() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -432,8 +445,9 @@ void gatherReceivers(const RenderFrame* F, const mx::Plane* frustum)
 // receivers in it: the casters in view (recv, those within the light's range), where a 5 x 5 grid of rays across the
 // face meets them inside the camera's view and the light's range, plus the centres of casters too small for the rays to
 // be sure of. Empty space never asks for texels: a face over nothing but air keeps the smallest square. 0: no receiver
-// in view; -1: the camera sees none of the face.
-float faceWant(const RenderFrame* F, v3 p, v3 dir, float t, float range, float focal, const uint32_t* recv, uint32_t recvCount)
+// in view; -1: the camera sees none of the face, or it is wholly behind a one-sided light.
+// lit: a one-sided light's normal (rects, discs), which lights nothing behind it; else null.
+float faceWant(const RenderFrame* F, v3 p, v3 dir, float t, float range, float focal, const uint32_t* recv, uint32_t recvCount, const v3* lit)
 {
     auto toView = [&](v3 q, float w) {
         return V(F->view[0][0] * q.x + F->view[0][1] * q.y + F->view[0][2] * q.z + F->view[0][3] * w,
@@ -463,11 +477,20 @@ float faceWant(const RenderFrame* F, v3 p, v3 dir, float t, float range, float f
     // The receivers that reach into the face: their spheres against its four side planes.
     uint32_t mine[kReceivers], count = 0;
     v3       side[4] = { normalize(dir * t - right), normalize(dir * t + right), normalize(dir * t - up), normalize(dir * t + up) };
+    if (lit)
+    {
+        // Wholly behind a one-sided light: it lights nothing there.
+        bool front = false;
+        for (uint32_t c = 0; c < 4 && !front; ++c)
+            front = dot(dir + right * (c & 1 ? t : -t) + up * (c & 2 ? t : -t), *lit) > 0.0f;
+        if (!front)
+            return -1.0f;
+    }
     for (uint32_t i = 0; i < recvCount; ++i)
     {
         const Receiver& r = gRecv[recv[i]];
         v3              d = r.c - p;
-        bool            in = dot(d, dir) > -r.r;
+        bool            in = dot(d, dir) > -r.r && (!lit || dot(d, *lit) > -r.r);
         for (uint32_t k = 0; k < 4 && in; ++k)
             in = dot(d, side[k]) > -r.r;
         if (in)
@@ -490,6 +513,8 @@ float faceWant(const RenderFrame* F, v3 p, v3 dir, float t, float range, float f
         for (int k = 0; k < 5; ++k)
         {
             v3    rw = normalize(dir + right * (t * (i * 0.5f - 1.0f)) + up * (t * (k * 0.5f - 1.0f)));
+            if (lit && dot(rw, *lit) <= 0.0f)
+                continue;
             v3    r = toView(rw, 0.0f);
             float s0 = 0.0f, s1 = range;
             clipRay(o.z - nearZ, r.z, &s0, &s1);
@@ -533,13 +558,12 @@ void buildLocalViews(Group& g, const RenderLight& l)
         {
             // Past 90 degrees by the widest filter the shader may use at the face's edge (where it switches faces),
             // so every tap lands in this face's own drawn texels: the PCF disk (softness, a quarter of it under
-            // contact-hardening, whose penumbra reaches min(24, 8% of the tile) texels and whose blocker search
+            // contact-hardening, whose penumbra reaches min(24, the light's share of the tile) texels and whose blocker search
             // 12), plus 2 for the bilinear compare and the 2 x 2 gathers. A narrower margin clamps the taps to the
             // tile's border texels, which draws a false shadow line along each face edge: a square around the
             // light's foot that moves with it.
-            float guard = settings.contact_hardening && settings.light_size > 0
-                              ? maxf(minf(24.0f, 0.08f * tileRes) + 0.25f * settings.softness, 12.0f) + 2.0f
-                              : settings.softness + 2.0f;
+            float share = penumbraShare(l);
+            float guard = share > 0 ? maxf(minf(24.0f, share * tileRes) + 0.25f * settings.softness, 12.0f) + 2.0f : settings.softness + 2.0f;
             tanHalf = tileRes / maxf(tileRes - 2.0f * guard, tileRes * 0.5f);
             perspective(v, p, kFaces[f], tanHalf, nearZ, l.range);
         }
@@ -707,7 +731,13 @@ bool shadows_prepare(uint64_t address)
 {
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
     gLightShadowsOn = false;
-    if (!gReady || (!settings.enabled && !settings.light_shadows) || !F || F->version != RENDER_FRAME_VERSION)
+    if (!gReady || !F || F->version != RENDER_FRAME_VERSION)
+        return false;
+    // The lights' real sizes for renderer_rt's traced penumbrae: always, whatever the maps' own filtering (pcss,
+    // contact_hardening) and even with the maps off.
+    F->rtSunAngle = settings.sun_size * 3.14159265f / 180.0f;
+    F->rtLightRadius = settings.light_size;
+    if (!settings.enabled && !settings.light_shadows)
         return false;
 
     // Atlases and pipelines follow the knobs.
@@ -715,10 +745,11 @@ bool shadows_prepare(uint64_t address)
     uint32_t res = pow2Floor(clampu(settings.sun_resolution, 512, 4096));
     uint32_t sunSize = cascades > 1 ? res * 2 : res;
     // The lights' atlas sizes itself: from 4096 (or the knob, if smaller), doubled up to the knob once the faces have
-    // wanted more than fits for a second, as far as the card's memory allows (8192 on cards of 6 GB or more). It never
-    // shrinks while the game runs (only when the knob is lowered), so a light's detail doesn't come and go.
-    uint64_t vram = gRenderer->pGpu ? gRenderer->pGpu->mVRAM : 0;
-    uint32_t localMax = pow2Floor(clampu(settings.local_atlas_resolution, 1024, vram >= (6ull << 30) ? 8192 : 4096));
+    // wanted more than fits for a second, as far as the card's memory allows. It never shrinks while the game runs (only
+    // when the knob is lowered), so a light's detail doesn't come and go. Memory is asked only then: the driver's free
+    // budget (yea::deviceMemory) must hold the growth with a margin left for the rest of the game (an eighth of the
+    // budget, at least 512 MB); where it can't say, cards of 6 GB or more grow to 8192. Refused, it asks again in 10 s.
+    uint32_t localMax = pow2Floor(clampu(settings.local_atlas_resolution, 1024, 8192));
     if (!gLocalAuto || gLocalAuto > localMax)
         gLocalAuto = localMax < 4096 ? localMax : 4096;
     double now = secondsNow();
@@ -728,12 +759,32 @@ bool shadows_prepare(uint64_t address)
             gOverSince = now;
         else if (now - gOverSince >= 1.0)
         {
-            char line[160];
-            snprintf(line, sizeof line, "renderer_shadows: the lights' atlas grows to %u (%u MB): its faces wanted %u%% of %u", gLocalAuto * 2,
-                     (gLocalAuto * 2 / 1024) * (gLocalAuto * 2 / 1024) * 4, gWanted * 100 / (gSide * gSide), gLocalAuto);
-            yea::log(line);
-            gLocalAuto *= 2;
-            gRedrawAll = true; // every light at once in the new atlas, so none is left without its shadow
+            uint64_t        extra = 3ull * gLocalAuto * gLocalAuto * 4; // 4 bytes a texel, the new atlas less the old
+            YeaDeviceMemory m = {};
+            bool            known = yea::deviceMemory(&m);
+            uint64_t        total = m.total ? m.total : (gRenderer->pGpu ? gRenderer->pGpu->mVRAM : 0);
+            uint64_t        margin = m.budget / 8 > (512ull << 20) ? m.budget / 8 : (512ull << 20);
+            uint64_t        free = m.budget > m.usage ? m.budget - m.usage : 0;
+            bool            room = known ? free >= extra + margin : total >= (6ull << 30);
+            char            line[200];
+            if (room)
+            {
+                snprintf(line, sizeof line, "renderer_shadows: the lights' atlas grows to %u (%u MB): its faces wanted %u%% of %u; %s %u MB free",
+                         gLocalAuto * 2, (gLocalAuto * 2 / 1024) * (gLocalAuto * 2 / 1024) * 4, gWanted * 100 / (gSide * gSide), gLocalAuto,
+                         known ? "the card has" : "no budget known, total", (uint32_t)((known ? free : total) >> 20));
+                gLocalAuto *= 2;
+                gRedrawAll = true; // every light at once in the new atlas, so none is left without its shadow
+                gOverSince = -1;
+            }
+            else
+            {
+                snprintf(line, sizeof line, "renderer_shadows: the lights' atlas stays %u: its faces want %u%% of it, but %s %u MB free", gLocalAuto,
+                         gWanted * 100 / (gSide * gSide), known ? "the card has" : "no budget known, total", (uint32_t)((known ? free : total) >> 20));
+                gOverSince = now + 9.0; // ask again in 10 s
+            }
+            if (room || !gRefusedLogged)
+                yea::log(line);
+            gRefusedLogged = !room;
         }
     }
     else
@@ -771,7 +822,7 @@ bool shadows_prepare(uint64_t address)
     }
     gSunRes = res;
     // The point lights' faces are drawn wider for wider filters (buildLocalViews): redraw them when those change.
-    float guardKey = settings.softness + (settings.contact_hardening && settings.light_size > 0 ? 1000.0f : 0.0f);
+    float guardKey = settings.softness + (settings.contact_hardening ? 1000.0f : 0.0f);
     if (guardKey != gGuardKey)
     {
         for (Group& g : gGroups)
@@ -798,7 +849,7 @@ bool shadows_prepare(uint64_t address)
         memset(views, 0, sizeof(RenderGpuShadowView) * kSunViews);
         gCascades = 0;
     }
-    if (!gFrozen && settings.enabled && F->sunOn && F->sunShadow)
+    if (!gFrozen && settings.enabled && F->sunOn && F->sunShadow && !F->rtSunShadows) // traced: renderer_rt has it
     {
         gCascades = cascades;
         v3    toSun = normalize(V(F->sunDir[0], F->sunDir[1], F->sunDir[2]));
@@ -893,7 +944,7 @@ bool shadows_prepare(uint64_t address)
     {
         RenderLight& l = F->lights[i];
         l.shadow = -1;
-        if (!l.castShadow || !wanted)
+        if (!l.castShadow || !wanted || l.traced >= 0) // traced lights: renderer_rt has them
             continue;
         v3    d = V(l.pos[0], l.pos[1], l.pos[2]) - camPos;
         float dist = maxf(length(d) - l.range, 1.0f);
@@ -1003,7 +1054,9 @@ bool shadows_prepare(uint64_t address)
             {
                 v3    dir = l.type == 1 ? kFaces[f] : normalize(V(l.dir[0], l.dir[1], l.dir[2]));
                 float t = l.type == 1 ? 1.0f : tanf(minf(acosf(clampf(l.cosOuter, -1, 1)) * 1.05f + 0.02f, 1.48f));
-                float want = faceWant(F, p, dir, t, l.range, focal, recv, whole >= 0.0f ? 0 : recvCount);
+                v3    lit = V(l.dir[0], l.dir[1], l.dir[2]);
+                bool  oneSided = l.kind == 3 || l.kind == 4;
+                float want = faceWant(F, p, dir, t, l.range, focal, recv, whole >= 0.0f ? 0 : recvCount, oneSided ? &lit : nullptr);
                 g.need[f] = want < 0.0f ? 0.0f : whole >= 0.0f ? whole : want;
             }
             g.needOk = 1;
@@ -1023,6 +1076,8 @@ bool shadows_prepare(uint64_t address)
                 uint32_t held = g.nfaces == faces ? g.k[f] : 0;
                 if (held && want > 0.0f && want < held * 2.0f)
                     k = want >= held * 0.5f ? held : k * 2; // shrink with a margin, so it doesn't grow straight back
+                // Soft lights are sized as every other: a penumbra is only wide where its blocker is far from the
+                // receiver, and sharp at contact however big the light, so a coarser tile would step those edges.
                 target[j][f] = k < maxCells ? k : maxCells;
                 shown[f] = want > 0.0f;
             }
@@ -1099,7 +1154,7 @@ bool shadows_prepare(uint64_t address)
         Group&               g = gGroups[groupOf[j]];
         const RenderLight& l = F->lights[picked[j]];
         g.seen = F->frameNumber;
-        float key[9];
+        float key[10];
         lightKey(l, key);
         bool stale = !g.valid || memcmp(key, g.key, sizeof key) != 0 || F->casterRemoved >= g.rendered;
         if (!stale && latestMove >= g.rendered)
@@ -1158,7 +1213,7 @@ bool shadows_prepare(uint64_t address)
     F->showCascades = (settings.show_cascades ? 1u : 0u) | (settings.show_atlas ? 2u : 0u);
     F->sunTexel = 1.0f / (float)gSunSize;
     F->localTexel = 1.0f / (float)gLocalSize;
-    F->localLightSize = settings.contact_hardening ? settings.light_size : 0.0f;
+    F->localLightSize = settings.contact_hardening ? (settings.light_size > 0 ? settings.light_size : -1.0f) : 0.0f;
     F->receiverPlane = settings.receiver_plane;
     return true;
 }
