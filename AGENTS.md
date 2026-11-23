@@ -318,7 +318,7 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   draws indirectly: camera-facing round sprites, premultiplied into `hdr` (additive ones write alpha 0), soft against
   the prepass depth (`soft_distance`) and the camera (`near_fade`), behind the froxel fog at their depth, before
   exposure, TAA and the upscaler; their coverage adds into the core's `reactive` (TAA takes up to 0.6 more of the
-  current frame there; renderer_upscale's FSR reactive and DLSS bias masks read it). Only at one sample (no MSAA). The draw pipeline is queued on Yea's compile threads by the first particles_prepare (never made on a
+  current frame there; renderer_upscale's FSR reactive mask reads it). Only at one sample (no MSAA). The draw pipeline is queued on Yea's compile threads by the first particles_prepare (never made on a
   drawing frame; particles simulate undrawn until it is ready; made in load() on a host without the service).
   The core sets frame `keepShadowMaps` (v19's fogShadowMaps) while fog or particles run. Every GPU object is freed in
   `unload()`.
@@ -410,8 +410,9 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   allocated in this module's own `update()`, never in `upscale_prepare`. Jitter: Halton 2,3 over 8 x ratio² phases;
   the render size is the vendors' ratio per quality mode (DLSS's own `renderSize` for DLSS); the core's exposure is copied into a 1x1 texture (one tiny
   dispatch); the upscalers' own sharpening is off. Particles' and glass's coverage (frame.h `reactive`, when set) is FSR's
-  reactive mask and DLSS's `biasColour`; glass's alone (`transparency`) is FSR's transparency-and-composition mask and
-  DLSS's `transparency` (dlss.h version 2, Yea 146; an older host ignores both). After one records, The Forge's bound state is forgotten so its next binds
+  reactive mask; glass's alone (`transparency`) is FSR's transparency-and-composition mask. DLSS gets neither (its
+  `biasColour` and `transparency` are nullptr, 6.1.1): with them set, Yea crashed in The Forge on an RTX 2080; pass them
+  again once Yea's DLSS service (dlss.h version 2) is fixed. After one records, The Forge's bound state is forgotten so its next binds
   are made in full. Lines said from `upscale_prepare` wait for this module's `update()`, so they are filed under
   renderer_upscale: which upscaler is picked and runs, its sizes, and why FSR can't run.
   Nothing of Microsoft's ships.
@@ -735,16 +736,15 @@ for the decals in its tile and z-bin (a box test, then up to three map reads or 
 
 ## Pitfalls
 
-- 6.1.0 is a diagnostic release for a lost Direct3D 12 device (DXGI_ERROR_INVALID_CALL on an RTX 2080, after the core
-  remade its scene for TAA). Its defaults are safe ones, and the next release puts the real ones back: msaa 1;
-  renderer_rt enabled, renderer_gi gi, renderer_particles particles, renderer_shadows glass_shadows, renderer_sky
-  physical_sky, renderer_vrs, renderer_ao, renderer_contact and renderer_ssr enabled all off; the core's refraction and
-  decals off; the example's dust, steam, glass, decals and models off. `modules/test_renderer_bisect` turns them on one
-  at a time. On Windows the core and renderer_particles compile on the main thread (no `yea::pipelines()`) until
-  Yea 149. The core keeps its last passes (`crumb`, at each timeEnd), logs them at unload, and logs the first frame with
-  each pass and with VRS's rates bound. Fixed in it: the forward pass bound renderer_vrs's rate image on frames
-  vrs_run hadn't written it (no gloss target while its prepass pipelines warmed). The image was unwritten and, when
-  just made, in UNORDERED_ACCESS. The core now binds rates only when vrs_run's own guard holds.
+- 6.1.0 was a diagnostic release for a lost Direct3D 12 device and a TheForge.dll access violation on an RTX 2080,
+  with safe defaults (6.1.1 put the real ones back). Its bisect (`modules/test_renderer_bisect`, every part on one
+  step at a time) ran clean through VRS with everything else on, and died at DLSS with particles and glass on: DLSS
+  given the see-through pass's masks (dlss.h version 2, Yea 148). renderer_upscale passes DLSS no masks until Yea's
+  service takes them (FSR keeps them). On Windows the core and renderer_particles compile on the main thread (no
+  `yea::pipelines()`) until Yea 149. The core keeps its last passes (`crumb`, at each timeEnd), logs them at unload and
+  logs the first frame with each pass and with VRS's rates bound. The forward pass binds renderer_vrs's rate image only
+  when vrs_run's own guard holds: on frames it hadn't written it (no gloss target while its prepass pipelines warmed)
+  the image was unwritten and, just made, in UNORDERED_ACCESS.
 - Third-party material: every addition or removal updates both `licenses.json` and `LICENSES.txt` (its name,
   what uses it, source, verbatim licence text with its copyright line) in the same commit.
 - Code run per light per pixel (`brdfLight`, the shadow filters) stays free of sin, cos, pow and per-tap sqrt: the

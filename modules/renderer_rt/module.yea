@@ -9,7 +9,7 @@ export bool rt_pick(u64 frame)
 category Ray-Traced Reflections
 # Reflections found by tracing rays through the scene, also of what is off screen or hidden. Only on GPUs
 # with ray tracing (hidden elsewhere), with Anti-aliasing (TAA) on; elsewhere Screen Reflections and the probes show.
-setting bool enabled false
+setting bool enabled true
 needs enabled raytracing
 player enabled
 # Surfaces rougher than this keep the probes' blurred reflections; traced ones fade out towards it.

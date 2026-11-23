@@ -5,7 +5,7 @@ export bool ao_prepare(u64 frame)
 export void ao_run(u64 frame)
 
 category Ambient Occlusion
-setting bool enabled false
+setting bool enabled true
 player enabled
 # Computed at half size and upsampled along edges: about a quarter of the cost, slightly softer in fine creases.
 setting bool half_resolution true

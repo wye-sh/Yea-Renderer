@@ -9,7 +9,7 @@ export void sky_run(u64 frame)
 category Atmosphere
 # The sky as Earth's atmosphere makes it: blue overhead, paler at the horizon, red and gold at sunset, its light
 # following the sun. Off: the Sky settings' plain gradient.
-setting bool physical_sky false
+setting bool physical_sky true
 # Haze: dust and droplets in the air (1: a clear day; higher is hazier, with a brighter halo round the sun).
 setting float haze 1 0 inf
 # How strongly the air scatters blue (1: Earth's).

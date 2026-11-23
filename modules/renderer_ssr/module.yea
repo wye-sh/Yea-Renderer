@@ -7,7 +7,7 @@ export void ssr_run(u64 frame)
 category Screen Reflections
 # Glossy surfaces reflect what is on screen exactly (from last frame's image), over the reflection
 # probes; where the reflected thing is off screen, the probes show. Needs Anti-aliasing (TAA) on.
-setting bool enabled false
+setting bool enabled true
 player enabled
 # Traces against half-size depth: faster, thin things may be missed.
 setting bool half_resolution false

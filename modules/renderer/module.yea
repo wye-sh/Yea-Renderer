@@ -368,7 +368,7 @@ setting float dark_adaptation 0.6 0 1
 # industry's ACES look (contrasty, warm highlights); Tony McMapface is Tomasz Stachowiak's neutral 3D table.
 setting choice tonemapper Khronos_PBR_Neutral Khronos_PBR_Neutral AgX Hable_Filmic Reinhard None ACES_Fitted Tony_McMapface
 category Anti-aliasing
-setting int msaa 1 1 8
+setting int msaa 4 1 8
 setting float specular_aa 1 0 2
 category Sky
 setting color sky_color 0.22 0.38 0.85
@@ -382,10 +382,10 @@ setting float near_plane 0.05 0.01 inf
 category Performance
 setting bool gpu_timings true
 # Decals (decal_add) painted on the scene; off saves their cost.
-setting bool decals false
+setting bool decals true
 # Glass bends and blurs what is behind it (material_refraction, rough see-through surfaces); off: seen straight through,
 # unblurred (saves a copy of the scene and its blurred levels while glass is in view).
-setting bool refraction false
+setting bool refraction true
 # How far a mesh's outline may be off on screen (display pixels) before a simpler version of it is drawn; 0 always
 # draws the finest. Built-in shapes only: meshes made vertex by vertex have one version.
 setting float lod_error 0.5 0 inf
