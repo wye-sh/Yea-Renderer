@@ -30,6 +30,19 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   nearest RENDER_MAX_BLEND_RUNS), and the core calls `particles_draw(frame, run)` just before each surface, so steam
   behind a pane is seen through it. F1's view modes draw blended surfaces as opaque ones. Their pipelines (`gBlendPipe`) are warmed with the rest and never made on a frame that
   draws: until they are, blended surfaces wait.
+- Refraction (the core, 4.9.0; no frame change): `material_refraction(m, ior, thickness, shape, tint)` (Table
+  `MaterialRefraction`; the Scene SRT's `gRefraction`, two float4 a material: ior, thickness, shape, given; tint). Tint
+  multiplies T everywhere (MSAA too). In the see-through pass only (one sample a pixel; knob `refraction`,
+  FLAG_REFRACTION while a refracting surface is in view): the scene colour chain `gChain` (RGBA16F, render size, up to 7
+  levels to ~8 px; `gSceneColor`), Chain.comp.fsl: level 0 a copy of hdr, then Jimenez 2014's 13-tap downsample, the
+  first Karis-weighted (no fireflies). Copied over the whole screen before the first refracting surface, then again over
+  the dirty rectangle (blended surfaces' screen rectangles since the last copy, the whole screen for a particle run)
+  before one whose rectangle, widened by its size each way, meets it: at most kChainCopies (6) a frame, so glass sees
+  glass and steam behind it. A refracting surface's multiply writes 0 and its add puts T times the chain at the bent
+  ray's landing (Forward.frag `refractedScene`: thin a slab, solid a ball refracted in and out, landing found in two
+  steps on gSceneDepth, a landing in front of the glass taking the straight view; mip from roughness x distance behind),
+  fog kept exact. A solid one draws its near side only; a thin double-sided one its far side, a recopy, its near side.
+  `transparency` is 1 over refracting glass. Not in MSAA, probe captures or ray-traced hits yet.
 - Decals (the core, frame v23): `decal_add` and friends (Table `Decal`, 4096). Up to RENDER_MAX_DECALS (256) in view
   a frame, sorted by priority then add order (`gDecalList`; past 256 the lowest go), as GpuDecal rows (a world-to-box
   matrix, axes, look, maps' slots, a noise seed). Applied in the forward pass before any lighting (DOOM 2016's
@@ -421,6 +434,8 @@ surface's luminance is that over its area). Colours linear RGB.
   below it; 0 opaque). Tables `TextureMap` (a row a shader slot), `TexturePath`, `MaterialMap`.
 - See-through: `material_blend(m, opacity)` (glass, lenses, visors, water; opacity times the base colour's alpha is how
   much of the surface is there, its reflection stays whole; 0 opaque). Blended surfaces cast no shadows yet.
+  `material_refraction(m, ior, thickness, shape, tint)`: how it bends (thin pane 0, solid ball or block 1), blurs (by its
+  roughness: frosted glass) and tints what is behind it. Knob `refraction` (Performance) turns the bending and blur off.
   renderer_models calls `material_blend(m, 1)` for glTF BLEND materials, their alpha in the factors.
 - Decals: `decal_add(pos, quat, half)` (a box; it paints along its -z, its z out of the surface), `decal_place`,
   `decal_look(d, albedo+opacity, roughness, metallic, emissive, nits, weights)` (weights: colour and glow, roughness,
@@ -584,7 +599,9 @@ HDR + depth at 4x MSAA, sun atlas 4096² D32 (64 MB), local atlas 4096² (64 MB)
 for screen reflections (a quarter of it at half resolution).
 
 See-through surfaces: per visible blended instance two draws a side (multiply, add) with the forward shader's lighting,
-sorted on the CPU (one qsort); particles add one tiny split dispatch and an indirect draw a run. Decals: their
+sorted on the CPU (one qsort); particles add one tiny split dispatch and an indirect draw a run. Refraction, while
+refracting glass is in view: a copy of the scene and its blurred levels (about 1.4 copies' worth of pixels), plus a
+partial copy where glass is behind glass or steam, and a few depth reads a glass pixel. Decals: their
 spheres binned with the lights (one more mask loop in the culling dispatch); in the forward pass each pixel pays only
 for the decals in its tile and z-bin (a box test, then up to three map reads or a few noise taps).
 
@@ -669,7 +686,8 @@ Types: `sun`, `points`, `spots`, `rects`, `discs`, `spheres`, `tubes`, each off 
 emitters (their fittings stay). Particles (`state Particles`, each emitter's handle + 1): `dust` (motes over the
 middle of the floor, 500 a second, 6 to 10 s, scattering forwards so they glint towards the sun and lamps) and `steam`
 (off the steel drum's top, rising and spreading), each off removing its emitter; Glass and Decals: `glass` (a clear pane
-between the start view and the steam, a teal one behind it, a clear ball by the path) and `decals` (a scorch by the white
+between the start view and the steam, a teal one behind it, a frosted one beside them, a solid glass ball by the path, all
+refracting) and `decals` (a scorch by the white
 boxes, worn yellow lines along the path with a puddle over them, green patina on the copper block, a glowing cyan strip on
 the stone ledge), switching either building the scene again; `build()` clears them with the scene. Four area lights at `area_luminance` (cd/m²; the pendant at three times it): a
 softbox on a stand by the sphere rows, a pendant disc over the white boxes, a fluorescent tube on the stone ledge,

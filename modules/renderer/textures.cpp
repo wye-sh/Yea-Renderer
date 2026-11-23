@@ -269,6 +269,37 @@ void material_blend(yea_handle m, float opacity)
 
 float materialOpacity(uint32_t row) { return row < MaterialBlends.size() ? MaterialBlends[row].opacity : 0.0f; }
 
+void material_refraction(yea_handle m, float ior, float thickness, uint32_t shape, yea_float3 tint)
+{
+    uint32_t row = rowOf(Materials, m);
+    if (row == kNone)
+        return;
+    while (MaterialRefractions.size() <= row)
+        if (!MaterialRefractions.add())
+            return;
+    MaterialRefraction& r = MaterialRefractions[row];
+    r.ior = ior < 1 ? 1 : ior > 3 ? 3 : ior;
+    r.thickness = thickness > 0 ? thickness : 0;
+    r.shape = shape ? 1 : 0;
+    r.tint = { tint.x < 0 ? 0 : tint.x > 1 ? 1 : tint.x, tint.y < 0 ? 0 : tint.y > 1 ? 1 : tint.y, tint.z < 0 ? 0 : tint.z > 1 ? 1 : tint.z };
+    r.set = 1;
+}
+
+bool materialRefraction(uint32_t row, float out[8])
+{
+    const bool set = row < MaterialRefractions.size() && MaterialRefractions[row].set;
+    const MaterialRefraction r = set ? MaterialRefractions[row] : MaterialRefraction{};
+    out[0] = set ? r.ior : 1.0f;
+    out[1] = r.thickness;
+    out[2] = (float)r.shape;
+    out[3] = set ? 1.0f : 0.0f;
+    out[4] = set ? r.tint.x : 1.0f;
+    out[5] = set ? r.tint.y : 1.0f;
+    out[6] = set ? r.tint.z : 1.0f;
+    out[7] = 0;
+    return set;
+}
+
 // --- The renderer's side ------------------------------------------------------------------------------------------------
 
 void materialMapsReset(uint32_t materialRow)
@@ -277,6 +308,8 @@ void materialMapsReset(uint32_t materialRow)
         MaterialMaps[materialRow] = MaterialMap{};
     if (materialRow < MaterialBlends.size())
         MaterialBlends[materialRow] = MaterialBlend{};
+    if (materialRow < MaterialRefractions.size())
+        MaterialRefractions[materialRow] = MaterialRefraction{};
 }
 
 uint32_t textureSlot(yea_handle h)

@@ -92,6 +92,14 @@ end
 table MaterialBlend none 4096
   float opacity
 end
+# How see-through materials bend and tint what is behind them (material_refraction), at their Material row: set 1 given.
+table MaterialRefraction none 4096
+  float ior
+  float thickness
+  u32 shape
+  float3 tint
+  u32 set
+end
 # A material's texture maps (material_maps), at its Material row: each map's texture handle (4294967295 none), the
 # factors the maps are multiplied by, and its alpha cutoff (0: opaque). set: 1 maps given, 2 factors given.
 table MaterialMap none 4096
@@ -193,6 +201,13 @@ export void material_alpha(handle m, float cutoff)
 # reflections stay whole (clear glass still reflects). Drawn sorted back to front after the opaque scene, lit as every
 # surface is, through fog. 0 opaque (the default). Blended surfaces cast no shadows and write no depth.
 export void material_blend(handle m, float opacity)
+# How a see-through material bends, blurs and tints what is seen through it: ior its index of refraction (glass 1.5,
+# water 1.33, 1 none), thickness (m) and shape: 0 thin (a pane or a sheet that thick: what is behind shifts a little), 1
+# solid (a ball or a block about that thick: what is behind is bent and flipped as through a lens). tint: the colour
+# that gets through (1, 1, 1 clear; coloured glass). Rough materials blur what is behind them by their roughness and how
+# far behind it lies (frosted glass). Without it: thin, no shift, clear. Refraction sees the opaque scene; a see-through
+# surface behind another shows through unbent.
+export void material_refraction(handle m, float ior, float thickness, u32 shape, float3 tint)
 
 export handle instance_add(u32 mesh, handle material)
 export void instance_place(handle i, float3 pos, float4 rotation, float3 scale)
@@ -330,6 +345,9 @@ category Performance
 setting bool gpu_timings true
 # Decals (decal_add) painted on the scene; off saves their cost.
 setting bool decals true
+# Glass bends and blurs what is behind it (material_refraction, rough see-through surfaces); off: seen straight through,
+# unblurred (saves a copy of the scene and its blurred levels while glass is in view).
+setting bool refraction true
 # How far a mesh's outline may be off on screen (display pixels) before a simpler version of it is drawn; 0 always
 # draws the finest. Built-in shapes only: meshes made vertex by vertex have one version.
 setting float lod_error 0.5 0 inf

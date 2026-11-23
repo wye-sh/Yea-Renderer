@@ -28,6 +28,7 @@
 #include "Shaders/Composite.srt.h"
 #include "Shaders/Exposure.srt.h"
 #include "Shaders/Tonemap.srt.h"
+#include "Shaders/Chain.srt.h"
 #undef SAMPLE_COUNT
 
 using namespace mx;
@@ -72,6 +73,7 @@ struct GpuFrame
     float    textures[4];    // x texture mip bias
     float    gi[4][4];       // frame.h giGrid (FLAG_GI)
     uint32_t decals[4];      // x decals in gDecals (FLAG_DECALS)
+    float    refraction[4];  // x the scene colour chain's levels (FLAG_REFRACTION)
     float    taps[32][4]; // xy: the shadow filters' Vogel disk, unturned
 };
 // A material's texture maps (Shaders/Common.h.fsl MaterialMapData).
@@ -101,6 +103,12 @@ struct GpuMaterial
     float params[4];
     float emissive[4];
 };
+// One level of one copy of the scene colour chain (Shaders/Chain.comp.fsl ChainData), at its own 256 bytes of gChainCb.
+struct GpuChain
+{
+    uint32_t rect[4]; // the texels written: x0, y0, x1, y1 (one past)
+    uint32_t mode[4]; // x 1 level 0, yz the level read's size, w 1 Karis-weighted
+};
 struct CompositeData
 {
     uint32_t mode[4];
@@ -119,7 +127,7 @@ const uint32_t kFlagCulled = 1, kFlagHeatmap = 2, kFlagCascades = 4, kFlagShadow
                kFlagContactDebug = 128, kFlagUnlit = 256, kFlagSsr = 512, kFlagSsrDebug = 1024,
                kFlagReceiverPlane = 2048, kFlagRt = 4096, kFlagRtDebug = 8192, kFlagRtShadows = 16384,
                kFlagRtSun = 32768, kFlagArea = 65536, kFlagSky = 131072, kFlagFog = 262144,
-               kFlagGi = 524288, kFlagGiDebug = 1048576, kFlagDecals = 2097152;
+               kFlagGi = 524288, kFlagGiDebug = 1048576, kFlagDecals = 2097152, kFlagRefraction = 4194304;
 const uint32_t kMaxFrames = 4;
 const uint32_t kMaxUnculledLights = 256;
 const uint32_t kHistogramBins = 128;
@@ -154,6 +162,19 @@ Pipeline *     gDepthPipe[4], *gForwardPipe[4], *gForwardFullPipe[4], *gForwardD
 Pipeline*      gBlendPipe[4];
 Shader *       gBlendShader, *gTransmitShader, *gBlendMsaaShader, *gTransmitMsaaShader;
 RenderTarget * gReactive, *gTransparency; // R8 at render size, one sample: frame.h reactive and transparency
+// Refraction (material_refraction): the scene colour chain glass reads what is behind it from, at render size with one
+// sample a pixel; level 0 a copy of the HDR target, each next half the size. Copied in the see-through pass at the first
+// refracting surface and again, over what was drawn since, before one whose screen rectangle that overlaps (at most
+// kChainCopies a frame), so glass sees the glass and steam behind it.
+const uint32_t kChainLevels = 7, kChainCopies = 6;
+Texture*       gChain;
+uint32_t       gChainMips;
+Shader*        gChainShader;
+Pipeline*      gChainPipe;
+DescriptorSet* gChainSet;                  // frame x copy x level
+Buffer*        gChainCb[kMaxFrames * kChainCopies * kChainLevels]; // a GpuChain each, at its set's index
+Buffer*        gRefractBuf[kMaxFrames];    // two float4 a material (materialRefraction)
+float*         gRefractCpu;
 Shader *       gDepthMaskedShader, *gMotionDepthMaskedShader, *gGlossMaskedShader, *gSurfaceMaskedShader;
 Buffer*        gMaterialMapBuf[kMaxFrames];
 GpuMaterialMap* gMaterialMapCpu;
@@ -257,6 +278,8 @@ struct BlendEntry
 {
     float    z;
     uint32_t instance, mesh, twoSided;
+    uint32_t refract;  // 1 thin, 2 solid (a ball: its far side isn't drawn, the near side refracts through all of it)
+    int32_t  rect[4];  // its screen rectangle (render pixels, x0, y0, x1, y1), refracting ones only
 };
 BlendEntry* gBlendList;
 uint32_t    gBlendCount, gBlendStream;
@@ -895,6 +918,10 @@ void destroyTargets()
     freeTarget(gSurface);
     freeTarget(gReactive);
     freeTarget(gTransparency);
+    if (gChain)
+        removeResource(gChain);
+    gChain = nullptr;
+    gChainMips = 0;
     if (gLdr)
         removeResource(gLdr);
     gLdr = nullptr;
@@ -935,6 +962,44 @@ void createTargets(uint32_t w, uint32_t h, uint32_t samples, bool motion, uint32
         addRenderTarget(gRenderer, &d, &gReactive);
         d.pName = "renderer_transparency";
         addRenderTarget(gRenderer, &d, &gTransparency);
+        // The scene colour chain (refraction), down to about 8 pixels across its short side.
+        uint32_t levels = 1;
+        while (levels < kChainLevels && ((w < h ? w : h) >> levels) >= 8)
+            levels++;
+        TextureDesc t = {};
+        t.mWidth = w;
+        t.mHeight = h;
+        t.mDepth = t.mArraySize = 1;
+        t.mMipLevels = levels;
+        t.mSampleCount = SAMPLE_COUNT_1;
+        t.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
+        t.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+        t.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+        t.pName = "renderer_scene_chain";
+        TextureLoadDesc tl = {};
+        tl.pDesc = &t;
+        tl.ppTexture = &gChain;
+        addResource(&tl, nullptr);
+        waitForAllResourceLoads();
+        gChainMips = gChain ? levels : 0;
+        // Each set reads the level above the one it writes (level 0 the HDR target); only the constants differ by frame
+        // and copy.
+        for (uint32_t i = 0; gChain && gChainSet && gHdr && i < gFrames * kChainCopies * kChainLevels; ++i)
+        {
+            uint32_t        level = i % kChainLevels < levels ? i % kChainLevels : levels - 1;
+            DescriptorData c[4] = {};
+            c[0].mIndex = SRT_RES_IDX(ChainSrt, PerFrame, gChain);
+            c[0].ppBuffers = &gChainCb[i];
+            c[1].mIndex = SRT_RES_IDX(ChainSrt, PerFrame, gHdrIn);
+            c[1].ppTextures = &gHdr->pTexture;
+            c[2].mIndex = SRT_RES_IDX(ChainSrt, PerFrame, gPrev);
+            c[2].ppTextures = &gChain;
+            c[2].mUAVMipSlice = (uint16_t)(level ? level - 1 : 0);
+            c[3].mIndex = SRT_RES_IDX(ChainSrt, PerFrame, gDst);
+            c[3].ppTextures = &gChain;
+            c[3].mUAVMipSlice = (uint16_t)level;
+            updateDescriptorSet(gRenderer, i, gChainSet, 4, c);
+        }
     }
     if (motion)
     {
@@ -1175,15 +1240,16 @@ void drawVisible(Cmd* cmd, uint32_t fi, Pipeline* const pipes[4], uint32_t sides
 }
 
 // See-through instance j of the sorted list (one instance, its stream entry after the opaque ones'): a double-sided one's
-// far side first, then its near side; each side multiplies what is behind by the light it lets through, then adds its own.
-void drawBlended(Cmd* cmd, uint32_t fi, uint32_t j)
+// far side first (sides 1), then its near side (sides 2); each side multiplies what is behind by the light it lets through,
+// then adds its own.
+void drawBlended(Cmd* cmd, uint32_t fi, uint32_t j, uint32_t sides = 3)
 {
     const BlendEntry& e = gBlendList[j];
     const Mesh&       mesh = Meshes[e.mesh];
     bindGeometry(cmd, gStreamBuf[fi], gBlendStream + j);
     cmdBindIndexBuffer(cmd, gIndexBuf, INDEX_TYPE_UINT32, 0);
     const uint32_t order[4] = { 1, 3, 0, 2 };
-    for (uint32_t k = e.twoSided ? 0 : 2; k < 4; ++k)
+    for (uint32_t k = e.twoSided && (sides & 1) ? 0 : 2; k < ((sides & 2) ? 4u : 2u); ++k)
     {
         cmdBindPipeline(cmd, gBlendPipe[order[k]]);
         cmdBindDescriptorSet(cmd, 0, gScenePersistent);
@@ -1226,6 +1292,44 @@ void barrierBuf(Cmd* cmd, Buffer* buf, ResourceState from, ResourceState to)
 {
     BufferBarrier b = { buf, from, to };
     cmdResourceBarrier(cmd, 1, &b, 0, nullptr, 0, nullptr);
+}
+
+// The scene colour chain over rect r (render pixels; x0, y0, x1, y1) of the HDR target, as copy `copy` of this frame:
+// level 0 copied, each next level filtered from the one above over the texels r reaches. Outside a render pass.
+void chainUpdate(Cmd* cmd, uint32_t fi, uint32_t copy, const int32_t r[4])
+{
+    TextureBarrier in = { gChain, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS };
+    RenderTargetBarrier hdr = { gHdr, RESOURCE_STATE_RENDER_TARGET, RESOURCE_STATE_SHADER_RESOURCE };
+    cmdResourceBarrier(cmd, 0, nullptr, 1, &in, 1, &hdr);
+    cmdBindPipeline(cmd, gChainPipe);
+    int32_t x0 = r[0], y0 = r[1], x1 = r[2], y1 = r[3];
+    for (uint32_t l = 0; l < gChainMips; ++l)
+    {
+        int32_t lw = (int32_t)(gWidth >> l), lh = (int32_t)(gHeight >> l);
+        if (l)
+        {
+            // Texel p of this level reads texels 2p - 2 .. 2p + 3 of the one above.
+            x0 = (x0 - 3) / 2 > 0 ? (x0 - 3) / 2 : 0;
+            y0 = (y0 - 3) / 2 > 0 ? (y0 - 3) / 2 : 0;
+            x1 = (x1 + 1) / 2 + 1;
+            y1 = (y1 + 1) / 2 + 1;
+            TextureBarrier uav = { gChain, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_UNORDERED_ACCESS };
+            cmdResourceBarrier(cmd, 0, nullptr, 1, &uav, 0, nullptr);
+        }
+        x1 = x1 < lw ? x1 : lw;
+        y1 = y1 < lh ? y1 : lh;
+        if (x1 <= x0 || y1 <= y0)
+            break;
+        uint32_t index = (fi * kChainCopies + copy) * kChainLevels + l;
+        GpuChain c = { { (uint32_t)x0, (uint32_t)y0, (uint32_t)x1, (uint32_t)y1 },
+                       { l == 0 ? 1u : 0u, l ? gWidth >> (l - 1) : 0u, l ? gHeight >> (l - 1) : 0u, l == 1 ? 1u : 0u } };
+        memcpy(gChainCb[index]->pCpuMappedAddress, &c, sizeof c);
+        cmdBindDescriptorSet(cmd, index, gChainSet);
+        cmdDispatch(cmd, (uint32_t)(x1 - x0 + 7) / 8, (uint32_t)(y1 - y0 + 7) / 8, 1);
+    }
+    TextureBarrier out = { gChain, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE };
+    RenderTargetBarrier back = { gHdr, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_RENDER_TARGET };
+    cmdResourceBarrier(cmd, 0, nullptr, 1, &out, 1, &back);
 }
 } // namespace
 
@@ -1451,7 +1555,8 @@ int load(int reloaded)
     }
     gAdaptShader = loadShader(nullptr, nullptr, "renderer_adapt.comp");
     gTonemapShader = loadShader(nullptr, nullptr, "renderer_tonemap.comp");
-    if (!ok || !gAdaptShader || !gTonemapShader)
+    gChainShader = loadShader(nullptr, nullptr, "renderer_chain.comp");
+    if (!ok || !gAdaptShader || !gTonemapShader || !gChainShader)
     {
         host->log(2, "renderer: shaders missing");
         return 1;
@@ -1475,9 +1580,13 @@ int load(int reloaded)
     addDescriptorSet(gRenderer, &exposureDesc, &gExposureSet);
     DescriptorSetDesc tonemapDesc = SRT_SET_DESC(TonemapSrt, PerFrame, gFrames, 0);
     addDescriptorSet(gRenderer, &tonemapDesc, &gTonemapSet);
+    DescriptorSetDesc chainDesc = SRT_SET_DESC(ChainSrt, PerFrame, gFrames * kChainCopies * kChainLevels, 0);
+    addDescriptorSet(gRenderer, &chainDesc, &gChainSet);
 
     const ResourceMemoryUsage cpu = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
     const ResourceState       sr = RESOURCE_STATE_SHADER_RESOURCE;
+    for (uint32_t i = 0; i < gFrames * kChainCopies * kChainLevels; ++i)
+        gChainCb[i] = makeBuffer(256, 0, DESCRIPTOR_TYPE_UNIFORM_BUFFER, cpu, RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, "renderer_chain");
     for (uint32_t i = 0; i < gFrames; ++i)
     {
         gFrameCb[i] = makeBuffer(sizeof(GpuFrame), 0, DESCRIPTOR_TYPE_UNIFORM_BUFFER, cpu, RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
@@ -1492,6 +1601,7 @@ int load(int reloaded)
                                      cpu, sr, "renderer_materials");
         gMaterialMapBuf[i] = makeBuffer((uint64_t)Materials.capacity() * sizeof(GpuMaterialMap), sizeof(GpuMaterialMap),
                                         DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_material_maps");
+        gRefractBuf[i] = makeBuffer((uint64_t)Materials.capacity() * 32, 16, DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_refraction");
         gTexturesBound[i] = 0;
         gLightBuf[i] = makeBuffer((uint64_t)Lights.capacity() * sizeof(RenderGpuLight), sizeof(RenderGpuLight), DESCRIPTOR_TYPE_BUFFER,
                                   cpu, sr, "renderer_lights");
@@ -1584,7 +1694,12 @@ int load(int reloaded)
     lightImagesInit();
     gLightImages = lightImagesMake();
     bool made = gDfg && gLtc && gLightImages && gExposure && gHistogram && gDummyU32 && gDummyViews && gDummyProbes && gDummySh && gDummyVolume && gDummyDepth && gDummyColor &&
-                gDummyRates && gDummyArray && gScenePersistent && gSceneFrame && gCompositeSet && gExposureSet && gTonemapSet && gShadowSampler;
+                gDummyRates && gDummyArray && gScenePersistent && gSceneFrame && gCompositeSet && gExposureSet && gTonemapSet && gShadowSampler &&
+                gChainSet;
+    for (uint32_t i = 0; i < gFrames * kChainCopies * kChainLevels; ++i)
+        made = made && gChainCb[i] && gChainCb[i]->pCpuMappedAddress;
+    for (uint32_t i = 0; i < gFrames; ++i)
+        made = made && gRefractBuf[i] && gRefractBuf[i]->pCpuMappedAddress;
     for (uint32_t i = 0; i < gFrames; ++i)
         made = made && gMaterialMapBuf[i] && gMaterialMapBuf[i]->pCpuMappedAddress && gFrameCb[i] && gCompositeCb[i] && gExposureCb[i] && gInstanceBuf[i] && gMaterialBuf[i] && gLightBuf[i] && gShapeBuf[i] && gLookBuf[i] && gLookBuf[i]->pCpuMappedAddress &&
                gDecalBuf[i] && gDecalBuf[i]->pCpuMappedAddress && gDecalSphereBuf[i] && gDecalSphereBuf[i]->pCpuMappedAddress &&
@@ -1620,6 +1735,12 @@ int load(int reloaded)
     tdesc.mComputeDesc.pShaderProgram = gTonemapShader;
     tdesc.pName = "renderer_tonemap";
     addPipeline(gRenderer, &tdesc, &gTonemapPipe);
+    PipelineDesc chdesc = {};
+    chdesc.mType = PIPELINE_TYPE_COMPUTE;
+    PIPELINE_LAYOUT_DESC(chdesc, NULL, SRT_LAYOUT_DESC(ChainSrt, PerFrame), NULL, NULL);
+    chdesc.mComputeDesc.pShaderProgram = gChainShader;
+    chdesc.pName = "renderer_chain";
+    addPipeline(gRenderer, &chdesc, &gChainPipe);
 
     gInfo = new InstanceInfo[Instances.capacity()];
     gInstCpu = new RenderGpuInstance[Instances.capacity()];
@@ -1629,6 +1750,7 @@ int load(int reloaded)
     gLookCpu = new uint32_t[Lights.capacity()];
     gMaterialCpu = new GpuMaterial[Materials.capacity()];
     gMaterialMapCpu = new GpuMaterialMap[Materials.capacity()];
+    gRefractCpu = new float[(size_t)Materials.capacity() * 8];
     texturesInit(gDummyColor->pTexture);
     gCasters = new RenderCaster[Instances.capacity()];
     gDrawables = new RenderCaster[Instances.capacity()];
@@ -1667,6 +1789,7 @@ void unload()
     freePipeline(gCompositePipe);
     freePipeline(gAdaptPipe);
     freePipeline(gTonemapPipe);
+    freePipeline(gChainPipe);
     destroyTargets();
     freeTarget(gDummyDepth);
     freeTarget(gDummyArray);
@@ -1686,6 +1809,7 @@ void unload()
         freeBuffer(gInstanceBuf[i]);
         freeBuffer(gMaterialBuf[i]);
         freeBuffer(gMaterialMapBuf[i]);
+        freeBuffer(gRefractBuf[i]);
         freeBuffer(gLightBuf[i]);
         freeBuffer(gShapeBuf[i]);
         freeBuffer(gLookBuf[i]);
@@ -1713,7 +1837,9 @@ void unload()
     freeBuffer(gAttrBuf);
     freeBuffer(gIndexBuf);
     gVertexCap = gIndexCap = 0;
-    DescriptorSet** sets[5] = { &gScenePersistent, &gSceneFrame, &gCompositeSet, &gExposureSet, &gTonemapSet };
+    for (uint32_t i = 0; i < kMaxFrames * kChainCopies * kChainLevels; ++i)
+        freeBuffer(gChainCb[i]);
+    DescriptorSet** sets[6] = { &gScenePersistent, &gSceneFrame, &gCompositeSet, &gExposureSet, &gTonemapSet, &gChainSet };
     for (DescriptorSet** set : sets)
         if (*set)
             removeDescriptorSet(gRenderer, *set), *set = nullptr;
@@ -1723,7 +1849,7 @@ void unload()
     Shader** shaders[] = { &gForwardDepthShader, &gForwardShader, &gSkyShader, &gAdaptShader, &gMotionDepthShader, &gMotionShader,
                            &gSkyMotionShader, &gForwardFullShader, &gMotionFullShader, &gGlossShader, &gSurfaceShader, &gTonemapShader,
                            &gDepthMaskedShader, &gMotionDepthMaskedShader, &gGlossMaskedShader, &gSurfaceMaskedShader, &gBlendShader,
-                           &gTransmitShader, &gBlendMsaaShader, &gTransmitMsaaShader };
+                           &gTransmitShader, &gBlendMsaaShader, &gTransmitMsaaShader, &gChainShader };
     for (Shader** s : shaders)
         if (*s)
             removeShader(gRenderer, *s), *s = nullptr;
@@ -1918,6 +2044,9 @@ void draw(uint32_t pass, const YeaFrame* yf)
     memset(gMeshCount, 0, sizeof gMeshCount);
     uint32_t keyCount = meshCount * 4;
     uint32_t casterCount[1024], drawCount[4096], blendCount = 0, blendAll = 0;
+    // Refraction (material_refraction) needs the see-through pass's one sample a pixel and its scene colour chain.
+    const bool refractOn = settings.refraction && !viewMode && samples == 1 && gChain && gChainPipe;
+    bool       refractVisible = false;
     memset(casterCount, 0, sizeof casterCount);
     memset(drawCount, 0, sizeof drawCount);
     // Mesh versions: display pixels per world unit at view depth 1, and the error allowed on screen (0: always the finest).
@@ -1990,7 +2119,32 @@ void draw(uint32_t pass, const YeaFrame* yf)
         {
             blendAll++;
             if (visible)
-                gBlendList[blendCount++] = { view[2][0] * sc.x + view[2][1] * sc.y + view[2][2] * sc.z + view[2][3], count, lod, twoSided ? 1u : 0u };
+            {
+                BlendEntry& e = gBlendList[blendCount++];
+                float       vz = view[2][0] * sc.x + view[2][1] * sc.y + view[2][2] * sc.z + view[2][3];
+                e = { vz, count, lod, twoSided ? 1u : 0u, 0u, { 0, 0, (int32_t)w, (int32_t)h } };
+                float refr[8];
+                if (refractOn && materialRefraction(in.material, refr))
+                {
+                    e.refract = refr[2] > 0.5f ? 2u : 1u;
+                    refractVisible = true;
+                }
+                // Its screen rectangle (the refraction chain is copied again only where a later surface reads what an
+                // earlier one changed): the box around its sphere in view space, projected, whole when it reaches the
+                // near plane.
+                float r = info.sphere[3], zn = vz - r, zf = vz + r;
+                if (zn > nearZ)
+                {
+                    float vx = view[0][0] * sc.x + view[0][1] * sc.y + view[0][2] * sc.z + view[0][3];
+                    float vy = view[1][0] * sc.x + view[1][1] * sc.y + view[1][2] * sc.z + view[1][3];
+                    float x0 = minf((vx - r) / zn, (vx - r) / zf) * p00, x1 = maxf((vx + r) / zn, (vx + r) / zf) * p00;
+                    float y0 = minf((vy - r) / zn, (vy - r) / zf) * p11, y1 = maxf((vy + r) / zn, (vy + r) / zf) * p11;
+                    e.rect[0] = (int32_t)maxf(floorf((x0 * 0.5f + 0.5f) * (float)w) - 2.0f, 0.0f);
+                    e.rect[1] = (int32_t)maxf(floorf((0.5f - y1 * 0.5f) * (float)h) - 2.0f, 0.0f);
+                    e.rect[2] = (int32_t)minf(ceilf((x1 * 0.5f + 0.5f) * (float)w) + 2.0f, (float)w);
+                    e.rect[3] = (int32_t)minf(ceilf((0.5f - y0 * 0.5f) * (float)h) + 2.0f, (float)h);
+                }
+            }
             count++;
             continue;
         }
@@ -2452,7 +2606,10 @@ void draw(uint32_t pass, const YeaFrame* yf)
         gm[i].emissive[2] = m.emissive.z;
     }
     for (uint32_t i = 0; i < Materials.size(); ++i)
+    {
         fillMaterialMap(gMaterialMapCpu[i], i);
+        materialRefraction(i, gRefractCpu + (size_t)i * 8);
+    }
 
     // Frame constants.
     memcpy(gf->viewProj, viewProj, sizeof viewProj);
@@ -2485,7 +2642,9 @@ void draw(uint32_t pass, const YeaFrame* yf)
                     ((viewMode & YEA_VIEW_WIREFRAME) ? kFlagUnlit : 0) | (ssr ? kFlagSsr : 0) | (ssr && F.ssrDebug ? kFlagSsrDebug : 0) |
                     (shadows && F.receiverPlane ? kFlagReceiverPlane : 0) | (rt ? kFlagRt : 0) | (rt && F.rtDebug ? kFlagRtDebug : 0) |
                     (rtShadows ? kFlagRtShadows : 0) | (rtShadows && F.rtSunShadows ? kFlagRtSun : 0) | (anyShape ? kFlagArea : 0) | (sky ? kFlagSky : 0) | (fog ? kFlagFog : 0) |
-                    (gi ? kFlagGi : 0) | (gi && F.giDebug ? kFlagGiDebug : 0) | (decals ? kFlagDecals : 0);
+                    (gi ? kFlagGi : 0) | (gi && F.giDebug ? kFlagGiDebug : 0) | (decals ? kFlagDecals : 0) |
+                    (refractVisible ? kFlagRefraction : 0);
+    gf->refraction[0] = (float)gChainMips;
     if (ssr)
     {
         gf->ssr[0] = F.ssrMaxRoughness;
@@ -2576,6 +2735,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     memcpy(gLookBuf[fi]->pCpuMappedAddress, gLookCpu, (size_t)F.allLightCount * 4);
     memcpy(gMaterialBuf[fi]->pCpuMappedAddress, gMaterialCpu, (size_t)Materials.size() * sizeof(GpuMaterial));
     memcpy(gMaterialMapBuf[fi]->pCpuMappedAddress, gMaterialMapCpu, (size_t)Materials.size() * sizeof(GpuMaterialMap));
+    memcpy(gRefractBuf[fi]->pCpuMappedAddress, gRefractCpu, (size_t)Materials.size() * 32);
     memcpy(gFrameCb[fi]->pCpuMappedAddress, &gFrameCpu, sizeof gFrameCpu);
     if (taa)
         memcpy(gPrevBuf[fi]->pCpuMappedAddress, gPrevCpu, (size_t)count * sizeof gPrevCpu[0]);
@@ -2657,7 +2817,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         Buffer*  masks = culled ? F.tileMasks : gDummyU32;
         Buffer*  bins = culled ? F.zbins : gDummyU32;
         Buffer*  views = shadows ? F.shadowViews : gDummyViews;
-        DescriptorData p[35] = {};
+        DescriptorData p[37] = {};
         Texture*       ssrDepth = ssr ? F.ssrDepth : gDummyDepth->pTexture;
         Texture*       previous = ssr ? F.previous->pTexture : gDummyColor->pTexture;
         Texture*       probeTex = probes ? F.probes->pTexture : gDummyArray->pTexture;
@@ -2748,14 +2908,19 @@ void draw(uint32_t pass, const YeaFrame* yf)
         p[32].ppBuffers = &decalMasks;
         p[33].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gDecalBins);
         p[33].ppBuffers = &decalBins;
-        uint32_t bindings = 34;
+        Texture* sceneColor = gChain ? gChain : gDummyColor->pTexture;
+        p[34].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gRefraction);
+        p[34].ppBuffers = &gRefractBuf[fi];
+        p[35].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gSceneColor);
+        p[35].ppTextures = &sceneColor;
+        uint32_t bindings = 36;
         if (gTexturesBound[fi] != F.textureVersion)
         {
-            p[34].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gTextures);
-            p[34].ppTextures = (Texture**)F.textures;
-            p[34].mCount = RENDER_MAX_TEXTURES;
+            p[36].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gTextures);
+            p[36].ppTextures = (Texture**)F.textures;
+            p[36].mCount = RENDER_MAX_TEXTURES;
             gTexturesBound[fi] = F.textureVersion;
-            bindings = 35;
+            bindings = 37;
         }
         updateDescriptorSet(gRenderer, fi, gSceneFrame, bindings, p);
 
@@ -3046,22 +3211,69 @@ void draw(uint32_t pass, const YeaFrame* yf)
                                       { gReactive, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_RENDER_TARGET },
                                       { gTransparency, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_RENDER_TARGET } };
         cmdResourceBarrier(cmd, 0, nullptr, 0, nullptr, 3, rb);
-        bind = {};
-        bind.mRenderTargetCount = 3;
-        bind.mRenderTargets[0] = { gHdr, LOAD_ACTION_LOAD };
-        bind.mRenderTargets[1] = { gReactive, LOAD_ACTION_CLEAR };
-        bind.mRenderTargets[2] = { gTransparency, LOAD_ACTION_CLEAR };
-        cmdBindRenderTargets(cmd, &bind);
-        cmdSetViewport(cmd, 0, 0, (float)w, (float)h, 0, 1);
-        cmdSetScissor(cmd, 0, 0, w, h);
+        auto bindPass = [&](bool first) {
+            bind = {};
+            bind.mRenderTargetCount = 3;
+            bind.mRenderTargets[0] = { gHdr, LOAD_ACTION_LOAD };
+            bind.mRenderTargets[1] = { gReactive, first ? LOAD_ACTION_CLEAR : LOAD_ACTION_LOAD };
+            bind.mRenderTargets[2] = { gTransparency, first ? LOAD_ACTION_CLEAR : LOAD_ACTION_LOAD };
+            cmdBindRenderTargets(cmd, &bind);
+            cmdSetViewport(cmd, 0, 0, (float)w, (float)h, 0, 1);
+            cmdSetScissor(cmd, 0, 0, w, h);
+        };
+        bindPass(true);
+        // Refraction: the scene colour chain copied before the first glass that bends what is behind it, and again over
+        // what was drawn since (the dirty rectangle: surfaces' screen rectangles, the whole screen for a particle run)
+        // before glass whose rectangle, widened by its own size each way for the rays it bends sideways, meets it.
+        const bool refract = blendDraw && (gFrameCpu.counts[2] & kFlagRefraction);
+        uint32_t   copies = 0;
+        int32_t    dirty[4] = { (int32_t)w, (int32_t)h, 0, 0 };
+        const int32_t whole[4] = { 0, 0, (int32_t)w, (int32_t)h };
+        auto grow = [&](const int32_t r[4]) {
+            dirty[0] = r[0] < dirty[0] ? r[0] : dirty[0];
+            dirty[1] = r[1] < dirty[1] ? r[1] : dirty[1];
+            dirty[2] = r[2] > dirty[2] ? r[2] : dirty[2];
+            dirty[3] = r[3] > dirty[3] ? r[3] : dirty[3];
+        };
+        auto chainFor = [&](const BlendEntry& e) {
+            const int32_t ew = e.rect[2] - e.rect[0], eh = e.rect[3] - e.rect[1];
+            const bool    meets = dirty[0] < e.rect[2] + ew && e.rect[0] - ew < dirty[2] && dirty[1] < e.rect[3] + eh &&
+                               e.rect[1] - eh < dirty[3];
+            if (copies && (!meets || copies >= kChainCopies))
+                return;
+            cmdBindRenderTargets(cmd, nullptr);
+            chainUpdate(cmd, fi, copies, copies ? dirty : whole);
+            copies++;
+            dirty[0] = (int32_t)w, dirty[1] = (int32_t)h, dirty[2] = dirty[3] = 0;
+            bindPass(false);
+        };
         // Past RENDER_MAX_BLEND_RUNS surfaces the farthest ones come first, with no particles between them.
         const uint32_t surfaces = blendDraw ? gBlendCount : 0;
         const uint32_t split = surfaces - F.blendRuns;
         for (uint32_t j = 0; j < surfaces; ++j)
         {
             if (runs && j >= split)
+            {
                 renderer_particles::particles_draw((uint64_t)(uintptr_t)&F, j - split);
-            drawBlended(cmd, fi, j);
+                grow(whole);
+            }
+            const BlendEntry& e = gBlendList[j];
+            if (refract && e.refract)
+            {
+                // A ball bends through all of itself from its near side: its far side isn't drawn. A thin shell's far
+                // side is, and its near side sees it through the chain.
+                if (e.refract == 1 && e.twoSided)
+                {
+                    chainFor(e);
+                    drawBlended(cmd, fi, j, 1);
+                    grow(e.rect);
+                }
+                chainFor(e);
+                drawBlended(cmd, fi, j, 2);
+            }
+            else
+                drawBlended(cmd, fi, j);
+            grow(e.rect);
         }
         // The runs nearer than every surface drawn (all of them while the see-through pipelines are still being made).
         for (uint32_t r = surfaces ? F.blendRuns : 0; runs && r <= F.blendRuns; ++r)

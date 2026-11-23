@@ -46,4 +46,6 @@ uint32_t          textureVersion();               // changes whenever textureSlo
 uint32_t          textureSlot(yea_handle t);      // a texture's slot + 1 once it is drawn with, else 0
 void              materialMapsReset(uint32_t materialRow); // a material row made afresh has no maps (and is opaque)
 float             materialOpacity(uint32_t materialRow);   // material_blend's opacity, 0: opaque
+bool              materialRefraction(uint32_t materialRow, float out[8]); // ior, thickness, shape, 1 given, tint rgb, 0;
+                                                                          // true when given
 } // namespace renderer

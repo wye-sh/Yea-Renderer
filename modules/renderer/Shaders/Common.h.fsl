@@ -46,6 +46,7 @@ STRUCT(FrameData)
     DATA(float4, textures, None);            // x texture mip bias (log2 of render over display width; 0 at native)
     DATA(float4, gi[4], None);               // dynamic diffuse GI (FLAG_GI): frame.h giGrid
     DATA(uint4, decals, None);               // x decals in gDecals (FLAG_DECALS)
+    DATA(float4, refraction, None);          // x gSceneColor's levels (FLAG_REFRACTION)
     DATA(float4, taps[32], None);            // xy: the shadow filters' Vogel disk of counts.w taps, unturned
 };
 
@@ -79,6 +80,7 @@ STRUCT(ProbeData)
 #define FLAG_GI       524288u // renderer_gi: diffuse ambient from its probes (gGiIrradiance, gGiDistance, gGiProbes)
 #define FLAG_GI_DEBUG 1048576u
 #define FLAG_DECALS   2097152u // decals: gDecals, binned (with FLAG_CULLED) in gDecalMasks and gDecalBins
+#define FLAG_REFRACTION 4194304u // the see-through pass: gSceneColor holds the scene behind glass, for gRefraction's materials
 #define FLAG_AREA     65536u // gLightShapes is filled: some light has a shape or its own size (area lights take LTC terms)
 #define RT_MISS       60000.0
 

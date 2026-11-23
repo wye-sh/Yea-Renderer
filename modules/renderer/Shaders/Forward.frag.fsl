@@ -210,6 +210,65 @@ float behind(float2 s, float rayZ)
     return rayZ - gFrame.camPos.w / max(d, 1e-7); // reversed-Z, infinite far: sky is never in front
 }
 
+#ifdef BLEND_PASS
+// The scene's view depth at pixel q (reversed-Z, infinite far).
+float sceneZ(float2 q)
+{
+    int2 p = int2(clamp(q, float2(0.0, 0.0), gFrame.screen.xy - 1.0));
+    return gFrame.camPos.w / max(LoadTex2D(gSceneDepth, NO_SAMPLER, p, 0).r, 1e-7);
+}
+
+// What glass shows through itself (material_refraction): the view ray bent into it at P by the shading normal N, out of
+// it, on to the scene behind, read from the scene colour chain (FLAG_REFRACTION). Thin (shape 0): a slab `thickness`
+// thick, so the ray leaves parallel to how it came, shifted. Solid (1): a ball that thick, refracted in and out of it
+// (Wyman 2005's image-space refraction with the far side taken as a sphere's), so what is behind is bent and flipped as
+// through a lens; past the critical angle the ray reflects inside. Where it lands, found on the depth behind in two steps;
+// a landing on something in front of the glass (whose colour isn't behind it) takes the straight view instead. Rough
+// glass blurs it: the transmitted lobe's spread (GGX alpha a2, twice for the two faces, narrowed by 1 - 1/ior) over the
+// distance behind, read from the chain's level of that size.
+float3 refractedScene(float3 P, float3 N, float3 V, float4 refr, float a2, float2 pixel)
+{
+    float  ior = max(refr.x, 1.0);
+    float3 I = -V;
+    float3 T = refract(I, N, 1.0 / ior);
+    if (dot(T, T) < 1e-6)
+        T = I;
+    float3 E;
+    float3 D;
+    if (refr.z < 0.5)
+    {
+        E = P + T * (refr.y / max(dot(T, -N), 0.2));
+        D = I;
+    }
+    else
+    {
+        E = P + T * (refr.y * max(dot(T, -N), 0.0));
+        float3 N2 = normalize(E - (P - N * (refr.y * 0.5))); // out of the ball where the ray leaves it
+        D = refract(T, -N2, ior);
+        if (dot(D, D) < 1e-6)
+            D = reflect(T, -N2);
+    }
+    float  zP = dot(gFrame.view[2], float4(P, 1.0));
+    float  zE = dot(gFrame.view[2], float4(E, 1.0));
+    float  dz = max(dot(gFrame.view[2].xyz, D), 0.1);
+    float  zBehind = sceneZ(pixel);
+    float2 q = pixelOf(clipOf(E + D * (max(zBehind - zE, 0.0) / dz)));
+    float  zq = sceneZ(q);
+    q = pixelOf(clipOf(E + D * (max(zq - zE, 0.0) / dz)));
+    zq = sceneZ(q);
+    if (zq < zP)
+    {
+        q = pixel;
+        zq = zBehind;
+    }
+    float far = max(zq - zE, 0.0) / dz; // the sky's too: its blur is then the spread's angle
+    float spread = 2.0 * sqrt(a2) * (1.0 - 1.0 / ior);
+    float px = spread * (far / max(zq, gFrame.camPos.w)) * 0.5 * gFrame.screen.y * gFrame.proj.y;
+    float lod = clamp(log2(max(px, 1.0)), 0.0, gFrame.refraction.x - 1.0);
+    return SampleLvlTex2D(gSceneColor, gSamplerTrilinearClamp, q * gFrame.screen.zw, lod).rgb;
+}
+#endif
+
 // Screen-space reflection (renderer_ssr): the reflected ray marched across the screen against the depth
 // copy, 1/depth stepped linearly in screen space (perspective-correct, McGuire and Mara 2014); at the first
 // step behind what the depth shows by less than `thickness`, refined by halving, the colour there from
@@ -453,11 +512,19 @@ float4 PS_MAIN(VSOutput In)
     // A thin surface: `coverage` of it is there (its diffuse light and emission scale by it), its specular reflection is
     // whole (clear glass still reflects), and what it reflects never passes through it: the rest lets the background
     // through, T = (1 - coverage) (1 - the specular's directional albedo), per channel.
-    float3 transmit = (1.0 - saturate(coverage)) * saturate(float3(1.0, 1.0, 1.0) - FssEss - Fms * Ems);
+    // Coloured glass (material_refraction's tint) passes only its colour of it.
+    float3 transmit = (1.0 - saturate(coverage)) * saturate(float3(1.0, 1.0, 1.0) - FssEss - Fms * Ems) *
+                      gRefraction[In.Material * 2u + 1u].rgb;
+#ifdef BLEND_PASS
+    // Glass that refracts replaces what is behind it with the scene it bends and blurs: the multiply clears it, the add
+    // puts the transmitted part of the scene colour chain there.
+    float4 refr = gRefraction[In.Material * 2u];
+    bool   refracts = (gFrame.counts.z & FLAG_REFRACTION) != 0u && refr.w > 0.5;
+#endif
 #ifdef TRANSMIT
 #ifdef BLEND_PASS
     PSOutput Transmit;
-    Transmit.Color = float4(transmit, 1.0);
+    Transmit.Color = float4(refracts ? float3(0.0, 0.0, 0.0) : transmit, 1.0);
     Transmit.Reactive = 0.0;
     Transmit.Transparency = 0.0;
     RETURN(Transmit);
@@ -696,6 +763,10 @@ float4 PS_MAIN(VSOutput In)
         color = applyFog(color, viewZ, In.Position.xy * gFrame.screen.zw);
         inscatter = applyFog(inscatter, viewZ, In.Position.xy * gFrame.screen.zw);
     }
+#ifdef BLEND_PASS
+    if (refracts)
+        inscatter -= refractedScene(In.WorldPos, N, V, refr, a2, In.Position.xy); // the chain has its own air in front
+#endif
     color = max(color - transmit * inscatter, float3(0.0, 0.0, 0.0));
 #else
     if ((gFrame.counts.z & FLAG_SKY) != 0u && gFrame.atmosphere.w > 0.0)
@@ -738,7 +809,7 @@ float4 PS_MAIN(VSOutput In)
     float    seen = 1.0 - min(transmit.r, min(transmit.g, transmit.b)); // how much of what is behind it is replaced
     Out.Color = float4(color, 1.0);
     Out.Reactive = seen;
-    Out.Transparency = seen;
+    Out.Transparency = refracts ? 1.0 : seen; // bent: none of it is where the scene's motion says
     RETURN(Out);
 #elif defined(MOTION)
     PSOutput Out;

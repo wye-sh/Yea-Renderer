@@ -228,8 +228,9 @@ void placeModels()
         models->boomBox = mdl::place(boom_box, { 5.0f, 1.4f, 2.0f }, toView);
 }
 
-// Glass: a clear pane between the start view and the steam, a teal one behind it (the steam drawn between them), and a
-// clear ball on the floor. See-through surfaces cast no shadows yet.
+// Glass: a clear pane between the start view and the steam, a teal one behind it (the steam drawn between them), a frosted
+// one beside them, and a solid glass ball on the floor that bends the floor and shapes behind it as a lens. See-through
+// surfaces cast no shadows yet.
 void addGlass()
 {
     gGlassBuilt = settings.glass;
@@ -238,13 +239,23 @@ void addGlass()
     uint32_t         box = renderer::mesh_box(), sphere = renderer::mesh_sphere(128);
     const yea_float4 facing = axisAngle({ 0, 1, 0 }, 1.08f); // square to the start view, over the drum
     yea_handle       clear = renderer::material_add({ 0.95f, 0.97f, 1.0f }, 0.03f, 0);
-    renderer::material_blend(clear, 0.06f);
+    renderer::material_blend(clear, 0.03f);
+    renderer::material_refraction(clear, 1.5f, 0.02f, 0, { 1, 1, 1 });
     yea_handle teal = renderer::material_add({ 0.2f, 0.75f, 0.7f }, 0.08f, 0);
-    renderer::material_blend(teal, 0.45f);
-    yea_handle panes[3] = { renderer::instance_add(box, clear), renderer::instance_add(box, teal), renderer::instance_add(sphere, clear) };
+    renderer::material_blend(teal, 0.12f);
+    renderer::material_refraction(teal, 1.5f, 0.02f, 0, { 0.3f, 0.85f, 0.78f });
+    yea_handle frosted = renderer::material_add({ 0.92f, 0.95f, 0.97f }, 0.3f, 0);
+    renderer::material_blend(frosted, 0.04f);
+    renderer::material_refraction(frosted, 1.5f, 0.02f, 0, { 0.95f, 0.97f, 1.0f });
+    yea_handle ball = renderer::material_add({ 0.95f, 0.97f, 1.0f }, 0.02f, 0);
+    renderer::material_blend(ball, 0.02f);
+    renderer::material_refraction(ball, 1.5f, 1.2f, 1, { 0.94f, 0.98f, 0.96f });
+    yea_handle panes[4] = { renderer::instance_add(box, clear), renderer::instance_add(box, teal), renderer::instance_add(sphere, ball),
+                            renderer::instance_add(box, frosted) };
     renderer::instance_place(panes[0], { 1.9f, 0.95f, 2.95f }, facing, { 2.0f, 1.9f, 0.02f });
     renderer::instance_place(panes[1], { -0.73f, 0.95f, 1.54f }, facing, { 2.0f, 1.9f, 0.02f });
     renderer::instance_place(panes[2], { -0.6f, 0.6f, 5.6f }, kNoRotation, { 1.2f, 1.2f, 1.2f });
+    renderer::instance_place(panes[3], { 4.3f, 0.95f, 4.3f }, facing, { 1.6f, 1.9f, 0.02f });
     for (yea_handle h : panes)
         renderer::instance_shadow(h, false);
 }

@@ -173,3 +173,7 @@
 #define TRANSMIT
 #include "Forward.frag.fsl"
 #end
+
+#comp renderer_chain.comp
+#include "Chain.comp.fsl"
+#end

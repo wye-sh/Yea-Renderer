@@ -780,6 +780,7 @@ void clear()
     TexturePaths.clear();
     MaterialMaps.clear();
     MaterialBlends.clear();
+    MaterialRefractions.clear();
     Decals.clear();
     build()->active = 0;
     sceneState()->removed = yea::host()->frame();

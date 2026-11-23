@@ -44,5 +44,8 @@ BEGIN_SRT(SceneSrt)
         DECL_BUFFER(PerFrame, Buffer(DecalData), gDecals)   // decals (FLAG_DECALS)
         DECL_BUFFER(PerFrame, Buffer(uint), gDecalMasks)     // renderer_culling's tiles of them
         DECL_BUFFER(PerFrame, Buffer(uint), gDecalBins)      // and z-bins
+        DECL_BUFFER(PerFrame, Buffer(float4), gRefraction)   // two a material (material_refraction): x ior, y thickness, z shape,
+                                                             // w 1 given; then rgb tint
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gSceneColor)  // the scene colour chain glass refracts (FLAG_REFRACTION)
     END_SRT_SET(PerFrame)
 END_SRT(SceneSrt)
