@@ -31,6 +31,7 @@ struct CaptureData
     uint32_t counts[4];
     float    fogMedium[4];
     float    fogAlbedo[4];
+    float    decalGrid[2][4]; // frame.h's (counts[2] decals)
 };
 struct CaptureView
 {
@@ -65,6 +66,7 @@ DescriptorSet *gCaptureSet, *gPassSet;
 Buffer *       gCaptureCb[kMaxFrames], *gViewBuf[kMaxFrames], *gStreamBuf[kMaxFrames], *gProbeBuf[kMaxFrames];
 Buffer*        gPassCb[kPassSets];
 Buffer*        gNoSkySh; // stands in for renderer_sky's SH (9 float4)
+Buffer *       gNoDecals, *gNoCells, *gNoItems; // stand in for the frame's decals while there are none
 RenderTarget * gChain[kMaxLevels], *gCaptureDepth, *gProbeRt;
 uint32_t       gOcta, gLevels; // probe image size and its mips (also the capture levels)
 bool           gReady;
@@ -439,7 +441,11 @@ int load(int reloaded)
     gRuns = new Run[kMaxRuns];
     memset(gCapturedAt, 0, sizeof gCapturedAt);
     gNoSkySh = makeBuffer(9 * 16, 16, DESCRIPTOR_TYPE_BUFFER, sr, "renderer_probe_no_sky_sh");
-    gReady = gCapturePipe[0] && gCapturePipe[1] && gDownPipe && gFilterPipe && gCaptureSet && gPassSet && gNoSkySh;
+    gNoDecals = makeBuffer(176, 176, DESCRIPTOR_TYPE_BUFFER, sr, "renderer_probe_no_decals");
+    gNoCells = makeBuffer(8, 8, DESCRIPTOR_TYPE_BUFFER, sr, "renderer_probe_no_decal_cells");
+    gNoItems = makeBuffer(4, 4, DESCRIPTOR_TYPE_BUFFER, sr, "renderer_probe_no_decal_items");
+    gReady = gCapturePipe[0] && gCapturePipe[1] && gDownPipe && gFilterPipe && gCaptureSet && gPassSet && gNoSkySh && gNoDecals &&
+             gNoCells && gNoItems;
     return gReady ? 0 : 1;
 }
 
@@ -459,9 +465,10 @@ void unload()
     for (Buffer* b : gPassCb)
         if (b)
             removeResource(b);
-    if (gNoSkySh)
-        removeResource(gNoSkySh);
-    gNoSkySh = nullptr;
+    Buffer** dummies[4] = { &gNoSkySh, &gNoDecals, &gNoCells, &gNoItems };
+    for (Buffer** b : dummies)
+        if (*b)
+            removeResource(*b), *b = nullptr;
     DescriptorSet* sets[2] = { gCaptureSet, gPassSet };
     for (DescriptorSet* s : sets)
         if (s)
@@ -511,7 +518,8 @@ bool probes_prepare(uint64_t address)
             gCapturedAt[i] = 0;
             continue;
         }
-        bool dirty = !gCapturedAt[i] || gCapturedGen[i] != p.gen || p.changed >= gCapturedAt[i] || gTexChanged >= gCapturedAt[i];
+        bool dirty = !gCapturedAt[i] || gCapturedGen[i] != p.gen || p.changed >= gCapturedAt[i] || gTexChanged >= gCapturedAt[i] ||
+                     F->decalsChanged >= gCapturedAt[i]; // decals added, moved, repainted or removed
         if (dirty && gTodoCount < budget)
             gTodo[gTodoCount++] = i;
     }
@@ -592,6 +600,8 @@ bool probes_prepare(uint64_t address)
         memcpy(cd.skyGround, F->skyGround, sizeof F->skyGround);
         cd.skyGround[3] = F->ambient;
         cd.counts[1] = F->skySh ? 1u : 0u;
+        cd.counts[2] = F->worldDecals && F->decalCells && F->decalItems ? F->worldDecalCount : 0;
+        memcpy(cd.decalGrid, F->decalGrid, sizeof cd.decalGrid);
         memcpy(cd.fogMedium, F->fogMedium, sizeof F->fogMedium);
         memcpy(cd.fogAlbedo, F->fogAlbedo, sizeof F->fogAlbedo);
         cd.counts[0] = F->lightBuffer ? (F->lightCount < kMaxCaptureLights ? F->lightCount : kMaxCaptureLights) : 0;
@@ -645,7 +655,16 @@ void probes_render(uint64_t address)
     uint32_t fi = F->frameIndex;
     Buffer*  lights = F->lightBuffer ? F->lightBuffer : gProbeBuf[fi]; // unread when there are none
     Buffer*        skySh = F->skySh ? F->skySh : gNoSkySh; // unread without renderer_sky
-    DescriptorData d[8] = {};
+    DescriptorData d[11] = {};
+    const bool     decals = F->worldDecalCount && F->worldDecals && F->decalCells && F->decalItems;
+    Buffer*        decalBufs[3] = { decals ? F->worldDecals : gNoDecals, decals ? F->decalCells : gNoCells,
+                                    decals ? F->decalItems : gNoItems };
+    d[7].mIndex = SRT_RES_IDX(CaptureSrt, PerFrame, gDecals);
+    d[7].ppBuffers = &decalBufs[0];
+    d[8].mIndex = SRT_RES_IDX(CaptureSrt, PerFrame, gDecalCells);
+    d[8].ppBuffers = &decalBufs[1];
+    d[9].mIndex = SRT_RES_IDX(CaptureSrt, PerFrame, gDecalItems);
+    d[9].ppBuffers = &decalBufs[2];
     d[5].mIndex = SRT_RES_IDX(CaptureSrt, PerFrame, gSkySh);
     d[5].ppBuffers = &skySh;
     d[0].mIndex = SRT_RES_IDX(CaptureSrt, PerFrame, gCapture);
@@ -660,14 +679,14 @@ void probes_render(uint64_t address)
     d[4].ppBuffers = &lights;
     d[6].mIndex = SRT_RES_IDX(CaptureSrt, PerFrame, gMaterialMaps);
     d[6].ppBuffers = (Buffer**)&F->materialMaps;
-    uint32_t bindings = 7;
+    uint32_t bindings = 10;
     if (gTexBound[fi] != F->textureVersion) // 1024 descriptors: only when the core's slots changed
     {
-        d[7].mIndex = SRT_RES_IDX(CaptureSrt, PerFrame, gTextures);
-        d[7].ppTextures = (Texture**)F->textures;
-        d[7].mCount = RENDER_MAX_TEXTURES;
+        d[10].mIndex = SRT_RES_IDX(CaptureSrt, PerFrame, gTextures);
+        d[10].ppTextures = (Texture**)F->textures;
+        d[10].mCount = RENDER_MAX_TEXTURES;
         gTexBound[fi] = F->textureVersion;
-        bindings = 8;
+        bindings = 11;
     }
     updateDescriptorSet(gRenderer, fi, gCaptureSet, bindings, d);
 

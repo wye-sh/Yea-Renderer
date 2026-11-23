@@ -35,6 +35,8 @@ struct GiData
     uint32_t raster[4];
     float    sunDir[4], sunColor[4], skyZenith[4], skyHorizon[4], skyGround[4], fogMedium[4], fogAlbedo[4];
     float    shadow[4], sunView[3][4];
+    uint32_t decals[4];
+    float    decalGrid[2][4];
 };
 struct Run
 {
@@ -79,6 +81,7 @@ DescriptorSet *gCapturePersistent, *gCaptureSet;
 Sampler*       gShadowCmp;
 RenderTarget * gFaces, *gFaceDepth, *gNoAtlas;
 Buffer *       gStream[kMaxFrames], *gNoViews, *gNoSh;
+Buffer *       gNoDecals, *gNoCells, *gNoItems; // stand in for the frame's decals while there are none
 uint32_t*      gStreamCpu;
 Run*           gRuns;
 uint32_t       gRunStart[kMaxSlots * 6 + 1];
@@ -439,6 +442,9 @@ bool makeCapture()
     gNoViews = makeBuffer(sizeof(RenderGpuShadowView) * 4, sizeof(RenderGpuShadowView), DESCRIPTOR_TYPE_BUFFER, cpu,
                           RESOURCE_STATE_SHADER_RESOURCE, "renderer_gi_no_views");
     gNoSh = makeBuffer(9 * 16, 16, DESCRIPTOR_TYPE_BUFFER, cpu, RESOURCE_STATE_SHADER_RESOURCE, "renderer_gi_no_sh");
+    gNoDecals = makeBuffer(176, 176, DESCRIPTOR_TYPE_BUFFER, cpu, RESOURCE_STATE_SHADER_RESOURCE, "renderer_gi_no_decals");
+    gNoCells = makeBuffer(8, 8, DESCRIPTOR_TYPE_BUFFER, cpu, RESOURCE_STATE_SHADER_RESOURCE, "renderer_gi_no_decal_cells");
+    gNoItems = makeBuffer(4, 4, DESCRIPTOR_TYPE_BUFFER, cpu, RESOURCE_STATE_SHADER_RESOURCE, "renderer_gi_no_decal_items");
     for (uint32_t i = 0; i < gFrames; ++i)
         gStream[i] = makeBuffer((uint64_t)kMaxEntries * 4, 0, DESCRIPTOR_TYPE_VERTEX_BUFFER, cpu, RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
                                 "renderer_gi_stream");
@@ -481,7 +487,7 @@ bool makeCapture()
     DescriptorSetDesc perFrame = SRT_SET_DESC(GiCaptureSrt, PerFrame, gFrames * 2, 0);
     addDescriptorSet(gRenderer, &perFrame, &gCaptureSet);
     waitForAllResourceLoads();
-    bool ok = gFaces && gFaceDepth && gNoAtlas && gNoViews && gNoSh && gShadowCmp && gCapturePipe && gSunPipe && gSun && gCapturePersistent && gCaptureSet &&
+    bool ok = gFaces && gFaceDepth && gNoAtlas && gNoViews && gNoSh && gNoDecals && gNoCells && gNoItems && gShadowCmp && gCapturePipe && gSunPipe && gSun && gCapturePersistent && gCaptureSet &&
               gNoViews->pCpuMappedAddress && gNoSh->pCpuMappedAddress;
     for (uint32_t i = 0; i < gFrames; ++i)
         ok = ok && gStream[i] && gStream[i]->pCpuMappedAddress && gSunStream[i] && gSunStream[i]->pCpuMappedAddress;
@@ -521,7 +527,7 @@ void freeCapture()
             removeRenderTarget(gRenderer, *r);
         *r = nullptr;
     }
-    Buffer** bufs[] = { &gNoViews, &gNoSh, &gStream[0], &gStream[1], &gStream[2], &gStream[3],
+    Buffer** bufs[] = { &gNoViews, &gNoSh, &gNoDecals, &gNoCells, &gNoItems, &gStream[0], &gStream[1], &gStream[2], &gStream[3],
                         &gSunStream[0], &gSunStream[1], &gSunStream[2], &gSunStream[3] };
     for (Buffer** b : bufs)
     {
@@ -733,7 +739,16 @@ void writeCaptureSet(const RenderFrame* F, uint32_t index, Texture* sun)
     Texture*   local = maps ? F->localAtlas->pTexture : gNoAtlas->pTexture;
     Buffer*    lights = F->lightBuffer ? F->lightBuffer : gNoViews; // unread without lights (raster.z 0)
     Buffer*    shapes = F->lightShapes ? F->lightShapes : gNoViews;
-    DescriptorData d[14] = {};
+    DescriptorData d[17] = {};
+    const bool     decals = F->worldDecalCount && F->worldDecals && F->decalCells && F->decalItems;
+    Buffer*        decalBufs[3] = { decals ? F->worldDecals : gNoDecals, decals ? F->decalCells : gNoCells,
+                                    decals ? F->decalItems : gNoItems };
+    d[13].mIndex = SRT_RES_IDX(GiCaptureSrt, PerFrame, gDecals);
+    d[13].ppBuffers = &decalBufs[0];
+    d[14].mIndex = SRT_RES_IDX(GiCaptureSrt, PerFrame, gDecalCells);
+    d[14].ppBuffers = &decalBufs[1];
+    d[15].mIndex = SRT_RES_IDX(GiCaptureSrt, PerFrame, gDecalItems);
+    d[15].ppBuffers = &decalBufs[2];
     d[0].mIndex = SRT_RES_IDX(GiCaptureSrt, PerFrame, gGi);
     d[0].ppBuffers = &gCb[F->frameIndex];
     d[1].mIndex = SRT_RES_IDX(GiCaptureSrt, PerFrame, gInstances);
@@ -760,14 +775,14 @@ void writeCaptureSet(const RenderFrame* F, uint32_t index, Texture* sun)
     d[11].ppBuffers = &gProbes;
     d[12].mIndex = SRT_RES_IDX(GiCaptureSrt, PerFrame, gMaterialMaps);
     d[12].ppBuffers = (Buffer**)&F->materialMaps;
-    uint32_t bindings = 13;
+    uint32_t bindings = 16;
     if (gTexBound[index] != F->textureVersion) // 1024 descriptors: only when the core's slots changed
     {
-        d[13].mIndex = SRT_RES_IDX(GiCaptureSrt, PerFrame, gTextures);
-        d[13].ppTextures = (Texture**)F->textures;
-        d[13].mCount = RENDER_MAX_TEXTURES;
+        d[16].mIndex = SRT_RES_IDX(GiCaptureSrt, PerFrame, gTextures);
+        d[16].ppTextures = (Texture**)F->textures;
+        d[16].mCount = RENDER_MAX_TEXTURES;
         gTexBound[index] = F->textureVersion;
-        bindings = 14;
+        bindings = 17;
     }
     updateDescriptorSet(gRenderer, index, gCaptureSet, bindings, d);
 }
@@ -973,6 +988,9 @@ bool gi_prepare(uint64_t address)
     d.params[3] = 0.15f * maxSpacing;
     d.counts[0] = gProbeCount;
     d.counts[1] = gRayCount;
+    // Decals, painted in the raster captures as on screen (they catch up as the captures go round).
+    d.decals[0] = F->worldDecals && F->decalCells && F->decalItems ? F->worldDecalCount : 0;
+    memcpy(d.decalGrid, F->decalGrid, sizeof d.decalGrid);
 
     memcpy(F->giGrid, d.grid, sizeof F->giGrid);
     memcpy(F->giRotation, d.rotation, sizeof F->giRotation);

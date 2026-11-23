@@ -56,6 +56,7 @@ STRUCT(ShadowView)
     DATA(float4, inv2, None);
 };
 
+#include "Decal.h.fsl" // a copy of the core's: DecalData here, decalsAt below
 #include "Trace.srt.h"
 #include "Shadow.h.fsl"
 #include "Cutout.h.fsl"
@@ -364,6 +365,47 @@ float3 applyHeightFog(float3 color, float3 O, float3 d, float t)
 
 float3 vertexPosition(uint v) { return asfloat(uint3(gPositions[v * 3u], gPositions[v * 3u + 1u], gPositions[v * 3u + 2u])); }
 
+// A decal's map (slot: gTextures' index + 1) with its uv's change across the footprint, as the forward pass samples it.
+float4 decalMap(uint slot, float2 uv, float2 dx, float2 dy)
+{
+    float4 c = float4(1.0, 1.0, 1.0, 1.0);
+    if ((gRt.counts.z & FLAG_MAPS) == 0u)
+        return c;
+    uint texSlot = slot - 1u;
+    BeginNonUniformResourceIndex(texSlot, MAX_TEXTURES);
+        c = SampleGradTex2D(gTextures[texSlot], gSamplerTrilinearWrap, uv, dx, dy);
+    EndNonUniformResourceIndex();
+    return c;
+}
+
+#define DECAL_DATA(k)                  gDecals[k]
+#define DECAL_SAMPLE(slot, uv, dx, dy) decalMap(slot, uv, dx, dy)
+#define DECAL_CELLS                    gDecalCells
+#define DECAL_ITEMS                    gDecalItems
+#include "Decal.h.fsl"
+
+// The decals over a hit (never glass: raster paints none on see-through surfaces), painted into its material and
+// shading normal N as the forward pass and the captures paint them (Decal.h.fsl decalsAt). P the hit, Ng its normal
+// before the normal map (turned towards the ray R), width the ray cone's there: the footprint spans it across the ray
+// and stretches along it by the angle, as a pixel's does on screen.
+MaterialData hitDecals(float3 P, float3 Ng, float3 R, float width, MaterialData m, inout(float3) N)
+{
+    if (gRt.decals.x == 0u)
+        return m;
+    float3 along = R - Ng * dot(R, Ng);
+    float  l = length(along);
+    along = l > 1e-4 ? along / l : normalize(cross(Ng, abs(Ng.y) < 0.9 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0)));
+    float3 dPdx = along * (width / max(abs(dot(Ng, R)), 0.05));
+    float3 dPdy = cross(Ng, along) * width;
+    float3 albedo = m.albedoRough.rgb, emissive = m.emissive.rgb;
+    float  rough = m.albedoRough.a, metal = m.params.x;
+    decalsAt(gRt.decals.x, gRt.decalGrid[0], gRt.decalGrid[1], P, Ng, dPdx, dPdy, albedo, rough, metal, emissive, N);
+    m.albedoRough = float4(albedo, rough);
+    m.params.x = metal;
+    m.emissive.rgb = emissive;
+    return m;
+}
+
 // The material a hit shows (top-level instance index, triangle, barycentrics): its flat values, or with the core's
 // texture maps (Hit.h.fsl hitLook) where it has them. The maps' mip comes from the ray cone (Akenine-Moller et al.
 // 2021): `width` the cone's width at the hit (m), R the ray's direction; the triangle's uv and world areas turn it into
@@ -592,6 +634,7 @@ float4 lightHit(Hit h, int2 p)
     float3       N = h.normal.xyz;
     float        occlusion;
     MaterialData m = hitMaterial(h.tri.x, h.tri.y, asfloat(h.tri.zw), h.cone, ray.xyz, N, occlusion);
+    m = hitDecals(pos.xyz, h.normal.xyz, ray.xyz, h.cone, m, N);
     float3       lit = shadeHit(pos.xyz, N, -ray.xyz, m, occlusion, float2(cos(phi), sin(phi)), MAX_SHADOW_RAYS, false, 1.0);
     // The fog between the reflecting surface and the hit (what the screen shows of it already holds the camera's).
     lit = applyHeightFog(lit, pos.xyz - ray.xyz * pos.w, ray.xyz, pos.w);
@@ -1251,8 +1294,11 @@ void CS_MAIN(SV_GroupID(uint3) gid, SV_GroupThreadID(uint3) tid)
             float  phi = float(pcgHash(index ^ (gRt.counts.y * 2654435761u)) & 0xFFFFu) * (2.0 * PI / 65536.0);
             // A probe ray's cone: its share of the sphere, sqrt(4 pi / rays) radians wide.
             float        occlusion;
-            MaterialData m = hitMaterial(RayQueryInstanceID(hit), RayQueryPrimitiveIndex(hit), RayQueryBarycentrics(hit),
-                                         t * sqrt(4.0 * PI / float(max(rays, 1u))), ray.Direction, N, occlusion);
+            float        cone = t * sqrt(4.0 * PI / float(max(rays, 1u)));
+            float3       Ng = N;
+            MaterialData m = hitMaterial(RayQueryInstanceID(hit), RayQueryPrimitiveIndex(hit), RayQueryBarycentrics(hit), cone,
+                                         ray.Direction, N, occlusion);
+            m = hitDecals(P, Ng, ray.Direction, cone, m, N);
             float3 lit = shadeHit(P, N, -ray.Direction, m, occlusion, float2(cos(phi), sin(phi)), GI_SHADOW_RAYS, true, 1.0);
             result = float4(clampSample(applyHeightFog(lit, ray.Origin, ray.Direction, t)), t);
         }

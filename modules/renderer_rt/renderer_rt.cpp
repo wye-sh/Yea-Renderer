@@ -46,6 +46,8 @@ struct RtData
     float    fogMedium[4], fogAlbedo[4]; // frame.h's height fog
     float    giGrid[4][4], giRot[3][4];  // renderer_gi's probes and their rays' rotation
     uint32_t giCounts[4];                // probes, rays a probe, groups across, 1: last frame's probes to sample
+    uint32_t decals[4];                  // decals hits paint (frame worldDecalCount)
+    float    decalGrid[2][4];            // frame.h decalGrid
 };
 
 // Shaders/ShadowData.h.fsl
@@ -142,6 +144,7 @@ Texture*       gShTintHist[2]; // RGBA16F arrays: accumulated (rgb over the unbl
 Texture*       gNoTint[2];     // 2 x 2 x 2 stand-ins bound without glass: [0] read (SHADER_RESOURCE), [1] written (UNORDERED_ACCESS)
 Buffer*        gNoRefraction;  // and for frame refraction (two float4) and dfg (float2) while the frame has none
 Buffer*        gNoDfg;
+Buffer *       gNoDecals, *gNoCells, *gNoItems; // and for the frame's decals while there are none
 bool           gTintNow;       // rt_prepare: glass casts traced shadows this frame
 bool           gGlassNow;      // rt_prepare: glass is in this frame's top-level structure
 uint64_t       gTintFrame;     // the frame the tint history was written (0: none)
@@ -809,11 +812,14 @@ int load(int reloaded)
         memset(gNoRefraction->pCpuMappedAddress, 0, 2 * 16);
     if (gNoDfg)
         memset(gNoDfg->pCpuMappedAddress, 0, 2 * 8);
+    gNoDecals = makeMapped(176, 176, DESCRIPTOR_TYPE_BUFFER, "renderer_rt_no_decals");
+    gNoCells = makeMapped(8, 8, DESCRIPTOR_TYPE_BUFFER, "renderer_rt_no_decal_cells");
+    gNoItems = makeMapped(4, 4, DESCRIPTOR_TYPE_BUFFER, "renderer_rt_no_decal_items");
     gNoShapes = makeMapped(sizeof(RenderGpuLightShape) * 4, sizeof(RenderGpuLightShape), DESCRIPTOR_TYPE_BUFFER, "renderer_rt_no_shapes");
     if (gNoShapes)
         memset(gNoShapes->pCpuMappedAddress, 0, sizeof(RenderGpuLightShape) * 4);
     gReady = gSet != nullptr && gGiSet != nullptr && gShSet != nullptr && gNoShapes != nullptr && gNoTint[0] && gNoTint[1] && gNoRefraction &&
-             gNoDfg;
+             gNoDfg && gNoDecals && gNoCells && gNoItems;
     yea::log(gReady ? "renderer_rt: ray-traced reflections on" : "renderer_rt: the trace pipeline failed");
     return gReady ? 0 : 1;
 }
@@ -865,6 +871,13 @@ void unload()
     if (gNoDfg)
         removeResource(gNoDfg);
     gNoRefraction = gNoDfg = nullptr;
+    Buffer** noDecals[3] = { &gNoDecals, &gNoCells, &gNoItems };
+    for (Buffer** b : noDecals)
+    {
+        if (*b)
+            removeResource(*b);
+        *b = nullptr;
+    }
     if (gNoShapes)
         removeResource(gNoShapes);
     gShSet = nullptr;
@@ -1115,6 +1128,9 @@ bool rt_prepare(uint64_t address)
     d.giCounts[2] = giAcross(gi ? F->giProbeCount * F->giRaysPerProbe : 0);
     d.giCounts[3] = F->giIrradiance && F->giDistance && F->giProbeData ? 1 : 0;
     gGiFrame = gi ? F->frameNumber : 0;
+    // Decals, painted at hits (reflections' and GI probe rays') as on screen. None on glass, as raster paints none there.
+    d.decals[0] = F->worldDecalCount && F->worldDecals && F->decalCells && F->decalItems ? F->worldDecalCount : 0;
+    memcpy(d.decalGrid, F->decalGrid, sizeof d.decalGrid);
     memcpy(gCb[F->frameIndex]->pCpuMappedAddress, &d, sizeof d);
 
     F->rtReflection = settings.enabled ? gTex : nullptr; // the filter writes it after the resolve; none: shadows only
@@ -1429,7 +1445,16 @@ void rt_run(uint64_t address)
     bool           maps = F->localAtlas && F->localAtlas->pTexture && F->shadowViews;
     Texture*       atlas = maps ? F->localAtlas->pTexture : gDummyAtlas->pTexture;
     Buffer*        views = maps ? F->shadowViews : gDummyViews;
-    DescriptorData p[35] = {};
+    DescriptorData p[38] = {};
+    const bool     decals = F->worldDecalCount && F->worldDecals && F->decalCells && F->decalItems;
+    Buffer*        decalBufs[3] = { decals ? F->worldDecals : gNoDecals, decals ? F->decalCells : gNoCells,
+                                    decals ? F->decalItems : gNoItems };
+    p[35].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gDecals);
+    p[35].ppBuffers = &decalBufs[0];
+    p[36].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gDecalCells);
+    p[36].ppBuffers = &decalBufs[1];
+    p[37].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gDecalItems);
+    p[37].ppBuffers = &decalBufs[2];
     Buffer*        positions = F->positions;
     p[32].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gPositions);
     p[32].ppBuffers = &positions;
@@ -1515,7 +1540,7 @@ void rt_run(uint64_t address)
     if (gi)
     {
         // renderer_gi's probe rays (a thread each; renderer_gi reads them in gi_run, after this).
-        updateDescriptorSet(gRenderer, fi, gGiSet, 35, p);
+        updateDescriptorSet(gRenderer, fi, gGiSet, 38, p);
         bindCutouts(F, gGiSet, fi, kMaxFrames * 7 + fi, SRT_RES_IDX(RtSrt, PerFrame, gMaterialMaps), SRT_RES_IDX(RtSrt, PerFrame, gTextures));
         uint32_t       groups = (F->giProbeCount * F->giRaysPerProbe + 63) / 64, across = giAcross(F->giProbeCount * F->giRaysPerProbe);
         BufferBarrier  rb = { F->giRayOut, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS };
@@ -1533,19 +1558,19 @@ void rt_run(uint64_t address)
         cmdEndDebugMarker(cmd);
         return;
     }
-    updateDescriptorSet(gRenderer, fi * 4, gSet, 35, p);
+    updateDescriptorSet(gRenderer, fi * 4, gSet, 38, p);
     p[12].ppTextures = &gHalf;
     p[24].ppTextures = &gHalfRay;
-    updateDescriptorSet(gRenderer, fi * 4 + 1, gSet, 35, p);
+    updateDescriptorSet(gRenderer, fi * 4 + 1, gSet, 38, p);
     p[13].ppTextures = &gTex;
-    updateDescriptorSet(gRenderer, fi * 4 + 2, gSet, 35, p);
+    updateDescriptorSet(gRenderer, fi * 4 + 2, gSet, 38, p);
     // The filter reads this frame's accumulation and writes the trace texture, free by then, as rtReflection.
     p[13].ppTextures = &gAccum[w ^ 1];
     p[15].ppTextures = &gAccum[w];
     p[16].ppTextures = &gAccumZ[w];
     p[20].ppTextures = &gTex;
     p[21].ppTextures = &gAccumZ[w ^ 1];
-    updateDescriptorSet(gRenderer, fi * 4 + 3, gSet, 35, p);
+    updateDescriptorSet(gRenderer, fi * 4 + 3, gSet, 38, p);
     // Cut-outs, for the passes that trace: the trace (and the probe pass, on its set) and the reconstruction.
     for (uint32_t k = 0; k < 2; ++k)
         bindCutouts(F, gSet, fi * 4 + k, fi * 4 + k, SRT_RES_IDX(RtSrt, PerFrame, gMaterialMaps), SRT_RES_IDX(RtSrt, PerFrame, gTextures));

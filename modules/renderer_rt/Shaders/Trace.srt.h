@@ -46,5 +46,8 @@ BEGIN_SRT(RtSrt)
         DECL_BUFFER(PerFrame, Buffer(uint), gPositions)          // hits' texture mips: float3 a vertex (RENDER_POSITION_STRIDE)
         DECL_BUFFER(PerFrame, Buffer(float4), gRefraction)       // glass (frame refraction): two float4 a material
         DECL_BUFFER(PerFrame, Buffer(float2), gDfg)              // the core's split-sum table (frame dfg)
+        DECL_BUFFER(PerFrame, Buffer(DecalData), gDecals)        // frame worldDecals (decals.x), decalCells, decalItems
+        DECL_BUFFER(PerFrame, Buffer(uint2), gDecalCells)
+        DECL_BUFFER(PerFrame, Buffer(uint), gDecalItems)
     END_SRT_SET(PerFrame)
 END_SRT(RtSrt)

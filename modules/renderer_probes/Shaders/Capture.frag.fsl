@@ -55,6 +55,13 @@ float4 sampleMap(uint slot, float2 uv, float2 dx, float2 dy)
     return c;
 }
 
+// Decals, painted as the forward pass paints them (the core's Decal.h.fsl).
+#define DECAL_DATA(k)                  gDecals[k]
+#define DECAL_SAMPLE(slot, uv, dx, dy) sampleMap(slot, uv, dx, dy)
+#define DECAL_CELLS                    gDecalCells
+#define DECAL_ITEMS                    gDecalItems
+#include "Decal.h.fsl"
+
 ROOT_SIGNATURE(DefaultRootSignature)
 float4 PS_MAIN(VSOutput In)
 {
@@ -79,6 +86,14 @@ float4 PS_MAIN(VSOutput In)
     float3 N = normalize(In.Normal);
     if (dot(N, gViews[In.View].eye.xyz - P) < 0.0)
         N = -N;
+    if (gCapture.counts.z != 0u)
+    {
+        float  rough = m.albedoRough.a;
+        float3 Nd = N;
+        decalsAt(gCapture.counts.z, gCapture.decalGrid0, gCapture.decalGrid1, P, N, ddx(P), ddy(P), m.albedoRough.rgb, rough,
+                 m.params.x, m.emissive.rgb, Nd);
+        N = Nd; // diffuse-only here: their roughness has no say
+    }
     float3 diffuse = m.albedoRough.rgb * (1.0 - 0.5 * saturate(m.params.x));
     float3 sky;
     if (gCapture.counts.y != 0u)

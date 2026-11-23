@@ -205,6 +205,15 @@ Buffer *       gDecalBuf[kMaxFrames], *gDecalSphereBuf[kMaxFrames]; // this fram
 GpuDecal*      gDecalCpu;
 float (*gDecalSphereCpu)[4];
 uint32_t*      gDecalList; // Decal rows in view, in paint order
+// Decals for captures and ray hits (frame worldDecals): every live one in paint order, and a world grid over them, rebuilt
+// when the decals change (gWorldHash), copied into a frame's buffers when its copy is older.
+const uint32_t kGridSide = 32, kGridCells = kGridSide * kGridSide * kGridSide, kGridItems = 65536;
+Buffer *       gWorldDecalBuf[kMaxFrames], *gDecalCellBuf[kMaxFrames], *gDecalItemBuf[kMaxFrames];
+GpuDecal*      gWorldDecalCpu;
+uint32_t *     gDecalCellCpu, *gDecalItemCpu, *gDecalCellCount; // cells as (first, count) pairs; items; counts while building
+uint64_t       gWorldHash, gWorldCopied[kMaxFrames], gDecalsChanged;
+uint32_t       gWorldCount, gWorldCells, gWorldItems;
+float          gDecalGrid[2][4];
 Texture*       gLightImages; // the rect lights' images (images.cpp)
 uint32_t*      gLookCpu;     // per GPU light: its image + 1, 0 none (gLightLooks)
 RenderGpuLightShape* gShapeCpu;
@@ -1382,6 +1391,171 @@ void fillMaterialMap(GpuMaterialMap& out, uint32_t row)
     out.misc[1] = 1;
 }
 
+// Decal row as the shaders read it (Shaders/Decal.h.fsl DecalData).
+void fillDecal(GpuDecal& g, uint32_t row)
+{
+    const Decal& d = Decals[row];
+    float          R[3][4];
+    quatRows(d.rot, { 1, 1, 1 }, { 0, 0, 0 }, R);
+    const float half[3] = { d.half.x, d.half.y, d.half.z }, pos[3] = { d.pos.x, d.pos.y, d.pos.z };
+    for (int j = 0; j < 3; ++j)
+    {
+        float t = 0;
+        for (int k = 0; k < 3; ++k)
+        {
+            g.row[j][k] = R[k][j] / half[j];
+            t += R[k][j] * pos[k];
+        }
+        g.row[j][3] = -t / half[j];
+    }
+    for (int k = 0; k < 3; ++k)
+    {
+        g.axisX[k] = R[k][0];
+        g.axisY[k] = R[k][1];
+        g.axisZ[k] = R[k][2];
+    }
+    // Surfaces turned past `angle` from facing along z are left alone, fading over its last 15 degrees.
+    const float a1 = d.angle * 0.01745329f, a0 = maxf(d.angle - 15.0f, 0.0f) * 0.01745329f;
+    g.axisZ[3] = cosf(a1);
+    g.axisX[3] = 1.0f / maxf(cosf(a0) - cosf(a1), 1e-3f);
+    g.axisY[3] = d.normalScale;
+    memcpy(g.albedo, &d.albedo, sizeof g.albedo);
+    g.material[0] = d.roughness, g.material[1] = d.metallic, g.material[2] = d.edge, g.material[3] = d.noise;
+    g.emissive[0] = d.emissive.x, g.emissive[1] = d.emissive.y, g.emissive[2] = d.emissive.z, g.emissive[3] = (float)d.shape;
+    memcpy(g.weights, &d.weights, sizeof g.weights);
+    g.maps[0] = textureSlot(d.baseColor);
+    g.maps[1] = textureSlot(d.normal);
+    g.maps[2] = textureSlot(d.orm);
+    g.maps[3] = (row * 0x9E3779B9u) ^ (d.gen * 0x85EBCA6Bu); // its own noise, kept while it lives
+}
+
+// Paint order: priority, then the order they were added.
+int decalOrder(const void* a, const void* b)
+{
+    const Decal &x = Decals[*(const uint32_t*)a], &y = Decals[*(const uint32_t*)b];
+    if (x.priority != y.priority)
+        return x.priority < y.priority ? -1 : 1;
+    return x.order < y.order ? -1 : x.order > y.order ? 1 : 0;
+}
+
+// Every live decal (the last RENDER_MAX_WORLD_DECALS in paint order) and the grid over them, when they changed since the
+// last build: their rows, the loaded maps and the decals knob decide.
+void buildWorldDecals(bool on, uint64_t frame)
+{
+    uint64_t h = 0x9E3779B97F4A7C15ull ^ ((uint64_t)textureVersion() << 1) ^ (on ? 1u : 0u);
+    for (uint32_t row = 0; on && row < Decals.size(); ++row)
+    {
+        if (!Decals[row].alive)
+            continue;
+        const uint32_t* w = (const uint32_t*)&Decals[row];
+        h = (h ^ row) * 0x100000001B3ull;
+        for (size_t i = 0; i < sizeof(Decal) / 4; ++i)
+            h = (h ^ w[i]) * 0x100000001B3ull;
+    }
+    if (h == gWorldHash && gDecalsChanged)
+        return;
+    gWorldHash = h;
+    gDecalsChanged = frame;
+    gWorldCount = gWorldCells = gWorldItems = 0;
+    memset(gDecalGrid, 0, sizeof gDecalGrid);
+    uint32_t n = 0;
+    for (uint32_t row = 0; on && row < Decals.size(); ++row)
+        if (Decals[row].alive)
+            gDecalList[n++] = row;
+    if (!n)
+        return;
+    qsort(gDecalList, n, sizeof(uint32_t), decalOrder);
+    const uint32_t skip = n > RENDER_MAX_WORLD_DECALS ? n - RENDER_MAX_WORLD_DECALS : 0;
+    // Each one's world box (lo, hi) over its turned box, and all of theirs.
+    float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
+    static float box[RENDER_MAX_WORLD_DECALS][6];
+    for (uint32_t i = skip; i < n; ++i)
+    {
+        const uint32_t k = gWorldCount++;
+        const Decal&   d = Decals[gDecalList[i]];
+        fillDecal(gWorldDecalCpu[k], gDecalList[i]);
+        float R[3][4];
+        quatRows(d.rot, { 1, 1, 1 }, { 0, 0, 0 }, R);
+        const float half[3] = { d.half.x, d.half.y, d.half.z }, pos[3] = { d.pos.x, d.pos.y, d.pos.z };
+        for (int a = 0; a < 3; ++a)
+        {
+            float e = fabsf(R[a][0]) * half[0] + fabsf(R[a][1]) * half[1] + fabsf(R[a][2]) * half[2];
+            box[k][a] = pos[a] - e;
+            box[k][a + 3] = pos[a] + e;
+            lo[a] = minf(lo[a], box[k][a]);
+            hi[a] = maxf(hi[a], box[k][a + 3]);
+        }
+    }
+    // Cubic cells, up to kGridSide along the longest side; coarser while the decals would fill more than kGridItems.
+    float longest = maxf(hi[0] - lo[0], maxf(hi[1] - lo[1], hi[2] - lo[2]));
+    float perMetre = (float)kGridSide / maxf(longest, 1e-3f);
+    for (int attempt = 0; attempt < 8; ++attempt, perMetre *= 0.5f)
+    {
+        uint32_t dims[3];
+        for (int a = 0; a < 3; ++a)
+        {
+            float c = ceilf((hi[a] - lo[a]) * perMetre);
+            dims[a] = c < 1 ? 1u : c > (float)kGridSide ? kGridSide : (uint32_t)c;
+        }
+        const uint32_t cells = dims[0] * dims[1] * dims[2];
+        memset(gDecalCellCount, 0, cells * 4);
+        uint32_t total = 0;
+        auto range = [&](uint32_t k, int a, uint32_t& c0, uint32_t& c1) {
+            float f0 = (box[k][a] - lo[a]) * perMetre, f1 = (box[k][a + 3] - lo[a]) * perMetre;
+            c0 = f0 < 0 ? 0u : (uint32_t)f0 < dims[a] ? (uint32_t)f0 : dims[a] - 1;
+            c1 = f1 < 0 ? 0u : (uint32_t)f1 < dims[a] ? (uint32_t)f1 : dims[a] - 1;
+        };
+        for (uint32_t k = 0; k < gWorldCount; ++k)
+        {
+            uint32_t x0, x1, y0, y1, z0, z1;
+            range(k, 0, x0, x1), range(k, 1, y0, y1), range(k, 2, z0, z1);
+            total += (x1 - x0 + 1) * (y1 - y0 + 1) * (z1 - z0 + 1);
+        }
+        if (total > kGridItems && attempt < 7)
+            continue;
+        if (total > kGridItems)
+        {
+            yea::host()->log(1, "renderer: decals too many or too large for captures and ray hits to see them all");
+            gWorldCount = 0;
+            return;
+        }
+        for (uint32_t k = 0; k < gWorldCount; ++k)
+        {
+            uint32_t x0, x1, y0, y1, z0, z1;
+            range(k, 0, x0, x1), range(k, 1, y0, y1), range(k, 2, z0, z1);
+            for (uint32_t z = z0; z <= z1; ++z)
+                for (uint32_t y = y0; y <= y1; ++y)
+                    for (uint32_t x = x0; x <= x1; ++x)
+                        gDecalCellCount[(z * dims[1] + y) * dims[0] + x]++;
+        }
+        uint32_t first = 0;
+        for (uint32_t c = 0; c < cells; ++c)
+        {
+            gDecalCellCpu[c * 2] = first;
+            gDecalCellCpu[c * 2 + 1] = 0;
+            first += gDecalCellCount[c];
+        }
+        // In paint order: each cell's decals ascending.
+        for (uint32_t k = 0; k < gWorldCount; ++k)
+        {
+            uint32_t x0, x1, y0, y1, z0, z1;
+            range(k, 0, x0, x1), range(k, 1, y0, y1), range(k, 2, z0, z1);
+            for (uint32_t z = z0; z <= z1; ++z)
+                for (uint32_t y = y0; y <= y1; ++y)
+                    for (uint32_t x = x0; x <= x1; ++x)
+                    {
+                        uint32_t* cell = &gDecalCellCpu[((z * dims[1] + y) * dims[0] + x) * 2];
+                        gDecalItemCpu[cell[0] + cell[1]++] = k;
+                    }
+        }
+        gWorldCells = cells;
+        gWorldItems = total;
+        gDecalGrid[0][0] = lo[0], gDecalGrid[0][1] = lo[1], gDecalGrid[0][2] = lo[2], gDecalGrid[0][3] = perMetre;
+        gDecalGrid[1][0] = (float)dims[0], gDecalGrid[1][1] = (float)dims[1], gDecalGrid[1][2] = (float)dims[2];
+        return;
+    }
+}
+
 void barrierRt(Cmd* cmd, RenderTarget* rt, ResourceState from, ResourceState to)
 {
     RenderTargetBarrier b = { rt, from, to };
@@ -1783,6 +1957,11 @@ int load(int reloaded)
         gLookBuf[i] = makeBuffer((uint64_t)Lights.capacity() * 4, 4, DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_light_looks");
         gDecalBuf[i] = makeBuffer(sizeof(GpuDecal) * RENDER_MAX_DECALS, sizeof(GpuDecal), DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_decals");
         gDecalSphereBuf[i] = makeBuffer(16 * RENDER_MAX_DECALS, 16, DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_decal_spheres");
+        gWorldDecalBuf[i] = makeBuffer(sizeof(GpuDecal) * RENDER_MAX_WORLD_DECALS, sizeof(GpuDecal), DESCRIPTOR_TYPE_BUFFER, cpu, sr,
+                                       "renderer_world_decals");
+        gDecalCellBuf[i] = makeBuffer((uint64_t)kGridCells * 8, 8, DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_decal_cells");
+        gDecalItemBuf[i] = makeBuffer((uint64_t)kGridItems * 4, 4, DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_decal_items");
+        gWorldCopied[i] = 0;
         gStreamBuf[i] = makeBuffer((uint64_t)Instances.capacity() * 4, 0, DESCRIPTOR_TYPE_VERTEX_BUFFER, cpu,
                                    RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, "renderer_stream");
         gPrevBuf[i] = makeBuffer((uint64_t)Instances.capacity() * 48, 48, DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_prev_instances");
@@ -1876,6 +2055,8 @@ int load(int reloaded)
     for (uint32_t i = 0; i < gFrames; ++i)
         made = made && gMaterialMapBuf[i] && gMaterialMapBuf[i]->pCpuMappedAddress && gFrameCb[i] && gCompositeCb[i] && gExposureCb[i] && gInstanceBuf[i] && gMaterialBuf[i] && gLightBuf[i] && gShapeBuf[i] && gLookBuf[i] && gLookBuf[i]->pCpuMappedAddress &&
                gDecalBuf[i] && gDecalBuf[i]->pCpuMappedAddress && gDecalSphereBuf[i] && gDecalSphereBuf[i]->pCpuMappedAddress &&
+               gWorldDecalBuf[i] && gWorldDecalBuf[i]->pCpuMappedAddress && gDecalCellBuf[i] && gDecalCellBuf[i]->pCpuMappedAddress &&
+               gDecalItemBuf[i] && gDecalItemBuf[i]->pCpuMappedAddress &&
                gStreamBuf[i] && gPrevBuf[i] && gFrameCb[i]->pCpuMappedAddress && gCompositeCb[i]->pCpuMappedAddress &&
                gExposureCb[i]->pCpuMappedAddress && gInstanceBuf[i]->pCpuMappedAddress && gMaterialBuf[i]->pCpuMappedAddress &&
                gLightBuf[i]->pCpuMappedAddress && gShapeBuf[i]->pCpuMappedAddress && gStreamBuf[i]->pCpuMappedAddress && gPrevBuf[i]->pCpuMappedAddress;
@@ -1949,6 +2130,11 @@ int load(int reloaded)
     gDecalCpu = new GpuDecal[RENDER_MAX_DECALS];
     gDecalSphereCpu = new float[RENDER_MAX_DECALS][4];
     gDecalList = new uint32_t[Decals.capacity()];
+    gWorldDecalCpu = new GpuDecal[RENDER_MAX_WORLD_DECALS];
+    gDecalCellCpu = new uint32_t[kGridCells * 2];
+    gDecalCellCount = new uint32_t[kGridCells];
+    gDecalItemCpu = new uint32_t[kGridItems];
+    gWorldHash = gDecalsChanged = 0;
     gPrevRows = new PrevRows[Instances.capacity()];
     memset(gPrevRows, 0, sizeof(PrevRows) * Instances.capacity());
     gLodMesh = new uint32_t[Instances.capacity()];
@@ -2007,6 +2193,9 @@ void unload()
         freeBuffer(gLookBuf[i]);
         freeBuffer(gDecalBuf[i]);
         freeBuffer(gDecalSphereBuf[i]);
+        freeBuffer(gWorldDecalBuf[i]);
+        freeBuffer(gDecalCellBuf[i]);
+        freeBuffer(gDecalItemBuf[i]);
         freeBuffer(gStreamBuf[i]);
         freeBuffer(gPrevBuf[i]);
     }
@@ -2630,50 +2819,13 @@ void draw(uint32_t pass, const YeaFrame* yf)
             if (sphereInside(frustum, 5, V(d.pos.x, d.pos.y, d.pos.z), r))
                 gDecalList[n++] = row;
         }
-        qsort(gDecalList, n, sizeof(uint32_t), [](const void* a, const void* b) {
-            const Decal &x = Decals[*(const uint32_t*)a], &y = Decals[*(const uint32_t*)b];
-            if (x.priority != y.priority)
-                return x.priority < y.priority ? -1 : 1;
-            return x.order < y.order ? -1 : x.order > y.order ? 1 : 0;
-        });
+        qsort(gDecalList, n, sizeof(uint32_t), decalOrder);
         const uint32_t skip = n > RENDER_MAX_DECALS ? n - RENDER_MAX_DECALS : 0;
         for (uint32_t i = skip; i < n; ++i)
         {
             const uint32_t row = gDecalList[i];
             const Decal&   d = Decals[row];
-            GpuDecal&      g = gDecalCpu[decalCount];
-            float          R[3][4];
-            quatRows(d.rot, { 1, 1, 1 }, { 0, 0, 0 }, R);
-            const float half[3] = { d.half.x, d.half.y, d.half.z }, pos[3] = { d.pos.x, d.pos.y, d.pos.z };
-            for (int j = 0; j < 3; ++j)
-            {
-                float t = 0;
-                for (int k = 0; k < 3; ++k)
-                {
-                    g.row[j][k] = R[k][j] / half[j];
-                    t += R[k][j] * pos[k];
-                }
-                g.row[j][3] = -t / half[j];
-            }
-            for (int k = 0; k < 3; ++k)
-            {
-                g.axisX[k] = R[k][0];
-                g.axisY[k] = R[k][1];
-                g.axisZ[k] = R[k][2];
-            }
-            // Surfaces turned past `angle` from facing along z are left alone, fading over its last 15 degrees.
-            const float a1 = d.angle * 0.01745329f, a0 = maxf(d.angle - 15.0f, 0.0f) * 0.01745329f;
-            g.axisZ[3] = cosf(a1);
-            g.axisX[3] = 1.0f / maxf(cosf(a0) - cosf(a1), 1e-3f);
-            g.axisY[3] = d.normalScale;
-            memcpy(g.albedo, &d.albedo, sizeof g.albedo);
-            g.material[0] = d.roughness, g.material[1] = d.metallic, g.material[2] = d.edge, g.material[3] = d.noise;
-            g.emissive[0] = d.emissive.x, g.emissive[1] = d.emissive.y, g.emissive[2] = d.emissive.z, g.emissive[3] = (float)d.shape;
-            memcpy(g.weights, &d.weights, sizeof g.weights);
-            g.maps[0] = textureSlot(d.baseColor);
-            g.maps[1] = textureSlot(d.normal);
-            g.maps[2] = textureSlot(d.orm);
-            g.maps[3] = (row * 0x9E3779B9u) ^ (d.gen * 0x85EBCA6Bu); // its own noise, kept while it lives
+            fillDecal(gDecalCpu[decalCount], row);
             gDecalSphereCpu[decalCount][0] = d.pos.x, gDecalSphereCpu[decalCount][1] = d.pos.y, gDecalSphereCpu[decalCount][2] = d.pos.z;
             gDecalSphereCpu[decalCount][3] = length(V(d.half.x, d.half.y, d.half.z));
             decalCount++;
@@ -2684,6 +2836,21 @@ void draw(uint32_t pass, const YeaFrame* yf)
     F.decalCount = decalCount;
     F.decalSpheres = decalCount ? gDecalSphereCpu : nullptr;
     F.decalSphereBuffer = decalCount ? gDecalSphereBuf[fi] : nullptr;
+    // What captures and ray hits see of the decals (frame worldDecals), copied into this frame's buffers when older.
+    buildWorldDecals(settings.decals && !viewMode, F.frameNumber);
+    if (gWorldCount && gWorldCopied[fi] != gWorldHash)
+    {
+        memcpy(gWorldDecalBuf[fi]->pCpuMappedAddress, gWorldDecalCpu, sizeof(GpuDecal) * gWorldCount);
+        memcpy(gDecalCellBuf[fi]->pCpuMappedAddress, gDecalCellCpu, (size_t)gWorldCells * 8);
+        memcpy(gDecalItemBuf[fi]->pCpuMappedAddress, gDecalItemCpu, (size_t)gWorldItems * 4);
+        gWorldCopied[fi] = gWorldHash;
+    }
+    F.worldDecalCount = gWorldCount;
+    F.worldDecals = gWorldCount ? gWorldDecalBuf[fi] : nullptr;
+    F.decalCells = gWorldCount ? gDecalCellBuf[fi] : nullptr;
+    F.decalItems = gWorldCount ? gDecalItemBuf[fi] : nullptr;
+    memcpy(F.decalGrid, gDecalGrid, sizeof F.decalGrid);
+    F.decalsChanged = gDecalsChanged;
     bool culled = renderer_culling::cull_prepare((uint64_t)(uintptr_t)&F) && F.tileMasks && F.zbins && F.wordsPerTile;
     // Decals need culling's bins with it; without culling the forward pass tries every one.
     const bool decals = decalCount && (!culled || (F.decalMasks && F.decalBins));

@@ -121,21 +121,7 @@ STRUCT(MaterialMapData)
 };
 #define MAX_TEXTURES 1024
 
-// A decal (renderer.cpp GpuDecal): the box it paints, mapped to -1..1 by its rows.
-STRUCT(DecalData)
-{
-    DATA(float4, row0, None);
-    DATA(float4, row1, None);
-    DATA(float4, row2, None);
-    DATA(float4, axisZ, None);    // world, out of the surface; w the cosine where its angle fade ends
-    DATA(float4, axisX, None);    // w 1 / the angle fade's width in cosine
-    DATA(float4, axisY, None);    // w normal map scale
-    DATA(float4, albedo, None);   // a opacity
-    DATA(float4, material, None); // x roughness, y metallic, z edge, w noise
-    DATA(float4, emissive, None); // rgb nits, w shape (0 ellipse, 1 rectangle)
-    DATA(float4, weights, None);  // colour, roughness, metallic, normal
-    DATA(uint4, maps, None);      // base colour, normal, ORM: slot in gTextures + 1, 0 none; w its noise seed
-};
+#include "Decal.h.fsl"
 #define DECAL_WORDS 8u // RENDER_MAX_DECALS / 32: gDecalMasks' words a tile
 
 STRUCT(LightData)

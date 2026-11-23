@@ -21,6 +21,9 @@ BEGIN_SRT(GiCaptureSrt)
         DECL_TEXTURE(PerFrame, Tex2D(float4), gGiDist)
         DECL_BUFFER(PerFrame, Buffer(float4), gGiProbes)
         DECL_BUFFER(PerFrame, Buffer(GiMaterialMap), gMaterialMaps) // the frame's materialMaps
+        DECL_BUFFER(PerFrame, Buffer(DecalData), gDecals)  // frame worldDecals (decals.x), decalCells, decalItems
+        DECL_BUFFER(PerFrame, Buffer(uint2), gDecalCells)
+        DECL_BUFFER(PerFrame, Buffer(uint), gDecalItems)
         DECL_ARRAY_TEXTURES(PerFrame, Tex2D(float4), gTextures, MAX_TEXTURES)
     END_SRT_SET(PerFrame)
 END_SRT(GiCaptureSrt)

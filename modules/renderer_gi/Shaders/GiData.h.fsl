@@ -18,7 +18,10 @@ STRUCT(GiData)
     DATA(float4, fogAlbedo, None); // rgb albedo, w the fog's range (m)
     DATA(float4, shadow, None);    // x 1: the sun's own map (gGiSun) holds the scene, y its texel (uv), z local atlas texel
     DATA(float4, sunView[3], None); // rows, world -> the sun map's ndc x, y (-1..1) and depth (0 nearest the sun, 1 farthest)
+    DATA(uint4, decals, None);     // x decals the captures paint (frame worldDecalCount)
+    DATA(float4, decalGrid[2], None); // frame.h decalGrid
 };
+#include "Decal.h.fsl" // a copy of the core's: DecalData here, decalsAt in Capture.frag.fsl
 
 // A material's texture maps (the core's MaterialMapData): slot + 1 in maps (x base colour, w emissive), the base colour
 // factor, misc.x the alpha cutoff (0: not cut out), misc.y 1 when maps were given (vertex colours count).

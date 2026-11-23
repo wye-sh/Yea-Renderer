@@ -60,9 +60,12 @@ STRUCT(CaptureData)
     DATA(float4, skyZenith, None);
     DATA(float4, skyHorizon, None);
     DATA(float4, skyGround, None);    // w ambient
-    DATA(uint4, counts, None);        // x lights
+    DATA(uint4, counts, None);        // x lights, y renderer_sky's SH, z decals (frame worldDecalCount)
     DATA(float4, fogMedium, None);    // frame.h's height fog (x 0: none)
     DATA(float4, fogAlbedo, None);
+    DATA(float4, decalGrid0, None);   // frame.h decalGrid[0] (counts.z decals)
+    DATA(float4, decalGrid1, None);   // frame.h decalGrid[1]
 };
 
+#include "Decal.h.fsl" // a copy of the core's: DecalData here, decalsAt in Capture.frag.fsl
 #include "Capture.srt.h"

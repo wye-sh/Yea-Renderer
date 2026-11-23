@@ -51,7 +51,13 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   clustered decals): the tile mask ANDed with the z-bin's range, in paint order, blending albedo and glow, roughness,
   metallic and the normal by coverage times weights. Coverage: the base colour map's alpha, else a procedural ellipse or
   rectangle with an `edge` fade and value-noise `noise` (ragged rim, patches), times the angle fade and the box's depth
-  fade. Not on see-through surfaces, in probe captures, GI captures or ray hits yet. Knob `decals` (Performance).
+  fade. Not on see-through surfaces. Knob `decals` (Performance).
+  Captures and ray hits (frame v25): every live decal (up to RENDER_MAX_WORLD_DECALS, 1024, in paint order) as
+  `worldDecals`, with a world grid over them (`decalCells`, `decalItems`, `decalGrid`: up to 32 cubed cells, coarser past
+  65536 entries), rebuilt only when a decal, the loaded maps or the knob change (`decalsChanged`). `Shaders/Decal.h.fsl`
+  is the one painting code (decalPaint; decalsAt through the grid): renderer_probes and renderer_gi keep identical copies
+  and paint their captures with it (probes recapture when `decalsChanged` moves; GI's raster captures catch up as they go
+  round), and renderer_rt paints its hits (not glass hits).
 - `renderer_shadows`: sun cascades (stabilised, PCF or PCSS; each redrawn only when its view or a caster over it
   changed) and a cached atlas for spot and point lights
   (6 tiles per point light), redrawn only when the light or a nearby caster moves. Each face's tile is a square of
@@ -164,7 +170,10 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   the surface, spreading by the pixel angle, twice the reflector's bend to its neighbours and the GGX alpha; a probe
   ray by sqrt(4 pi / rays)) over the triangle's uv-to-world area, plus mipBias; positions are bound for that. Normal maps
   use each vertex's world normal and tangent at unit length, as the core's Material.h.fsl mappedNormal does (the core's
-  vertex normal keeps the instance's scale for specular antialiasing; Tangent.w carries that length with the sign). The core's vertex and index buffers get the device-address and
+  vertex normal keeps the instance's scale for specular antialiasing; Tangent.w carries that length with the sign). Then hits take the frame's world decals (frame v25
+  `worldDecals` through its grid, `decalsAt` in `Shaders/Decal.h.fsl`, an identical copy of the core's: change them
+  together), as the forward pass and the captures paint them: never on glass, the footprint the ray cone's width across
+  the ray, stretched along it by the angle (`hitDecals`). The core's vertex and index buffers get the device-address and
   build-input flags and a uint view when the service exists. While it runs, the prepass writes `surface`
   (RGBA16F: x reflection roughness, yzw the normal; renderer_vrs reads x as its gloss). After the prepass, one
   full-size compute dispatch traces each pixel below `max_roughness` along one GGX visible-normal sample (R2
