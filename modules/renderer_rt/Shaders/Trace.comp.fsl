@@ -74,9 +74,6 @@ STRUCT(ShadowView)
 #define FLAG_DEBUG 4u
 #define FLAG_MAPS 8u // the frame has material maps (gMaterialMaps, gTextures bound): hits read them
 #define FLAG_GLASS 16u // see-through instances are in the top-level structure (Hit.h.fsl): rays look for their layers
-#define FLAG_REFRACT 32u // glass refracts (frame refractOn): reflection rays bend through material_refraction's layers
-#define GLASS_LAYERS 4u // glass layers a reflection ray shades and bends through, front to back; past them it goes on
-                        // straight, multiplied by the T of every layer it passes (raster's every layer multiplies)
 // Instance masks (renderer_rt.cpp): 1 seen in reflections, 2 casts shadows (glass too), 4 opaque and casts (what GI
 // probe rays hit), 8 glass (every see-through instance: what GI probe rays pass through, tinted).
 #define MASK_REFLECTED 1u
@@ -461,45 +458,17 @@ STRUCT(Hit)
     DATA(uint4, tri, None);     // the hit's top-level instance, triangle and barycentrics (as uints)
     DATA(float, cone, None);    // the ray cone's width there (m)
     DATA(float, invPdf, None);  // 1 / the probability the ray was cast with (GGX visible normals), for its reuse
-    // The glass layers in front of what the ray saw (FLAG_GLASS), shaded as it met them: what it shows is
-    // glassOwn.rgb + glassThrough.rgb x what is behind (their light and fog, and the product of their T and the fog).
-    DATA(float4, glassOwn, None);     // w the layers (0: none)
-    DATA(float4, glassThrough, None); // w the path before the last segment (m): pos.w and result.a go on from it
-    DATA(float4, first, None);        // xyz the ray as cast (what the half-resolution reuse reads), before any glass bent it
-    DATA(uint, others, None);         // followRay: layers met of another instance than its `self`
-    DATA(float, spread, None);        // and the spreads (rad) of the layers it bent through
+    DATA(float4, glass, None);  // the nearest glass layer in front of what the ray saw (FLAG_GLASS): xyz where, w its
+                                // distance (0: none)
+    DATA(uint4, glassTri, None); // its top-level instance, triangle and barycentrics (as uints)
+    DATA(float, glassCone, None); // the ray cone's width there (m)
 };
 
-// Where a ray that meets refracting glass (material_refraction refr, at P with shading normal N, coming along I)
-// leaves it, and which way, as the core's see-through pass bends the view (Forward.frag refractedScene): a thin pane
-// (shape 0) `thickness` thick shifts it, on as it came; a solid one is a ball that thick, refracted in and out of it,
-// reflecting inside past the critical angle.
-void refractThrough(float3 P, float3 N, float3 I, float4 refr, out(float3) E, out(float3) D)
-{
-    float  ior = max(refr.x, 1.0);
-    float3 T = refract(I, N, 1.0 / ior);
-    if (dot(T, T) < 1e-6)
-        T = I;
-    if (refr.z < 0.5)
-    {
-        E = P + T * (refr.y / max(dot(T, -N), 0.2));
-        D = I;
-    }
-    else
-    {
-        E = P + T * (refr.y * max(dot(T, -N), 0.0));
-        float3 N2 = normalize(E - (P - N * (refr.y * 0.5)));
-        D = refract(T, -N2, ior);
-        if (dot(D, D) < 1e-6)
-            D = reflect(T, -N2);
-    }
-}
-
-// The ray cone along pixel p's reflected ray (Akenine-Moller et al. 2021), its width t along it c.x + t c.y: a pixel wide at
-// the surface (view depth z, normal N), spreading by the pixel's angle, twice the surface's own bend across a pixel (the
-// normal's change to the neighbours on the same surface) and the lobe's width (alpha) for a rough reflection, so distant
-// and curved reflections pick blurrier mips instead of shimmering.
-float2 coneOf(int2 p, float z, float3 N, float alpha)
+// The ray cone's width t along pixel p's reflected ray (Akenine-Moller et al. 2021): a pixel wide at the surface (view
+// depth z, normal N), spreading by the pixel's angle, twice the surface's own bend across a pixel (the normal's change
+// to the neighbours on the same surface) and the lobe's width (alpha) for a rough reflection, so distant and curved
+// reflections pick blurrier mips instead of shimmering.
+float coneWidth(int2 p, float z, float3 N, float alpha, float t)
 {
     int2  size = int2(gRt.screen.xy);
     float pixelAngle = 2.0 / (gRt.up.w * gRt.screen.y);
@@ -511,10 +480,12 @@ float2 coneOf(int2 p, float z, float3 N, float alpha)
         if (dq > 0.0 && abs(gRt.forward.w / dq - z) < 0.05 * z)
             bend = max(bend, length(normalize(LoadTex2D(gSurface, NO_SAMPLER, q, 0).yzw) - N));
     }
-    return float2(z * pixelAngle, pixelAngle + 2.0 * bend + alpha);
+    return z * pixelAngle + t * (pixelAngle + 2.0 * bend + alpha);
 }
 
-Hit noHit()
+// Traces pixel p's reflected ray (surface and d: its surface and depth). What the screen shows, the sky and
+// untraced pixels come back finished; a hit to light where it is comes back with result.a < 0 (lightHit).
+Hit traceRay(int2 p, float4 surface, float d, uint seq)
 {
     Hit o;
     o.result = float4(0.0, 0.0, 0.0, 0.0);
@@ -526,173 +497,93 @@ Hit noHit()
     o.tri = uint4(0u, 0u, 0u, 0u);
     o.cone = 0.0;
     o.invPdf = 0.0;
-    o.glassOwn = float4(0.0, 0.0, 0.0, 0.0);
-    o.glassThrough = float4(1.0, 1.0, 1.0, 0.0);
-    o.first = float4(0.0, 0.0, 0.0, 0.0);
-    o.others = 0u;
-    o.spread = 0.0;
-    return o;
-}
-
-// Follows `ray` (for pixel p: fp its noise's pixel, seq its sequence) to what it meets. Glass is never committed: the
-// nearest layer that counts (Hit.h.fsl) is shaded where the ray meets it, and the ray goes on from it (bent through
-// refracting glass, Forward.frag's way), up to GLASS_LAYERS in all with the `layers` already met; past them the rest of
-// the glass only multiplies. The path so far: `travelled` metres, the cone's width cone.x + t cone.y at t along it (coneOf),
-// rough refracting layers' spreads spreadSum (rad) and spreadAt (each times where it was met). screen: a hit visible on
-// screen now and last frame takes the screen's colour. What the screen shows, the sky and untraced pixels come back
-// finished; a hit to light where it is comes back with result.a < 0 (lightHit); others counts the layers met of another
-// top-level instance than `self`; jitter: rough layers send it over their spread (else straight on, bent).
-Hit followRay(RayDesc ray, int2 p, uint seq, int2 fp, float2 cone, uint layers, float travelled, float spreadSum, float spreadAt,
-              bool screen, uint self, bool jitter)
-{
-    Hit    o = noHit();
+    o.glass = float4(0.0, 0.0, 0.0, 0.0);
+    o.glassTri = uint4(0u, 0u, 0u, 0u);
+    o.glassCone = 0.0;
     int2   size = int2(gRt.screen.xy);
-    bool   debug = (gRt.counts.z & FLAG_DEBUG) != 0u;
-    float3 R = ray.Direction;
-    uint   met = layers;
-    float3 own = float3(0.0, 0.0, 0.0), through = float3(1.0, 1.0, 1.0);
-    bool   isHit = false;
-    float  t = 0.0;
-    uint   index = 0u, prim = 0u;
-    float2 bary = float2(0.0, 0.0);
-    for (uint seg = 0u; seg <= GLASS_LAYERS; ++seg)
+    float  rough = surface.x;
+    if (d <= 0.0 || rough >= gRt.camPos.w)
+        return o;
+
+    // The pixel's world position, from depth (reversed-Z, infinite far), undoing the TAA jitter it was drawn with.
+    float  z = gRt.forward.w / d;
+    float2 u = float2(p) + 0.5 - gRt.screen.zw;
+    float2 ndc = float2(u.x / gRt.screen.x * 2.0 - 1.0, 1.0 - u.y / gRt.screen.y * 2.0);
+    float3 P = gRt.camPos.xyz + gRt.right.xyz * (ndc.x * z / gRt.right.w) + gRt.up.xyz * (ndc.y * z / gRt.up.w) + gRt.forward.xyz * z;
+    float3 N = normalize(surface.yzw);
+    float3 V = normalize(gRt.camPos.xyz - P);
+
+    // The reflected ray, about one visible microfacet normal; a mirror stays a mirror.
+    float  alpha = rough * rough;
+    float3 R = reflect(-V, N);
+    if (alpha > 1e-3)
     {
-        float  glassT = ray.TMax;
-        uint4  glassTri = uint4(0u, 0u, 0u, 0u);
-        bool   lookForGlass = layers < GLASS_LAYERS;
-        RayQueryClosestHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RT_RAY_FLAGS, ray, MASK_REFLECTED, hit)
-        RayQueryBeginForEachCandidate(hit)
-        {
-            uint   ci = RayQueryCandidateInstanceID(hit);
-            uint   cp = RayQueryCandidatePrimitiveIndex(hit);
-            float2 cb = RayQueryCandidateBarycentrics(hit);
-            if (isGlass(ci))
-            {
-                float ct = RayQueryCandidateRayT(hit);
-                uint  material;
-                if (lookForGlass && ct < glassT && !cutAway(ci, cp, cb) &&
-                    glassCounts(ci, (gRtInstances[ci].w & RT_INST_MATERIAL) - 1u, dot(hitNormal(ci, cp, cb, material), ray.Direction) < 0.0))
-                {
-                    glassT = ct;
-                    glassTri = uint4(ci, cp, asuint(cb));
-                }
-            }
-            else if (!cutAway(ci, cp, cb))
-                RayQueryCommitCandidate(hit);
-            RayQueryProceed(hit);
-        }
-        RayQueryEndForEachCandidate(hit)
-        isHit = RayQueryIsHit(hit);
-        t = isHit ? RayQueryRayT(hit) : ray.TMax;
-        if (isHit)
-        {
-            index = RayQueryInstanceID(hit);
-            prim = RayQueryPrimitiveIndex(hit);
-            bary = RayQueryBarycentrics(hit);
-        }
-        if (glassT >= t)
-            break;
-        if (glassTri.x != self)
-            o.others += 1u;
-        // A layer, as the core's see-through pass draws one over what is behind: its own light (diffuse and glow by
-        // its coverage, specular whole, no decals) plus its T times what is behind, each fogged over the way to it.
-        float3 I = ray.Direction;
-        float3 G = ray.Origin + I * glassT;
-        float3 fog0 = applyHeightFog(float3(0.0, 0.0, 0.0), ray.Origin, I, glassT);
-        float3 fogT = applyHeightFog(float3(1.0, 1.0, 1.0), ray.Origin, I, glassT) - fog0;
-        own += through * fog0;
-        through *= fogT;
-        float2       gb = asfloat(glassTri.zw);
-        uint         material;
-        float3       Ng = hitNormal(glassTri.x, glassTri.y, gb, material);
-        if (dot(Ng, I) > 0.0)
-            Ng = -Ng; // the side the ray came from
-        float        at = travelled + glassT;
-        float        occlusion, alpha;
-        MaterialData m = hitMaterialAlpha(glassTri.x, glassTri.y, gb, cone.x + at * cone.y + spreadSum * at - spreadAt, I, Ng,
-                                          occlusion, alpha);
-        float        coverage = saturate(gMaterialMaps[material].misc.z * alpha);
-        float        phi = noise2(float2(fp) + float(gRt.counts.y % 64u) * 5.588238) * 2.0 * PI;
-        own += through * shadeHit(G, Ng, -I, m, occlusion, float2(cos(phi), sin(phi)), MAX_SHADOW_RAYS, false, coverage);
-        through *= glassTransmit(m, material, coverage, max(dot(Ng, -I), 1e-3));
-        layers += 1u;
-        // On from it: straight, or bent through it (and over the rough one's spread, which the history averages).
-        float4 refr = gRefraction[material * 2u];
-        float3 E = G;
-        float3 D = I;
-        if ((gRt.counts.z & FLAG_REFRACT) != 0u && refr.w > 0.5)
-        {
-            refractThrough(G, Ng, I, refr, E, D);
-            float a = m.albedoRough.a * m.albedoRough.a;
-            float spread = 2.0 * a * (1.0 - 1.0 / max(refr.x, 1.0));
-            o.spread += spread;
-            if (jitter && spread > 1e-5)
-            {
-                float2 u2 = sample2(p + int2(37 * int(layers), 91), seq);
-                float3 axis = abs(D.y) < 0.9 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
-                float3 tx = normalize(cross(axis, D));
-                float3 ty = cross(D, tx);
-                float  r = 0.5 * spread * sqrt(u2.x);
-                float  ph = 2.0 * PI * u2.y;
-                D = normalize(D + (tx * cos(ph) + ty * sin(ph)) * tan(r));
-            }
-            spreadSum += spread;
-            spreadAt += spread * at;
-        }
-        float inside = length(E - G);
-        travelled = at + inside;
-        // Bent: from just short of where it leaves (a thin pane's far face is met again there, as raster draws it).
-        // Straight: from just past the layer.
-        ray.Origin = inside > 0.0 ? E - D * min(5e-4, 0.25 * inside) : G + D * (2e-4 + 1e-5 * at);
-        ray.Direction = D;
-        ray.TMax = max(gRt.params.x - travelled, 1e-3);
+        float3 axis = abs(N.y) < 0.9 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+        float3 tx = normalize(cross(axis, N));
+        float3 ty = cross(N, tx);
+        float3 v = float3(dot(V, tx), dot(V, ty), max(dot(V, N), 1e-4));
+        float3 h = sampleVndf(v, alpha, sample2(p, seq));
+        float3 Rj = reflect(-V, tx * h.x + ty * h.y + N * h.z);
+        if (dot(Rj, N) > 0.0)
+            R = Rj;
+        // G1(V) D(H) / (4 N.V), as reconstruct weighs the ray by (1 / it, as a half can't hold it at grazing angles).
+        float a2 = alpha * alpha;
+        float pdf = smithG1(v.z, a2) * ggxD(saturate(dot(N, normalize(V + R))), a2) / (4.0 * v.z);
+        o.invPdf = pdf > 0.0 ? 1.0 / pdf : 0.0;
     }
-    if (layers >= GLASS_LAYERS)
+
+    RayDesc ray;
+    ray.Origin = P + N * (0.001 * z + 0.004); // off the surface, more further away where depth is coarser
+    ray.Direction = R;
+    ray.TMin = 0.0;
+    ray.TMax = gRt.params.x;
+    // Glass is never committed: the nearest layer that counts (Hit.h.fsl) is kept, to show over what is behind it.
+    float  glassT = ray.TMax;
+    uint4  glassTri = uint4(0u, 0u, 0u, 0u);
+    RayQueryClosestHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RT_RAY_FLAGS, ray, MASK_REFLECTED, hit)
+    RayQueryBeginForEachCandidate(hit)
     {
-        // Past the layers it shades: the rest of the glass on the way only multiplies (a second ray only glass
-        // answers, up to the hit; any order: a product).
-        RayDesc glassRay = ray;
-        glassRay.TMax = t;
-        RayQueryAnyHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RT_RAY_FLAGS, glassRay, MASK_GI_GLASS, deeper)
-        RayQueryBeginForEachCandidate(deeper)
+        uint   ci = RayQueryCandidateInstanceID(hit);
+        uint   cp = RayQueryCandidatePrimitiveIndex(hit);
+        float2 cb = RayQueryCandidateBarycentrics(hit);
+        if (isGlass(ci))
         {
-            uint   ci = RayQueryCandidateInstanceID(deeper);
-            uint   cp = RayQueryCandidatePrimitiveIndex(deeper);
-            float2 cb = RayQueryCandidateBarycentrics(deeper);
-            if (!cutAway(ci, cp, cb))
+            float ct = RayQueryCandidateRayT(hit);
+            uint  material;
+            if (ct < glassT && !cutAway(ci, cp, cb) && glassCounts(ci, (gRtInstances[ci].w & RT_INST_MATERIAL) - 1u, dot(hitNormal(ci, cp, cb, material), R) < 0.0))
             {
-                float3 g = glassThrough(ci, cp, cb, ray.Direction);
-                through *= g;
-                if (ci != self && min(g.r, min(g.g, g.b)) < 1.0)
-                    o.others += 1u;
+                glassT = ct;
+                glassTri = uint4(ci, cp, asuint(cb));
             }
-            RayQueryProceed(deeper);
         }
-        RayQueryEndForEachCandidate(deeper)
+        else if (!cutAway(ci, cp, cb))
+            RayQueryCommitCandidate(hit);
+        RayQueryProceed(hit);
     }
-    float3 R0 = R;
-    R = ray.Direction; // what the ray met came along the last segment
-    o.ray = float4(R0, 0.0); // kept for the half-resolution rays' reuse
-    if (layers > met)
+    RayQueryEndForEachCandidate(hit)
+    o.ray = float4(R, 0.0); // kept for the half-resolution rays' reuse
+    bool debug = (gRt.counts.z & FLAG_DEBUG) != 0u;
+    if (glassT < (RayQueryIsHit(hit) ? RayQueryRayT(hit) : ray.TMax))
     {
-        o.glassOwn = float4(debug ? float3(1.0, 0.0, 1.0) : own, float(layers - met));
-        o.glassThrough = float4(debug ? float3(0.0, 0.0, 0.0) : through, travelled);
+        o.glass = float4(ray.Origin + R * glassT, glassT);
+        o.glassTri = glassTri;
+        o.glassCone = coneWidth(p, z, N, alpha, glassT);
     }
-    else
-        o.glassThrough.w = travelled;
-    if (!isHit)
+    if (!RayQueryIsHit(hit))
     {
         float3 sky = applyHeightFog(skyRadiance(R) * gRt.sunColor.w, ray.Origin, R, gRt.fogAlbedo.w);
         o.result = float4(debug ? float3(0.5, 0.5, 0.5) : clampSample(sky), RT_MISS);
-        o.pos = float4(ray.Origin, ray.TMax); // where the last segment set out from, and how far it looked
-        o.normal = float4(R, 0.0);
         return o;
     }
+    float  t = RayQueryRayT(hit);
+    uint   index = RayQueryInstanceID(hit);
+    uint   prim = RayQueryPrimitiveIndex(hit);
+    float2 bary = RayQueryBarycentrics(hit);
     float3 Hp = ray.Origin + R * t;
     // How much of the hit to take from the screen: visible there now (its depth matches) and last frame.
     float  screenWeight = 0.0;
     float3 screenColor = float3(0.0, 0.0, 0.0);
-    if (screen)
+    if ((gRt.counts.z & FLAG_SCREEN) != 0u)
     {
         float4 c = clipOf(gRt.viewProj, Hp);
         float4 pc = clipOf(gRt.prevViewProj, Hp);
@@ -716,7 +607,7 @@ Hit followRay(RayDesc ray, int2 p, uint seq, int2 fp, float2 cone, uint layers, 
     }
     if (screenWeight >= 1.0)
     {
-        o.result = float4(clampSample(debug ? float3(0.0, 1.0, 0.0) : screenColor), max(travelled + t, 1e-3));
+        o.result = float4(clampSample(debug ? float3(0.0, 1.0, 0.0) : screenColor), max(t, 1e-3));
         return o;
     }
     uint   material;
@@ -730,53 +621,7 @@ Hit followRay(RayDesc ray, int2 p, uint seq, int2 fp, float2 cone, uint layers, 
     o.screen = float4(screenColor, 0.0);
     o.material = material;
     o.tri = uint4(index, prim, asuint(bary));
-    o.cone = cone.x + (travelled + t) * cone.y + spreadSum * (travelled + t) - spreadAt;
-    return o;
-}
-
-// Traces pixel p's reflected ray (surface and d: its surface and depth); its result as followRay's.
-Hit traceRay(int2 p, float4 surface, float d, uint seq, int2 fp)
-{
-    float rough = surface.x;
-    if (d <= 0.0 || rough >= gRt.camPos.w)
-        return noHit();
-
-    // The pixel's world position, from depth (reversed-Z, infinite far), undoing the TAA jitter it was drawn with.
-    float  z = gRt.forward.w / d;
-    float2 u = float2(p) + 0.5 - gRt.screen.zw;
-    float2 ndc = float2(u.x / gRt.screen.x * 2.0 - 1.0, 1.0 - u.y / gRt.screen.y * 2.0);
-    float3 P = gRt.camPos.xyz + gRt.right.xyz * (ndc.x * z / gRt.right.w) + gRt.up.xyz * (ndc.y * z / gRt.up.w) + gRt.forward.xyz * z;
-    float3 N = normalize(surface.yzw);
-    float3 V = normalize(gRt.camPos.xyz - P);
-
-    // The reflected ray, about one visible microfacet normal; a mirror stays a mirror.
-    float  alpha = rough * rough;
-    float3 R = reflect(-V, N);
-    float  invPdf = 0.0;
-    if (alpha > 1e-3)
-    {
-        float3 axis = abs(N.y) < 0.9 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
-        float3 tx = normalize(cross(axis, N));
-        float3 ty = cross(N, tx);
-        float3 v = float3(dot(V, tx), dot(V, ty), max(dot(V, N), 1e-4));
-        float3 h = sampleVndf(v, alpha, sample2(p, seq));
-        float3 Rj = reflect(-V, tx * h.x + ty * h.y + N * h.z);
-        if (dot(Rj, N) > 0.0)
-            R = Rj;
-        // G1(V) D(H) / (4 N.V), as reconstruct weighs the ray by (1 / it, as a half can't hold it at grazing angles).
-        float a2 = alpha * alpha;
-        float pdf = smithG1(v.z, a2) * ggxD(saturate(dot(N, normalize(V + R))), a2) / (4.0 * v.z);
-        invPdf = pdf > 0.0 ? 1.0 / pdf : 0.0;
-    }
-
-    RayDesc ray;
-    ray.Origin = P + N * (0.001 * z + 0.004); // off the surface, more further away where depth is coarser
-    ray.Direction = R;
-    ray.TMin = 0.0;
-    ray.TMax = gRt.params.x;
-    Hit o = followRay(ray, p, seq, fp, coneOf(p, z, N, alpha), 0u, 0.0, 0.0, 0.0, (gRt.counts.z & FLAG_SCREEN) != 0u, 0xFFFFFFFFu, true);
-    o.first = float4(R, 0.0);
-    o.invPdf = invPdf;
+    o.cone = coneWidth(p, z, N, alpha, t);
     return o;
 }
 
@@ -798,23 +643,41 @@ float4 lightHit(Hit h, int2 p)
     float3 color = lerp(lit, screen, ray.w);
     if ((gRt.counts.z & FLAG_DEBUG) != 0u)
         color = float3(0.0, ray.w, 1.0 - ray.w);
-    return float4(clampSample(color), max(h.glassThrough.w + pos.w, 1e-3));
+    return float4(clampSample(color), max(pos.w, 1e-3));
 }
 
-// A sample (what the ray saw behind) with the glass layers in front of it (traceRay shaded them).
-float4 overGlass(Hit h, float4 behind)
+// A sample (what the ray saw behind) with the glass layer in front of it (h.glass), as the core's see-through pass
+// draws one over the scene: what is behind times the layer's T, plus its own light (its diffuse and glow by its
+// coverage, its specular whole), fogged over its distance. No decals on glass, as in the raster. p turns the maps' filter.
+float4 overGlass(Hit h, float4 behind, int2 p)
 {
-    if (h.glassOwn.w <= 0.0)
+    if (h.glass.w <= 0.0)
         return behind;
-    return float4(clampSample(h.glassOwn.rgb + behind.rgb * h.glassThrough.rgb), behind.a);
+    float3       R = h.ray.xyz;
+    float2       bary = asfloat(h.glassTri.zw);
+    uint         material;
+    float3       N = hitNormal(h.glassTri.x, h.glassTri.y, bary, material);
+    if (dot(N, R) > 0.0)
+        N = -N; // the side the ray came from
+    float        occlusion, alpha;
+    MaterialData m = hitMaterialAlpha(h.glassTri.x, h.glassTri.y, bary, h.glassCone, R, N, occlusion, alpha);
+    float        coverage = saturate(gMaterialMaps[material].misc.z * alpha);
+    float3       T = glassTransmit(m, material, coverage, max(dot(N, -R), 1e-3));
+    float        phi = noise2(float2(p) + float(gRt.counts.y % 64u) * 5.588238) * 2.0 * PI;
+    float3       own = shadeHit(h.glass.xyz, N, -R, m, occlusion, float2(cos(phi), sin(phi)), MAX_SHADOW_RAYS, false, coverage);
+    own = applyHeightFog(own, h.glass.xyz - R * h.glass.w, R, h.glass.w);
+    float3 color = own + behind.rgb * T;
+    if ((gRt.counts.z & FLAG_DEBUG) != 0u)
+        color = float3(1.0, 0.0, 1.0);
+    return float4(clampSample(color), behind.a);
 }
 
 // What pixel p's reflected ray sees: rgb, a its distance (0: not traced, RT_MISS: the sky).
 float4 tracePixel(int2 p, float4 surface, float d)
 {
-    Hit h = traceRay(p, surface, d, gRt.counts.y, p);
+    Hit h = traceRay(p, surface, d, gRt.counts.y);
     float4 behind = h.result.a >= 0.0 ? h.result : lightHit(h, p);
-    return overGlass(h, behind);
+    return overGlass(h, behind, p);
 }
 
 // Half resolution: each 2 x 2 block traces one pixel, a different one each frame (TAA gathers them).
@@ -856,15 +719,15 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
         if (trace)
         {
             // A half-resolution pixel is traced every fourth frame: its own samples are consecutive.
-            Hit h = traceRay(p, surface, LoadTex2D(gDepth, NO_SAMPLER, p, 0).r, isHalf ? gRt.counts.y >> 2u : gRt.counts.y, isHalf ? b : p);
+            Hit h = traceRay(p, surface, LoadTex2D(gDepth, NO_SAMPLER, p, 0).r, isHalf ? gRt.counts.y >> 2u : gRt.counts.y);
             // The maps' filter is turned by where the sample is written (the half-size texel at half resolution).
             if (h.result.a < 0.0)
                 h.result = lightHit(h, isHalf ? b : p);
-            h.result = overGlass(h, h.result);
+            h.result = overGlass(h, h.result, isHalf ? b : p);
             if (isHalf)
             {
                 Write2D(gOutHalf, b, h.result);
-                Write2D(gOutHalfRay, b, float4(h.first.xyz, h.invPdf));
+                Write2D(gOutHalfRay, b, float4(h.ray.xyz, h.invPdf));
             }
             else
                 Write2D(gOutFull, p, h.result);
@@ -978,22 +841,6 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id, SV_GroupID(uint3) gid)
 }
 #endif
 
-float3 compressColor(float3 c) { return c / (1.0 + max(c.r, max(c.g, c.b))); }
-float3 expandColor(float3 c) { return c / max(1.0 - max(c.r, max(c.g, c.b)), 1e-4); }
-float3 toYCoCg(float3 c) { return float3(dot(c, float3(0.25, 0.5, 0.25)), dot(c, float3(0.5, 0.0, -0.5)), dot(c, float3(-0.25, 0.5, -0.25))); }
-float3 fromYCoCg(float3 c) { return float3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z); }
-
-// h clipped towards the box's centre; m says how far outside it was, in the box's half-widths (over 1: clipped).
-float3 clipToBox(float3 h, float3 lo, float3 hi, out float m)
-{
-    float3 centre = 0.5 * (lo + hi);
-    float3 extent = 0.5 * (hi - lo) + float3(1e-5, 1e-5, 1e-5);
-    float3 v = h - centre;
-    float3 a = abs(v / extent);
-    m = max(a.x, max(a.y, a.z));
-    return m > 1.0 ? centre + v / m : h;
-}
-
 #if defined(TRACE_RESOLVE) || defined(TRACE_FILTER)
 // This frame's reflection at pixel q (surface and d: its surface and depth): traced at full resolution by the
 // trace pass, reconstructed from the half-resolution rays, or nothing.
@@ -1025,6 +872,22 @@ float4 currentAt(int2 q, float4 surface, float d)
 // or past STILL_SNAP_NOW on one (see resolve).
 #define STILL_SNAP_NOW 4.0
 #define STILL_STRIKES 3.0
+
+float3 compressColor(float3 c) { return c / (1.0 + max(c.r, max(c.g, c.b))); }
+float3 expandColor(float3 c) { return c / max(1.0 - max(c.r, max(c.g, c.b)), 1e-4); }
+float3 toYCoCg(float3 c) { return float3(dot(c, float3(0.25, 0.5, 0.25)), dot(c, float3(0.5, 0.0, -0.5)), dot(c, float3(-0.25, 0.5, -0.25))); }
+float3 fromYCoCg(float3 c) { return float3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z); }
+
+// h clipped towards the box's centre; m says how far outside it was, in the box's half-widths (over 1: clipped).
+float3 clipToBox(float3 h, float3 lo, float3 hi, out float m)
+{
+    float3 centre = 0.5 * (lo + hi);
+    float3 extent = 0.5 * (hi - lo) + float3(1e-5, 1e-5, 1e-5);
+    float3 v = h - centre;
+    float3 a = abs(v / extent);
+    m = max(a.x, max(a.y, a.z));
+    return m > 1.0 ? centre + v / m : h;
+}
 
 float2 uvOf(float4 c) { return c.xy / c.w * float2(0.5, -0.5) + 0.5; }
 bool   inScreen(float2 uv) { return uv.x > 0.0 && uv.y > 0.0 && uv.x < 1.0 && uv.y < 1.0; }
@@ -1482,279 +1345,6 @@ void CS_MAIN(SV_GroupID(uint3) gid, SV_GroupThreadID(uint3) tid)
         result.rgb *= through;
     }
     gGiRayOut[index] = result;
-    RETURN();
-}
-#endif
-
-#if defined(REFRACT_PASS)
-// Glass that bends lets through how many layers of other glass the straight view to world point W (or along direction W,
-// `sky`) crosses beyond view depth z (as the see-through pass draws them, before `self`): what the chain holds there.
-uint glassBehind(float3 W, bool sky, float z, uint self)
-{
-    RayDesc ray;
-    ray.Origin = gRt.camPos.xyz;
-    ray.Direction = sky ? W : normalize(W - gRt.camPos.xyz);
-    ray.TMin = 0.0;
-    ray.TMax = sky ? gRt.params.x : max(length(W - gRt.camPos.xyz) - 1e-3, 0.0);
-    float zPerT = dot(ray.Direction, gRt.forward.xyz);
-    uint  count = 0u;
-    RayQueryAnyHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RT_RAY_FLAGS, ray, MASK_GI_GLASS, straight)
-    RayQueryBeginForEachCandidate(straight)
-    {
-        uint   ci = RayQueryCandidateInstanceID(straight);
-        uint   cp = RayQueryCandidatePrimitiveIndex(straight);
-        float2 cb = RayQueryCandidateBarycentrics(straight);
-        if (ci != self && RayQueryCandidateRayT(straight) * zPerT > z && !cutAway(ci, cp, cb))
-        {
-            float3 g = glassThrough(ci, cp, cb, ray.Direction);
-            if (min(g.r, min(g.g, g.b)) < 1.0)
-                count += 1u;
-        }
-        RayQueryProceed(straight);
-    }
-    RayQueryEndForEachCandidate(straight)
-    return count;
-}
-
-// On-screen refraction (frame rtRefraction, rtRefractLanding), a thread a pixel of the see-through instances' screen
-// rectangle (refract.xy to refract.zw). The camera's ray through the pixel's centre (this frame's jittered projection, as
-// the forward pass draws it) to the nearest glass layer that refracts and counts (Hit.h.fsl glassCounts) in front of the
-// opaque depth; bent into and out of it as Forward.frag's refractedScene bends the view (refractThrough), then followed
-// through the scene, deeper glass shaded (followRay). rgb what it brings back, as the chain would hold it there: fogged
-// from the camera to the layer and on along the bent path; a the layer's view depth (0: none). Where what the bent ray
-// meets is on screen, is what the depth shows there, and the straight view to it crosses as many other layers of glass
-// as the bent path did, the landing says to read the chain there (it holds steam), with refractedScene's mip for the
-// spread. Rough glass elsewhere takes one ray over its spread a frame, accumulated (CS_MAIN below).
-STRUCT(Refracted)
-{
-    DATA(float4, color, None); // rgb this frame's sample, a the layer's view depth (0: no refracting layer)
-    DATA(float4, land, None);  // rtRefractLanding's
-    DATA(float4, prev, None);  // xyz where the layer's point was last frame, w 1 when known
-    DATA(float, jittered, None); // 1: over the spreads (what the history accumulates)
-    DATA(float, footprint, None); // how much the layer's view depth changes across the pixel (m)
-};
-
-Refracted refractAt(int2 p)
-{
-    Refracted o;
-    o.color = float4(0.0, 0.0, 0.0, 0.0);
-    o.land = float4(0.0, 0.0, 0.0, 0.0);
-    o.prev = float4(0.0, 0.0, 0.0, 0.0);
-    o.jittered = 0.0;
-    o.footprint = 0.0;
-    float2 u = float2(p) + 0.5 - gRt.screen.zw;
-    float2 ndc = float2(u.x / gRt.screen.x * 2.0 - 1.0, 1.0 - u.y / gRt.screen.y * 2.0);
-    float3 I = normalize(gRt.right.xyz * (ndc.x / gRt.right.w) + gRt.up.xyz * (ndc.y / gRt.up.w) + gRt.forward.xyz);
-    float  zPerT = dot(I, gRt.forward.xyz);
-    float  d = LoadTex2D(gDepth, NO_SAMPLER, p, 0).r;
-    RayDesc view;
-    view.Origin = gRt.camPos.xyz;
-    view.Direction = I;
-    view.TMin = gRt.forward.w / zPerT;
-    view.TMax = d > 0.0 ? gRt.forward.w / d / zPerT : gRt.params.x + gRt.forward.w / zPerT;
-    float glassT = view.TMax;
-    uint4 tri = uint4(0xFFFFFFFFu, 0u, 0u, 0u);
-    RayQueryClosestHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RT_RAY_FLAGS, view, MASK_GI_GLASS, toGlass)
-    RayQueryBeginForEachCandidate(toGlass)
-    {
-        uint   ci = RayQueryCandidateInstanceID(toGlass);
-        uint   cp = RayQueryCandidatePrimitiveIndex(toGlass);
-        float2 cb = RayQueryCandidateBarycentrics(toGlass);
-        float  ct = RayQueryCandidateRayT(toGlass);
-        uint   material = (gRtInstances[ci].w & RT_INST_MATERIAL) - 1u;
-        uint   mat;
-        if (ct < glassT && gRefraction[material * 2u].w > 0.5 && !cutAway(ci, cp, cb) &&
-            glassCounts(ci, material, dot(hitNormal(ci, cp, cb, mat), I) < 0.0))
-        {
-            glassT = ct;
-            tri = uint4(ci, cp, asuint(cb));
-        }
-        RayQueryProceed(toGlass);
-    }
-    RayQueryEndForEachCandidate(toGlass)
-    if (tri.x == 0xFFFFFFFFu)
-        return o;
-
-    // The layer, its shading normal (after its maps) towards the camera.
-    float3       G = gRt.camPos.xyz + I * glassT;
-    float        zG = glassT * zPerT;
-    float2       gb = asfloat(tri.zw);
-    uint         material;
-    float3       N = hitNormal(tri.x, tri.y, gb, material);
-    if (dot(N, I) > 0.0)
-        N = -N;
-    float        pixelAngle = 2.0 / (gRt.up.w * gRt.screen.y);
-    float        occlusion, alpha;
-    MaterialData m = hitMaterialAlpha(tri.x, tri.y, gb, zG * pixelAngle, I, N, occlusion, alpha);
-    float4       refr = gRefraction[material * 2u];
-    float3       E, D;
-    refractThrough(G, N, I, refr, E, D);
-    float  ior = max(refr.x, 1.0);
-    float  a = m.albedoRough.a * m.albedoRough.a;
-    float  spread = 2.0 * a * (1.0 - 1.0 / ior);
-    float  inside = length(E - G);
-    float2 cone = float2(0.0, pixelAngle); // a pixel's footprint, on from the camera
-    float  travelled = glassT + inside;
-    RayDesc ray;
-    ray.Origin = inside > 0.0 ? E - D * min(5e-4, 0.25 * inside) : G + D * (2e-4 + 1e-5 * glassT);
-    ray.Direction = D;
-    ray.TMin = 0.0;
-    ray.TMax = max(gRt.params.x - travelled, 1e-3);
-    uint seq = gRt.counts.y;
-    Hit  h = followRay(ray, p, seq, p, cone, 1u, travelled, spread, spread * glassT, false, tri.x, false);
-
-    // Where it lands on screen (this frame's jittered pixels), if what it meets is what the depth shows there.
-    float4 land = float4(0.0, 0.0, 0.0, 0.0);
-    bool   sky = h.result.a == RT_MISS;
-    float3 Hp = sky ? D : h.pos.xyz;
-    float4 c = sky ? float4(dot(gRt.viewProj[0].xyz, D), dot(gRt.viewProj[1].xyz, D), dot(gRt.viewProj[2].xyz, D), dot(gRt.viewProj[3].xyz, D))
-                   : clipOf(gRt.viewProj, Hp);
-    if (c.w > (sky ? 1e-4 : gRt.forward.w))
-    {
-        float2 q = (c.xy / c.w * float2(0.5, -0.5) + 0.5) * gRt.screen.xy + gRt.screen.zw;
-        if (q.x >= 0.0 && q.y >= 0.0 && q.x < gRt.screen.x && q.y < gRt.screen.y)
-        {
-            float dq = LoadTex2D(gDepth, NO_SAMPLER, int2(q), 0).r;
-            bool  seen = sky ? dq <= 0.0 : dq > 0.0 && abs(gRt.forward.w / dq - c.w) < 0.02 * c.w + 0.03;
-            if (seen && glassBehind(Hp, sky, zG, tri.x) == h.others)
-            {
-                // refractedScene's mip: the spread over the way behind, at the landing's depth (the sky's: its angle).
-                float behind = sky ? 1.0 / max(dot(gRt.forward.xyz, D), 0.1) : length(Hp - E) / max(c.w, gRt.forward.w);
-                float px = spread * behind * 0.5 * gRt.screen.y * gRt.up.w;
-                land = float4(q - (float2(p) + 0.5), log2(max(px, 1.0)), 1.0);
-            }
-        }
-    }
-
-    // What it brings back: through rough glass (this layer or deeper) off the screen's landing, over their spreads, one
-    // ray a frame, accumulated.
-    float n = 0.0;
-    if (land.w < 0.5 && spread + h.spread > 1e-5)
-    {
-        float2 u2 = sample2(p + int2(37, 91), seq);
-        float3 axis = abs(D.y) < 0.9 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
-        float3 tx = normalize(cross(axis, D));
-        float3 ty = cross(D, tx);
-        float  r = 0.5 * spread * sqrt(u2.x);
-        float  ph = 2.0 * PI * u2.y;
-        ray.Direction = normalize(D + (tx * cos(ph) + ty * sin(ph)) * tan(r));
-        h = followRay(ray, p, seq, p, cone, 1u, travelled, spread, spread * glassT, false, tri.x, true);
-        n = 1.0;
-    }
-    float4 behind = h.result.a >= 0.0 ? h.result : lightHit(h, p);
-    o.color = float4(applyHeightFog(overGlass(h, behind).rgb, gRt.camPos.xyz, I, glassT), zG);
-    o.land = land;
-    o.jittered = n;
-    // Where it was last frame (gRtInstances' last-frame rows, all zero where it has none), and how fast the layer's
-    // depth changes across the pixel there (grazing glass: a pixel's jitter moves it far).
-    uint   rows = uint(gRt.refractTemporal.z) + tri.x * 3u;
-    float4 r0 = asfloat(gRtInstances[rows]);
-    float4 r1 = asfloat(gRtInstances[rows + 1u]);
-    float4 r2 = asfloat(gRtInstances[rows + 2u]);
-    if (dot(abs(r0), float4(1.0, 1.0, 1.0, 1.0)) > 0.0)
-        o.prev = float4(dot(r0, float4(G, 1.0)), dot(r1, float4(G, 1.0)), dot(r2, float4(G, 1.0)), 1.0);
-    float cosI = max(abs(dot(N, I)), 0.05);
-    o.footprint = zG * pixelAngle * sqrt(max(1.0 - cosI * cosI, 0.0)) / cosI;
-    return o;
-}
-
-// The samples' colour in the group (compressed YCoCg, exposed; w 1 where the pixel has a refracting layer): the
-// neighbourhood the history is clipped to.
-GroupShared(float4, gsRefract[64]);
-#define REFRACT_CLIP 1.25 // the box: the neighbourhood's mean +- this many standard deviations, as the reflections'
-
-ROOT_SIGNATURE(ComputeRootSignature)
-NUM_THREADS(8, 8, 1)
-void CS_MAIN(SV_DispatchThreadID(uint3) id, SV_GroupThreadID(uint3) tid)
-{
-    INIT_MAIN;
-    int2      size = int2(gRt.screen.xy);
-    int2      p = int2(id.xy) + int2(gRt.refract.xy);
-    bool      inRect = p.x < int(gRt.refract.z) && p.y < int(gRt.refract.w);
-    Refracted r;
-    r.color = float4(0.0, 0.0, 0.0, 0.0);
-    r.land = float4(0.0, 0.0, 0.0, 0.0);
-    r.prev = float4(0.0, 0.0, 0.0, 0.0);
-    r.jittered = 0.0;
-    r.footprint = 0.0;
-    if (inRect)
-        r = refractAt(p);
-    float exposure = max(gExposure[1], 1e-8);
-    bool  has = r.color.a > 0.0;
-    gsRefract[tid.y * 8u + tid.x] = has ? float4(toYCoCg(compressColor(max(r.color.rgb, float3(0.0, 0.0, 0.0)) * exposure)), 1.0)
-                                        : float4(0.0, 0.0, 0.0, 0.0);
-    GroupMemoryBarrier();
-    if (!inRect)
-        RETURN();
-
-    // Last frame's, where this layer's point was then (followed on moving glass), if it was this layer there: its depth
-    // within the pixel's footprint. Clipped to this frame's neighbourhood, so it gives way where what is behind changed.
-    float  hn = 0.0;
-    float3 hist = float3(0.0, 0.0, 0.0);
-    bool   have = false;
-    if (has && gRt.refractTemporal.x > 0.5 && r.prev.w > 0.5)
-    {
-        float4 pc = clipOf(gRt.prevViewProj, r.prev.xyz);
-        if (pc.w > gRt.forward.w)
-        {
-            float2 qf = (pc.xy / pc.w * float2(0.5, -0.5) + 0.5) * gRt.screen.xy;
-            int2   q = int2(floor(qf));
-            if (q.x >= 0 && q.y >= 0 && q.x < size.x && q.y < size.y)
-            {
-                float4 h = LoadTex2D(gRefractHistory, NO_SAMPLER, q, 0);
-                hn = LoadTex2D(gRefractHistoryN, NO_SAMPLER, q, 0).r;
-                have = hn > 0.0 && abs(h.a - pc.w) < 0.01 * pc.w + 0.01 + r.footprint;
-                hist = h.rgb;
-            }
-        }
-    }
-    if (have)
-    {
-        float3 m1 = float3(0.0, 0.0, 0.0), m2 = float3(0.0, 0.0, 0.0);
-        float  k = 0.0;
-        for (int dy = -1; dy <= 1; ++dy)
-            for (int dx = -1; dx <= 1; ++dx)
-            {
-                int2 g = int2(tid.xy) + int2(dx, dy);
-                if (g.x >= 0 && g.y >= 0 && g.x < 8 && g.y < 8)
-                {
-                    float4 c = gsRefract[uint(g.y) * 8u + uint(g.x)];
-                    m1 += c.xyz * c.w;
-                    m2 += c.xyz * c.xyz * c.w;
-                    k += c.w;
-                }
-            }
-        m1 /= k;
-        float3 sigma = sqrt(max(m2 / k - m1 * m1, float3(0.0, 0.0, 0.0)));
-        float  outside;
-        float3 hc = clipToBox(toYCoCg(compressColor(max(hist, float3(0.0, 0.0, 0.0)) * exposure)), m1 - sigma * REFRACT_CLIP,
-                              m1 + sigma * REFRACT_CLIP, outside);
-        hist = expandColor(fromYCoCg(hc)) / exposure;
-    }
-    float3 rgb = r.color.rgb;
-    float  n = 0.0;
-    if (r.jittered > 0.5)
-    {
-        // Over the spreads: one more sample of it.
-        n = have ? min(hn + 1.0, gRt.refractTemporal.y) : 1.0;
-        rgb = have ? lerp(hist, rgb, 1.0 / n) : rgb;
-    }
-    else if (have && r.land.w > 0.5)
-    {
-        // The screen's landing this frame (the core reads the chain, not rgb): kept, for when the landing leaves it again.
-        n = hn;
-        rgb = hist;
-    }
-    float4 land = r.land;
-    if ((gRt.counts.z & FLAG_DEBUG) != 0u && has)
-    {
-        // show_hits: green where the landing was on screen, blue where it was found by rays.
-        rgb = land.w > 0.5 ? float3(0.0, 1.0, 0.0) : float3(0.0, 0.0, 1.0);
-        land.w = 0.0;
-    }
-    Write2D(gOutRefract, p, float4(rgb, r.color.a));
-    Write2D(gOutRefractLand, p, land);
-    Write2D(gOutRefractN, p, n);
     RETURN();
 }
 #endif

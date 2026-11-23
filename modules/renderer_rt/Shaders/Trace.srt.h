@@ -13,7 +13,7 @@ BEGIN_SRT(RtSrt)
         DECL_TEXTURE(PerFrame, Tex2D(float4), gSurface)
         DECL_TEXTURE(PerFrame, Tex2D(float4), gPrevious)
         DECL_BUFFER(PerFrame, Buffer(InstanceData), gInstances)
-        DECL_BUFFER(PerFrame, Buffer(uint4), gRtInstances) // per top-level instance; then glass's last-frame rows
+        DECL_BUFFER(PerFrame, Buffer(uint4), gRtInstances)
         DECL_BUFFER(PerFrame, Buffer(MaterialData), gMaterials)
         DECL_BUFFER(PerFrame, Buffer(LightData), gLights)
         DECL_BUFFER(PerFrame, Buffer(uint), gAttributes) // RENDER_ATTRIBUTE_STRIDE: 5 u32 a vertex, [0] the normal
@@ -49,10 +49,5 @@ BEGIN_SRT(RtSrt)
         DECL_BUFFER(PerFrame, Buffer(DecalData), gDecals)        // frame worldDecals (decals.x), decalCells, decalItems
         DECL_BUFFER(PerFrame, Buffer(uint2), gDecalCells)
         DECL_BUFFER(PerFrame, Buffer(uint), gDecalItems)
-        DECL_TEXTURE(PerFrame, Tex2D(float4), gRefractHistory)    // the refraction pass (frame rtRefraction): last frame's
-        DECL_TEXTURE(PerFrame, Tex2D(float), gRefractHistoryN)    // and the samples each pixel of it holds (0: none)
-        DECL_RWTEXTURE(PerFrame, RWTex2D(half4), gOutRefract)     // this frame's rtRefraction
-        DECL_RWTEXTURE(PerFrame, RWTex2D(half4), gOutRefractLand) // rtRefractLanding
-        DECL_RWTEXTURE(PerFrame, RWTex2D(half), gOutRefractN)
     END_SRT_SET(PerFrame)
 END_SRT(RtSrt)

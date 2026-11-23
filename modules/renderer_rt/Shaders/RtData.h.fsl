@@ -42,7 +42,4 @@ STRUCT(RtData)
                                      // w 1 when last frame's probes can be sampled (the bounce at hits)
     DATA(uint4, decals, None);       // x decals hits paint (frame worldDecalCount; 0: none)
     DATA(float4, decalGrid[2], None); // frame.h decalGrid
-    DATA(uint4, refract, None);       // the refraction pass's rectangle: xy its first pixel, zw past its last
-    DATA(float4, refractTemporal, None); // x 1 when last frame's refraction is its history, y frames of history, z where
-                                         // gRtInstances' last-frame rows of each top-level instance start (3 a glass one)
 };

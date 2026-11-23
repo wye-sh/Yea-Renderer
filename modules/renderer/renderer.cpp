@@ -130,7 +130,7 @@ const uint32_t kFlagCulled = 1, kFlagHeatmap = 2, kFlagCascades = 4, kFlagShadow
                kFlagReceiverPlane = 2048, kFlagRt = 4096, kFlagRtDebug = 8192, kFlagRtShadows = 16384,
                kFlagRtSun = 32768, kFlagArea = 65536, kFlagSky = 131072, kFlagFog = 262144,
                kFlagGi = 524288, kFlagGiDebug = 1048576, kFlagDecals = 2097152, kFlagRefraction = 4194304, kFlagRtTint = 8388608,
-               kFlagGlassShadow = 16777216, kFlagRtRefract = 33554432;
+               kFlagGlassShadow = 16777216;
 const uint32_t kMaxFrames = 4;
 const uint32_t kMaxUnculledLights = 256;
 const uint32_t kHistogramBins = 128;
@@ -1926,7 +1926,7 @@ void drawSeeThrough(Cmd* cmd, uint32_t fi, uint32_t count, bool refract, Rebind 
         else
         {
             segSwitch(cmd, fi, kTimeGlass);
-            drawBlended(cmd, fi, j, e.refract == 2 ? 2u : 3u); // a solid's near side alone, as when it bends
+            drawBlended(cmd, fi, j);
         }
         grow(e.rect);
     }
@@ -2922,12 +2922,10 @@ void draw(uint32_t pass, const YeaFrame* yf)
                 float       vz = view[2][0] * sc.x + view[2][1] * sc.y + view[2][2] * sc.z + view[2][3];
                 e = { vz, count, lod, twoSided ? 1u : 0u, 0u, { 0, 0, (int32_t)w, (int32_t)h } };
                 float refr[8];
-                // Its shape whatever the knob: a solid is one layer (its near side) with refraction off too, so how many
-                // times glass tints doesn't change with the knob (and matches the shadow maps' tint and renderer_rt).
-                if (materialRefraction(in.material, refr))
+                if (refractOn && materialRefraction(in.material, refr))
                 {
                     e.refract = refr[2] > 0.5f ? 2u : 1u;
-                    refractVisible = refractVisible || refractOn;
+                    refractVisible = true;
                 }
                 // Its screen rectangle (the refraction chain is copied again only where a later surface reads what an
                 // earlier one changed): the box around its sphere in view space, projected, whole when it reaches the
@@ -3208,9 +3206,6 @@ void draw(uint32_t pass, const YeaFrame* yf)
     F.depth = gDepth;
     F.lightBuffer = gLightBuf[fi];
     F.lightShapes = gShapeBuf[fi];
-    F.ltc = gLtc;
-    F.lightLooks = gLookBuf[fi];
-    F.lightImages = gLightImages;
     F.taps = 16;
     F.softness = 1.5f;
     F.hdr = gHdr;
@@ -3293,7 +3288,6 @@ void draw(uint32_t pass, const YeaFrame* yf)
     });
     F.refraction = gRefractBuf[fi];
     F.dfg = gDfg;
-    F.refractOn = refractOn ? 1u : 0u;
     F.materials = gMaterialBuf[fi];
     F.tintDepth = F.tintColor = nullptr;
     F.shadowTints = nullptr;
@@ -3327,8 +3321,6 @@ void draw(uint32_t pass, const YeaFrame* yf)
     const bool rtRun = rtGate && (gOk.rt ? CPU_T("rt_prepare", renderer_rt::rt_prepare((uint64_t)(uintptr_t)&F)) : false);
     bool       rt = rtRun && F.rtReflection;
     const bool rtShadows = rtRun && rtPicked && F.rtShadows;
-    // renderer_rt traces on-screen refraction (frame v28): its two images, filled in rt_run before the see-through pass.
-    const bool rtRefract = rtRun && refractOn && F.rtRefraction && F.rtRefractLanding;
     bool ssr = !rt && taa && !viewMode && (gOk.ssr ? CPU_T("ssr_prepare", renderer_ssr::ssr_prepare((uint64_t)(uintptr_t)&F)) : false) && F.ssrOn && F.ssrDepth && F.previous;
     bool vrs = taa && !viewMode && (gOk.vrs ? CPU_T("vrs_prepare", renderer_vrs::vrs_prepare((uint64_t)(uintptr_t)&F)) : false) && F.rateImage && F.rateCopy;
 
@@ -3472,7 +3464,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
                     (rtShadows ? kFlagRtShadows : 0) | (rtShadows && F.rtSunShadows ? kFlagRtSun : 0) | (anyShape ? kFlagArea : 0) | (sky ? kFlagSky : 0) | (fog ? kFlagFog : 0) |
                     (gi ? kFlagGi : 0) | (gi && F.giDebug ? kFlagGiDebug : 0) | (decals ? kFlagDecals : 0) |
                     (refractVisible ? kFlagRefraction : 0) | (rtShadows && F.rtShadowTint ? kFlagRtTint : 0) |
-                    (glassShadows ? kFlagGlassShadow : 0) | (rtRefract ? kFlagRtRefract : 0);
+                    (glassShadows ? kFlagGlassShadow : 0);
     gf->refraction[0] = (float)gChainMips;
     if (ssr)
     {
@@ -3647,7 +3639,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         Buffer*  sideMasks = culled ? F.sideMasks : gDummyU32;
         Buffer*  bins = culled ? F.zbins : gDummyU32;
         Buffer*  views = shadows ? F.shadowViews : gDummyViews;
-        DescriptorData p[44] = {};
+        DescriptorData p[42] = {};
         Texture*       ssrDepth = ssr ? F.ssrDepth : gDummyDepth->pTexture;
         Texture*       previous = ssr ? F.previous->pTexture : gDummyColor->pTexture;
         Texture*       probeTex = probes ? F.probes->pTexture : gDummyArray->pTexture;
@@ -3758,21 +3750,14 @@ void draw(uint32_t pass, const YeaFrame* yf)
         p[39].ppTextures = &tintColor;
         p[40].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gSideMasks);
         p[40].ppBuffers = &sideMasks;
-        // renderer_rt's on-screen refraction (frame v28), or stand-ins.
-        Texture* rtRefr = rtRefract ? F.rtRefraction : gDummyColor->pTexture;
-        Texture* rtLand = rtRefract ? F.rtRefractLanding : gDummyColor->pTexture;
-        p[41].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gRtRefraction);
-        p[41].ppTextures = &rtRefr;
-        p[42].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gRtRefractLanding);
-        p[42].ppTextures = &rtLand;
-        uint32_t bindings = 43;
+        uint32_t bindings = 41;
         if (gTexturesBound[fi] != F.textureVersion)
         {
-            p[43].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gTextures);
-            p[43].ppTextures = (Texture**)F.textures;
-            p[43].mCount = RENDER_MAX_TEXTURES;
+            p[41].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gTextures);
+            p[41].ppTextures = (Texture**)F.textures;
+            p[41].mCount = RENDER_MAX_TEXTURES;
             gTexturesBound[fi] = F.textureVersion;
-            bindings = 44;
+            bindings = 42;
         }
         CPU_T("descriptors", updateDescriptorSet(gRenderer, fi, gSceneFrame, bindings, p));
 
