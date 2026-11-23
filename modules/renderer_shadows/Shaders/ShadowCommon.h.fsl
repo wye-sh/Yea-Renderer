@@ -1,0 +1,6 @@
+// What the shadow passes read: the core's instance rows, the views, and (alpha-tested casters) the material maps.
+#ifndef SHADOW_COMMON_H
+#define SHADOW_COMMON_H
+#include "ShadowTypes.h.fsl"
+#include "Shadow.srt.h"
+#endif

@@ -1,0 +1,55 @@
+// Alpha-tested casters in the rays (frame v21's material maps): include after the SRT that declares gRtInstances,
+// gIndices, gAttributes, gMaterialMaps and gTextures. Only instances whose material cuts out (the core's
+// RenderCaster.masked) are non-opaque in the top-level structure, so every other hit is committed by the traversal
+// itself and never reaches a candidate loop. Each ray query loops over its candidates:
+//     RayQueryBeginForEachCandidate(q)
+//     {
+//         if (!cutAway(RayQueryCandidateInstanceID(q), RayQueryCandidatePrimitiveIndex(q), RayQueryCandidateBarycentrics(q)))
+//             RayQueryCommitCandidate(q);
+//         RayQueryProceed(q);
+//     }
+// (Vulkan's candidate instance ID is the instance's index, Direct3D 12's its InstanceID: renderer_rt.cpp makes them
+// the same.)
+#ifndef RT_CUTOUT_H
+#define RT_CUTOUT_H
+
+// gRtInstances' w (renderer_rt.cpp): the material + 1 in its low bits (0 where neither flag below needs it), and flags.
+#define RT_INST_MATERIAL  0x00FFFFFFu
+#define RT_INST_CUT       0x20000000u // alpha-tested: candidates cut away where the base colour's alpha is under its cutoff
+#define RT_INST_TWO_SIDED 0x40000000u
+#define RT_INST_GLASS     0x80000000u // see-through (Hit.h.fsl): never committed, its layers tint what passes
+
+float2 vertexUv(uint v) { return asfloat(uint2(gAttributes[v * 5u + 2u], gAttributes[v * 5u + 3u])); }
+
+float vertexAlpha(uint v) { return float(gAttributes[v * 5u + 4u] >> 24u) * (1.0 / 255.0); }
+
+// Whether a candidate hit falls where its material is cut out: the base colour's alpha (times its factor, and the
+// vertex alpha when the material's maps were given) under its cutoff, as the camera's and the shadow maps' passes
+// cut it. The map is read at its full resolution: the cut-out's true shape, which the frames average.
+bool cutAway(uint index, uint prim, float2 bary)
+{
+    uint4 inst = gRtInstances[index]; // x instance row, y first index, z first vertex, w its material + 1 and flags
+    if ((inst.w & RT_INST_CUT) == 0u)
+        return false;
+    MaterialMapData mm = gMaterialMaps[(inst.w & RT_INST_MATERIAL) - 1u];
+    uint            v0 = gIndices[inst.y + prim * 3u] + inst.z;
+    uint            v1 = gIndices[inst.y + prim * 3u + 1u] + inst.z;
+    uint            v2 = gIndices[inst.y + prim * 3u + 2u] + inst.z;
+    float           b0 = 1.0 - bary.x - bary.y;
+    float           a = mm.baseFactor.a;
+    if (mm.misc.y > 0.5)
+        a *= vertexAlpha(v0) * b0 + vertexAlpha(v1) * bary.x + vertexAlpha(v2) * bary.y;
+    if (mm.maps.x != 0u)
+    {
+        float2 uv = vertexUv(v0) * b0 + vertexUv(v1) * bary.x + vertexUv(v2) * bary.y;
+        float4 c = float4(1.0, 1.0, 1.0, 1.0);
+        uint   texSlot = mm.maps.x - 1u;
+        BeginNonUniformResourceIndex(texSlot, MAX_TEXTURES);
+            c = SampleLvlTex2D(gTextures[texSlot], gSamplerTrilinearWrap, uv, 0.0);
+        EndNonUniformResourceIndex();
+        a *= c.a;
+    }
+    return a < mm.misc.x;
+}
+
+#endif

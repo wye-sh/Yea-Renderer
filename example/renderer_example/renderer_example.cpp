@@ -4,12 +4,20 @@
 // camera (hold the mouse button to look, the move keys to fly). Each light type can be switched off, which removes its
 // lights. Reset: the scene is rebuilt with the lights and camera where they start.
 #include "yea_renderer_example.h"
+#include "../../modules/renderer_models/ModelLink.h"
 
 #include <math.h>
 #include <stdio.h>
 
 namespace renderer_example
 {
+// Sample models (Khronos' glTF samples, CC0; example/model_sources/fetch_and_cook.sh cooks them), placed among the
+// shapes. Their sizes are their Scale knobs' defaults in module.yea (each file's own units kept, as cooked).
+MODEL(lantern, "models/Lantern.rmodel");
+MODEL(flight_helmet, "models/FlightHelmet.rmodel");
+MODEL(water_bottle, "models/WaterBottle.rmodel");
+MODEL(boom_box, "models/BoomBox.rmodel");
+
 namespace
 {
 const uint32_t kMaxLights = 512, kMaxSpin = 16, kAreas = 5, kPanes = 12, kNone = 0xFFFFFFFFu;
@@ -37,7 +45,7 @@ struct State
     yea_float3 spinAxis[kMaxSpin];
     uint32_t   orbMesh, cylinderMesh, boxMesh, sphereMesh;
     yea_handle housingMaterial;
-    uint32_t   instances, lightsAlive; // the renderer's live counts once this frame's scene was in place
+    uint32_t   epoch, unusedCount; // the renderer's scene_epoch this scene was built in (was its instance and light counts)
     // The area lights: each light and its emitter (kNone while its type is off), and the emitter's material.
     yea_handle areas[kAreas];
     yea_handle areaEmitters[kAreas];
@@ -49,6 +57,7 @@ struct State
 };
 State* gState;
 bool   gFreshVersion; // this version of the module hasn't built its scene yet: build it once (new meshes reach a running game)
+bool   gGlassBuilt, gDecalsBuilt; // the glass and decals knobs as the scene was built (switching one builds it again)
 
 // Mouse look: the host holds the mouse (hidden, kept in the window) while the left button stays down
 // after a press on the game; it lets go itself when F1 opens, focus is lost, the view switches or resets.
@@ -204,11 +213,92 @@ void addProbes()
 
 // The whole scene, from nothing. Not while the renderer is unloaded (a crash, a revert, a reload): its imports are
 // stubs then, and a scene built against them would hold invalid handles that never move what the renderer has.
+// The sample models, placed again whenever renderer_models lost them (Reset State, its scene starting over). A model's
+// front, its file's +Z, faces -Z as cooked; each is turned towards the start view.
+void placeModels()
+{
+    const yea_float4 toView = axisAngle({ 0, 1, 0 }, -2.17f);
+    if (!mdl::placed(models->lantern)) // a 3 m street lamp by the white boxes, its arm over the path
+        models->lantern = mdl::place(lantern, { -7.6f, -0.02f, 4.2f }, axisAngle({ 0, 1, 0 }, -0.5f));
+    if (!mdl::placed(models->flightHelmet)) // on its stand on the stone ledge, right of the tube light
+        models->flightHelmet = mdl::place(flight_helmet, { 4.6f, 0.5f, -7.4f }, toView);
+    if (!mdl::placed(models->waterBottle)) // on the floor in front, standing on its base
+        models->waterBottle = mdl::place(water_bottle, { 7.4f, 0.52f, 4.4f }, toView);
+    if (!mdl::placed(models->boomBox)) // on the copper block
+        models->boomBox = mdl::place(boom_box, { 5.0f, 1.4f, 2.0f }, toView);
+}
+
+// Glass: a clear pane between the start view and the steam, a teal one behind it (the steam drawn between them), a frosted
+// one beside them, and a solid glass ball on the floor that bends the floor and shapes behind it as a lens.
+// Their shadows: tinted where shadows are ray-traced (renderer_rt), none from shadow maps yet.
+void addGlass()
+{
+    gGlassBuilt = settings.glass;
+    if (!settings.glass)
+        return;
+    uint32_t         box = renderer::mesh_box(), sphere = renderer::mesh_sphere(128);
+    const yea_float4 facing = axisAngle({ 0, 1, 0 }, 1.08f); // square to the start view, over the drum
+    yea_handle       clear = renderer::material_add({ 0.95f, 0.97f, 1.0f }, 0.03f, 0);
+    renderer::material_blend(clear, 0.03f);
+    renderer::material_refraction(clear, 1.5f, 0.02f, 0, { 1, 1, 1 });
+    yea_handle teal = renderer::material_add({ 0.2f, 0.75f, 0.7f }, 0.08f, 0);
+    renderer::material_blend(teal, 0.12f);
+    renderer::material_refraction(teal, 1.5f, 0.02f, 0, { 0.3f, 0.85f, 0.78f });
+    yea_handle frosted = renderer::material_add({ 0.92f, 0.95f, 0.97f }, 0.3f, 0);
+    renderer::material_blend(frosted, 0.04f);
+    renderer::material_refraction(frosted, 1.5f, 0.02f, 0, { 0.95f, 0.97f, 1.0f });
+    yea_handle ball = renderer::material_add({ 0.95f, 0.97f, 1.0f }, 0.02f, 0);
+    renderer::material_blend(ball, 0.02f);
+    renderer::material_refraction(ball, 1.5f, 1.2f, 1, { 0.94f, 0.98f, 0.96f });
+    yea_handle panes[4] = { renderer::instance_add(box, clear), renderer::instance_add(box, teal), renderer::instance_add(sphere, ball),
+                            renderer::instance_add(box, frosted) };
+    renderer::instance_place(panes[0], { 1.9f, 0.95f, 2.95f }, facing, { 2.0f, 1.9f, 0.02f });
+    renderer::instance_place(panes[1], { -0.73f, 0.95f, 1.54f }, facing, { 2.0f, 1.9f, 0.02f });
+    renderer::instance_place(panes[2], { -0.6f, 0.6f, 5.6f }, kNoRotation, { 1.2f, 1.2f, 1.2f });
+    renderer::instance_place(panes[3], { 4.3f, 0.95f, 4.3f }, facing, { 1.6f, 1.9f, 0.02f });
+}
+
+// Decals painted over the floor, the copper block and the stone ledge.
+void addDecals()
+{
+    gDecalsBuilt = settings.decals;
+    if (!settings.decals)
+        return;
+    const yea_float4 up = axisAngle({ 1, 0, 0 }, -0.5f * kPi); // the box's z out of the floor
+    const yea_float4 none = { 0, 0, 0, 1 };
+    // A scorch by the white boxes: soot, ragged and patchy.
+    yea_handle d = renderer::decal_add({ -3.2f, 0, 1.0f }, up, { 1.3f, 1.3f, 0.3f });
+    renderer::decal_look(d, { 0.02f, 0.018f, 0.016f, 0.95f }, 0.95f, 0, { 0, 0, 0 }, 0, { 1, 1, 1, 0 });
+    renderer::decal_shape(d, 0, 0.5f, 0.8f, 80);
+    // Worn yellow lines along the path, and a puddle over them in front: dark, mirror-smooth, flat.
+    const float lines[2] = { -1.1f, 2.1f };
+    for (float x : lines)
+    {
+        d = renderer::decal_add({ x, 0, 4.5f }, up, { 0.07f, 3.5f, 0.3f });
+        renderer::decal_look(d, { 0.85f, 0.62f, 0.05f, 1 }, 0.55f, 0, { 0, 0, 0 }, 0, { 1, 1, 1, 0 });
+        renderer::decal_shape(d, 1, 0.15f, 0.2f, 80);
+    }
+    d = renderer::decal_add({ 2.0f, 0, 6.2f }, up, { 2.0f, 1.1f, 0.3f });
+    renderer::decal_look(d, { 0.04f, 0.04f, 0.045f, 1 }, 0.04f, 0, { 0, 0, 0 }, 0, { 0.35f, 1, 1, 1 });
+    renderer::decal_shape(d, 0, 0.45f, 0.5f, 60);
+    renderer::decal_priority(d, 1);
+    // Green patina creeping up the copper block's front.
+    d = renderer::decal_add({ 5.2f, 0.45f, 2.5f }, none, { 1.0f, 0.5f, 0.2f });
+    renderer::decal_look(d, { 0.25f, 0.55f, 0.42f, 0.9f }, 0.8f, 0, { 0, 0, 0 }, 0, { 1, 1, 1, 0 });
+    renderer::decal_shape(d, 0, 0.6f, 0.7f, 70);
+    // A glowing cyan strip along the stone ledge's front.
+    d = renderer::decal_add({ -3.0f, 0.25f, -6.75f }, none, { 1.2f, 0.05f, 0.2f });
+    renderer::decal_look(d, { 0.05f, 0.4f, 0.5f, 1 }, 0.3f, 0, { 0.3f, 0.9f, 1.0f }, 40, { 1, 1, 1, 0 });
+    renderer::decal_shape(d, 1, 0.2f, 0, 80);
+}
+
 void build(State* s)
 {
     s->built = 0;
     renderer::clear();
     renderer_probes::probe_clear();
+    renderer_particles::particle_emitter_clear();
+    particles->dust = particles->steam = 0;
     s->lightCount = s->spinCount = 0;
     s->sun = kNone;
     // Segments so the silhouettes stay round in the close-ups (a sphere filling the screen at 2560x1356 is under a
@@ -265,6 +355,8 @@ void build(State* s)
     addSpin(s, torus, white, { -8.5f, 1.3f, -1.0f }, { 2.2f, 2.2f, 2.2f }, { 0, 0, 1 });
 
     addProbes();
+    addGlass();
+    addDecals();
 
     // The area lights' dark fittings: the softbox's backing and stand, the pendant's canopy and cord, the tube's
     // brackets. They stay when a type is switched off (a lamp turned off). Those beside an emitter cast no shadow (they
@@ -406,6 +498,53 @@ void addArea(State* s, uint32_t i)
 bool areaOn(uint32_t type)
 {
     return type == 3 ? settings.rects : type == 4 ? settings.discs : type == 5 ? settings.spheres : settings.tubes;
+}
+
+// The particle emitters the knobs ask for (a handle + 1 in `slot`, 0 none): one switched off is removed, its particles
+// living out their lives; one that couldn't be made (renderer_particles not loaded yet) is tried again next frame.
+void syncEmitter(uint32_t& slot, bool on, yea_handle (*make)())
+{
+    if (on && !slot)
+    {
+        yea_handle h = make();
+        slot = h == kNone ? 0 : h + 1;
+    }
+    else if (!on && slot)
+    {
+        renderer_particles::particle_emitter_remove(slot - 1);
+        slot = 0;
+    }
+}
+
+// Dust over the middle of the floor, among the spheres and shapes: tiny, slow, lasting, scattering forwards so it
+// glints looking towards the sun and the lamps and stays dark in shadow.
+yea_handle makeDust()
+{
+    yea_handle d = renderer_particles::particle_emitter_add({ 0, 1.6f, 1.0f });
+    if (d == kNone)
+        return d;
+    renderer_particles::particle_emitter_shape(d, 1, { 6.0f, 1.4f, 4.5f });
+    renderer_particles::particle_emitter_rate(d, 500, 3500);
+    renderer_particles::particle_emitter_motion(d, 0.03f, 180, 1, 0.002f, 0.8f, 0.06f);
+    renderer_particles::particle_emitter_life(d, 6, 10);
+    renderer_particles::particle_emitter_look(d, { 0.9f, 0.85f, 0.75f }, { 0.9f, 0.85f, 0.75f }, 0.012f, 0.012f, 0.9f);
+    renderer_particles::particle_emitter_light(d, 0, 0.7f, false);
+    return d;
+}
+
+// Steam off the top of the steel drum (0.5, 0.8, 2.2; radius 0.8): rising, spreading and thinning as it swirls.
+yea_handle makeSteam()
+{
+    yea_handle s = renderer_particles::particle_emitter_add({ 0.5f, 0.82f, 2.2f });
+    if (s == kNone)
+        return s;
+    renderer_particles::particle_emitter_shape(s, 1, { 0.5f, 0.01f, 0.5f });
+    renderer_particles::particle_emitter_rate(s, 40, 0);
+    renderer_particles::particle_emitter_motion(s, 0.5f, 15, 0.5f, -0.3f, 0.6f, 0.5f);
+    renderer_particles::particle_emitter_life(s, 2.5f, 4);
+    renderer_particles::particle_emitter_look(s, { 0.95f, 0.95f, 0.95f }, { 0.95f, 0.95f, 0.95f }, 0.15f, 0.8f, 0.3f);
+    renderer_particles::particle_emitter_light(s, 0, 0.3f, false);
+    return s;
 }
 
 // The lights the knobs ask for: switched-off types removed (not just dark, so their cost goes too).
@@ -608,14 +747,15 @@ void update(uint32_t phase, float dt)
     if (phase != YEA_PHASE_SIMULATE)
         return;
     State* s = state();
+    mdl::update(); // the Model Viewer's models
     // The renderer's scene must be the one this module built: after a renderer crash, revert or reload that lost or
     // replaced it (or one that came back while this module had built against stubs), every handle held here is stale
-    // and nothing would move, so build it all again.
-    if (!s->built || gFreshVersion || renderer::instance_count() != s->instances || renderer::light_count() != s->lightsAlive)
+    // and nothing would move, so build it all again. Its scene_epoch says so, whatever other modules add to the scene.
+    if (!s->built || gFreshVersion || renderer::scene_epoch() != s->epoch || settings.glass != gGlassBuilt || settings.decals != gDecalsBuilt)
     {
         char line[160];
-        snprintf(line, sizeof line, "renderer_example: building the scene (built %u; renderer has %u instances, %u lights; expected %u, %u)",
-                 s->built, renderer::instance_count(), renderer::light_count(), s->instances, s->lightsAlive);
+        snprintf(line, sizeof line, "renderer_example: building the scene (built %u; the renderer's scene %u, built in %u)", s->built,
+                 renderer::scene_epoch(), s->epoch);
         build(s);
         if (s->built)
         {
@@ -629,11 +769,13 @@ void update(uint32_t phase, float dt)
         addProbes(); // renderer_probes came up after the scene was built: its import was a stub then
     if (!settings.benchmark_view)
         s->t += dt; // Benchmark View holds the lights and shapes still, so timings repeat
+    placeModels();
     syncLights(s);
+    syncEmitter(particles->dust, settings.dust, makeDust);
+    syncEmitter(particles->steam, settings.steam, makeSteam);
     animate(s);
     moveCamera(s, dt);
-    s->instances = renderer::instance_count();
-    s->lightsAlive = renderer::light_count();
+    s->epoch = renderer::scene_epoch();
 }
 
 void draw(uint32_t pass, const YeaFrame* frame) {}

@@ -1,0 +1,30 @@
+// Glass into the tint maps, one layer a pass (renderer_shadows.cpp drawTints): each see-through caster's surface where a
+// light ray meets it lets through T = (1 - coverage) (1 - the specular's directional albedo) tint, the core's
+// see-through pass's rule (renderer's Forward.frag TRANSLUCENT) and renderer_rt's (Hit.h.fsl glassTransmit), with the
+// cosine between the ray and the surface's normal after its normal map. A layer counts where the ray meets a front face
+// (by the interpolated normal), or any face of a two-sided material except a solid refraction, as renderer_rt counts them.
+// TINT_PEEL: what lies at or nearer than the previous layer (gTintPrev) is peeled away. Out: the depth in the view (R32F)
+// and T, alpha 1, the nearest surface left kept by the depth test. TINT_REST, after a view's last layer: every surface past
+// the one it kept, multiplied into its colour (T) and counted in its alpha (how many surfaces the last layer holds, which
+// renderer_shadows counts to give the view more layers).
+#include "TintShade.h.fsl"
+
+STRUCT(PSOutput)
+{
+    DATA(float, Depth, SV_Target0);
+    DATA(float4, Color, SV_Target1);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+PSOutput PS_MAIN(VSOutput In)
+{
+    INIT_MAIN;
+    float  z = 1.0;
+    float3 T = float3(1.0, 1.0, 1.0);
+    if (!tintSurface(In, false, z, T))
+        discard;
+    PSOutput Out;
+    Out.Depth = z;
+    Out.Color = float4(T, 1.0);
+    RETURN(Out);
+}

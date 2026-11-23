@@ -17,12 +17,42 @@ table MeshLod none 1024
   u32 next
   float error
 end
-table Vertex none 262144
+# A vertex as the GPU streams have it: its position, then its attributes packed as frame.h's RENDER_ATTRIBUTE_STRIDE says
+# (octahedral normal and tangent, uv0, colour).
+table Vertex none 1048576
   float3 pos
-  float3 normal
+  u32 normal
+  u32 tangent
+  float2 uv
+  u32 color
 end
-table Index none 1048576
+table Index none 4194304
   u32 v
+end
+# Skinned meshes (skin.cpp): a Mesh row's first SkinVertex row + 1 (0: not skinned; rows match Mesh's, and may be fewer),
+# and each vertex's 4 bones (u16 pairs, the first low) and weights (unorm16 pairs, summing to 65535).
+table MeshSkin none 1024
+  u32 firstSkin
+end
+table SkinVertex none 1048576
+  u32 bones01
+  u32 bones23
+  u32 weights01
+  u32 weights23
+end
+# Morph targets (skin.cpp): a morphed mesh's first MorphVertex row + 1 (0: none) and its first MorphDelta row.
+table MeshMorph none 1024
+  u32 firstVertex
+  u32 firstDelta
+end
+# A vertex's deltas: the first (from its mesh's firstDelta) in the low 24 bits, their count in the top 8.
+table MorphVertex none 1048576
+  u32 ref
+end
+# A delta (renderer_models' rmodel.h RmodelMorphDelta): position offset and the target and normal offset packed.
+table MorphDelta none 1048576
+  float3 p
+  u32 packed
 end
 table Material none 4096
   float3 albedo
@@ -65,6 +95,75 @@ table Light none 4096
   u32 gen
   u32 alive
 end
+# Texture maps (textures.cpp): each a mip chain at `offset` in a file (its path in TexturePath), which the renderer reads
+# and uploads in its own frames, a few at a time, and again after it restarts. Rows as Mesh's (handles row | gen << 20);
+# a row is a slot in the shaders' texture array.
+table TextureMap none 1024
+  u32 pathFirst
+  u32 pathLength
+  u64 offset
+  u64 bytes
+  u32 format
+  u32 width
+  u32 height
+  u32 mips
+  u32 gen
+  u32 alive
+end
+table TexturePath none 262144
+  u8 c
+end
+# Blended (see-through) materials (material_blend), at their Material row: opacity 0 opaque.
+table MaterialBlend none 4096
+  float opacity
+end
+# How see-through materials bend and tint what is behind them (material_refraction), at their Material row: set 1 given.
+table MaterialRefraction none 4096
+  float ior
+  float thickness
+  u32 shape
+  float3 tint
+  u32 set
+end
+# A material's texture maps (material_maps), at its Material row: each map's texture handle (4294967295 none), the
+# factors the maps are multiplied by, and its alpha cutoff (0: opaque). set: 1 maps given, 2 factors given.
+table MaterialMap none 4096
+  u32 baseColor
+  u32 orm
+  u32 normal
+  u32 emissive
+  float4 baseFactor
+  float roughness
+  float metallic
+  float normalScale
+  float occlusion
+  float cutoff
+  u32 set
+end
+# Decals (decal_add): boxes that paint what lies inside them, applied in the forward pass through the light culling's
+# tiles (renderer_culling), in order of priority then age. Rows as Light's (handles row | gen << 20).
+table Decal none 4096
+  float3 pos
+  float4 rot
+  float3 half
+  float4 albedo
+  float roughness
+  float metallic
+  float3 emissive
+  float4 weights
+  u32 shape
+  float edge
+  float noise
+  float angle
+  u32 baseColor
+  u32 normal
+  u32 orm
+  float normalScale
+  i32 priority
+  u32 order
+  u32 gen
+  u32 alive
+end
 # Images for rect lights (light_image): up to 16, each 65536 rows (256 x 256, sRGB rgba8, row 0 at the top) one after
 # another; LightLook's rows match Light's (image + 1, 0 none).
 table LightTexel none 1048576
@@ -87,6 +186,20 @@ export u32 mesh_vertex(float3 pos, float3 normal)
 # Only that side is drawn unless its material is double-sided.
 export void mesh_triangle(u32 a, u32 b, u32 c)
 export u32 mesh_end()
+# A cooked mesh in one call (renderer_models' loader): vertex_count positions (float3 each) and attributes (5 u32 each, as
+# frame.h's RENDER_ATTRIBUTE_STRIDE), index_count u32 indices from 0, its triangles counter-clockwise around their outward
+# normal. Its mesh, or 4294967295 when the tables are full or a mesh is being built.
+export u32 mesh_packed(u64 positions, u64 attributes, u32 vertex_count, u64 indices, u32 index_count)
+# Makes `simpler` the next version of `mesh` (its LOD chain, the finest first) and sets how far `mesh` strays from the
+# true shape (object units); `simpler` 4294967295 ends the chain there.
+export void mesh_lod(u32 mesh, float error, u32 simpler)
+# A skinned mesh, right after it is made: its vertices' bones and weights (renderer_models' rmodel.h
+# RmodelSkinVertex[its vertex count]) and the bounds its animation reaches (object units).
+export void mesh_skin(u32 mesh, u64 skin, float3 lo, float3 hi)
+# A skinned mesh's morph targets, after mesh_skin: a u32 a vertex (`refs`: the first of its deltas in the low 24 bits,
+# their count in the top 8) into `deltas` (rmodel.h RmodelMorphDelta[delta_count]). Only the deltas its vertices name
+# are kept. Its instances morph by instance_morph's weights.
+export void mesh_morph(u32 mesh, u64 refs, u64 deltas, u32 delta_count)
 
 export handle material_add(float3 albedo, float roughness, float metallic)
 export void material_set(handle m, float3 albedo, float roughness, float metallic)
@@ -98,6 +211,36 @@ export void material_reflections(handle m, bool on)
 # its triangles face (see mesh_triangle), which is cheaper; for closed shapes. On: open or thin
 # surfaces such as leaves, cloth or a single plane seen from below.
 export void material_double_sided(handle m, bool on)
+# A texture map from a cooked model's file (renderer_models' rmodel.h RmodelTexture): `path` a C string, the full path of
+# the file; its mips (`mips` of them, the largest `width` x `height` first) `bytes` long at `offset`. format: 1 BC7 sRGB,
+# 2 BC7 linear, 3 BC5. The renderer reads it in its own frames (never during this call), leaving out top mips for
+# texture_detail or GPU memory. Its texture, 4294967295 when full.
+export handle texture_add(u64 path, u64 offset, u64 bytes, u32 format, u32 width, u32 height, u32 mips)
+# 0 no such texture, 1 loading, 2 drawn with, 3 failed (its file unreadable or the GPU refused it).
+export u32 texture_state(handle t)
+export void texture_remove(handle t)
+# A material's texture maps (4294967295: none): base colour (rgb, alpha), ORM (occlusion, roughness, metallic), normal
+# (tangent space x, y) and emissive. With a map, the material draws factor times map (factors from material_factors);
+# until it has loaded, and without one, as material_set and material_emissive say.
+export void material_maps(handle m, handle base_color, handle orm, handle normal, handle emissive)
+# The factors the maps multiply (glTF's): base colour and alpha, roughness, metallic, the normal map's x and y scale, and
+# how strongly the occlusion map darkens (0 not at all, 1 fully).
+export void material_factors(handle m, float4 base_color, float roughness, float metallic, float normal_scale, float occlusion)
+# Alpha-tested (cut out) where base colour alpha is below cutoff, for leaves, fences and cloth; 0 opaque (the default).
+export void material_alpha(handle m, float cutoff)
+# See-through, blended over what is behind (glass, lenses, visors, water): opacity times the base colour's own alpha
+# (material_factors' base_color alpha, its map's and the vertex colour's) is how much of the surface is there; its
+# reflections stay whole (clear glass still reflects). Drawn sorted back to front after the opaque scene, lit as every
+# surface is, through fog. 0 opaque (the default). Blended surfaces write no depth; with
+# instance_shadow on, ray-traced shadows (renderer_rt) take their colour through them (shadow maps don't see them).
+export void material_blend(handle m, float opacity)
+# How a see-through material bends, blurs and tints what is seen through it: ior its index of refraction (glass 1.5,
+# water 1.33, 1 none), thickness (m) and shape: 0 thin (a pane or a sheet that thick: what is behind shifts a little), 1
+# solid (a ball or a block about that thick: what is behind is bent and flipped as through a lens). tint: the colour
+# that gets through (1, 1, 1 clear; coloured glass). Rough materials blur what is behind them by their roughness and how
+# far behind it lies (frosted glass). Without it: thin, no shift, clear. Refraction sees the opaque scene; a see-through
+# surface behind another shows through unbent.
+export void material_refraction(handle m, float ior, float thickness, u32 shape, float3 tint)
 
 export handle instance_add(u32 mesh, handle material)
 export void instance_place(handle i, float3 pos, float4 rotation, float3 scale)
@@ -106,6 +249,11 @@ export void instance_shadow(handle i, bool cast)
 # Detail kept with distance for this instance: its lod_error divided by quality (2: finer versions twice as far; 1 as
 # every other instance).
 export void instance_lod_quality(handle i, float quality)
+# An instance of a skinned mesh, posed this frame: its palette (3x4 rows a bone, model space; the mesh's bones index it),
+# called every frame it moves (renderer_models does). Without one this frame it stands in its bind pose.
+export void instance_pose(handle i, u64 palette, u32 bones)
+# Its morph targets' weights this frame (floats, one a target), with instance_pose. Without them it shows no morph.
+export void instance_morph(handle i, u64 weights, u32 count)
 export void instance_remove(handle i)
 export u32 instance_count()
 
@@ -134,8 +282,31 @@ export void light_shadow(handle l, bool cast)
 export void light_remove(handle l)
 export u32 light_count()
 
+# Decals: paint on whatever lies inside a box (a scorch, a puddle, a sign, dirt, a painted line), projected along the
+# box's own -z (its local z: rotation applied to (0, 0, 1) points back out of the surface). pos its centre, half its half
+# size (m): x and y across the paint, z how deep it reaches. Its handle, 4294967295 when 4096 are made.
+export handle decal_add(float3 pos, float4 rotation, float3 half)
+export void decal_place(handle d, float3 pos, float4 rotation, float3 half)
+# What it paints: albedo with opacity (how much of the surface's own colour it covers), roughness, metallic and an
+# emissive glow (colour times luminance, nits). weights: how much of each it applies, x colour (and glow), y roughness, z
+# metallic, w the normal (towards its normal map's, or flat without one); 0 leaves that part as the surface had it. A wet
+# puddle: dark albedo at colour 0.3, roughness 0.05 at 1, normal 1 (flat water over the bumps).
+export void decal_look(handle d, float4 albedo, float roughness, float metallic, float3 emissive, float luminance, float4 weights)
+# Its outline: shape 0 a soft ellipse, 1 a rectangle; edge (0 to 1) how much of it fades out towards the rim; noise (0
+# to 1) how ragged and patchy it is (splats, dirt, rust). angle (degrees): surfaces turned further than this from facing
+# along its z are left unpainted, fading over the last 15.
+export void decal_shape(handle d, u32 shape, float edge, float noise, float angle_deg)
+# Texture maps (texture_add's handles; 4294967295 none) across the box, its top along y: base colour (rgb times albedo,
+# alpha times opacity), a tangent-space normal map (BC5 x, y) times normal_scale, and ORM (roughness and metallic times
+# decal_look's). With a base colour map, its alpha replaces the shape's outline.
+export void decal_maps(handle d, handle base_color, handle normal, handle orm, float normal_scale)
+# Higher priorities paint over lower ones; equal ones in the order they were added.
+export void decal_priority(handle d, i32 priority)
+export void decal_remove(handle d)
+export void decal_clear()
+
 export void camera(float3 eye, float3 target, float fov_deg)
-# Removes every mesh, material, instance and light.
+# Removes every mesh, material, instance, light and decal.
 export void clear()
 # Changes whenever the scene a module built is gone (clear(), Reset State, a material layout change), never on a
 # reload that keeps it: a module that adds meshes, materials or instances builds them again when it changes. Never 0.
@@ -167,7 +338,20 @@ import renderer_rt void rt_run(u64 frame)
 import renderer_upscale bool upscale_prepare(u64 frame) = false
 import renderer_upscale void upscale_run(u64 frame)
 import renderer_post u64 post_prepare(u64 frame) = 0
+import renderer_sky bool sky_prepare(u64 frame) = false
+import renderer_sky void sky_run(u64 frame)
+import renderer_fog bool fog_prepare(u64 frame) = false
+import renderer_fog void fog_run(u64 frame)
+import renderer_fog bool fog_on() = false
+import renderer_particles bool particles_on() = false
+import renderer_particles bool particles_prepare(u64 frame) = false
+import renderer_particles void particles_run(u64 frame)
+import renderer_particles bool particles_draw_begin(u64 frame) = false
+import renderer_particles void particles_draw(u64 frame, u32 run)
+import renderer_particles void particles_draw_end(u64 frame)
 import renderer_post void post_run(u64 frame)
+import renderer_gi bool gi_prepare(u64 frame) = false
+import renderer_gi void gi_run(u64 frame)
 
 category Exposure
 setting float exposure_ev 0
@@ -175,6 +359,9 @@ player exposure_ev
 setting bool auto_exposure true
 setting float manual_ev100 9
 setting float adapt_speed 1.5 0 inf
+# How much auto exposure brightens scenes darker than a sunset (dusk, night, dim interiors): 1 all the way, as bright as
+# day; lower keeps them looking dark.
+setting float dark_adaptation 0.6 0 1
 # How the bright HDR image is fitted to the screen. Khronos PBR Neutral keeps material colours true; AgX rolls
 # bright, saturated light (coloured lamps, the sun) towards white as film does; Hable Filmic is the Uncharted 2
 # curve; Reinhard compresses brightness alone; None clips; ACES Fitted is Stephen Hill's fit of the film
@@ -194,7 +381,16 @@ category Camera
 setting float near_plane 0.05 0.01 inf
 category Performance
 setting bool gpu_timings true
+# Decals (decal_add) painted on the scene; off saves their cost.
+setting bool decals true
+# Glass bends and blurs what is behind it (material_refraction, rough see-through surfaces); off: seen straight through,
+# unblurred (saves a copy of the scene and its blurred levels while glass is in view).
+setting bool refraction true
 # How far a mesh's outline may be off on screen (display pixels) before a simpler version of it is drawn; 0 always
 # draws the finest. Built-in shapes only: meshes made vertex by vertex have one version.
 setting float lod_error 0.5 0 inf
 player lod_error
+# Texture maps' finest detail: Half and Quarter leave out their largest mips, for GPUs short of memory (the renderer also
+# leaves out more by itself when the GPU's free memory can't hold a texture).
+setting choice texture_detail Full Full Half Quarter
+player texture_detail

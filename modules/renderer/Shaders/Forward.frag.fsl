@@ -2,7 +2,13 @@
 // range (Drobot 2017), the sun with cascaded shadows, sky ambient with multiple scattering.
 #include "Common.h.fsl"
 #include "Scene.srt.h"
+#define GI_IRRADIANCE gGiIrradiance
+#define GI_DISTANCE   gGiDistance
+#define GI_PROBES     gGiProbes
+#define GI_SAMPLER    gSamplerBilinearClamp
+#include "GiSample.h.fsl"
 #include "Lighting.h.fsl"
+#include "Material.h.fsl"
 
 STRUCT(VSOutput)
 {
@@ -14,6 +20,9 @@ STRUCT(VSOutput)
     DATA(float4, CurrClip, TEXCOORD3);
     DATA(float4, PrevClip, TEXCOORD4);
 #endif
+    DATA(float2, Uv, TEXCOORD5);
+    DATA(float4, Tangent, TEXCOORD6);
+    DATA(float4, Color, TEXCOORD7);
 };
 
 #ifdef MOTION
@@ -21,6 +30,18 @@ STRUCT(PSOutput)
 {
     DATA(float4, Color, SV_Target0);
     DATA(float2, Motion, SV_Target1); // uv now - uv last frame
+};
+#endif
+// See-through surfaces (material_blend), drawn back to front after the opaque scene, two blends each: TRANSMIT
+// multiplies what is behind by the light the surface lets through (rgb T), then TRANSLUCENT alone adds its own light.
+// BLEND_PASS: the core's see-through pass (one sample a pixel): no depth target, so the depth test is done here against
+// the scene's depth, and the reactive and transparency masks are written too. Without it (MSAA), inside the forward pass.
+#ifdef BLEND_PASS
+STRUCT(PSOutput)
+{
+    DATA(float4, Color, SV_Target0);
+    DATA(float, Reactive, SV_Target1);
+    DATA(float, Transparency, SV_Target2);
 };
 #endif
 
@@ -56,7 +77,9 @@ float3 environment(float3 P, float3 R, float rough, bool reflections)
     float ambient = gFrame.skyGround.w;
     if (!reflections)
         return skyIrradiance(R) * ambient;
-    float3 sky = lerp(skyRadiance(R), skyIrradiance(R), rough) * ambient;
+    float3 sky = ((gFrame.counts.z & FLAG_SKY) != 0u ? skyReflection(R, rough) : lerp(skyRadiance(R), skyIrradiance(R), rough)) * ambient;
+    if (gFrame.fogMedium.x > 0.0)
+        sky = applyHeightFog(sky, P, R, gFrame.fogAlbedo.w); // the fog's range of it, as the sky pass has
     float3 color = float3(0.0, 0.0, 0.0);
     float  remaining = 1.0;
     float  lod = rough * float(max(gFrame.probeInfo.y, 1u) - 1u);
@@ -86,6 +109,24 @@ float3 environment(float3 P, float3 R, float rough, bool reflections)
     return color + sky * remaining;
 }
 
+// --- Decals ---------------------------------------------------------------------------------------
+#define DECAL_DATA(k)                  gDecals[k]
+#define DECAL_SAMPLE(slot, uv, dx, dy) sampleMap(slot, uv, dx, dy)
+#include "Decal.h.fsl"
+
+// Decal k painted over the surface at P (decalPaint, Decal.h.fsl) into the material m and normal N.
+void applyDecal(uint k, float3 P, float3 Ng, float3 dPdx, float3 dPdy, inout(MaterialData) m, inout(float3) N)
+{
+    float3 albedo = m.albedoRough.rgb;
+    float  rough = m.albedoRough.a;
+    float  metal = m.params.x;
+    float3 emissive = m.emissive.rgb;
+    decalPaint(k, P, Ng, dPdx, dPdy, albedo, rough, metal, emissive, N);
+    m.albedoRough = float4(albedo, rough);
+    m.params.x = metal;
+    m.emissive.rgb = emissive;
+}
+
 float4 clipOf(float3 W)
 {
     float4 w = float4(W, 1.0);
@@ -102,6 +143,65 @@ float behind(float2 s, float rayZ)
     float  d = LoadTex2D(gSsrDepth, NO_SAMPLER, q, 0).r;
     return rayZ - gFrame.camPos.w / max(d, 1e-7); // reversed-Z, infinite far: sky is never in front
 }
+
+#ifdef TRANSLUCENT
+// The scene's view depth at pixel q (reversed-Z, infinite far): the see-through pass's depth, or with MSAA its resolve.
+float sceneZ(float2 q)
+{
+    int2 p = int2(clamp(q, float2(0.0, 0.0), gFrame.screen.xy - 1.0));
+    return gFrame.camPos.w / max(LoadTex2D(gSceneDepth, NO_SAMPLER, p, 0).r, 1e-7);
+}
+
+// What glass shows through itself (material_refraction): the view ray bent into it at P by the shading normal N, out of
+// it, on to the scene behind, read from the scene colour chain (FLAG_REFRACTION). Thin (shape 0): a slab `thickness`
+// thick, so the ray leaves parallel to how it came, shifted. Solid (1): a ball that thick, refracted in and out of it
+// (Wyman 2005's image-space refraction with the far side taken as a sphere's), so what is behind is bent and flipped as
+// through a lens; past the critical angle the ray reflects inside. Where it lands, found on the depth behind in two steps;
+// a landing on something in front of the glass (whose colour isn't behind it) takes the straight view instead. Rough
+// glass blurs it: the transmitted lobe's spread (GGX alpha a2, twice for the two faces, narrowed by 1 - 1/ior) over the
+// distance behind, read from the chain's level of that size.
+float3 refractedScene(float3 P, float3 N, float3 V, float4 refr, float a2, float2 pixel)
+{
+    float  ior = max(refr.x, 1.0);
+    float3 I = -V;
+    float3 T = refract(I, N, 1.0 / ior);
+    if (dot(T, T) < 1e-6)
+        T = I;
+    float3 E;
+    float3 D;
+    if (refr.z < 0.5)
+    {
+        E = P + T * (refr.y / max(dot(T, -N), 0.2));
+        D = I;
+    }
+    else
+    {
+        E = P + T * (refr.y * max(dot(T, -N), 0.0));
+        float3 N2 = normalize(E - (P - N * (refr.y * 0.5))); // out of the ball where the ray leaves it
+        D = refract(T, -N2, ior);
+        if (dot(D, D) < 1e-6)
+            D = reflect(T, -N2);
+    }
+    float  zP = dot(gFrame.view[2], float4(P, 1.0));
+    float  zE = dot(gFrame.view[2], float4(E, 1.0));
+    float  dz = max(dot(gFrame.view[2].xyz, D), 0.1);
+    float  zBehind = sceneZ(pixel);
+    float2 q = pixelOf(clipOf(E + D * (max(zBehind - zE, 0.0) / dz)));
+    float  zq = sceneZ(q);
+    q = pixelOf(clipOf(E + D * (max(zq - zE, 0.0) / dz)));
+    zq = sceneZ(q);
+    if (zq < zP)
+    {
+        q = pixel;
+        zq = zBehind;
+    }
+    float far = max(zq - zE, 0.0) / dz; // the sky's too: its blur is then the spread's angle
+    float spread = 2.0 * sqrt(a2) * (1.0 - 1.0 / ior);
+    float px = spread * (far / max(zq, gFrame.camPos.w)) * 0.5 * gFrame.screen.y * gFrame.proj.y;
+    float lod = clamp(log2(max(px, 1.0)), 0.0, gFrame.refraction.x - 1.0);
+    return SampleLvlTex2D(gSceneColor, gSamplerTrilinearClamp, q * gFrame.screen.zw, lod).rgb;
+}
+#endif
 
 // Screen-space reflection (renderer_ssr): the reflected ray marched across the screen against the depth
 // copy, 1/depth stepped linearly in screen space (perspective-correct, McGuire and Mara 2014); at the first
@@ -206,7 +306,7 @@ float4 screenReflection(float3 P, float3 R, float rough, float noise)
 }
 
 ROOT_SIGNATURE(DefaultRootSignature)
-#ifdef MOTION
+#if defined(MOTION) || defined(BLEND_PASS)
 PSOutput PS_MAIN(VSOutput In)
 #else
 float4 PS_MAIN(VSOutput In)
@@ -228,24 +328,101 @@ float4 PS_MAIN(VSOutput In)
 #endif
     }
 #endif
+    // Texture maps (cooked models): the material's look at this pixel replaces its flat one. Alpha-tested materials were
+    // cut out by the depth prepass, and draw here only where it kept them (an equal depth test).
+    MaterialMapData mm = gMaterialMaps[In.Material];
+    float  occlusion = 1.0;
+    float  uvScale = exp2(gFrame.textures.x);
+    float2 uvDx = ddx(In.Uv) * uvScale;
+    float2 uvDy = ddy(In.Uv) * uvScale;
+    // The unit normal's change across the pixel: In.Normal's length is the instance's scale squared (Forward.vert),
+    // which would widen a scaled-up object's highlights and sharpen a scaled-down one's past what their curvature asks.
+    float3 unitN = normalize(In.Normal);
+    float3 dndx = ddx(unitN);
+    float3 dndy = ddy(unitN);
+#ifdef BLEND_PASS
+    // Behind the opaque scene (reversed-Z: smaller is farther); after the derivatives, which need the whole quad.
+    if (In.Position.z < LoadTex2D(gSceneDepth, NO_SAMPLER, int2(In.Position.xy), 0).r)
+        discard;
+#endif
+#ifdef TRANSLUCENT
+    float coverage = mm.misc.z; // material_blend's opacity times the base colour's alpha
+#endif
+    if (mm.misc.y > 0.5)
+    {
+        MaterialLook look = materialLook(m, mm, In.Uv, uvDx, uvDy, In.Color);
+        m.albedoRough = float4(look.albedo, look.rough);
+        m.params.x = look.metallic;
+        m.emissive.rgb = look.emissive;
+        occlusion = look.occlusion;
+#ifdef TRANSLUCENT
+        coverage *= look.alpha;
+#endif
+    }
     float3 N = normalize(In.Normal);
     float3 V = normalize(gFrame.camPos.xyz - In.WorldPos);
     float  rough = clamp(m.albedoRough.a, 0.03, 1.0);
     float  a2 = rough * rough;
     a2 *= a2;
     // Specular antialiasing: widen the lobe where the normal changes quickly across the pixel.
-    float3 dndx = ddx(In.Normal);
-    float3 dndy = ddy(In.Normal);
     float  variance = 0.25 * gFrame.misc.y * (dot(dndx, dndx) + dot(dndy, dndy));
     a2 = saturate(a2 + min(2.0 * variance, 0.18));
     // Two-sided: shade the face towards the viewer.
     float NoV = dot(N, V);
+    float facing = 1.0;
     if (NoV < 0.0)
     {
         N = -N;
         NoV = -NoV;
+        facing = -1.0;
+    }
+    if (mm.maps.z != 0u)
+    {
+        // The normal map's normal, turned with the face (a back face's whole tangent frame flips).
+        N = mappedNormal(mm, In.Normal, In.Tangent, In.Uv, uvDx, uvDy) * facing;
+        NoV = dot(N, V);
     }
     NoV = max(NoV, 1e-3);
+#ifndef TRANSLUCENT
+    if ((gFrame.counts.z & FLAG_DECALS) != 0u)
+    {
+        // Decals (DOOM 2016's clustered decals): renderer_culling's tile mask ANDed with the z-bin's range, in paint order,
+        // before any lighting reads the surface.
+        float3 Ng = normalize(In.Normal) * facing;
+        float3 dPdx = ddx(In.WorldPos) * uvScale;
+        float3 dPdy = ddy(In.WorldPos) * uvScale;
+        float  dz = dot(gFrame.view[2], float4(In.WorldPos, 1.0));
+        // Every decal without culling (its masks then read as all set); one loop, so applyDecal is inlined once.
+        bool culledDecals = (gFrame.counts.z & FLAG_CULLED) != 0u;
+        uint first = 0u;
+        uint last = gFrame.decals.x - 1u;
+        uint base = 0u;
+        if (culledDecals)
+        {
+            uint bin = gDecalBins[min(uint(max(dz, 0.0) * gFrame.misc.x), gFrame.tiles.w - 1u)];
+            first = bin & 0xFFFFu;
+            last = bin >> 16;
+            uint2 tile = uint2(In.Position.xy) / gFrame.tiles.x;
+            base = (tile.y * gFrame.tiles.y + tile.x) * DECAL_WORDS;
+        }
+        for (uint w = first >> 5; first <= last && w <= (last >> 5); ++w)
+        {
+            uint lo = w == (first >> 5) ? (first & 31u) : 0u;
+            uint hi = w == (last >> 5) ? (last & 31u) : 31u;
+            uint mask = (culledDecals ? gDecalMasks[base + w] : 0xFFFFFFFFu) & (0xFFFFFFFFu << lo) & (0xFFFFFFFFu >> (31u - hi));
+            while (mask != 0u)
+            {
+                uint b = FirstBitLow(mask);
+                mask &= mask - 1u;
+                applyDecal(w * 32u + b, In.WorldPos, Ng, dPdx, dPdy, m, N);
+            }
+        }
+        rough = clamp(m.albedoRough.a, 0.03, 1.0);
+        a2 = rough * rough;
+        a2 = saturate(a2 * a2 + min(2.0 * variance, 0.18));
+        NoV = max(dot(N, V), 1e-3);
+    }
+#endif
 
     float  metallic = saturate(m.params.x);
     float3 albedo = m.albedoRough.rgb;
@@ -261,6 +438,35 @@ float4 PS_MAIN(VSOutput In)
     float2 dfg = dfgLookup(NoV, sqrt(sqrt(a2)));
     float  Ess = dfg.x + dfg.y;
     s.energy = float3(1.0, 1.0, 1.0) + s.f0 * (1.0 / max(Ess, 1e-3) - 1.0);
+    float3 FssEss = s.f0 * dfg.x + float3(dfg.y, dfg.y, dfg.y);
+    float  Ems = 1.0 - Ess;
+    float3 Favg = s.f0 + (float3(1.0, 1.0, 1.0) - s.f0) * (1.0 / 21.0);
+    float3 Fms = FssEss * Favg / (float3(1.0, 1.0, 1.0) - Ems * Favg);
+#ifdef TRANSLUCENT
+    // A thin surface: `coverage` of it is there (its diffuse light and emission scale by it), its specular reflection is
+    // whole (clear glass still reflects), and what it reflects never passes through it: the rest lets the background
+    // through, T = (1 - coverage) (1 - the specular's directional albedo), per channel.
+    // Coloured glass (material_refraction's tint) passes only its colour of it.
+    float3 transmit = (1.0 - saturate(coverage)) * saturate(float3(1.0, 1.0, 1.0) - FssEss - Fms * Ems) *
+                      gRefraction[In.Material * 2u + 1u].rgb;
+    // Glass that refracts replaces what is behind it with the scene it bends and blurs: the multiply clears it, the add
+    // puts the transmitted part of the scene colour chain there.
+    float4 refr = gRefraction[In.Material * 2u];
+    bool   refracts = (gFrame.counts.z & FLAG_REFRACTION) != 0u && refr.w > 0.5;
+#ifdef TRANSMIT
+#ifdef BLEND_PASS
+    PSOutput Transmit;
+    Transmit.Color = float4(refracts ? float3(0.0, 0.0, 0.0) : transmit, 1.0);
+    Transmit.Reactive = 0.0;
+    Transmit.Transparency = 0.0;
+    RETURN(Transmit);
+#else
+    RETURN(float4(refracts ? float3(0.0, 0.0, 0.0) : transmit, 1.0));
+#endif
+#endif
+    s.diffuse *= saturate(coverage);
+    m.emissive.rgb *= saturate(coverage);
+#endif
     s.ltcX = float3(1.0, 0.0, 0.0);
     s.ltcY = float3(0.0, 1.0, 0.0);
     s.ltcInv = float4(1.0, 0.0, 0.0, 1.0);
@@ -286,42 +492,53 @@ float4 PS_MAIN(VSOutput In)
     float  ao = 1.0;
     float3 diffuseAo = float3(1.0, 1.0, 1.0);
     float  specularAo = 1.0;
-    if ((gFrame.counts.z & FLAG_AO) != 0u)
+#ifdef TRANSLUCENT
+    bool   ssao = false; // renderer_ao's (and contact shadows', ray-traced reflections' and shadows') are the opaque scene's
+#else
+    bool   ssao = (gFrame.counts.z & FLAG_AO) != 0u;
+#endif
+    if (ssao || occlusion < 1.0)
     {
-        int2 p = int2(In.Position.xy);
-        if (gFrame.aoParams.z > 1.5)
+        // The texture's own occlusion map joins renderer_ao's (the darker of the two), as Filament does; without
+        // renderer_ao it alone, with multiple bounces and specular occlusion at full strength.
+        if (ssao)
         {
-            // Half size: the four nearest texels, bilinear weights times how close each one's depth (carried with it)
-            // is to this pixel's, so occlusion never bleeds across an edge; when none is close, the closest in depth.
-            int2   last = (int2(gFrame.screen.xy) + int2(1, 1)) / 2 - int2(1, 1);
-            int2   base = p / 2;
-            float2 f = float2(p - base * 2) * 0.5;
-            float  sum = 0.0;
-            float  total = 0.0;
-            float  best = 1e30;
-            float  nearest = 1.0;
-            for (int j = 0; j < 2; ++j)
+            int2 p = int2(In.Position.xy);
+            if (gFrame.aoParams.z > 1.5)
             {
-                for (int i = 0; i < 2; ++i)
+                // Half size: the four nearest texels, bilinear weights times how close each one's depth (carried with it)
+                // is to this pixel's, so occlusion never bleeds across an edge; when none is close, the closest in depth.
+                int2   last = (int2(gFrame.screen.xy) + int2(1, 1)) / 2 - int2(1, 1);
+                int2   base = p / 2;
+                float2 f = float2(p - base * 2) * 0.5;
+                float  sum = 0.0;
+                float  total = 0.0;
+                float  best = 1e30;
+                float  nearest = 1.0;
+                for (int j = 0; j < 2; ++j)
                 {
-                    float2 q = LoadTex2D(gAo, NO_SAMPLER, min(base + int2(i, j), last), 0).xy;
-                    float  dz = abs(q.y - viewZ);
-                    float  w = (i == 0 ? 1.0 - f.x : f.x) * (j == 0 ? 1.0 - f.y : f.y) * saturate(1.0 - dz / (viewZ * 0.03));
-                    sum += q.x * w;
-                    total += w;
-                    if (dz < best)
+                    for (int i = 0; i < 2; ++i)
                     {
-                        best = dz;
-                        nearest = q.x;
+                        float2 q = LoadTex2D(gAo, NO_SAMPLER, min(base + int2(i, j), last), 0).xy;
+                        float  dz = abs(q.y - viewZ);
+                        float  w = (i == 0 ? 1.0 - f.x : f.x) * (j == 0 ? 1.0 - f.y : f.y) * saturate(1.0 - dz / (viewZ * 0.03));
+                        sum += q.x * w;
+                        total += w;
+                        if (dz < best)
+                        {
+                            best = dz;
+                            nearest = q.x;
+                        }
                     }
                 }
+                ao = total > 1e-4 ? sum / total : nearest;
             }
-            ao = total > 1e-4 ? sum / total : nearest;
+            else
+                ao = LoadTex2D(gAo, NO_SAMPLER, p, 0).x;
         }
-        else
-            ao = LoadTex2D(gAo, NO_SAMPLER, p, 0).x;
+        ao = min(ao, occlusion);
         diffuseAo = float3(ao, ao, ao);
-        if (gFrame.aoParams.y > 0.0)
+        if (!ssao || gFrame.aoParams.y > 0.0)
         {
             float3 a = 2.0404 * albedo - 0.3324;
             float3 b = -4.7951 * albedo + 0.6417;
@@ -329,18 +546,30 @@ float4 PS_MAIN(VSOutput In)
             diffuseAo = max(diffuseAo, ((diffuseAo * a + b) * diffuseAo + c) * diffuseAo);
         }
         float so = saturate(pow(max(NoV + ao, 1e-4), exp2(-16.0 * sqrt(sqrt(a2)) - 1.0)) - 1.0 + ao);
-        specularAo = lerp(1.0, so, gFrame.aoParams.x);
+        specularAo = lerp(1.0, so, ssao ? gFrame.aoParams.x : 1.0);
     }
     float3 R = reflect(-V, N);
     float  horizon = saturate(1.0 + dot(R, normalize(In.Normal) * (dot(In.Normal, V) < 0.0 ? -1.0 : 1.0)));
     float3 irradiance = skyIrradiance(N) * ambient;
+    if ((gFrame.counts.z & FLAG_GI) != 0u)
+    {
+        // Dynamic diffuse GI (renderer_gi): the probes round the pixel hold the sky as it reaches here and the light
+        // bounced off everything, ambient strength included; the sky alone outside their volume.
+        float  inside;
+        float3 gi = giIrradiance(In.WorldPos, N, -V, gFrame.gi[0], gFrame.gi[1], gFrame.gi[2], gFrame.gi[3], inside);
+        irradiance = lerp(irradiance, gi, inside);
+    }
     float  r = sqrt(sqrt(a2));
     // Ray-traced (renderer_rt): what the reflected ray hit, or the sky; fading out towards the roughness limit, where
     // the probes' prefiltered reflections take over. Where it takes over fully (smooth surfaces, a ray traced), the
     // probes and sky would only be lerped away, so they aren't looked up (SSR never runs with it).
     float  rtFound = 0.0;
     float3 rtSeen = float3(0.0, 0.0, 0.0);
+#ifndef TRANSLUCENT
     if ((gFrame.counts.z & FLAG_RT) != 0u && m.params.z > 0.5)
+#else
+    if (false)
+#endif
     {
         float4 traced = LoadTex2D(gRtReflection, NO_SAMPLER, int2(In.Position.xy), 0);
         float  limit = gFrame.rt.x;
@@ -379,23 +608,26 @@ float4 PS_MAIN(VSOutput In)
     if (rtFound > 0.0 && rtFound < 1.0)
         radiance = lerp(radiance, rtSeen, rtFound);
     radiance *= horizon * horizon;
-    float3 FssEss = s.f0 * dfg.x + float3(dfg.y, dfg.y, dfg.y);
-    float  Ems = 1.0 - Ess;
-    float3 Favg = s.f0 + (float3(1.0, 1.0, 1.0) - s.f0) * (1.0 / 21.0);
-    float3 Fms = FssEss * Favg / (float3(1.0, 1.0, 1.0) - Ems * Favg);
     float3 kD = s.diffuse * (float3(1.0, 1.0, 1.0) - FssEss - Fms * Ems);
     color += FssEss * radiance * specularAo + (Fms * Ems + kD) * irradiance * diffuseAo;
     color += m.emissive.rgb;
 
     // Directional lights; the first has the cascades and contact shadows (renderer_contact).
+#ifdef TRANSLUCENT
+    float contact = 1.0;
+    uint  sunFlags = gFrame.counts.z & ~FLAG_RT_SUN; // the cascades (kept while see-through surfaces are in view)
+#else
     float contact = (gFrame.counts.z & FLAG_CONTACT) != 0u ? LoadTex2D(gContactShadow, NO_SAMPLER, int2(In.Position.xy), 0).r : 1.0;
+    uint  sunFlags = gFrame.counts.z;
+#endif
     for (uint d = 0u; d < gFrame.counts.y; ++d)
     {
         float3 L = gFrame.sunDir[d].xyz;
         if (dot(N, L) <= 0.0)
             continue;
-        float shadow = (d == 0u && (gFrame.counts.z & FLAG_RT_SUN) != 0u) ? LoadTex3D(gRtShadows, NO_SAMPLER, int3(s.pixel, 0), 0).r
-                     : (d == 0u && (gFrame.counts.z & FLAG_SHADOWS) != 0u) ? sunShadow(In.WorldPos, N, viewZ, s.rot, dither) : 1.0;
+        float3 shadow = (d == 0u && (sunFlags & FLAG_RT_SUN) != 0u) ? tracedShadow(s.pixel, 0)
+                      : (d == 0u && (sunFlags & FLAG_SHADOWS) != 0u) ? sunShadow(In.WorldPos, N, viewZ, s.rot, dither)
+                      : float3(1.0, 1.0, 1.0);
         if (d == 0u)
             shadow *= contact;
         color += brdfLight(s, L, gFrame.sunColor[d].rgb * shadow);
@@ -403,7 +635,19 @@ float4 PS_MAIN(VSOutput In)
 
     // Local lights.
     uint lightCount = 0u;
+#ifdef TRANSLUCENT
     if ((gFrame.counts.z & FLAG_CULLED) != 0u)
+    {
+        // The depth bin alone: the screen tiles' depth ranges end at the opaque scene, which this surface is in front of.
+        uint bin = gZBins[min(uint(max(viewZ, 0.0) * gFrame.misc.x), gFrame.tiles.w - 1u)];
+        uint last = min(bin >> 16, gFrame.counts.x - 1u);
+        for (uint k = bin & 0xFFFFu; k <= last && gFrame.counts.x > 0u; ++k)
+            color += shadeLocalLight(k, s, color);
+    }
+    else if (false)
+#else
+    if ((gFrame.counts.z & FLAG_CULLED) != 0u)
+#endif
     {
         uint binIndex = min(uint(max(viewZ, 0.0) * gFrame.misc.x), gFrame.tiles.w - 1u);
         uint bin = gZBins[binIndex];
@@ -438,6 +682,29 @@ float4 PS_MAIN(VSOutput In)
         lightCount = gFrame.counts.x;
     }
 
+#ifdef TRANSLUCENT
+    // Fog and aerial perspective are x A + B from the camera to here; what is behind already has B in front of it, which
+    // the multiply took T of: add its (1 - T) back, so the air in front stays whole, f(color) - T f(0).
+    float3 inscatter = float3(0.0, 0.0, 0.0);
+    if ((gFrame.counts.z & FLAG_SKY) != 0u && gFrame.atmosphere.w > 0.0)
+    {
+        color = aerialPerspective(color, In.WorldPos, In.Position.xy * gFrame.screen.zw);
+        inscatter = aerialPerspective(inscatter, In.WorldPos, In.Position.xy * gFrame.screen.zw);
+    }
+    if ((gFrame.counts.z & FLAG_FOG) != 0u)
+    {
+        color = applyFog(color, viewZ, In.Position.xy * gFrame.screen.zw);
+        inscatter = applyFog(inscatter, viewZ, In.Position.xy * gFrame.screen.zw);
+    }
+    if (refracts)
+        inscatter -= refractedScene(In.WorldPos, N, V, refr, a2, In.Position.xy); // the chain has its own air in front
+    color = max(color - transmit * inscatter, float3(0.0, 0.0, 0.0));
+#else
+    if ((gFrame.counts.z & FLAG_SKY) != 0u && gFrame.atmosphere.w > 0.0)
+        color = aerialPerspective(color, In.WorldPos, In.Position.xy * gFrame.screen.zw);
+    if ((gFrame.counts.z & FLAG_FOG) != 0u)
+        color = applyFog(color, viewZ, In.Position.xy * gFrame.screen.zw);
+#endif
 
 #ifdef FULL
     if ((gFrame.counts.z & FLAG_CASCADES) != 0u)
@@ -448,6 +715,8 @@ float4 PS_MAIN(VSOutput In)
     }
     if ((gFrame.counts.z & FLAG_AO_DEBUG) != 0u)
         color = float3(ao, ao, ao); // shown at exposure 1
+    if ((gFrame.counts.z & FLAG_GI_DEBUG) != 0u)
+        color = irradiance * diffuseAo; // the diffuse light from the sky and bounces on a white surface
     if ((gFrame.counts.z & FLAG_CONTACT_DEBUG) != 0u)
         color = float3(contact, contact, contact);
     if ((gFrame.counts.z & FLAG_RT_DEBUG) != 0u)
@@ -466,7 +735,14 @@ float4 PS_MAIN(VSOutput In)
         color = color * 0.15 + heatColor(float(lightCount)) * (0.6 / exposure);
     }
 #endif
-#ifdef MOTION
+#if defined(BLEND_PASS)
+    PSOutput Out;
+    float    seen = 1.0 - min(transmit.r, min(transmit.g, transmit.b)); // how much of what is behind it is replaced
+    Out.Color = float4(color, 1.0);
+    Out.Reactive = seen;
+    Out.Transparency = refracts ? 1.0 : seen; // bent: none of it is where the scene's motion says
+    RETURN(Out);
+#elif defined(MOTION)
     PSOutput Out;
     Out.Color = float4(color, 1.0);
     Out.Motion = (In.CurrClip.xy / In.CurrClip.w - In.PrevClip.xy / max(In.PrevClip.w, 1e-6)) * float2(0.5, -0.5);

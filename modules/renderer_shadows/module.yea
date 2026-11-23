@@ -9,6 +9,11 @@ export bool light_shadows_on()
 # The core's mesh versions (renderer's Mesh and MeshLod rows): casters draw the simplest within half a texel.
 import table renderer Mesh
 import table renderer MeshLod
+# The see-through casters' materials, so their glass tint is redrawn when one changes.
+import table renderer Material
+import table renderer MaterialBlend
+import table renderer MaterialRefraction
+import table renderer MaterialMap
 
 category Sun Shadows
 setting bool enabled true
@@ -43,3 +48,11 @@ setting int max_tile_resolution 1024 128 2048
 setting bool contact_hardening true
 setting float light_size 0.06 0 inf
 setting bool show_atlas false
+category Glass
+# Glass that casts shadows (instance_shadow on a see-through instance) colours the shadow maps' light by what it lets
+# through, in layers out from the light (as many as its panes need), for the sun's cascades and every shadowed light.
+setting bool glass_shadows true
+player glass_shadows
+# The side of the maps the glass's layers share (two squares of them, 4 bytes a texel each, plus a scratch of three):
+# a view's glass gets coarser squares when they don't all fit.
+setting int glass_resolution 2048 1024 4096

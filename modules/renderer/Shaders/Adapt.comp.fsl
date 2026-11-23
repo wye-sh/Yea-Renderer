@@ -42,6 +42,11 @@ void CS_MAIN(SV_GroupThreadID(uint3) tid)
             }
             // EV100 = log2(L * 100 / 12.5)
             target = sum / max(weight, 1.0) + 3.0;
+            // Darker than a sunset leaves things (dusk, night, unlit interiors), exposure lifts only a share of the
+            // darkness, as the eye and a photographer do, so a dark scene still reads dark.
+            float knee = gExposureData.dark.x;
+            if (target < knee)
+                target = knee - (knee - target) * gExposureData.dark.y;
         }
         float ev = (fresh || gExposureData.adapt.w > 0.5) ? target : prevEv + (target - prevEv) * gExposureData.adapt.x;
         gExposureRW[0] = ev;

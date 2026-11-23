@@ -1,14 +1,16 @@
 // One group per screen tile: the tile's depth range from the prepass (sky pixels left out), then
 // every light's sphere against the tile's four side planes and depth range, into a bitmask
-// (Drobot 2017). The pixel shader ANDs it with its Z-bin's light range.
+// (Drobot 2017). The pixel shader ANDs it with its Z-bin's light range. The core's decals the same way, into their own
+// DECAL_WORDS words a tile.
 #define MAX_WORDS 128u
+#define DECAL_WORDS 8u
 
 STRUCT(CullData)
 {
     DATA(float4, view[3], None);  // world -> view rows (+z forward)
     DATA(float4, proj, None);     // x P00, y P11, z near
     DATA(uint4, size, None);      // x width, y height, z tile size, w tiles x
-    DATA(uint4, counts, None);    // x lights, y words per tile
+    DATA(uint4, counts, None);    // x lights, y words per tile, z decals
 };
 
 STRUCT(CullLight)
@@ -25,6 +27,7 @@ STRUCT(CullLight)
 GroupShared(uint, gsMinDepth);
 GroupShared(uint, gsMaxDepth);
 GroupShared(uint, gsMask[MAX_WORDS]);
+GroupShared(uint, gsDecal[DECAL_WORDS]);
 
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(16, 16, 1)
@@ -40,6 +43,8 @@ void CS_MAIN(SV_GroupID(uint3) gid, SV_GroupThreadID(uint3) tid, SV_GroupIndex(u
     }
     for (uint w = gi; w < words; w += 256u)
         gsMask[w] = 0u;
+    if (gi < DECAL_WORDS)
+        gsDecal[gi] = 0u;
     GroupMemoryBarrier();
 
     // Reversed-Z: larger is nearer; 0 is the sky.
@@ -106,11 +111,26 @@ void CS_MAIN(SV_GroupID(uint3) gid, SV_GroupThreadID(uint3) tid, SV_GroupIndex(u
             uint prev;
             AtomicOr(gsMask[i >> 5], 1u << (i & 31u), prev);
         }
+        for (uint k = gi; k < gCull.counts.z; k += 256u)
+        {
+            float4 sp = gDecals[k];
+            float4 wc = float4(sp.xyz, 1.0);
+            float3 c = float3(dot(gCull.view[0], wc), dot(gCull.view[1], wc), dot(gCull.view[2], wc));
+            float  r = sp.w;
+            if (c.z + r < zNear || c.z - r > zFar)
+                continue;
+            if (dot(nl, c) < -r || dot(nr, c) < -r || dot(nb, c) < -r || dot(nt, c) < -r)
+                continue;
+            uint prev;
+            AtomicOr(gsDecal[k >> 5], 1u << (k & 31u), prev);
+        }
     }
     GroupMemoryBarrier();
 
     uint base = (gid.y * gCull.size.w + gid.x) * words;
     for (uint w2 = gi; w2 < words; w2 += 256u)
         gTileMasks[base + w2] = gsMask[w2];
+    if (gi < DECAL_WORDS)
+        gDecalMasks[(gid.y * gCull.size.w + gid.x) * DECAL_WORDS + gi] = gsDecal[gi];
     RETURN();
 }

@@ -1,0 +1,256 @@
+// Volumetric fog in froxels (Wronski 2014; Hillaire, "Physically Based and Unified Volumetric Rendering in Frostbite",
+// 2015), two passes:
+// LIGHT: per froxel, the medium at a point jittered inside it each frame (exponential height fog plus the local fog
+//   volumes), the light it scatters towards the camera (the sun through its cascades, the sky's ambient, the local
+//   lights through their shadow maps, all with a Henyey-Greenstein phase), blended with last frame's froxel at the same
+//   place in the world (reprojected). Out: rgb scattering coefficient x the light in, a extinction (1/m).
+// INTEGRATE: per column, front to back, Frostbite's energy-conserving step (the light scattered in over a slice,
+//   integrated against the slice's own transmittance). Out: rgb the light scattered in and a the transmittance from the
+//   camera to the far side of each slice.
+#include "FogData.h.fsl"
+#include "Fog.srt.h"
+#define GI_IRRADIANCE gGiIrradiance
+#define GI_DISTANCE   gGiDistance
+#define GI_PROBES     gGiProbes
+#define GI_SAMPLER    gSamplerBilinearClamp
+#include "GiSample.h.fsl"
+
+#define FOG_PI 3.14159265
+
+#if defined(VULKAN)
+#define FirstBitLow(x) uint(findLSB(x))
+#else
+#define FirstBitLow(x) firstbitlow(x)
+#endif
+
+// Where slice edge s (fractional) lies in view depth.
+float sliceDepth(float s) { return gFog.depth.x * (exp2(s * gFog.depth.y * gFog.depth.w) - 1.0); }
+
+// The world-space ray through screen uv, scaled to advance one unit of view depth.
+float3 rayAt(float2 uv)
+{
+    float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    return gFog.view[0].xyz * (ndc.x / gFog.proj.x) + gFog.view[1].xyz * (ndc.y / gFog.proj.y) + gFog.view[2].xyz;
+}
+
+#if defined(LIGHT)
+float phaseHG(float c, float g)
+{
+    float g2 = g * g;
+    float d = max(1.0 + g2 - 2.0 * g * c, 1e-4);
+    return (1.0 - g2) / (4.0 * FOG_PI * d * sqrt(d));
+}
+
+float3 toAtlas(FogShadowView v, float3 P)
+{
+    float4 q = float4(P, 1.0);
+    float4 c = float4(dot(v.row0, q), dot(v.row1, q), dot(v.row2, q), dot(v.row3, q));
+    float3 ndc = c.xyz / c.w;
+    return float3(v.rect.xy + (ndc.xy * float2(0.5, -0.5) + float2(0.5, 0.5)) * v.rect.zw, ndc.z);
+}
+
+// The sun's visibility from its cascades: one filtered compare (2 x 2 texels). Past the last cascade, lit.
+float sunVisibility(float3 P, float viewZ)
+{
+    uint count = uint(gFog.sunColor.w);
+    uint c = 0u;
+    while (c < count && viewZ > gFog.cascadeEnd[c])
+        c += 1u;
+    if (c >= count)
+        return 1.0;
+    FogShadowView v = gViews[c];
+    float3 a = toAtlas(v, P);
+    if (a.z >= 1.0)
+        return 1.0;
+    float  t = gFog.misc.z;
+    float2 uv = clamp(a.xy, v.rect.xy + t, v.rect.xy + v.rect.zw - t);
+    return CompareTex2D(gSunAtlas, gShadowCmp, float3(uv, a.z));
+}
+
+float localVisibility(FogLight l, float3 P)
+{
+    uint view = uint(l.params.y);
+    if (l.color.w < 1.5)
+    {
+        // A cube: the face from where it was drawn (renderer core's localShadow). Faces go +x -x +y -y +z -z.
+        float3 d = P - gViews[view].info.yzw;
+        float3 ad = abs(d);
+        view += ad.x >= ad.y && ad.x >= ad.z ? (d.x > 0.0 ? 0u : 1u) : (ad.y >= ad.z ? (d.y > 0.0 ? 2u : 3u) : (d.z > 0.0 ? 4u : 5u));
+    }
+    FogShadowView v = gViews[view];
+    float3 a = toAtlas(v, P);
+    float  t = gFog.misc.w;
+    float2 uv = clamp(a.xy, v.rect.xy + t, v.rect.xy + v.rect.zw - t);
+    return CompareTex2D(gLocalAtlas, gShadowCmp, float3(uv, a.z));
+}
+
+float3 localLight(uint i, float3 P, float3 V, float g, bool maps)
+{
+    FogLight l = gLights[i];
+    float3 toLight = l.pos.xyz - P;
+    float  d2 = dot(toLight, toLight);
+    if (d2 >= l.pos.w * l.pos.w)
+        return float3(0.0, 0.0, 0.0);
+    float3 L = toLight * rsqrt(max(d2, 1e-8));
+    float  f = d2 * l.params.z;
+    float  window = saturate(1.0 - f * f);
+    // An area light is a point to the fog, its candela as seen face-on, no nearer than its own size.
+    FogLightShape sh = gShapes[i];
+    float  near = sh.ex.w > 2.5 ? 1.0 / (FOG_PI * max(sh.ey.w, 1e-6)) : 1e-4;
+    float  atten = window * window / max(d2, near);
+    if (l.color.w > 1.5)
+    {
+        float cone = saturate(dot(-L, l.dir.xyz) * l.dir.w + l.params.x);
+        atten *= cone * cone;
+    }
+    if (sh.ex.w > 2.5 && sh.ex.w < 4.5)
+        atten *= max(dot(-L, l.dir.xyz), 0.0); // rects and discs: one side, Lambertian
+    if (atten <= 0.0)
+        return float3(0.0, 0.0, 0.0);
+    if (maps && l.params.y >= 0.0) // traced lights too: renderer_shadows keeps their tiles while fog runs
+        atten *= localVisibility(l, P);
+    return l.color.rgb * (atten * phaseHG(dot(V, L), g));
+}
+
+// The group's own light list: a bit per light (up to 4096) whose sphere reaches the group's 4 x 4 x 4 froxels.
+#define MAX_WORDS 128u
+GroupShared(uint, gsMask[MAX_WORDS]);
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(4, 4, 4)
+void CS_MAIN(SV_DispatchThreadID(uint3) id, SV_GroupID(uint3) gid, SV_GroupIndex(uint) gi)
+{
+    INIT_MAIN;
+    // Cull the lights against the group's froxels, every thread taking a share. A light left out has its sphere wholly
+    // outside them, where it adds exactly nothing: the sum over the list is the sum over every light, in the same order.
+    uint words = min((gFog.counts.x + 31u) / 32u, MAX_WORDS);
+    for (uint w = gi; w < words; w += 64u)
+        gsMask[w] = 0u;
+    GroupMemoryBarrier();
+    {
+        // The group's box in view space (+z forward): its columns' screen rectangle between its slices' depths.
+        float2 res = float2(gFog.camPos.w, gFog.albedo.w);
+        float2 uv0 = float2(gid.xy * 4u * gFog.size.w) / res;
+        float2 uv1 = float2(min(gid.xy * 4u + 4u, gFog.size.xy) * gFog.size.w) / res;
+        float  z0 = sliceDepth(float(gid.z * 4u));
+        float  z1 = sliceDepth(float(min(gid.z * 4u + 4u, gFog.size.z)));
+        float  nx0 = uv0.x * 2.0 - 1.0, nx1 = uv1.x * 2.0 - 1.0;
+        float  ny0 = 1.0 - uv1.y * 2.0, ny1 = 1.0 - uv0.y * 2.0;
+        float3 lo = float3(nx0 * (nx0 < 0.0 ? z1 : z0) / gFog.proj.x, ny0 * (ny0 < 0.0 ? z1 : z0) / gFog.proj.y, z0);
+        float3 hi = float3(nx1 * (nx1 > 0.0 ? z1 : z0) / gFog.proj.x, ny1 * (ny1 > 0.0 ? z1 : z0) / gFog.proj.y, z1);
+        uint   n = min(gFog.counts.x, MAX_WORDS * 32u);
+        for (uint i = gi; i < n; i += 64u)
+        {
+            float4 sp = float4(gLights[i].sphere.xyz, 1.0);
+            float3 c = float3(dot(gFog.view[0], sp), dot(gFog.view[1], sp), dot(gFog.view[2], sp));
+            float3 d = max(lo - c, float3(0.0, 0.0, 0.0)) + max(c - hi, float3(0.0, 0.0, 0.0));
+            if (dot(d, d) <= gLights[i].sphere.w * gLights[i].sphere.w)
+            {
+                uint prev;
+                AtomicOr(gsMask[i >> 5], 1u << (i & 31u), prev);
+            }
+        }
+    }
+    GroupMemoryBarrier();
+    if (id.x >= gFog.size.x || id.y >= gFog.size.y || id.z >= gFog.size.z)
+        RETURN();
+    // A point jittered inside the froxel (the jitter changes each frame; the history averages it).
+    float2 px = (float2(id.xy) + gFog.proj.zw) * float(gFog.size.w);
+    float2 uv = px / float2(gFog.camPos.w, gFog.albedo.w);
+    float  viewZ = sliceDepth(float(id.z) + gFog.depth.z);
+    float3 ray = rayAt(uv);
+    float3 P = gFog.camPos.xyz + ray * viewZ;
+    float3 V = normalize(ray);
+
+    // The medium: height fog, then the volumes.
+    float  hd = gFog.height.x * exp(-gFog.height.y * max(P.y - gFog.height.z, 0.0));
+    float3 scatter = gFog.albedo.rgb * hd;
+    float  extinction = hd;
+    for (uint k = 0u; k < gFog.counts.y; ++k)
+    {
+        FogVolume v = gVolumes[k];
+        float3 q = abs(P - v.center.xyz) / max(v.extent.xyz, float3(1e-4, 1e-4, 1e-4));
+        float  e = v.center.w > 0.5 ? length(q) : max(q.x, max(q.y, q.z));
+        float  d = v.medium.w * saturate((1.0 - e) * v.extent.w);
+        scatter += v.medium.rgb * d;
+        extinction += d;
+    }
+
+    float4 now = float4(0.0, 0.0, 0.0, extinction);
+    if (extinction > 0.0)
+    {
+        float  g = gFog.height.w;
+        // The sky's light from all round (any phase integrates to 1).
+        float3 Lin = gFog.ambient.w > 0.0 ? max(gSkySh[0].rgb, float3(0.0, 0.0, 0.0)) * (0.282095 * gFog.ambient.w) : gFog.ambient.rgb;
+        if ((gFog.counts.z & 2u) != 0u)
+        {
+            // renderer_gi's probes: the sky as it reaches here and the light bounced off everything round (last frame's).
+            float  inside;
+            float3 gi = giAmbient(P, gFog.gi[0], gFog.gi[1], gFog.gi[2], gFog.gi[3], inside);
+            Lin = lerp(Lin, gi, inside);
+        }
+        if (gFog.sunDir.w > 0.0)
+            Lin += gFog.sunColor.rgb * (sunVisibility(P, viewZ) * phaseHG(dot(V, gFog.sunDir.xyz), g));
+        bool maps = (gFog.counts.z & 1u) != 0u;
+        for (uint w = 0u; w < words; ++w)
+        {
+            uint mask = gsMask[w];
+            while (mask != 0u)
+            {
+                uint b = FirstBitLow(mask);
+                mask &= mask - 1u;
+                Lin += localLight(w * 32u + b, P, V, g, maps);
+            }
+        }
+        now.rgb = scatter * Lin;
+    }
+
+    // Last frame's froxel at this point in the world.
+    if (gFog.misc.y > 0.0)
+    {
+        float4 q = float4(P, 1.0);
+        float  pz = dot(gFog.prevView[2], q);
+        if (pz > 0.0)
+        {
+            float2 ndc = float2(dot(gFog.prevView[0], q) * gFog.prevProj.x, dot(gFog.prevView[1], q) * gFog.prevProj.y) / pz;
+            float2 puv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+            float3 c = float3(puv * float2(gFog.camPos.w, gFog.albedo.w) / (float2(gFog.size.xy) * float(gFog.size.w)),
+                              log2(pz / gFog.prevProj.z + 1.0) * gFog.prevProj.w);
+            if (min(c.x, min(c.y, c.z)) >= 0.0 && max(c.x, max(c.y, c.z)) <= 1.0)
+            {
+                float4 before = SampleLvlTex3D(gIn, gSamplerBilinearClamp, c, 0.0);
+                now = lerp(now, before, gFog.misc.y);
+            }
+        }
+    }
+    Write3D(gOut, int3(id), min(now, float4(65000.0, 65000.0, 65000.0, 65000.0)));
+    RETURN();
+}
+#else
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) id)
+{
+    INIT_MAIN;
+    if (id.x >= gFog.size.x || id.y >= gFog.size.y)
+        RETURN();
+    // The ray's length per unit of view depth at the column's centre.
+    float2 uv = (float2(id.xy) + float2(0.5, 0.5)) * float(gFog.size.w) / float2(gFog.camPos.w, gFog.albedo.w);
+    float  stretch = length(rayAt(uv));
+    float3 light = float3(0.0, 0.0, 0.0);
+    float  trans = 1.0;
+    float  before = 0.0;
+    for (uint z = 0u; z < gFog.size.z; ++z)
+    {
+        float4 s = LoadTex3D(gIn, NO_SAMPLER, int3(id.xy, z), 0);
+        float  edge = sliceDepth(float(z + 1u));
+        float  ext = max(s.a, 1e-7);
+        float  t = exp(-ext * (edge - before) * stretch);
+        light += trans * (s.rgb - s.rgb * t) / ext;
+        trans *= t;
+        before = edge;
+        Write3D(gOut, int3(id.xy, z), float4(light, trans));
+    }
+    RETURN();
+}
+#endif

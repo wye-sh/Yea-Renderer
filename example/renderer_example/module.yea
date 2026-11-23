@@ -8,12 +8,16 @@ import renderer u32 mesh_cone(u32 segments) = 4294967295
 import renderer u32 mesh_torus(float thickness, u32 segments) = 4294967295
 import renderer handle material_add(float3 albedo, float roughness, float metallic) = 4294967295
 import renderer void material_emissive(handle m, float3 color, float luminance)
+import renderer void material_blend(handle m, float opacity)
+import renderer void material_refraction(handle m, float ior, float thickness, u32 shape, float3 tint)
+import renderer handle decal_add(float3 pos, float4 rotation, float3 half) = 4294967295
+import renderer void decal_look(handle d, float4 albedo, float roughness, float metallic, float3 emissive, float luminance, float4 weights)
+import renderer void decal_shape(handle d, u32 shape, float edge, float noise, float angle_deg)
+import renderer void decal_priority(handle d, i32 priority)
 import renderer handle instance_add(u32 mesh, handle material) = 4294967295
 import renderer void instance_place(handle i, float3 pos, float4 rotation, float3 scale)
 import renderer void instance_shadow(handle i, bool cast)
 import renderer void instance_remove(handle i)
-import renderer u32 instance_count() = 0
-import renderer u32 light_count() = 0
 import renderer handle light_add(u32 type) = 4294967295
 import renderer void light_place(handle l, float3 pos, float3 dir)
 import renderer void light_color(handle l, float3 color, float intensity)
@@ -28,11 +32,42 @@ import renderer void light_shadow(handle l, bool cast)
 import renderer void light_remove(handle l)
 import renderer void camera(float3 eye, float3 target, float fov_deg)
 import renderer void clear()
+import renderer u32 scene_epoch() = 0
+import renderer_models u64 api(u32 version) = 0
 import renderer_probes handle probe_add(float3 pos, float3 box_min, float3 box_max) = 4294967295
 import renderer_probes void probe_clear()
 import renderer_probes u32 probe_count() = 0
+import renderer_particles handle particle_emitter_add(float3 pos) = 4294967295
+import renderer_particles void particle_emitter_shape(handle e, u32 shape, float3 extent)
+import renderer_particles void particle_emitter_rate(handle e, float per_second, u32 burst)
+import renderer_particles void particle_emitter_motion(handle e, float speed, float spread_deg, float speed_jitter, float gravity, float drag, float turbulence)
+import renderer_particles void particle_emitter_life(handle e, float min_s, float max_s)
+import renderer_particles void particle_emitter_look(handle e, float3 color_start, float3 color_end, float size_start, float size_end, float opacity)
+import renderer_particles void particle_emitter_light(handle e, float emissive, float anisotropy, bool additive)
+import renderer_particles void particle_emitter_remove(handle e)
+import renderer_particles void particle_emitter_clear()
 
 export bool picture(bool on)
+
+# The sample models' placements (renderer_models' handles), kept through reloads.
+# The scene's particle emitters: each handle + 1 (0 none).
+state Particles
+  u32 dust
+  u32 steam
+end
+
+state Models
+  u32 lantern
+  u32 flightHelmet
+  u32 waterBottle
+  u32 boomBox
+end
+# Their sizes: Lantern's file is about 26 m tall (3.1 m here), BoomBox's 2 cm wide (0.8 m), the bottle 26 cm (1 m);
+# the helmet is life size on its stand (0.72 m, 1 m here).
+default lantern_scale 0.12
+default flight_helmet_scale 1.4
+default water_bottle_scale 4
+default boom_box_scale 40
 
 # Hold to look around.
 action look MouseLeft
@@ -58,10 +93,22 @@ setting bool discs true
 setting bool spheres true
 setting bool tubes true
 category Sun
-setting float sun_intensity 400 0 inf
-setting color sun_color 1 0.82 0.65
-setting float sun_elevation 22 2 90
+# The sun's light above the atmosphere (lux in this scene's units); the physical sky dims and reddens it on the way down.
+setting float sun_intensity 500 0 inf
+setting color sun_color 1 0.97 0.94
+setting float sun_elevation 22 -10 90
 setting float sun_azimuth 35 0 360
+category Particles
+# Dust motes drifting over the floor, glinting where the sun reaches them.
+setting bool dust true
+# Steam rising off the steel drum.
+setting bool steam true
+category Glass and Decals
+# Glass panes either side of the steam (clear in front, teal behind), a frosted one and a solid glass ball, bending and
+# blurring what is behind them.
+setting bool glass true
+# A scorch, a puddle, worn painted lines, patina on the copper block and a glowing strip on the stone ledge.
+setting bool decals true
 category Camera
 setting float fov 55 20 100
 setting float look_sensitivity 1 0.1 inf

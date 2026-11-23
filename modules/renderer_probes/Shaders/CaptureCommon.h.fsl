@@ -1,4 +1,14 @@
 // Layouts of the scene capture (the core's InstanceData, MaterialData and LightData).
+// A vertex's octahedral normal or tangent (frame.h's RENDER_ATTRIBUTE_STRIDE), as a unit vector.
+float3 octDecode(float2 f)
+{
+    float3 n = float3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    float  t = saturate(-n.z);
+    n.x += n.x >= 0.0 ? -t : t;
+    n.y += n.y >= 0.0 ? -t : t;
+    return normalize(n);
+}
+
 STRUCT(InstanceData)
 {
     DATA(float4, row0, None);
@@ -13,6 +23,17 @@ STRUCT(MaterialData)
     DATA(float4, params, None);       // x metallic
     DATA(float4, emissive, None);
 };
+
+// A material's texture maps (the core's MaterialMapData): base colour slot + 1 in maps.x, emissive in maps.w; the base
+// colour's factor; misc.x the alpha cutoff (0 opaque), misc.y 1 when the maps were given (vertex colours count).
+STRUCT(MaterialMapData)
+{
+    DATA(uint4, maps, None);
+    DATA(float4, baseFactor, None);
+    DATA(float4, factors, None);
+    DATA(float4, misc, None);
+};
+#define MAX_TEXTURES 1024
 
 STRUCT(LightData)
 {
@@ -39,7 +60,12 @@ STRUCT(CaptureData)
     DATA(float4, skyZenith, None);
     DATA(float4, skyHorizon, None);
     DATA(float4, skyGround, None);    // w ambient
-    DATA(uint4, counts, None);        // x lights
+    DATA(uint4, counts, None);        // x lights, y renderer_sky's SH, z decals (frame worldDecalCount)
+    DATA(float4, fogMedium, None);    // frame.h's height fog (x 0: none)
+    DATA(float4, fogAlbedo, None);
+    DATA(float4, decalGrid0, None);   // frame.h decalGrid[0] (counts.z decals)
+    DATA(float4, decalGrid1, None);   // frame.h decalGrid[1]
 };
 
+#include "Decal.h.fsl" // a copy of the core's: DecalData here, decalsAt in Capture.frag.fsl
 #include "Capture.srt.h"

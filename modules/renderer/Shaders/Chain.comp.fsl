@@ -1,0 +1,91 @@
+// One level of the scene colour chain glass refracts and blurs (renderer.cpp's see-through pass), over the rectangle of it
+// that changed: level 0 a copy of the HDR target; every next level half the size through Jimenez 2014's 13-tap downsample
+// (Call of Duty: Advanced Warfare), whose overlapping boxes keep a moving edge from flickering between levels, as rough
+// glass needs. The first downsample weighs each box by Karis's 1 / (1 + luma), so one bright glint (a sun highlight) can't
+// bloom into a flickering blotch behind frosted glass.
+STRUCT(ChainData)
+{
+    DATA(uint4, rect, None);  // xy the first texel written, zw one past the last
+    DATA(uint4, mode, None);  // x 1: level 0 (a copy of gHdrIn), yz the level read's size, w 1: Karis-weighted
+};
+#ifdef CHAIN_MS
+#include "ChainMs.srt.h"
+
+// Level 0 with MSAA (as UE resolves its scene colour and depth before translucency reads them): the samples' mean colour
+// (the light the pixel shows) and their nearest depth (an edge pixel counts as its nearer surface, so a refracted ray
+// landing there takes the straight view rather than colour from in front of the glass).
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) id)
+{
+    INIT_MAIN;
+    uint2 p = gChain.rect.xy + id.xy;
+    if (p.x >= gChain.rect.z || p.y >= gChain.rect.w)
+        RETURN();
+    float3 c = float3(0.0, 0.0, 0.0);
+    float  z = 0.0;
+    for (int s = 0; s < SAMPLE_COUNT; ++s)
+    {
+        c += LoadTex2DMS(gHdrMs, NO_SAMPLER, int2(p), s).rgb;
+        z = max(z, LoadTex2DMS(gDepthMs, NO_SAMPLER, int2(p), s).r);
+    }
+    Write2D(gDst, int2(p), float4(c * (1.0 / float(SAMPLE_COUNT)), 1.0));
+    Write2D(gDepthOut, int2(p), z);
+    RETURN();
+}
+#else
+#include "Chain.srt.h"
+
+float3 texel(int2 p, int2 last) { return LoadRWTex2D(gPrev, clamp(p, int2(0, 0), last)).rgb; }
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) id)
+{
+    INIT_MAIN;
+    uint2 p = gChain.rect.xy + id.xy;
+    if (p.x >= gChain.rect.z || p.y >= gChain.rect.w)
+        RETURN();
+    if (gChain.mode.x != 0u)
+    {
+        Write2D(gDst, int2(p), float4(LoadTex2D(gHdrIn, NO_SAMPLER, int2(p), 0).rgb, 1.0));
+        RETURN();
+    }
+    // The 6 x 6 texels of the level read around this one's 2 x 2, and the 2 x 2 boxes the 13 taps average: box (i, j)
+    // starts at texel (2p + i, 2p + j) - 2, the taps at offsets -2, -1, 0, 1, 2 texels from the centre corner.
+    int2   last = int2(gChain.mode.yz) - int2(1, 1);
+    int2   o = int2(p) * 2 - int2(2, 2);
+    float3 s[36];
+    for (int y = 0; y < 6; ++y)
+        for (int x = 0; x < 6; ++x)
+            s[y * 6 + x] = texel(o + int2(x, y), last);
+    float3 box[25];
+    for (int j = 0; j < 5; ++j)
+        for (int i = 0; i < 5; ++i)
+            box[j * 5 + i] = (s[j * 6 + i] + s[j * 6 + i + 1] + s[j * 6 + i + 6] + s[j * 6 + i + 7]) * 0.25;
+    // The taps: the centre box (2, 2), the four inner ones (1|3, 1|3), and the outer nine at even offsets.
+    float3 inner = box[6] + box[8] + box[16] + box[18];
+    float3 sum;
+    if (gChain.mode.w != 0u)
+    {
+        // Karis average: each of the five 4-tap groups of Jimenez's weighting by its own luma.
+        float3 g0 = inner * 0.25;
+        float3 g1 = (box[0] + box[2] + box[10] + box[12]) * 0.25;
+        float3 g2 = (box[2] + box[4] + box[12] + box[14]) * 0.25;
+        float3 g3 = (box[10] + box[12] + box[20] + box[22]) * 0.25;
+        float3 g4 = (box[12] + box[14] + box[22] + box[24]) * 0.25;
+        float3 luma = float3(0.2126, 0.7152, 0.0722);
+        float  w0 = 0.5 / (1.0 + dot(g0, luma));
+        float  w1 = 0.125 / (1.0 + dot(g1, luma));
+        float  w2 = 0.125 / (1.0 + dot(g2, luma));
+        float  w3 = 0.125 / (1.0 + dot(g3, luma));
+        float  w4 = 0.125 / (1.0 + dot(g4, luma));
+        sum = (g0 * w0 + g1 * w1 + g2 * w2 + g3 * w3 + g4 * w4) / (w0 + w1 + w2 + w3 + w4);
+    }
+    else
+        sum = inner * 0.125 + (box[0] + box[4] + box[20] + box[24]) * 0.03125 + (box[2] + box[10] + box[14] + box[22]) * 0.0625 +
+              box[12] * 0.125;
+    Write2D(gDst, int2(p), float4(sum, 1.0));
+    RETURN();
+}
+#endif

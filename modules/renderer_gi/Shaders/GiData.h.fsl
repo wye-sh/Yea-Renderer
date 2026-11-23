@@ -1,0 +1,95 @@
+// renderer_gi's constants (renderer_gi.cpp's GiData), shared by its compute passes and its raster capture.
+STRUCT(GiData)
+{
+    DATA(float4, grid[4], None);   // frame.h giGrid (GiSample.h.fsl says what each holds)
+    DATA(float4, rotation[3], None); // this frame's ray rotation (rows)
+    DATA(float4, params, None);    // x hysteresis, y the distance tiles' farthest (m), z a big change (radiance step past
+                                   // which history counts less), w the closest a probe may sit to a surface (m)
+    DATA(uint4, counts, None);     // x probes, y rays a probe, z 1: rays are in for the probes blended this frame,
+                                   // w 1: rasterized (only raster.y probes from raster.x, every one of them captured)
+    DATA(uint4, raster, None);     // x the first probe captured, y probes captured, z lights, w flags (1 local shadow maps,
+                                   // 2 the probes hold light already, 4 the physical sky's images)
+    DATA(float4, sunDir, None);    // towards the sun, w 1 when on
+    DATA(float4, sunColor, None);  // rgb lux as it arrives, w the ambient strength
+    DATA(float4, skyZenith, None); // the gradient sky (without renderer_sky)
+    DATA(float4, skyHorizon, None);
+    DATA(float4, skyGround, None);
+    DATA(float4, fogMedium, None); // frame.h's height fog (x 0: none)
+    DATA(float4, fogAlbedo, None); // rgb albedo, w the fog's range (m)
+    DATA(float4, shadow, None);    // x 1: the sun's own map (gGiSun) holds the scene, y its texel (uv), z local atlas texel,
+                                   // w 1: gGiSunDyn holds moving casters this frame (renderer_gi.cpp fitSun)
+    DATA(float4, sunView[3], None); // rows, world -> the sun map's ndc x, y (-1..1) and depth (0 nearest the sun, 1 farthest)
+    DATA(uint4, decals, None);     // x decals the captures paint (frame worldDecalCount)
+    DATA(float4, decalGrid[2], None); // frame.h decalGrid
+};
+#include "Decal.h.fsl" // a copy of the core's: DecalData here, decalsAt in Capture.frag.fsl
+
+// A material's texture maps (the core's MaterialMapData): slot + 1 in maps (x base colour, w emissive), the base colour
+// factor, misc.x the alpha cutoff (0: not cut out), misc.y 1 when maps were given (vertex colours count).
+STRUCT(GiMaterialMap)
+{
+    DATA(uint4, maps, None);
+    DATA(float4, baseFactor, None);
+    DATA(float4, factors, None);
+    DATA(float4, misc, None);
+};
+#define MAX_TEXTURES 1024
+
+// The core's layouts the raster capture reads (frame.h's RenderGpuInstance, RenderGpuLight, RenderGpuLightShape,
+// RenderGpuShadowView; renderer's Shaders/Common.h.fsl MaterialData).
+STRUCT(GiInstance)
+{
+    DATA(float4, row0, None);
+    DATA(float4, row1, None);
+    DATA(float4, row2, None);
+    DATA(uint4, misc, None); // x material
+};
+
+STRUCT(GiMaterial)
+{
+    DATA(float4, albedoRough, None);
+    DATA(float4, params, None); // x metallic
+    DATA(float4, emissive, None);
+};
+
+STRUCT(GiLight)
+{
+    DATA(float4, pos, None);    // xyz, w range
+    DATA(float4, color, None);  // rgb candela, w type (2 spot; area lights 1)
+    DATA(float4, dir, None);    // xyz spot direction, w spot scale
+    DATA(float4, params, None); // x spot offset, y first shadow view or -1, z 1/range^2
+    DATA(float4, sphere, None);
+};
+
+STRUCT(GiLightShape)
+{
+    DATA(float4, ex, None); // w kind: 0 point or spot, 3 rect, 4 disc (one-sided, along dir), 5 sphere, 6 tube
+    DATA(float4, ey, None); // w kinds 3 to 6: 1 / area
+};
+
+STRUCT(GiShadowView)
+{
+    DATA(float4, row0, None);
+    DATA(float4, row1, None);
+    DATA(float4, row2, None);
+    DATA(float4, row3, None);
+    DATA(float4, rect, None);
+    DATA(float4, info, None); // x world size of a texel (at distance 1 when perspective); lights: yzw drawn from
+    DATA(float4, inv0, None);
+    DATA(float4, inv1, None);
+    DATA(float4, inv2, None);
+};
+
+// The raster capture's cube faces, +X -X +Y -Y +Z -Z: forward, right, up (as renderer_probes' faces).
+float3 giFaceAxis(uint face, uint axis)
+{
+    float3 f = float3(0.0, 0.0, 1.0), r = float3(1.0, 0.0, 0.0), u = float3(0.0, 1.0, 0.0);
+    if (face == 0u) { f = float3(1.0, 0.0, 0.0); r = float3(0.0, 0.0, -1.0); }
+    else if (face == 1u) { f = float3(-1.0, 0.0, 0.0); r = float3(0.0, 0.0, 1.0); }
+    else if (face == 2u) { f = float3(0.0, 1.0, 0.0); u = float3(0.0, 0.0, -1.0); }
+    else if (face == 3u) { f = float3(0.0, -1.0, 0.0); u = float3(0.0, 0.0, 1.0); }
+    else if (face == 5u) { f = float3(0.0, 0.0, -1.0); r = float3(-1.0, 0.0, 0.0); }
+    return axis == 0u ? f : (axis == 1u ? r : u);
+}
+
+#define GI_FACE_TEXELS 16u

@@ -1,0 +1,16 @@
+// renderer_sky's constants (renderer_sky.cpp's SkyData).
+STRUCT(SkyData)
+{
+    DATA(float4, radii, None);    // x ground radius, y top radius (km), z camera height above the centre (km), w aerial perspective strength
+    DATA(float4, rayleigh, None); // rgb scattering at the ground (1/km), w scale height (km)
+    DATA(float4, mie, None);      // x scattering, y absorption at the ground (1/km), z anisotropy g, w scale height (km)
+    DATA(float4, ozone, None);    // rgb absorption at its peak (1/km); w ground albedo
+    DATA(float4, sunDir, None);   // xyz towards the sun (world, y up), w its illuminance above the atmosphere
+    DATA(float4, sunColor, None); // rgb its colour above the atmosphere, w cos of its angular radius
+    DATA(float4, camPos, None);   // xyz the camera (world metres), w aerial perspective depth (km) covered by the volume
+    DATA(float4, camRight, None);   // the view's right axis / p00 (the aerial perspective's froxel directions)
+    DATA(float4, camUp, None);      // its up axis / p11
+    DATA(float4, camForward, None); // its forward axis
+    DATA(uint4, size, None);      // xy this pass's output size, z face or slice count, w mip
+    DATA(float4, misc, None);     // x the cube mip's roughness
+};

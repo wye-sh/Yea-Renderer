@@ -3,7 +3,7 @@
 // every knob of renderer_models' each block (chair_scale, chair_up_axis, chair_lod_quality, chair_cast_shadows,
 // chair_double_sided), tuned in the Model Viewer.
 //
-//   MODEL(chair, "models/chair.rmodel");   // a cooked model in this module's Assets/ (the cooker writes it)
+//   MODEL(chair, "models/chair.rmodel");   // a cooked model in this module's Assets/ (tools/model_cook writes it)
 //   MODEL(crate, "box");                   // a built-in shape: box, sphere, cylinder, cone, torus, plane
 //
 //   void update(uint32_t phase, float dt)
@@ -13,12 +13,29 @@
 //       mdl::move(gChair, pos, rot);
 //   }
 //
+// Skinned models play their first clip, looping, once placed. mdl::play(h, "Run") switches clip (fading over a
+// fraction of a second by default), mdl::clipTime(h) gives how far in it is, and mdl::joint(h, "hand_r", m) a joint's
+// world transform (3x4 rows), to attach something to it. Clips and joints are named as in the source file. A model
+// with morph targets (blend shapes: a face's smile, a blink) follows its clip's weights; mdl::morph(h, "Smile", 0.8f)
+// holds one at a weight over them, mdl::unmorph(h, "Smile") (or every one, with no name) hands it back to the clip.
+// Retargeting: mdl::play(h, animations, "Run") plays another skinned model's clip on this one, as UE's IK Retargeter
+// does (its chains matched by their bones' names, the pelvis scaled by the two's heights, IK on the legs and arms so
+// feet stay planted), so one model can hold the clips every character uses:
+//   MODEL(hero, "models/Hero.rmodel");   MODEL(moves, "models/Moves.rmodel");
+//   mdl::play(heroPlacement, moves, "Run");
+// Root motion: mdl::rootMotion(h, true) plays its clips in place (the travel and turn of the node that carries them left
+// out), and each frame mdl::takeRootMotion(h, m) hands over what was left out, for the game to move it by (as UE's
+// root motion: the game owns where the character is, so it can collide, follow a path or be networked):
+//   float m[4];
+//   if (mdl::takeRootMotion(h, m)) { pos += { m[0], m[1], m[2] }; yaw += m[3]; mdl::move(h, pos, yawQuat(yaw)); }
+//
 // Placements are kept by renderer_models (through its reloads); Reset State empties them, so place again whenever
 // mdl::placed(h) is false. The handle is 0 while renderer_models isn't running.
 #pragma once
 
 #include <yea/base.h>
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -89,7 +106,31 @@ struct Api
     // For a panel (the Model Viewer): every model, in the order declared.
     uint32_t (*count)(void);
     int (*info)(uint32_t index, Info* out);
+    // Skinned models (later in Api: check `size`). play: by name (nullptr or "" the rest pose); speed 1 as authored,
+    // fade seconds from what played; 0 when it has no such clip.
+    int (*play)(uint32_t placement, const char* clip, float speed, int loop, float fade);
+    float (*time)(uint32_t placement); // seconds into its clip
+    int (*joint)(uint32_t placement, const char* name, float* out); // 12 floats, 3x4 rows, world; 0 no such joint
+    uint32_t (*clips)(uint32_t model); // its clips, for a panel
+    const char* (*clip)(uint32_t model, uint32_t index, float* duration);
+    // Morph targets (later in Api: check `size`). morph: a target's weight held over its clip's; 0 no such target.
+    // unmorph: a target (nullptr: every one) back to its clip's.
+    int (*morph)(uint32_t placement, const char* target, float weight);
+    void (*unmorph)(uint32_t placement, const char* target);
+    uint32_t (*morphs)(uint32_t model); // its targets, for a panel
+    const char* (*morphTarget)(uint32_t model, uint32_t index, float* weight); // its name, and its default weight
+    // Root motion (later in Api: check `size`). rootMotion: on, its clips play in place; 0 when it has none to give.
+    // takeMotion: what they left out since the last take, world (out[0..2] metres, out[3] radians about +Y).
+    int (*rootMotion)(uint32_t placement, int on);
+    int (*takeMotion)(uint32_t placement, float* out);
+    // Retargeting (later in Api: check `size`): another skinned model's clip, played on this one's skeleton; 0 when
+    // either isn't skinned or the source has no such clip.
+    int (*playFrom)(uint32_t placement, uint32_t model, const char* clip, float speed, int loop, float fade);
 };
+inline bool hasAnim(const Api* a) { return a->size >= offsetof(Api, morph); }
+inline bool hasMorph(const Api* a) { return a->size >= offsetof(Api, rootMotion); }
+inline bool hasRootMotion(const Api* a) { return a->size >= offsetof(Api, playFrom); }
+inline bool hasRetarget(const Api* a) { return a->size >= sizeof(Api); }
 
 struct Model;
 namespace detail
@@ -234,5 +275,59 @@ inline bool placed(uint32_t placement)
 {
     const Api* a = detail::api();
     return a && placement && a->placed(placement);
+}
+// A skinned placement's clip: by name, speed 1 as authored, faded in over `fade` seconds. False: no such clip (or not
+// skinned, or renderer_models isn't running). While its model is still loading it is taken by name once loaded (true).
+inline bool play(uint32_t placement, const char* clip, float speed = 1.0f, bool loop = true, float fade = 0.2f)
+{
+    const Api* a = detail::api();
+    return a && placement && hasAnim(a) && a->play(placement, clip, speed, loop ? 1 : 0, fade);
+}
+inline float clipTime(uint32_t placement)
+{
+    const Api* a = detail::api();
+    return a && placement && hasAnim(a) ? a->time(placement) : 0.0f;
+}
+// A joint's world transform this frame (3x4 rows: x, y and z axes in its columns, then its position), to attach
+// something to it. False when it has none of that name.
+inline bool joint(uint32_t placement, const char* name, float out[12])
+{
+    const Api* a = detail::api();
+    return a && placement && hasAnim(a) && a->joint(placement, name, out);
+}
+// A morph target held at `weight` (usually 0 to 1) over what its clip says. False: no such target (or no morphs, or
+// renderer_models isn't running).
+inline bool morph(uint32_t placement, const char* target, float weight)
+{
+    const Api* a = detail::api();
+    return a && placement && hasMorph(a) && a->morph(placement, target, weight);
+}
+// Another skinned model's clip (`from`'s, by name; nullptr or "" the rest pose) played on this one, retargeted onto its
+// skeleton, crossfaded as play() does. False: either isn't skinned, or `from` has no such clip.
+inline bool play(uint32_t placement, const Model& from, const char* clip, float speed = 1.0f, bool loop = true, float fade = 0.2f)
+{
+    const Api* a = detail::api();
+    return a && placement && from.id && hasRetarget(a) && a->playFrom(placement, from.id, clip, speed, loop ? 1 : 0, fade);
+}
+// Root motion on (its clips play in place) or off (as authored). False: it isn't skinned.
+inline bool rootMotion(uint32_t placement, bool on)
+{
+    const Api* a = detail::api();
+    return a && placement && hasRootMotion(a) && a->rootMotion(placement, on ? 1 : 0);
+}
+// The motion its clips left out since the last take, in the world: out[0..2] metres to move it by, out[3] radians to
+// turn it by about +Y (placed upright). False (and zeros) while root motion is off.
+inline bool takeRootMotion(uint32_t placement, float out[4])
+{
+    const Api* a = detail::api();
+    out[0] = out[1] = out[2] = out[3] = 0;
+    return a && placement && hasRootMotion(a) && a->takeMotion(placement, out);
+}
+// A held target (nullptr: every one) back to its clip's weight.
+inline void unmorph(uint32_t placement, const char* target = nullptr)
+{
+    const Api* a = detail::api();
+    if (a && placement && hasMorph(a))
+        a->unmorph(placement, target);
 }
 } // namespace mdl

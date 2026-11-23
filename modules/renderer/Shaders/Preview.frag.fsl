@@ -7,6 +7,7 @@
 #include "Preview.srt.h"
 #ifndef GROUND
 #include "Brdf.h.fsl"
+#include "Material.h.fsl"
 #endif
 
 STRUCT(VSOutput)
@@ -16,6 +17,9 @@ STRUCT(VSOutput)
 #ifndef GROUND
     DATA(float3, Normal, TEXCOORD1);
     DATA(FLAT(uint), Material, TEXCOORD2);
+    DATA(float2, Uv, TEXCOORD5);
+    DATA(float4, Tangent, TEXCOORD6);
+    DATA(float4, Color, TEXCOORD7);
 #endif
 };
 
@@ -74,21 +78,45 @@ ROOT_SIGNATURE(DefaultRootSignature)
 float4 PS_MAIN(VSOutput In)
 {
     INIT_MAIN;
-    MaterialData m = gMaterials[In.Material];
+    MaterialData    m = gMaterials[In.Material];
+    MaterialMapData mm = gMaterialMaps[In.Material];
+    float2          uvDx = ddx(In.Uv);
+    float2          uvDy = ddy(In.Uv);
+    float           occlusion = 1.0;
+    if (mm.misc.y > 0.5)
+    {
+        MaterialLook look = materialLook(m, mm, In.Uv, uvDx, uvDy, In.Color);
+        if (mm.misc.x > 0.0)
+            clip(look.alpha - mm.misc.x); // no prepass here: alpha-tested parts cut out as they draw
+        m.albedoRough = float4(look.albedo, look.rough);
+        m.params.x = look.metallic;
+        m.emissive.rgb = look.emissive;
+        occlusion = look.occlusion;
+    }
     float3       N = normalize(In.Normal);
     float3       V = normalize(gPreview.camPos.xyz - In.WorldPos);
     float        rough = clamp(m.albedoRough.a, 0.03, 1.0);
     float        a2 = rough * rough;
     a2 *= a2;
     // Specular antialiasing, as the forward pass (strength 1).
-    float3 dndx = ddx(In.Normal);
-    float3 dndy = ddy(In.Normal);
+    // The unit normal's change across the pixel: In.Normal's length is the instance's scale squared (Forward.vert),
+    // which would widen a scaled-up object's highlights and sharpen a scaled-down one's past what their curvature asks.
+    float3 unitN = normalize(In.Normal);
+    float3 dndx = ddx(unitN);
+    float3 dndy = ddy(unitN);
     a2 = saturate(a2 + min(0.5 * (dot(dndx, dndx) + dot(dndy, dndy)), 0.18));
     float NoV = dot(N, V);
+    float facing = 1.0;
     if (NoV < 0.0)
     {
         N = -N;
         NoV = -NoV;
+        facing = -1.0;
+    }
+    if (mm.maps.z != 0u)
+    {
+        N = mappedNormal(mm, In.Normal, In.Tangent, In.Uv, uvDx, uvDy) * facing;
+        NoV = dot(N, V);
     }
     NoV = max(NoV, 1e-3);
 
@@ -127,7 +155,7 @@ float4 PS_MAIN(VSOutput In)
     float3 Favg = s.f0 + (float3(1.0, 1.0, 1.0) - s.f0) * (1.0 / 21.0);
     float3 Fms = FssEss * Favg / (float3(1.0, 1.0, 1.0) - Ems * Favg);
     float3 kD = s.diffuse * (float3(1.0, 1.0, 1.0) - FssEss - Fms * Ems);
-    color += FssEss * radiance + (Fms * Ems + kD) * irradiance;
+    color += (FssEss * radiance + (Fms * Ems + kD) * irradiance) * occlusion;
     color += m.emissive.rgb;
     RETURN(float4(color, 1.0));
 }

@@ -6,7 +6,7 @@
 // (colour already converted, with depth), and each pixel's 3 x 3 neighbourhood comes from there.
 STRUCT(TaaData)
 {
-    DATA(float4, params, None); // x current frame's weight (1: no history), y clamp width
+    DATA(float4, params, None); // x current frame's weight (1: no history), y clamp width, z 1: gReactive bound
     DATA(float4, texel, None);  // xy 1 / size
     DATA(uint4, size, None);    // xy size
 };
@@ -100,6 +100,9 @@ void CS_MAIN(SV_GroupID(uint3) gid, SV_GroupThreadID(uint3) tid, SV_GroupIndex(u
     float  alpha = gTaa.params.x;
     if (prevUV.x < 0.0 || prevUV.y < 0.0 || prevUV.x > 1.0 || prevUV.y > 1.0)
         alpha = 1.0;
+    // Where particles cover the pixel (no motion vectors of their own), more of this frame, so they don't smear.
+    if (gTaa.params.z > 0.5)
+        alpha = max(alpha, 0.6 * LoadTex2D(gReactive, NO_SAMPLER, p, 0).r);
     float3 result = centre;
     if (alpha < 1.0)
     {

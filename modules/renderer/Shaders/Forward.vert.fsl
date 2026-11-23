@@ -8,8 +8,14 @@
 STRUCT(VSInput)
 {
     DATA(float3, Position, POSITION);
-    DATA(float3, Normal, NORMAL);
+    DATA(float2, Normal, NORMAL); // octahedral
     DATA(uint, Instance, TEXCOORD1);
+    DATA(int2, Tangent, TANGENT); // octahedral snorm16 as integers: y's lowest bit the bitangent's sign (odd: -1)
+    DATA(float2, Uv, TEXCOORD0);
+    DATA(float4, Color, COLOR);
+#ifdef MOTION
+    DATA(float3, PrevPosition, TEXCOORD2); // last frame's: the same as Position unless skinned (renderer's skin.cpp)
+#endif
 };
 
 STRUCT(VSOutput)
@@ -22,6 +28,9 @@ STRUCT(VSOutput)
     DATA(float4, CurrClip, TEXCOORD3);
     DATA(float4, PrevClip, TEXCOORD4);
 #endif
+    DATA(float2, Uv, TEXCOORD5);
+    DATA(float4, Tangent, TEXCOORD6); // world, unit length; w the bitangent's sign times Normal's length (Material.h.fsl)
+    DATA(float4, Color, TEXCOORD7);
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -42,12 +51,20 @@ VSOutput VS_MAIN(VSInput In)
     float3 c0 = cross(b, c);
     float3 c1 = cross(c, a);
     float3 c2 = cross(a, b);
-    float3 n = In.Normal;
+    float3 n = octDecode(In.Normal);
     Out.Normal = float3(dot(c0, n), dot(c1, n), dot(c2, n));
     Out.Material = inst.misc.x;
+    float2 tf = max(float2(In.Tangent) * (1.0 / 32767.0), float2(-1.0, -1.0));
+    float3 t = octDecode(tf);
+    // The normal stays as it comes (specular antialiasing reads its derivatives); the normal map's frame wants unit
+    // vectors per vertex (MikkTSpace), so the tangent is unit length and w carries the normal's length with the sign.
+    Out.Tangent = float4(normalize(float3(dot(a, t), dot(b, t), dot(c, t))), ((In.Tangent.y & 1) != 0 ? -1.0 : 1.0) * length(Out.Normal));
+    Out.Uv = In.Uv;
+    Out.Color = In.Color;
 #ifdef MOTION
     PrevInstanceData prev = gPrevInstances[In.Instance];
-    float4 pw = float4(dot(prev.row0, p), dot(prev.row1, p), dot(prev.row2, p), 1.0);
+    float4 pp = float4(In.PrevPosition, 1.0);
+    float4 pw = float4(dot(prev.row0, pp), dot(prev.row1, pp), dot(prev.row2, pp), 1.0);
     Out.CurrClip = float4(dot(gFrame.viewProjNoJitter[0], w), dot(gFrame.viewProjNoJitter[1], w), dot(gFrame.viewProjNoJitter[2], w), dot(gFrame.viewProjNoJitter[3], w));
     Out.PrevClip = float4(dot(gFrame.prevViewProj[0], pw), dot(gFrame.prevViewProj[1], pw), dot(gFrame.prevViewProj[2], pw), dot(gFrame.prevViewProj[3], pw));
 #endif

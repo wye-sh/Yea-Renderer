@@ -33,6 +33,7 @@ Pipeline*      gPipe;
 DescriptorSet* gSet;
 Buffer*        gCb[kMaxFrames];
 RenderTarget*  gHistory[2];
+Texture*       gNoReactive; // stands in for frame.h reactive when no particles drew
 uint32_t       gWidth, gHeight;
 uint32_t       gCurrent;
 uint64_t       gResolvedFrame; // the frame the current history was resolved in
@@ -119,8 +120,22 @@ int load(int reloaded)
         d.ppBuffer = &gCb[i];
         addResource(&d, nullptr);
     }
+    {
+        TextureDesc t = {};
+        t.mWidth = t.mHeight = 2; // one texel high gets a 1D view on Vulkan
+        t.mDepth = t.mArraySize = t.mMipLevels = 1;
+        t.mSampleCount = SAMPLE_COUNT_1;
+        t.mFormat = TinyImageFormat_R8_UNORM;
+        t.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+        t.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+        t.pName = "renderer_taa_no_reactive";
+        TextureLoadDesc tl = {};
+        tl.pDesc = &t;
+        tl.ppTexture = &gNoReactive;
+        addResource(&tl, nullptr);
+    }
     waitForAllResourceLoads();
-    gReady = gPipe && gSet;
+    gReady = gPipe && gSet && gNoReactive;
     return gReady ? 0 : 1;
 }
 
@@ -133,6 +148,9 @@ void unload()
     for (uint32_t i = 0; i < gFrames; ++i)
         if (gCb[i])
             removeResource(gCb[i]);
+    if (gNoReactive)
+        removeResource(gNoReactive);
+    gNoReactive = nullptr;
     if (gSet)
         removeDescriptorSet(gRenderer, gSet);
     if (gPipe)
@@ -190,6 +208,7 @@ bool taa_prepare(uint64_t address)
     TaaData  d = {};
     d.params[0] = valid ? 1.0f - keep : 1.0f;
     d.params[1] = settings.clamp_width;
+    d.params[2] = F->reactive ? 1.0f : 0.0f;
     d.texel[0] = 1.0f / (float)F->width;
     d.texel[1] = 1.0f / (float)F->height;
     d.size[0] = F->width;
@@ -205,7 +224,8 @@ void taa_resolve(uint64_t address)
         return;
     Cmd*           cmd = F->cmd;
     RenderTarget*  out = gHistory[gCurrent];
-    DescriptorData p[7] = {};
+    Texture*       reactive = F->reactive ? F->reactive : gNoReactive;
+    DescriptorData p[8] = {};
     p[0].mIndex = SRT_RES_IDX(TaaSrt, PerFrame, gTaa);
     p[0].ppBuffers = &gCb[F->frameIndex];
     p[1].mIndex = SRT_RES_IDX(TaaSrt, PerFrame, gHdr);
@@ -220,7 +240,9 @@ void taa_resolve(uint64_t address)
     p[5].ppBuffers = &F->exposure;
     p[6].mIndex = SRT_RES_IDX(TaaSrt, PerFrame, gOut);
     p[6].ppTextures = &out->pTexture;
-    updateDescriptorSet(gRenderer, F->frameIndex, gSet, 7, p);
+    p[7].mIndex = SRT_RES_IDX(TaaSrt, PerFrame, gReactive);
+    p[7].ppTextures = &reactive;
+    updateDescriptorSet(gRenderer, F->frameIndex, gSet, 8, p);
 
     cmdBeginDebugMarker(cmd, 0.8f, 0.4f, 1.0f, "Renderer TAA");
     barrier(cmd, out, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS);

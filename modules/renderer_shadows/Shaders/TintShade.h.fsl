@@ -1,0 +1,109 @@
+// One glass surface's part in the tint maps (Tint.frag.fsl, TintRest.frag.fsl): false where it takes none (peeled, behind
+// the opaque surface, a back face that doesn't count, cut out), else its depth in the view z and what it lets through T.
+// rest: the last layer's rest pass, which takes only surfaces past the one its layer pass kept (gScratchZ).
+#ifndef TINT_SHADE_H
+#define TINT_SHADE_H
+#include "TintCommon.h.fsl"
+#include "Material.h.fsl"
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float3, WorldPos, TEXCOORD0);
+    DATA(float3, Normal, TEXCOORD1);
+    DATA(FLAT(uint), Material, TEXCOORD2);
+    DATA(FLAT(uint), Flags, TEXCOORD3);
+    DATA(FLAT(uint), Pass, TEXCOORD4);
+    DATA(float2, Uv, TEXCOORD5);
+    DATA(float4, Tangent, TEXCOORD6);
+    DATA(float4, Color, TEXCOORD7);
+};
+
+// The core's split-sum table lookup (renderer's Shaders/Brdf.h.fsl dfgLookup, identical; frame.h dfg).
+float2 dfgLookup(float NoV, float rough)
+{
+    float  x = sqrt(saturate(NoV)) * 127.0;
+    float  y = saturate(rough) * 127.0;
+    uint   x0 = uint(x);
+    uint   y0 = uint(y);
+    uint   x1 = min(x0 + 1u, 127u);
+    uint   y1 = min(y0 + 1u, 127u);
+    float  fx = x - float(x0);
+    float  fy = y - float(y0);
+    float2 a = lerp(gDfg[y0 * 128u + x0], gDfg[y0 * 128u + x1], fx);
+    float2 b = lerp(gDfg[y1 * 128u + x0], gDfg[y1 * 128u + x1], fx);
+    return lerp(a, b, fy);
+}
+
+bool tintSurface(VSOutput In, bool rest, inout(float) z, inout(float3) T)
+{
+    TintPass pass = gPasses[In.Pass];
+    float2   dx = ddx(In.Uv);
+    float2   dy = ddy(In.Uv);
+    z = saturate(In.Position.z);
+    if (rest)
+    {
+        // The surface this layer's pass kept is the nearest left: the rest lie past it.
+        float kept = LoadTex2D(gScratchZ, NO_SAMPLER, int2(In.Position.xy), 0).r;
+        if (z <= kept + max(kept * 1e-6, 1e-7))
+            return false;
+    }
+    if ((pass.info.y & TINT_PEEL) != 0u)
+    {
+        int2  prev = int2(In.Position.xy) - int2(int(pass.info.w & 0xFFFFu), int(pass.info.w >> 16)) +
+                     int2(int(pass.info.z & 0xFFFFu), int(pass.info.z >> 16));
+        float before = LoadTex2D(gTintPrev, NO_SAMPLER, prev, 0).r;
+        if (z <= before + max(before * 1e-6, 1e-7))
+            return false;
+    }
+    {
+        // Glass behind the opaque surface the map holds there lights nothing it can tint: left out, so it takes no layer.
+        ShadowView v = gViews[pass.info.x];
+        float4     q = float4(In.WorldPos, 1.0);
+        float4     c = float4(dot(v.row0, q), dot(v.row1, q), dot(v.row2, q), dot(v.row3, q));
+        float2     uv = v.rect.xy + ((c.xy / c.w) * float2(0.5, -0.5) + float2(0.5, 0.5)) * v.rect.zw;
+        float      opaque = (pass.info.y & TINT_LOCAL) != 0u ? SampleLvlTex2D(gLocalAtlas, gSamplerPointClamp, uv, 0.0).r
+                                                             : SampleLvlTex2D(gSunAtlas, gSamplerPointClamp, uv, 0.0).r;
+        if (z > opaque)
+            return false;
+    }
+    float3 R = pass.light.w > 0.5 ? normalize(In.WorldPos - pass.light.xyz) : pass.light.xyz;
+    float3 Ng = normalize(In.Normal);
+    bool   front = dot(Ng, R) < 0.0;
+    uint   material = In.Material;
+    bool   twoSided = In.Flags != 0u;
+    if (!front && !(twoSided && gRefraction[material * 2u].z < 0.5))
+        return false;
+    MaterialData    m = gMaterials[material];
+    MaterialMapData mm = gMaterialMaps[material];
+    float           coverage = mm.misc.z;
+    float3          albedo = m.albedoRough.rgb;
+    float           rough = m.albedoRough.a;
+    float           metallic = m.params.x;
+    if (mm.misc.y > 0.5)
+    {
+        MaterialLook look = materialLook(m, mm, In.Uv, dx, dy, In.Color);
+        if (mm.misc.x > 0.0 && look.alpha < mm.misc.x)
+            return false; // cut out (material_alpha), as renderer_rt's cutAway
+        albedo = look.albedo;
+        rough = look.rough;
+        metallic = look.metallic;
+        coverage *= look.alpha;
+    }
+    float  facing = front ? 1.0 : -1.0;
+    float3 N = Ng * facing;
+    if (mm.maps.z != 0u)
+        N = mappedNormal(mm, In.Normal, In.Tangent, In.Uv, dx, dy) * facing;
+    float  NoV = max(abs(dot(N, R)), 1e-3);
+    metallic = saturate(metallic);
+    float3 f0 = lerp(float3(m.params.y, m.params.y, m.params.y), albedo, metallic);
+    float2 dfg = dfgLookup(NoV, clamp(rough, 0.03, 1.0));
+    float  Ess = dfg.x + dfg.y;
+    float3 FssEss = f0 * dfg.x + float3(dfg.y, dfg.y, dfg.y);
+    float  Ems = 1.0 - Ess;
+    float3 Favg = f0 + (float3(1.0, 1.0, 1.0) - f0) * (1.0 / 21.0);
+    float3 Fms = FssEss * Favg / (float3(1.0, 1.0, 1.0) - Ems * Favg);
+    T = (1.0 - saturate(coverage)) * saturate(float3(1.0, 1.0, 1.0) - FssEss - Fms * Ems) * gRefraction[material * 2u + 1u].rgb;
+    return true;
+}
+#endif

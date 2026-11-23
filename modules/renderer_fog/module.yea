@@ -1,0 +1,57 @@
+module renderer_fog
+
+# Local fog volumes games place (a misty hollow, smoke in a room): an axis-aligned box, or the ellipsoid inside it,
+# adding its own medium to the height fog. Rows are never moved.
+table Volume none 16
+  float3 center
+  float3 extent
+  float3 albedo
+  float density
+  float softness
+  u32 shape
+  u32 gen
+  u32 alive
+end
+
+# shape 0: a box, 1: an ellipsoid; half_size its half extents (m). Returns a handle (4294967295 when all 16 are
+# taken). A new volume has density 0.1 (1/m), a white albedo and softness 0.25.
+export handle fog_volume_add(u32 shape, float3 center, float3 half_size)
+export void fog_volume_place(handle v, float3 center, float3 half_size)
+# density: extinction per metre at its heart; albedo: the share of it that scatters (per colour; the rest absorbs);
+# softness: how far in from its sides it fades in, as a share of its half size (0: a hard edge).
+export void fog_volume_medium(handle v, float density, float3 albedo, float softness)
+export void fog_volume_remove(handle v)
+# Removes every volume.
+export void fog_volume_clear()
+
+# Called by renderer (the core) each frame with the address of its RenderFrame (frame.h): fog_prepare once the
+# lights, shadows and sky are set, before probes_prepare (the froxel volume and the height fog for other rays, or false:
+# no fog), fog_run after the shadow maps are drawn.
+export bool fog_prepare(u64 frame)
+# Whether fog will run this frame (on, with something in the air): the core asks before shadows are planned.
+export bool fog_on()
+export void fog_run(u64 frame)
+
+category Fog
+# Air that holds light: sunbeams through gaps, glowing halos round lamps, distance fading into mist.
+setting bool fog false
+player fog
+# How thick it is at and below base_height (extinction per metre: at 0.02, about two-thirds of the light is lost over 50 m).
+setting float density 0.02 0 inf
+# How quickly it thins above base_height (per metre; 0: the same at every height).
+setting float height_falloff 0.2 0 inf
+setting float base_height 0
+# The share of light the fog scatters, per colour (the rest it absorbs: darker, smokier fog).
+setting color albedo 1 1 1
+# How much light carries on forwards through it (0: equally in every direction; towards 1: bright halos looking
+# towards the sun and lamps, as in real mist).
+setting float anisotropy 0.6 -0.9 0.95
+
+category Fog Quality
+# Detail of the fog's light (Low: 16 px froxels and 64 slices; Medium: 8 px and 64; High: 8 px and 128).
+setting choice quality High Low Medium High
+player quality
+# How far out the fog is worked out (m); beyond it, things keep the fog at this distance.
+setting float range 100 1 inf
+# Blend each frame with the last, for smooth, stable fog (off: noisier, but no trailing when lights move fast).
+setting bool temporal true

@@ -1,0 +1,50 @@
+#include "Common_3/Graphics/FSL/defaults.h"
+
+#rootsig default.rootsig
+#end
+
+#rootsig compute.rootsig
+#end
+
+#comp renderer_particles_init.comp
+#define INIT
+#include "Sim.comp.fsl"
+#end
+
+#comp renderer_particles_emit.comp
+#define EMIT
+#include "Sim.comp.fsl"
+#end
+
+#comp renderer_particles_simulate.comp
+#define SIMULATE
+#include "Sim.comp.fsl"
+#end
+
+#comp renderer_particles_pad.comp
+#define PAD
+#include "Sim.comp.fsl"
+#end
+
+#comp renderer_particles_sort_local.comp
+#define SORT_LOCAL
+#include "Sim.comp.fsl"
+#end
+
+#comp renderer_particles_sort_global.comp
+#define SORT_GLOBAL
+#include "Sim.comp.fsl"
+#end
+
+#comp renderer_particles_split.comp
+#define SPLIT
+#include "Sim.comp.fsl"
+#end
+
+#vert renderer_particles.vert
+#include "Draw.vert.fsl"
+#end
+
+#frag renderer_particles.frag
+#include "Draw.frag.fsl"
+#end

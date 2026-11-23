@@ -11,8 +11,11 @@
 STRUCT(VSInput)
 {
     DATA(float3, Position, POSITION);
-    DATA(float3, Normal, NORMAL);
+    DATA(float2, Normal, NORMAL); // octahedral
     DATA(uint, Instance, TEXCOORD1);
+    DATA(int2, Tangent, TANGENT); // as Forward.vert's
+    DATA(float2, Uv, TEXCOORD0);
+    DATA(float4, Color, COLOR);
 };
 
 STRUCT(VSOutput)
@@ -22,6 +25,9 @@ STRUCT(VSOutput)
     DATA(float3, WorldPos, TEXCOORD0);
     DATA(float3, Normal, TEXCOORD1);
     DATA(FLAT(uint), Material, TEXCOORD2);
+    DATA(float2, Uv, TEXCOORD5);
+    DATA(float4, Tangent, TEXCOORD6);
+    DATA(float4, Color, TEXCOORD7);
 #endif
 };
 
@@ -42,9 +48,13 @@ VSOutput VS_MAIN(VSInput In)
     float3 a = inst.row0.xyz;
     float3 b = inst.row1.xyz;
     float3 c = inst.row2.xyz;
-    float3 n = In.Normal;
+    float3 n = octDecode(In.Normal);
     Out.Normal = float3(dot(cross(b, c), n), dot(cross(c, a), n), dot(cross(a, b), n));
     Out.Material = inst.misc.x;
+    float3 t = octDecode(max(float2(In.Tangent) * (1.0 / 32767.0), float2(-1.0, -1.0)));
+    Out.Tangent = float4(normalize(float3(dot(a, t), dot(b, t), dot(c, t))), ((In.Tangent.y & 1) != 0 ? -1.0 : 1.0) * length(Out.Normal)); // as Forward.vert
+    Out.Uv = In.Uv;
+    Out.Color = In.Color;
 #endif
     RETURN(Out);
 }

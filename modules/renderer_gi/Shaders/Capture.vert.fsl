@@ -1,0 +1,72 @@
+// The raster fallback: the scene into one face of a probe's capture. An instance-rate stream of entries (instance |
+// view << 20 | two-sided << 31, view = slot * 6 + face), never SV_InstanceID; the probe's place (with its relocation)
+// comes from its data, so the CPU never needs it.
+// SUN_SHADOW: the shadow casters into the sun's own map (gGi.sunView, orthographic); entries are instance indices.
+#include "GiData.h.fsl"
+#include "Capture.srt.h"
+#include "GiSample.h.fsl"
+
+STRUCT(VSInput)
+{
+    DATA(float3, Position, POSITION);
+    DATA(float2, Normal, NORMAL); // octahedral
+    DATA(uint, Entry, TEXCOORD1);
+    DATA(float2, Uv, TEXCOORD0);
+    DATA(float4, Color, COLOR);
+};
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float3, WorldPos, TEXCOORD0);
+    DATA(float3, Normal, TEXCOORD1);
+    DATA(float3, Eye, TEXCOORD2);
+    DATA(FLAT(uint), Material, TEXCOORD3);
+    DATA(float2, Uv, TEXCOORD4);
+    DATA(float4, Color, TEXCOORD5);
+};
+
+float3 octDecode(float2 f)
+{
+    float3 n = float3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    float  t = saturate(-n.z);
+    n.x += n.x >= 0.0 ? -t : t;
+    n.y += n.y >= 0.0 ? -t : t;
+    return normalize(n);
+}
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN(VSInput In)
+{
+    INIT_MAIN;
+    VSOutput   Out;
+    GiInstance inst = gInstances[In.Entry & 0xFFFFFu];
+    float4 p = float4(In.Position, 1.0);
+    float3 w = float3(dot(inst.row0, p), dot(inst.row1, p), dot(inst.row2, p));
+    Out.WorldPos = w;
+    Out.Uv = In.Uv;
+    Out.Color = In.Color;
+    Out.Material = inst.misc.x | (In.Entry & 0x80000000u);
+#if defined(SUN_SHADOW)
+    float4 q = float4(w, 1.0);
+    Out.Position = float4(dot(gGi.sunView[0], q), dot(gGi.sunView[1], q), dot(gGi.sunView[2], q), 1.0);
+    Out.Normal = float3(0.0, 1.0, 0.0);
+    Out.Eye = float3(0.0, 0.0, 0.0);
+#else
+    uint   view = (In.Entry >> 20u) & 0x7FFu;
+    uint   slot = view / 6u;
+    uint   face = view - slot * 6u;
+    uint   i = (gGi.raster.x + slot) % gGi.counts.x;
+    float3 eye = giProbePosition(i, gGiProbes[i].xyz, gGi.grid[0], gGi.grid[1], gGi.grid[2]);
+    float3 d = w - eye;
+    // A 90 degree face, reversed-Z with an infinite far plane (renderer_probes' faces).
+    Out.Position = float4(dot(giFaceAxis(face, 1u), d), dot(giFaceAxis(face, 2u), d), 0.02, dot(giFaceAxis(face, 0u), d));
+    float3 a = inst.row0.xyz;
+    float3 b = inst.row1.xyz;
+    float3 c = inst.row2.xyz;
+    float3 n = octDecode(In.Normal);
+    Out.Normal = float3(dot(cross(b, c), n), dot(cross(c, a), n), dot(cross(a, b), n));
+    Out.Eye = eye;
+#endif
+    RETURN(Out);
+}

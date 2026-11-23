@@ -10,5 +10,6 @@ BEGIN_SRT(TaaSrt)
         DECL_TEXTURE(PerFrame, Tex2D(float4), gHistory)
         DECL_BUFFER(PerFrame, Buffer(float), gExposure)
         DECL_RWTEXTURE(PerFrame, RWTex2D(half4), gOut) // RGBA16F
+        DECL_TEXTURE(PerFrame, Tex2D(float), gReactive) // frame.h reactive (params.z 1), else a stand-in
     END_SRT_SET(PerFrame)
 END_SRT(TaaSrt)

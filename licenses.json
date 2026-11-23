@@ -119,5 +119,49 @@
         ]
       }
     ]
+  },
+  {
+    "name": "Lantern (Khronos glTF sample model, cooked)",
+    "version": "glTF-Sample-Assets e124e8d",
+    "license": "CC0-1.0",
+    "source": "https://github.com/KhronosGroup/glTF-Sample-Assets/tree/e124e8d8d7330a5372bc2b4d00d39a4a9d7997ea/Models/Lantern",
+    "licenseUrl": "https://github.com/KhronosGroup/glTF-Sample-Assets/blob/e124e8d8d7330a5372bc2b4d00d39a4a9d7997ea/Models/Lantern/LICENSE.md",
+    "usedBy": [
+      "example/renderer_example/Assets/models/Lantern.rmodel"
+    ],
+    "notice": "Lantern by sbtron, Microsoft (2017); Draco version by Frank Galligan (2018). Dedicated to the public domain (CC0 1.0). Logos and trademarks excluded."
+  },
+  {
+    "name": "Flight Helmet (Khronos glTF sample model, cooked)",
+    "version": "glTF-Sample-Assets e124e8d",
+    "license": "CC0-1.0",
+    "source": "https://github.com/KhronosGroup/glTF-Sample-Assets/tree/e124e8d8d7330a5372bc2b4d00d39a4a9d7997ea/Models/FlightHelmet",
+    "licenseUrl": "https://github.com/KhronosGroup/glTF-Sample-Assets/blob/e124e8d8d7330a5372bc2b4d00d39a4a9d7997ea/Models/FlightHelmet/LICENSE.md",
+    "usedBy": [
+      "example/renderer_example/Assets/models/FlightHelmet.rmodel"
+    ],
+    "notice": "Flight Helmet, converted from Maya by Gary Hsu (2018). Dedicated to the public domain (CC0 1.0). Logos and trademarks excluded."
+  },
+  {
+    "name": "Water Bottle (Khronos glTF sample model, cooked)",
+    "version": "glTF-Sample-Assets e124e8d",
+    "license": "CC0-1.0",
+    "source": "https://github.com/KhronosGroup/glTF-Sample-Assets/tree/e124e8d8d7330a5372bc2b4d00d39a4a9d7997ea/Models/WaterBottle",
+    "licenseUrl": "https://github.com/KhronosGroup/glTF-Sample-Assets/blob/e124e8d8d7330a5372bc2b4d00d39a4a9d7997ea/Models/WaterBottle/LICENSE.md",
+    "usedBy": [
+      "example/renderer_example/Assets/models/WaterBottle.rmodel"
+    ],
+    "notice": "Water Bottle by Microsoft (2017). Dedicated to the public domain (CC0 1.0). Logos and trademarks excluded."
+  },
+  {
+    "name": "Boom Box (Khronos glTF sample model, cooked)",
+    "version": "glTF-Sample-Assets e124e8d",
+    "license": "CC0-1.0",
+    "source": "https://github.com/KhronosGroup/glTF-Sample-Assets/tree/e124e8d8d7330a5372bc2b4d00d39a4a9d7997ea/Models/BoomBox",
+    "licenseUrl": "https://github.com/KhronosGroup/glTF-Sample-Assets/blob/e124e8d8d7330a5372bc2b4d00d39a4a9d7997ea/Models/BoomBox/LICENSE.md",
+    "usedBy": [
+      "example/renderer_example/Assets/models/BoomBox.rmodel"
+    ],
+    "notice": "Boom Box by Microsoft (2017). Dedicated to the public domain (CC0 1.0). Logos and trademarks excluded."
   }
 ]
