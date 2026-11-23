@@ -174,7 +174,13 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   energy-conserving step front to back into `fogVolume`: light scattered in and transmittance to each slice's far side.
   The core applies it (FLAG_FOG, `applyFog` in Lighting.h.fsl) after aerial perspective on every lit pixel and on the
   sky (its last slice) at render size, before TAA or the upscaler, so it works with each. Not under F1's view modes.
-  Not yet in probe captures or ray-traced reflections. Every GPU object is freed in `unload()`.
+  Rays the froxels don't hold (probe captures, the reflected sky in the forward pass, renderer_rt's hits and misses)
+  take the height fog analytically along the ray (frame v19 `fogMedium`, `fogAlbedo`; `applyHeightFog`, the same in
+  Lighting.h.fsl, Capture.frag.fsl and Trace.comp.fsl): exact optical depth of the exponential height profile, the sun
+  unshadowed with the phase and the sky's mean light scattered in; local volumes only in the froxels. `fog_on` (core,
+  before rt_pick) sets frame `fogShadowMaps`: renderer_shadows then keeps the sun's cascades and traced lights' tiles
+  even while renderer_rt traces them, so sunbeams and lamp shafts stay shadowed (surfaces still read the traced
+  shadows). fog_prepare runs just before probes_prepare. Every GPU object is freed in `unload()`.
 - `renderer_post`: post-processing on the resolved (TAA or upscaled) scene-linear HDR image at display size, before
   the core's tonemapper, so it works the same with every upscaler (NVIDIA's DLSS guide and UE5 place it there).
   `post_prepare` (after the core's composite constants, before its descriptors) returns the image the tonemap pass and

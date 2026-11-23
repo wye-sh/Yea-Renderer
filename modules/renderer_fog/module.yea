@@ -25,8 +25,11 @@ export void fog_volume_remove(handle v)
 export void fog_volume_clear()
 
 # Called by renderer (the core) each frame with the address of its RenderFrame (frame.h): fog_prepare once the
-# lights, shadows and sky are set (the froxel volume, or false: no fog), fog_run after the shadow maps are drawn.
+# lights, shadows and sky are set, before probes_prepare (the froxel volume and the height fog for other rays, or false:
+# no fog), fog_run after the shadow maps are drawn.
 export bool fog_prepare(u64 frame)
+# Whether fog will run this frame (on, with something in the air): the core asks before shadows are planned.
+export bool fog_on()
 export void fog_run(u64 frame)
 
 category Fog

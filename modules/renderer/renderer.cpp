@@ -63,6 +63,8 @@ struct GpuFrame
     float    atmosphere2[4]; // aerial volume depth (km), the sky image's mips
     float    fog[4];  // renderer_fog: frame.h fogParams
     float    fog2[4]; // xy frame.h fogUv
+    float    fogMedium[4]; // frame.h's (x 0: no height fog)
+    float    fogAlbedo[4];
     float    taps[32][4]; // xy: the shadow filters' Vogel disk, unturned
 };
 struct GpuMaterial
@@ -1678,6 +1680,9 @@ void draw(uint32_t pass, const YeaFrame* yf)
         F.lightCount = kMaxUnculledLights;
     // Ray-traced shadows (renderer_rt): its pick comes first, so renderer_shadows draws nothing for what it traces.
     const bool rtGate = taa && !viewMode && gRaytracing && gSurface && gDepthSurfacePipe[0] && gDepthSurfacePipe[1] && F.previous;
+    // While fog runs it reads the shadow maps: renderer_shadows keeps them even for what renderer_rt traces.
+    const bool fogMaps = !viewMode && renderer_fog::fog_on();
+    F.fogShadowMaps = fogMaps ? 1u : 0u;
     const bool rtPicked = rtGate && renderer_rt::rt_pick((uint64_t)(uintptr_t)&F);
     if (!rtPicked)
     {
@@ -1698,6 +1703,9 @@ void draw(uint32_t pass, const YeaFrame* yf)
     F.skyHorizon[0] = hor.x * L, F.skyHorizon[1] = hor.y * L, F.skyHorizon[2] = hor.z * L;
     F.skyGround[0] = gnd.x * L, F.skyGround[1] = gnd.y * L, F.skyGround[2] = gnd.z * L;
     F.ambient = settings.ambient;
+    // Volumetric fog (renderer_fog): it reads the lights, their bins and shadow views, and the sky, all set by now; probes
+    // and ray-traced reflections then read its height fog (fogMedium).
+    const bool fog = fogMaps && renderer_fog::fog_prepare((uint64_t)(uintptr_t)&F) && F.fogVolume;
     bool probes = renderer_probes::probes_prepare((uint64_t)(uintptr_t)&F) && F.probes && F.probeData && F.probeCount;
     // Ray-traced reflections where the GPU has ray queries; screen-space ones otherwise.
     F.surface = gSurface;
@@ -1707,8 +1715,6 @@ void draw(uint32_t pass, const YeaFrame* yf)
     const bool rtShadows = rtRun && rtPicked && F.rtShadows;
     bool ssr = !rt && taa && !viewMode && renderer_ssr::ssr_prepare((uint64_t)(uintptr_t)&F) && F.ssrOn && F.ssrDepth && F.previous;
     bool vrs = taa && !viewMode && renderer_vrs::vrs_prepare((uint64_t)(uintptr_t)&F) && F.rateImage && F.rateCopy;
-    // Volumetric fog (renderer_fog): it reads the lights, their bins and shadow views, and the sky, all set by now.
-    const bool fog = !viewMode && renderer_fog::fog_prepare((uint64_t)(uintptr_t)&F) && F.fogVolume;
 
     // GPU lights in sorted order, with the shadow views renderer_shadows picked; then, for reflections
     // (renderer_rt), the lights outside the view, without shadows.
@@ -1866,6 +1872,8 @@ void draw(uint32_t pass, const YeaFrame* yf)
         memcpy(gf->fog, F.fogParams, sizeof F.fogParams);
         gf->fog2[0] = F.fogUv[0];
         gf->fog2[1] = F.fogUv[1];
+        memcpy(gf->fogMedium, F.fogMedium, sizeof F.fogMedium);
+        memcpy(gf->fogAlbedo, F.fogAlbedo, sizeof F.fogAlbedo);
     }
     if (probes)
     {

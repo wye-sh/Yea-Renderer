@@ -50,6 +50,8 @@ STRUCT(CaptureData)
     DATA(float4, skyHorizon, None);
     DATA(float4, skyGround, None);    // w ambient
     DATA(uint4, counts, None);        // x lights
+    DATA(float4, fogMedium, None);    // frame.h's height fog (x 0: none)
+    DATA(float4, fogAlbedo, None);
 };
 
 #include "Capture.srt.h"

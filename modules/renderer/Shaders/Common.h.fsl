@@ -41,6 +41,8 @@ STRUCT(FrameData)
     DATA(float4, atmosphere2, None);         // x aerial perspective volume depth (km), y gSkyEnv's mips
     DATA(float4, fog, None);                 // volumetric fog (FLAG_FOG): frame.h fogParams
     DATA(float4, fog2, None);                // xy frame.h fogUv
+    DATA(float4, fogMedium, None);           // frame.h's: height fog for reflected rays (x 0: none)
+    DATA(float4, fogAlbedo, None);
     DATA(float4, taps[32], None);            // xy: the shadow filters' Vogel disk of counts.w taps, unturned
 };
 

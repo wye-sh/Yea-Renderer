@@ -57,6 +57,8 @@ float3 environment(float3 P, float3 R, float rough, bool reflections)
     if (!reflections)
         return skyIrradiance(R) * ambient;
     float3 sky = ((gFrame.counts.z & FLAG_SKY) != 0u ? skyReflection(R, rough) : lerp(skyRadiance(R), skyIrradiance(R), rough)) * ambient;
+    if (gFrame.fogMedium.x > 0.0)
+        sky = applyHeightFog(sky, P, R, gFrame.fogAlbedo.w); // the fog's range of it, as the sky pass has
     float3 color = float3(0.0, 0.0, 0.0);
     float  remaining = 1.0;
     float  lod = rough * float(max(gFrame.probeInfo.y, 1u) - 1u);

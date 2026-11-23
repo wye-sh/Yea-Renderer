@@ -85,6 +85,40 @@ float3 skyIrradiance(float3 N)
     return lerp(down, up, N.y * 0.5 + 0.5);
 }
 
+// Height fog along a ray the froxels don't hold (renderer_fog's fogMedium, x 0: none): over length t from O along unit
+// d, the color behind fades by the transmittance and the light scattered in is added. The optical depth is exact: the
+// density is rho at and below the base and rho e^(-k h) at h above it, whose integral over height is rho h below and
+// rho (1 - e^(-k h)) / k above, so the ray's is the difference at its ends over d.y. With the light along the ray taken
+// as constant (the sun unshadowed with its phase, the sky's mean radiance), single scattering adds albedo L (1 - T).
+float fogHeightIntegral(float h, float rho, float k)
+{
+    if (h <= 0.0 || k < 1e-5)
+        return rho * h;
+    return rho * (1.0 - exp(-k * h)) / k;
+}
+
+float3 applyHeightFog(float3 color, float3 O, float3 d, float t)
+{
+    float4 m = gFrame.fogMedium;
+    float  h0 = O.y - m.z;
+    float  depth;
+    if (abs(d.y) < 1e-4)
+        depth = m.x * exp(-m.y * max(h0, 0.0)) * t;
+    else
+        depth = (fogHeightIntegral(h0 + d.y * t, m.x, m.y) - fogHeightIntegral(h0, m.x, m.y)) / d.y;
+    float  T = exp(-max(depth, 0.0));
+    float3 sky = (gFrame.counts.z & FLAG_SKY) != 0u ? max(gSkySh[0].rgb, float3(0.0, 0.0, 0.0)) * 0.282095
+                                                     : (gFrame.skyHorizon.rgb * 0.5 + gFrame.skyZenith.rgb * (2.0 / 3.0) + gFrame.skyGround.rgb * (5.0 / 6.0)) * 0.5;
+    float3 L = sky * gFrame.skyGround.w;
+    if (gFrame.counts.y > 0u)
+    {
+        float g = m.w, c = dot(d, gFrame.sunDir[0].xyz);
+        float q = max(1.0 + g * g - 2.0 * g * c, 1e-4);
+        L += gFrame.sunColor[0].rgb * ((1.0 - g * g) / (4.0 * PI * q * sqrt(q)));
+    }
+    return color * T + gFrame.fogAlbedo.rgb * L * (1.0 - T);
+}
+
 // --- Shadows ---------------------------------------------------------------------------------
 
 float interleavedGradientNoise(float2 px)

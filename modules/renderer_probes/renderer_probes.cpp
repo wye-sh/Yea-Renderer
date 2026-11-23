@@ -28,6 +28,8 @@ struct CaptureData
     float    skyHorizon[4];
     float    skyGround[4];
     uint32_t counts[4];
+    float    fogMedium[4];
+    float    fogAlbedo[4];
 };
 struct CaptureView
 {
@@ -572,6 +574,8 @@ bool probes_prepare(uint64_t address)
         memcpy(cd.skyGround, F->skyGround, sizeof F->skyGround);
         cd.skyGround[3] = F->ambient;
         cd.counts[1] = F->skySh ? 1u : 0u;
+        memcpy(cd.fogMedium, F->fogMedium, sizeof F->fogMedium);
+        memcpy(cd.fogAlbedo, F->fogAlbedo, sizeof F->fogAlbedo);
         cd.counts[0] = F->lightBuffer ? (F->lightCount < kMaxCaptureLights ? F->lightCount : kMaxCaptureLights) : 0;
         memcpy(gCaptureCb[F->frameIndex]->pCpuMappedAddress, &cd, sizeof cd);
         memcpy(gViewBuf[F->frameIndex]->pCpuMappedAddress, gViewsCpu, sizeof(CaptureView) * gTodoCount * 6);

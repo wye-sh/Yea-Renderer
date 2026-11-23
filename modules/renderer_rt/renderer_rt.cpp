@@ -40,6 +40,7 @@ struct RtData
     float    taps[32][4];
     float    sky[4]; // x 1: renderer_sky's physical sky, y its image's mips
     uint32_t probe[4]; // TEMPORARY (probe_rays)
+    float    fogMedium[4], fogAlbedo[4]; // frame.h's height fog
 };
 
 struct Blas
@@ -513,6 +514,8 @@ bool rt_prepare(uint64_t address)
     d.sunColor[3] = F->ambient;
     d.sky[0] = F->skyEnv && F->skySh ? 1.0f : 0.0f;
     d.sky[1] = (float)F->skyEnvMips;
+    memcpy(d.fogMedium, F->fogMedium, sizeof d.fogMedium);
+    memcpy(d.fogAlbedo, F->fogAlbedo, sizeof d.fogAlbedo);
     d.counts[0] = F->allLightCount;
     d.counts[1] = (uint32_t)F->frameNumber;
     d.counts[2] = (settings.screen_colors ? kFlagScreen : 0) | (settings.show_hits ? kFlagDebug : 0);

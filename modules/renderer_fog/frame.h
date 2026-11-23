@@ -10,7 +10,7 @@ struct Buffer;
 struct RenderTarget;
 struct Texture;
 
-#define RENDER_FRAME_VERSION 18u
+#define RENDER_FRAME_VERSION 19u
 #define RENDER_RT_MAX_TRACED 8u
 #define RENDER_MAX_CASCADES  4u
 #define RENDER_VIEW_SHIFT    20u // shadow instance stream entry: instance | view << 20
@@ -306,5 +306,12 @@ struct RenderFrame
                            // and a the transmittance, from the camera to the far side of each slice; nullptr: no fog
     float    fogParams[4]; // view depth z lies at slice p = log2(z * x + 1) * y (slice k's far side at p = k + 1); z 1 / slices
     float    fogUv[2];     // render uv times these: the volume's xy (it may reach past the view's right and bottom edges)
+    // Frame v19. The height fog for rays the froxels don't hold (probe captures, reflections and their sky, ray-traced
+    // reflections), which take it analytically along the ray: the exact optical depth, the sun (unshadowed) and the sky's
+    // mean light scattered in. Set by fog_prepare; fogMedium[0] 0 without fog.
+    float    fogMedium[4]; // x density (1/m) at and below z (base height, m), y falloff above it (1/m), w anisotropy g
+    float    fogAlbedo[4]; // rgb scattering albedo, w the fog's range (m): how much of it a ray that leaves (the sky) crosses
+    uint32_t fogShadowMaps; // set by the core before rt_pick while renderer_fog runs: renderer_shadows keeps the sun's
+                            // cascades and traced lights' tiles even when renderer_rt traces them (the fog reads the maps)
 };
 #define RENDER_RT_MISS 60000.0f

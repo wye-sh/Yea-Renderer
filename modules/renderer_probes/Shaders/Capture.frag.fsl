@@ -12,6 +12,37 @@ STRUCT(VSOutput)
     DATA(FLAT(uint), View, TEXCOORD3);
 };
 
+// The height fog between the probe and P (the core's applyHeightFog in Lighting.h.fsl: exact optical depth, the sun
+// unshadowed and the sky's mean light scattered in).
+float fogHeightIntegral(float h, float rho, float k)
+{
+    if (h <= 0.0 || k < 1e-5)
+        return rho * h;
+    return rho * (1.0 - exp(-k * h)) / k;
+}
+
+float3 applyHeightFog(float3 color, float3 O, float3 d, float t)
+{
+    float4 m = gCapture.fogMedium;
+    float  h0 = O.y - m.z;
+    float  depth;
+    if (abs(d.y) < 1e-4)
+        depth = m.x * exp(-m.y * max(h0, 0.0)) * t;
+    else
+        depth = (fogHeightIntegral(h0 + d.y * t, m.x, m.y) - fogHeightIntegral(h0, m.x, m.y)) / d.y;
+    float  T = exp(-max(depth, 0.0));
+    float3 sky = gCapture.counts.y != 0u ? max(gSkySh[0].rgb, float3(0.0, 0.0, 0.0)) * 0.282095
+                                         : (gCapture.skyHorizon.rgb * 0.5 + gCapture.skyZenith.rgb * (2.0 / 3.0) + gCapture.skyGround.rgb * (5.0 / 6.0)) * 0.5;
+    float3 L = sky * gCapture.skyGround.w;
+    if (gCapture.sunDir.w > 0.0)
+    {
+        float g = m.w, c = dot(d, gCapture.sunDir.xyz);
+        float q = max(1.0 + g * g - 2.0 * g * c, 1e-4);
+        L += gCapture.sunColor.rgb * ((1.0 - g * g) / (4.0 * 3.14159265 * q * sqrt(q)));
+    }
+    return color * T + gCapture.fogAlbedo.rgb * L * (1.0 - T);
+}
+
 ROOT_SIGNATURE(DefaultRootSignature)
 float4 PS_MAIN(VSOutput In)
 {
@@ -57,5 +88,11 @@ float4 PS_MAIN(VSOutput In)
         light += l.color.rgb * (e * saturate(dot(N, L)));
     }
     c += diffuse * (1.0 / 3.14159265) * light + m.emissive.rgb;
+    if (gCapture.fogMedium.x > 0.0)
+    {
+        float3 toP = P - gViews[In.View].eye.xyz;
+        float  t = length(toP);
+        c = applyHeightFog(c, gViews[In.View].eye.xyz, toP / max(t, 1e-6), t);
+    }
     RETURN(float4(c, 1.0));
 }

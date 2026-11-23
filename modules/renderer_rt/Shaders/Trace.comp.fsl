@@ -278,6 +278,39 @@ float ggxD(float NoH, float a2)
 
 float smithG1(float NoV, float a2) { return 2.0 * NoV / (NoV + sqrt(a2 + (1.0 - a2) * NoV * NoV)); }
 
+// renderer_fog's height fog along a reflected ray (the core's applyHeightFog in Lighting.h.fsl: exact optical depth, the
+// sun unshadowed and the sky's mean light scattered in), over length t from O along unit d.
+float fogHeightIntegral(float h, float rho, float k)
+{
+    if (h <= 0.0 || k < 1e-5)
+        return rho * h;
+    return rho * (1.0 - exp(-k * h)) / k;
+}
+
+float3 applyHeightFog(float3 color, float3 O, float3 d, float t)
+{
+    float4 m = gRt.fogMedium;
+    if (m.x <= 0.0)
+        return color;
+    float  h0 = O.y - m.z;
+    float  depth;
+    if (abs(d.y) < 1e-4)
+        depth = m.x * exp(-m.y * max(h0, 0.0)) * t;
+    else
+        depth = (fogHeightIntegral(h0 + d.y * t, m.x, m.y) - fogHeightIntegral(h0, m.x, m.y)) / d.y;
+    float  T = exp(-max(depth, 0.0));
+    float3 sky = gRt.sky.x > 0.5 ? max(gSkySh[0].rgb, float3(0.0, 0.0, 0.0)) * 0.282095
+                                 : (gRt.skyHorizon.rgb * 0.5 + gRt.skyZenith.rgb * (2.0 / 3.0) + gRt.skyGround.rgb * (5.0 / 6.0)) * 0.5;
+    float3 L = sky * gRt.sunColor.w;
+    if (gRt.sunDir.w > 0.0)
+    {
+        float g = m.w, c = dot(d, gRt.sunDir.xyz);
+        float q = max(1.0 + g * g - 2.0 * g * c, 1e-4);
+        L += gRt.sunColor.rgb * ((1.0 - g * g) / (4.0 * PI * q * sqrt(q)));
+    }
+    return color * T + gRt.fogAlbedo.rgb * L * (1.0 - T);
+}
+
 STRUCT(Hit)
 {
     DATA(float4, result, None); // the finished sample (rgb, a distance; 0: not traced, RT_MISS: the sky); a < 0: light it
@@ -343,7 +376,7 @@ Hit traceRay(int2 p, float4 surface, float d, uint seq)
     bool debug = (gRt.counts.z & FLAG_DEBUG) != 0u;
     if (!RayQueryIsHit(hit))
     {
-        float3 sky = skyRadiance(R) * gRt.sunColor.w;
+        float3 sky = applyHeightFog(skyRadiance(R) * gRt.sunColor.w, ray.Origin, R, gRt.fogAlbedo.w);
         o.result = float4(debug ? float3(0.5, 0.5, 0.5) : clampSample(sky), RT_MISS);
         return o;
     }
@@ -410,6 +443,8 @@ float4 lightHit(float4 pos, float4 normal, float4 ray, float3 screen, uint mater
     // The maps' filter turned per pixel and frame, as the core's (TAA averages it).
     float  phi = noise2(float2(p) + float(gRt.counts.y % 64u) * 5.588238) * 2.0 * PI;
     float3 lit = shadeHit(pos.xyz, normal.xyz, -ray.xyz, gMaterials[material], float2(cos(phi), sin(phi)));
+    // The fog between the reflecting surface and the hit (what the screen shows of it already holds the camera's).
+    lit = applyHeightFog(lit, pos.xyz - ray.xyz * pos.w, ray.xyz, pos.w);
     float3 color = lerp(lit, screen, ray.w);
     if ((gRt.counts.z & FLAG_DEBUG) != 0u)
         color = float3(0.0, ray.w, 1.0 - ray.w);
