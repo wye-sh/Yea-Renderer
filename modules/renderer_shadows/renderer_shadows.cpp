@@ -6,6 +6,8 @@
 #include "frame.h"
 #include "mathx.h"
 
+#include <stdio.h>
+
 #include <Common_3/Graphics/Interfaces/IGraphics.h>
 #include <Common_3/Resources/ResourceLoader/Interfaces/IResourceLoader.h>
 #include <Common_3/Graphics/FSL/defaults.h>
@@ -35,8 +37,10 @@ struct Group
     uint64_t              seen;
     float                 key[9];
     RenderGpuShadowView views[6];
-    uint32_t              cells;  // each face's square, in cells per side (0: none held)
-    uint32_t              nfaces; // squares held
+    uint8_t               k[6];   // each face's square, in cells per side (sized by its own footprint on screen)
+    uint32_t              nfaces; // squares held (0: none)
+    float                 need[6];  // texels each face wants (faceWant), refreshed a few lights a frame
+    uint32_t              needOk;   // need[] filled
     uint8_t               cx[6], cy[6];
 };
 
@@ -74,6 +78,7 @@ uint32_t              gSunValid; // bit per cascade: drawn and kept since
 uint32_t              gSunDirty; // bit per cascade: to draw this frame
 RenderGpuShadowView gSunDrawn[kSunViews];
 uint64_t              gSunSig[kSunViews];
+uint32_t gNeedCursor; // the next light whose faces' needs are refreshed
 uint32_t gPending[kGroups];
 uint32_t gPendingCount;
 uint32_t gStreamUsed;
@@ -134,30 +139,43 @@ bool cellsAlloc(uint32_t k, uint32_t* x, uint32_t* y)
 void groupFree(Group& g)
 {
     for (uint32_t f = 0; f < g.nfaces; ++f)
-        cellsMark(g.cx[f], g.cy[f], g.cells, false);
-    g.cells = g.nfaces = 0;
+        cellsMark(g.cx[f], g.cy[f], g.k[f], false);
+    g.nfaces = 0;
+    memset(g.k, 0, sizeof g.k);
 }
 
-// Squares for a group's faces, at k cells per side or the largest smaller size that fits.
-bool groupAlloc(Group& g, uint32_t faces, uint32_t k)
+// A square for each of a group's faces at its size in k (cells per side), largest first so they pack, each at the
+// largest smaller size that fits when its own doesn't.
+bool groupAlloc(Group& g, uint32_t faces, const uint32_t* k)
 {
     groupFree(g);
-    for (; k >= 1; k /= 2)
+    uint32_t order[6];
+    for (uint32_t f = 0; f < faces; ++f)
     {
-        uint32_t f = 0, x, y;
-        for (; f < faces && cellsAlloc(k, &x, &y); ++f)
-        {
-            cellsMark(x, y, k, true);
-            g.cx[f] = (uint8_t)x;
-            g.cy[f] = (uint8_t)y;
-        }
-        g.cells = k;
-        g.nfaces = f;
-        if (f == faces)
-            return true;
-        groupFree(g);
+        uint32_t i = f;
+        for (; i > 0 && k[order[i - 1]] < k[f]; --i)
+            order[i] = order[i - 1];
+        order[i] = f;
     }
-    return false;
+    for (uint32_t i = 0; i < faces; ++i)
+    {
+        uint32_t f = order[i], x = 0, y = 0, c = k[f];
+        while (c >= 1 && !cellsAlloc(c, &x, &y))
+            c /= 2;
+        if (!c)
+        {
+            for (uint32_t j = 0; j < i; ++j)
+                cellsMark(g.cx[order[j]], g.cy[order[j]], g.k[order[j]], false);
+            memset(g.k, 0, sizeof g.k);
+            return false;
+        }
+        cellsMark(x, y, c, true);
+        g.cx[f] = (uint8_t)x;
+        g.cy[f] = (uint8_t)y;
+        g.k[f] = (uint8_t)c;
+    }
+    g.nfaces = faces;
+    return true;
 }
 
 uint32_t pow2Floor(uint32_t v)
@@ -316,16 +334,194 @@ void lightKey(const RenderLight& l, float key[9])
     key[8] = (float)l.type;
 }
 
+// When the faces' sizes change, at most every 20 s: how many faces hold each size, and how full the atlas is.
+uint64_t gLogFrame;
+uint32_t gLogSizes[5];
+uint32_t gWanted; // cells the faces wanted this frame, before they were fitted into the atlas
+void logAtlas(uint64_t frame)
+{
+    uint32_t sizes[5] = {}, used = 0;
+    for (const Group& g : gGroups)
+        for (uint32_t f = 0; f < g.nfaces; ++f)
+        {
+            uint32_t i = 0;
+            while ((2u << i) <= g.k[f] && i < 4)
+                ++i;
+            sizes[i]++;
+            used += g.k[f] * g.k[f];
+        }
+    if (!memcmp(sizes, gLogSizes, sizeof sizes) || (gLogFrame && frame < gLogFrame + 1200))
+        return;
+    memcpy(gLogSizes, sizes, sizeof sizes);
+    gLogFrame = frame;
+    char line[160];
+    snprintf(line, sizeof line, "renderer_shadows: light faces at 128/256/512/1024/2048: %u/%u/%u/%u/%u; local atlas %u%% full (%u), %u%% wanted",
+             sizes[0], sizes[1], sizes[2], sizes[3], sizes[4], gSide ? used * 100 / (gSide * gSide) : 0, gSide * kCell,
+             gSide ? gWanted * 100 / (gSide * gSide) : 0);
+    yea::log(line);
+}
+
+// Clips s to where a + b * s >= 0.
+void clipRay(float a, float b, float* s0, float* s1)
+{
+    if (b > 0.0f)
+        *s0 = maxf(*s0, -a / b);
+    else if (b < 0.0f)
+        *s1 = minf(*s1, -a / b);
+    else if (a < 0.0f)
+        *s1 = -1.0f;
+}
+
+// A caster seen by the camera, as a receiver of light shadows: its mesh's bounding sphere through its instance's
+// transform, an ellipsoid (a floor is a flat disc, not a sphere around it).
+struct Receiver
+{
+    v3    c;       // world centre
+    float r;       // world bounding sphere's radius
+    float inv[9];  // world -> object, rows
+    float radius;  // object units
+};
+const uint32_t kReceivers = 1024;
+Receiver       gRecv[kReceivers];
+uint32_t       gRecvCount;
+bool           gRecvAll; // every caster in view fitted
+
+// The casters the camera sees, each with its inverse transform.
+void gatherReceivers(const RenderFrame* F, const mx::Plane* frustum)
+{
+    gRecvCount = 0;
+    gRecvAll = true;
+    uint32_t meshes = renderer::Meshes.size();
+    for (uint32_t i = 0; i < F->casterCount; ++i)
+    {
+        const RenderCaster& k = F->casters[i];
+        v3                  c = V(k.sphere[0], k.sphere[1], k.sphere[2]);
+        if (k.instance >= F->instanceCount || k.mesh >= meshes || !sphereInside(frustum, 5, c, k.sphere[3]))
+            continue;
+        if (gRecvCount == kReceivers)
+        {
+            gRecvAll = false;
+            break;
+        }
+        const float(*m)[4] = F->instanceRows[k.instance].row;
+        float a = m[0][0], b = m[0][1], cc = m[0][2], d = m[1][0], e = m[1][1], f = m[1][2], g = m[2][0], h = m[2][1], q = m[2][2];
+        float A = e * q - f * h, B = f * g - d * q, C = d * h - e * g, det = a * A + b * B + cc * C;
+        if (fabsf(det) < 1e-12f)
+            continue;
+        float     s = 1.0f / det;
+        Receiver& o = gRecv[gRecvCount++];
+        o.c = c;
+        o.r = k.sphere[3];
+        o.radius = renderer::Meshes[k.mesh].radius;
+        float inv[9] = { A * s, (cc * h - b * q) * s, (b * f - cc * e) * s, B * s, (a * q - cc * g) * s, (cc * d - a * f) * s,
+                         C * s, (b * g - a * h) * s, (a * e - b * d) * s };
+        memcpy(o.inv, inv, sizeof inv);
+    }
+}
+
+// The texels across a face (from the light at p along dir, half-angle tangent t, out to range) that match the screen's
+// pixels where the face's texels are largest on what the camera sees. A texel s from the light is 2 * t * s / texels
+// across and a pixel z deep is z / focal, so a face wants 2 * t * focal * s / z texels at its largest s / z over the
+// receivers in it: the casters in view (recv, those within the light's range), where a 5 x 5 grid of rays across the
+// face meets them inside the camera's view and the light's range, plus the centres of casters too small for the rays to
+// be sure of. Empty space never asks for texels: a face over nothing but air keeps the smallest square. 0: no receiver
+// in view; -1: the camera sees none of the face.
+float faceWant(const RenderFrame* F, v3 p, v3 dir, float t, float range, float focal, const uint32_t* recv, uint32_t recvCount)
+{
+    auto toView = [&](v3 q, float w) {
+        return V(F->view[0][0] * q.x + F->view[0][1] * q.y + F->view[0][2] * q.z + F->view[0][3] * w,
+                 F->view[1][0] * q.x + F->view[1][1] * q.y + F->view[1][2] * q.z + F->view[1][3] * w,
+                 F->view[2][0] * q.x + F->view[2][1] * q.y + F->view[2][2] * q.z + F->view[2][3] * w);
+    };
+    // The camera's view: z >= near and |x| * p00 <= z, |y| * p11 <= z, each as a + b * s >= 0 along a ray.
+    v3    o = toView(p, 1.0f), right, up;
+    float px = F->p00, py = F->p11, nearZ = F->nearZ;
+    basis(dir, &right, &up);
+    // Nothing of the face in view: its pyramid (light, then the four corners at range) wholly outside one side.
+    v3 corner[4];
+    for (uint32_t c = 0; c < 4; ++c)
+        corner[c] = toView((dir + right * (c & 1 ? t : -t) + up * (c & 2 ? t : -t)) * range, 0.0f) + o;
+    for (uint32_t side = 0; side < 5; ++side)
+    {
+        auto inside = [&](v3 q) {
+            float v[5] = { q.z - nearZ, q.z - px * q.x, q.z + px * q.x, q.z - py * q.y, q.z + py * q.y };
+            return v[side] >= 0.0f;
+        };
+        bool any = inside(o);
+        for (uint32_t c = 0; c < 4 && !any; ++c)
+            any = inside(corner[c]);
+        if (!any)
+            return -1.0f;
+    }
+    // The receivers that reach into the face: their spheres against its four side planes.
+    uint32_t mine[kReceivers], count = 0;
+    v3       side[4] = { normalize(dir * t - right), normalize(dir * t + right), normalize(dir * t - up), normalize(dir * t + up) };
+    for (uint32_t i = 0; i < recvCount; ++i)
+    {
+        const Receiver& r = gRecv[recv[i]];
+        v3              d = r.c - p;
+        bool            in = dot(d, dir) > -r.r;
+        for (uint32_t k = 0; k < 4 && in; ++k)
+            in = dot(d, side[k]) > -r.r;
+        if (in)
+            mine[count++] = recv[i];
+    }
+    float best = 0.0f;
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        // A small one by its centre, at its nearest depth.
+        const Receiver& r = gRecv[mine[i]];
+        v3              d = r.c - p;
+        float           dist = length(d);
+        if (r.r > 0.25f * dist || dist > range || dot(d, dir) * t < fmaxf(fabsf(dot(d, right)), fabsf(dot(d, up))))
+            continue;
+        v3 q = toView(r.c, 1.0f);
+        if (q.z - r.r > nearZ && fabsf(q.x) * px <= q.z + r.r * px && fabsf(q.y) * py <= q.z + r.r * py)
+            best = maxf(best, dist / (q.z - r.r));
+    }
+    for (int i = 0; i < 5; ++i)
+        for (int k = 0; k < 5; ++k)
+        {
+            v3    rw = normalize(dir + right * (t * (i * 0.5f - 1.0f)) + up * (t * (k * 0.5f - 1.0f)));
+            v3    r = toView(rw, 0.0f);
+            float s0 = 0.0f, s1 = range;
+            clipRay(o.z - nearZ, r.z, &s0, &s1);
+            clipRay(o.z - px * o.x, r.z - px * r.x, &s0, &s1);
+            clipRay(o.z + px * o.x, r.z + px * r.x, &s0, &s1);
+            clipRay(o.z - py * o.y, r.z - py * r.y, &s0, &s1);
+            clipRay(o.z + py * o.y, r.z + py * r.y, &s0, &s1);
+            if (s0 > s1)
+                continue;
+            for (uint32_t j = 0; j < count; ++j)
+            {
+                // Where the ray is inside the receiver's ellipsoid: |inv (p + s rw - c)| <= radius.
+                const Receiver& e = gRecv[mine[j]];
+                v3              po = p - e.c;
+                const float*    m = e.inv;
+                v3              a = V(m[0] * po.x + m[1] * po.y + m[2] * po.z, m[3] * po.x + m[4] * po.y + m[5] * po.z, m[6] * po.x + m[7] * po.y + m[8] * po.z);
+                v3              b = V(m[0] * rw.x + m[1] * rw.y + m[2] * rw.z, m[3] * rw.x + m[4] * rw.y + m[5] * rw.z, m[6] * rw.x + m[7] * rw.y + m[8] * rw.z);
+                float           A = dot(b, b), B = dot(a, b), C = dot(a, a) - e.radius * e.radius, disc = B * B - A * C;
+                if (disc < 0.0f || A <= 0.0f)
+                    continue;
+                float sq = sqrtf(disc), e0 = maxf((-B - sq) / A, s0), e1 = minf((-B + sq) / A, s1);
+                if (e0 > e1)
+                    continue;
+                best = maxf(best, maxf(e0 / (o.z + r.z * e0), e1 / (o.z + r.z * e1)));
+            }
+        }
+    return 2.0f * t * focal * best;
+}
+
 void buildLocalViews(Group& g, const RenderLight& l)
 {
-    float tileRes = (float)(g.cells * kCell), atlas = (float)(gSide * kCell);
+    float atlas = (float)(gSide * kCell);
     v3    p = V(l.pos[0], l.pos[1], l.pos[2]);
     float nearZ = clampf(l.range * 0.005f, 0.01f, 0.2f);
     g.faces = l.type == 1 ? 6 : 1;
     for (uint32_t f = 0; f < g.faces; ++f)
     {
         RenderGpuShadowView& v = g.views[f];
-        float                  tanHalf;
+        float                  tanHalf, tileRes = (float)(g.k[f] * kCell);
         if (l.type == 1)
         {
             // Past 90 degrees by the widest filter the shader may use at the face's edge (where it switches faces),
@@ -703,7 +899,7 @@ bool shadows_prepare(uint64_t address)
     }
     // Lights no longer shadowed give their squares back.
     for (Group& g : gGroups)
-        if (!g.used && g.cells)
+        if (!g.used && g.nfaces)
         {
             groupFree(g);
             g.valid = 0;
@@ -723,54 +919,123 @@ bool shadows_prepare(uint64_t address)
         groupOf[j] = (int32_t)best;
     }
 
-    // --- Tile sizes: texels matched to screen pixels where the light's reach is ------------------
-    // A face spans twice the light's range; seen from the camera that is 2 * r pixels across, so it
-    // wants about 2 * r texels. Sizes change only when the wanted one doubles or halves, the largest
-    // are halved until all fit 90% of the atlas, and only as many
-    // lights are moved to new squares as are redrawn this frame, so none loses its shadow meanwhile.
+    // --- Tile sizes: each face's texels matched to the screen's pixels where it shows ----------------
+    // Each face is sized on its own by its footprint on screen (faceWant), so the faces over what the camera sees
+    // get the texels and those it can't see keep the smallest square (still drawn: reflections and ray-traced
+    // shadows read them). A face's size changes only when the wanted one doubles or halves, so sizes don't pop as
+    // lights move; the largest are halved until all fit 90% of the atlas, and only as many lights are moved to
+    // new squares as are redrawn this frame, so none loses its shadow meanwhile.
     uint32_t budget = clampu(settings.updates_per_frame, 1, kGroups);
-    uint32_t target[kGroups];
+    uint32_t target[kGroups][6];
+    float    need[kGroups][6]; // cells wanted
     {
         uint32_t maxCells = clampu((int32_t)(pow2Floor(clampu(settings.max_tile_resolution, kCell, 2048)) / kCell), 1, gSide);
         float    focal = F->p11 * (float)F->displayHeight * 0.5f; // the shown size, so tiles keep their size at any render scale
         uint32_t area = 0;
+        mx::Plane frustum[6];
+        {
+            float vp[4][4], proj[4][4] = { { F->p00, 0, 0, 0 }, { 0, F->p11, 0, 0 }, { 0, 0, 0, F->nearZ }, { 0, 0, 1, 0 } };
+            float view[4][4] = { { F->view[0][0], F->view[0][1], F->view[0][2], F->view[0][3] },
+                                 { F->view[1][0], F->view[1][1], F->view[1][2], F->view[1][3] },
+                                 { F->view[2][0], F->view[2][1], F->view[2][2], F->view[2][3] },
+                                 { 0, 0, 0, 1 } };
+            mul(proj, view, vp);
+            clipPlanes(vp, frustum);
+            frustum[4] = frustum[5]; // reversed-Z: the sixth is the near plane, the fifth degenerate
+        }
+        // The faces' needs cost rays against receivers: lights new to a group at once, and four more a frame in turn.
+        // Sizes change only when a need doubles or halves, so a few frames' wait never shows.
+        bool     gathered = false;
+        uint32_t refresh = 4, start = pickedCount ? gNeedCursor % pickedCount : 0;
+        for (uint32_t n = 0; n < pickedCount; ++n)
+        {
+            uint32_t           j = (start + n) % pickedCount;
+            Group&             g = gGroups[groupOf[j]];
+            if (g.needOk && !refresh)
+                continue;
+            if (g.needOk)
+                refresh--;
+            if (!gathered)
+                gatherReceivers(F, frustum);
+            gathered = true;
+            const RenderLight& l = F->lights[picked[j]];
+            v3       p = V(l.pos[0], l.pos[1], l.pos[2]);
+            uint32_t recv[kReceivers], recvCount = 0;
+            for (uint32_t i = 0; i < gRecvCount; ++i)
+                if (length(gRecv[i].c - p) < l.range + gRecv[i].r)
+                    recv[recvCount++] = i;
+            // Past the receivers fitted (gatherReceivers), or too many in reach for the rays, the whole light's size on
+            // screen for every face it shows.
+            float whole = gRecvAll && recvCount <= 64 ? -1.0f : 2.0f * l.range * focal / maxf(length(p - camPos), l.range);
+            for (uint32_t f = 0; f < (l.type == 1 ? 6u : 1u); ++f)
+            {
+                v3    dir = l.type == 1 ? kFaces[f] : normalize(V(l.dir[0], l.dir[1], l.dir[2]));
+                float t = l.type == 1 ? 1.0f : tanf(minf(acosf(clampf(l.cosOuter, -1, 1)) * 1.05f + 0.02f, 1.48f));
+                float want = faceWant(F, p, dir, t, l.range, focal, recv, whole >= 0.0f ? 0 : recvCount);
+                g.need[f] = want < 0.0f ? 0.0f : whole >= 0.0f ? whole : want;
+            }
+            g.needOk = 1;
+        }
+        gNeedCursor = start + 4;
         for (uint32_t j = 0; j < pickedCount; ++j)
         {
             const RenderLight& l = F->lights[picked[j]];
             const Group&       g = gGroups[groupOf[j]];
-            float dist = length(V(l.pos[0], l.pos[1], l.pos[2]) - camPos);
-            float want = maxf(2.0f * l.range * focal / maxf(dist, l.range) / (float)kCell, 1.0f);
-            uint32_t k = pow2Floor((uint32_t)want);
-            if (g.cells && want < g.cells * 2.0f)
-                k = want >= g.cells * 0.5f ? g.cells : k * 2; // shrink one step at a time
-            target[j] = k < maxCells ? k : maxCells;
-            area += (l.type == 1 ? 6 : 1) * target[j] * target[j];
+            uint32_t faces = l.type == 1 ? 6 : 1;
+            bool shown[6] = {};
+            for (uint32_t f = 0; f < faces; ++f)
+            {
+                float want = g.need[f] * 2.0f / (float)kCell; // two texels a pixel: a filtered edge as sharp as the screen shows it
+                need[j][f] = want;
+                uint32_t k = want >= 1.0f ? pow2Floor((uint32_t)want) : 1;
+                uint32_t held = g.nfaces == faces ? g.k[f] : 0;
+                if (held && want > 0.0f && want < held * 2.0f)
+                    k = want >= held * 0.5f ? held : k * 2; // shrink with a margin, so it doesn't grow straight back
+                target[j][f] = k < maxCells ? k : maxCells;
+                shown[f] = want > 0.0f;
+            }
+            // A shown face at least half its largest neighbour (every face but the opposite one), so a shadow's
+            // sharpness changes by at most one step across a seam.
+            for (uint32_t pass = 0; pass < 2 && faces == 6; ++pass)
+                for (uint32_t f = 0; f < 6; ++f)
+                    for (uint32_t n = 0; n < 6 && shown[f]; ++n)
+                        if (n / 2 != f / 2 && target[j][f] * 2 < target[j][n])
+                            target[j][f] = target[j][n] / 2;
+            for (uint32_t f = 0; f < faces; ++f)
+                area += target[j][f] * target[j][f];
         }
         uint32_t capacity = gSide * gSide * 9 / 10;
+        gWanted = area;
         while (area > capacity)
         {
-            int32_t pick = -1;
+            // The face with the most texels for what it needs gives way, so all end at about the same texels a
+            // pixel; one growing before one keeping its size, then the dimmer light's.
+            int32_t  pj = -1;
+            uint32_t pf = 0;
+            float    worst = 0.0f;
             for (uint32_t j = 0; j < pickedCount; ++j)
             {
-                if (target[j] <= 1)
-                    continue;
-                if (pick < 0 || target[j] > target[pick])
+                const Group& g = gGroups[groupOf[j]];
+                uint32_t     faces = F->lights[picked[j]].type == 1 ? 6 : 1;
+                for (uint32_t f = 0; f < faces; ++f)
                 {
-                    pick = (int32_t)j;
-                    continue;
+                    uint32_t tk = target[j][f];
+                    if (tk <= 1)
+                        continue;
+                    float over = (float)tk / maxf(need[j][f], 0.01f) * (tk > (g.nfaces == faces ? g.k[f] : 0u) ? 2.0f : 1.0f);
+                    if (pj < 0 || over > worst || (over == worst && pickedScore[j] < pickedScore[pj]))
+                    {
+                        pj = (int32_t)j;
+                        pf = f;
+                        worst = over;
+                    }
                 }
-                if (target[j] < target[pick])
-                    continue;
-                // Same size: keep lights at the size they have; then the dimmest gives way.
-                bool growJ = target[j] > gGroups[groupOf[j]].cells, growP = target[pick] > gGroups[groupOf[pick]].cells;
-                if ((growJ && !growP) || (growJ == growP && pickedScore[j] < pickedScore[pick]))
-                    pick = (int32_t)j;
             }
-            if (pick < 0)
+            if (pj < 0)
                 break;
-            uint32_t faces = F->lights[picked[pick]].type == 1 ? 6 : 1;
-            area -= faces * (target[pick] * target[pick] - target[pick] * target[pick] / 4);
-            target[pick] /= 2;
+            uint32_t tk = target[pj][pf];
+            area -= tk * tk - tk * tk / 4;
+            target[pj][pf] = tk / 2;
         }
     }
     uint32_t moved = 0;
@@ -780,7 +1045,10 @@ bool shadows_prepare(uint64_t address)
             // Lights without a shadow first, then those changing size.
             Group&   g = gGroups[groupOf[j]];
             uint32_t faces = F->lights[picked[j]].type == 1 ? 6 : 1;
-            if ((pass == 0) != (g.valid == 0) || (g.cells == target[j] && g.nfaces == faces))
+            bool     same = g.nfaces == faces;
+            for (uint32_t f = 0; f < faces && same; ++f)
+                same = g.k[f] == target[j][f];
+            if ((pass == 0) != (g.valid == 0) || same)
                 continue;
             if (pass == 1)
                 groupFree(g); // its squares can be part of the new ones
@@ -788,6 +1056,7 @@ bool shadows_prepare(uint64_t address)
             if (groupAlloc(g, faces, target[j]))
                 moved++;
         }
+    logAtlas(F->frameNumber);
 
     uint64_t latestMove = 0;
     for (uint32_t i = 0; i < F->casterCount; ++i)
@@ -811,7 +1080,7 @@ bool shadows_prepare(uint64_t address)
                     stale = true;
             }
         }
-        if (stale && !gFrozen && g.cells)
+        if (stale && !gFrozen && g.nfaces)
             dirty[dirtyCount++] = j;
     }
     // The oldest shadows first (lights with none yet before all), so every moving light takes its
@@ -939,10 +1208,10 @@ void shadows_render(uint64_t address)
         for (uint32_t k = 0; k < gPendingCount; ++k)
         {
             const Group& g = gGroups[gPending[k]];
-            float        tile = (float)(g.cells * kCell);
             for (uint32_t f = 0; f < g.faces; ++f)
             {
                 uint32_t idx = gPending[k] * 6 + f;
+                float    tile = (float)(g.k[f] * kCell);
                 float    x = (float)(g.cx[f] * kCell), y = (float)(g.cy[f] * kCell);
                 cmdSetViewport(cmd, x, y, tile, tile, 0, 1);
                 cmdSetScissor(cmd, (uint32_t)x, (uint32_t)y, (uint32_t)tile, (uint32_t)tile);

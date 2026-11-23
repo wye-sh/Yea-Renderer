@@ -1,7 +1,7 @@
 {
  "name": "renderer",
  "title": "Renderer",
- "version": "3.6.3",
+ "version": "3.6.4",
  "source": "https://github.com/wye-sh/Yea-Renderer",
  "summary": "Yea's 3D rendering engine to drop into a view: PBR materials, a coloured sun, point and spot lights, light culling in compute, cascaded and cached local shadows, ambient occlusion, contact shadows, reflection probes, ray-traced and screen-space reflections, variable-rate shading, temporal antialiasing, FSR and DLSS upscaling, auto exposure and tonemapping, with every part tunable in F1.",
  "license": "MIT",

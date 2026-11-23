@@ -13,9 +13,14 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   tile depth range from the prepass). Switch off: every pixel loops all visible lights (capped at 256).
 - `renderer_shadows`: sun cascades (stabilised, PCF or PCSS; each redrawn only when its view or a caster over it
   changed) and a cached atlas for spot and point lights
-  (6 tiles per point light), redrawn only when the light or a nearby caster moves. Tiles are squares of
-  128 to max_tile_resolution px, sized to the light's reach on screen and halved, largest first, until
-  all fit 90% of the atlas; a light changes size only when its wanted size doubles or halves.
+  (6 tiles per point light), redrawn only when the light or a nearby caster moves. Each face's tile is a square of
+  128 to max_tile_resolution px, sized on its own (`faceWant`) to 2 texels a pixel where its texels are largest on
+  what the camera sees of it: rays across the face against the visible casters (the receivers, each its mesh's sphere
+  through its transform, an ellipsoid), so faces over air or off screen keep 128 (still drawn, for reflections and
+  ray-traced shadows; drawables that don't cast count for nothing). Needs are cached, four lights refreshed a frame.
+  A face changes size only when its need doubles or halves, a shown face stays at least half its neighbours', and
+  the most over-served face is halved until all fit 90% of the atlas. It logs the sizes, the atlas fill and what the
+  faces wanted when they change (at most every 20 s).
   Sampling (in the core's Lighting.h.fsl): every filter tap compares against the receiver's own depth
   there (receiver-plane bias: the surface's tangent plane carried into the view's ndc by the first three
   columns of its inverse, `inv` in the shadow view, three dot products; no screen derivatives, as lights are
