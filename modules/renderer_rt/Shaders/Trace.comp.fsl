@@ -24,6 +24,15 @@ STRUCT(MaterialData)
     DATA(float4, emissive, None);
 };
 
+STRUCT(MaterialMapData) // the core's (renderer's Shaders/Common.h.fsl): base colour slot + 1 in maps.x, its factor's
+{                       // alpha in baseFactor.a, misc.x the alpha cutoff, misc.y 1 when the maps were given
+    DATA(uint4, maps, None);
+    DATA(float4, baseFactor, None);
+    DATA(float4, factors, None);
+    DATA(float4, misc, None);
+};
+#define MAX_TEXTURES 1024
+
 STRUCT(LightData)
 {
     DATA(float4, pos, None);     // xyz, w range
@@ -49,6 +58,7 @@ STRUCT(ShadowView)
 
 #include "Trace.srt.h"
 #include "Shadow.h.fsl"
+#include "Cutout.h.fsl"
 
 #define PI 3.14159265
 #define RT_MISS 60000.0
@@ -61,11 +71,11 @@ STRUCT(ShadowView)
 #define SHADOWS_OFF 2u   // none
 #define MAX_HIT_LIGHTS 64u
 #define MAX_SHADOW_RAYS 8u
-// Every instance is opaque triangles: no procedural primitives to test for (only Direct3D 12 has the flag).
+// Triangles only: no procedural primitives to test for. Opacity comes from the instances (Cutout.h.fsl).
 #if defined(RAY_FLAG_SKIP_AABB)
-#define RT_RAY_FLAGS (RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_AABB)
+#define RT_RAY_FLAGS RAY_FLAG_SKIP_AABB
 #else
-#define RT_RAY_FLAGS RAY_FLAG_FORCE_OPAQUE
+#define RT_RAY_FLAGS RAY_FLAG_NONE
 #endif
 
 float noise2(float2 p) { return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715)))); }
@@ -192,6 +202,13 @@ float lightVisible(float3 P, float3 L, float tMax)
     shadowRay.TMin = 0.0;
     shadowRay.TMax = tMax;
     RayQueryAnyHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RT_RAY_FLAGS, shadowRay, 2u, occluded) // casters only
+    RayQueryBeginForEachCandidate(occluded)
+    {
+        if (!cutAway(RayQueryCandidateInstanceID(occluded), RayQueryCandidatePrimitiveIndex(occluded), RayQueryCandidateBarycentrics(occluded)))
+            RayQueryCommitCandidate(occluded);
+        RayQueryProceed(occluded);
+    }
+    RayQueryEndForEachCandidate(occluded)
     return RayQueryIsHit(occluded) ? 0.0 : 1.0;
 }
 
@@ -372,6 +389,13 @@ Hit traceRay(int2 p, float4 surface, float d, uint seq)
     ray.TMin = 0.0;
     ray.TMax = gRt.params.x;
     RayQueryClosestHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RT_RAY_FLAGS, ray, 1u, hit)
+    RayQueryBeginForEachCandidate(hit)
+    {
+        if (!cutAway(RayQueryCandidateInstanceID(hit), RayQueryCandidatePrimitiveIndex(hit), RayQueryCandidateBarycentrics(hit)))
+            RayQueryCommitCandidate(hit);
+        RayQueryProceed(hit);
+    }
+    RayQueryEndForEachCandidate(hit)
     o.ray = float4(R, 0.0); // kept for the half-resolution rays' reuse
     bool debug = (gRt.counts.z & FLAG_DEBUG) != 0u;
     if (!RayQueryIsHit(hit))
@@ -982,6 +1006,13 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
         ray.TMin = 0.0;
         ray.TMax = 1000.0;
         RayQueryAnyHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RT_RAY_FLAGS, ray, 2u, sunHit)
+        RayQueryBeginForEachCandidate(sunHit)
+        {
+            if (!cutAway(RayQueryCandidateInstanceID(sunHit), RayQueryCandidatePrimitiveIndex(sunHit), RayQueryCandidateBarycentrics(sunHit)))
+                RayQueryCommitCandidate(sunHit);
+            RayQueryProceed(sunHit);
+        }
+        RayQueryEndForEachCandidate(sunHit)
         hits += RayQueryIsHit(sunHit) ? 1u : 0u;
     }
     uint  lights = min(budget > 0u ? budget - 1u : 0u, gRt.counts.x);
@@ -1002,6 +1033,13 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
         ray.TMin = 0.0;
         ray.TMax = max(dist - radius, 0.0);
         RayQueryAnyHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RT_RAY_FLAGS, ray, 2u, probeHit)
+        RayQueryBeginForEachCandidate(probeHit)
+        {
+            if (!cutAway(RayQueryCandidateInstanceID(probeHit), RayQueryCandidatePrimitiveIndex(probeHit), RayQueryCandidateBarycentrics(probeHit)))
+                RayQueryCommitCandidate(probeHit);
+            RayQueryProceed(probeHit);
+        }
+        RayQueryEndForEachCandidate(probeHit)
         hits += RayQueryIsHit(probeHit) ? 1u : 0u;
     }
     if (hits == gRt.counts.w + 100000u) // never: at most 9 hits

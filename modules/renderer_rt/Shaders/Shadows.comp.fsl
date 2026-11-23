@@ -25,8 +25,18 @@ STRUCT(LightShape) // the core's RenderGpuLightShape
                             // kind 0 its own radius (0: none)
 };
 
+STRUCT(MaterialMapData) // as Trace.comp.fsl's (the core's)
+{
+    DATA(uint4, maps, None);
+    DATA(float4, baseFactor, None);
+    DATA(float4, factors, None);
+    DATA(float4, misc, None);
+};
+#define MAX_TEXTURES 1024
+
 #include "ShadowData.h.fsl"
 #include "Shadows.srt.h"
+#include "Cutout.h.fsl"
 
 #define PI 3.14159265
 #define NO_LIGHT 0xFFFFFFFFu
@@ -69,11 +79,11 @@ float penumbraPx(float3 P, uint4 slot, float blocker)
 }
 
 #if defined(SHADOW_TRACE)
-// Every instance is opaque triangles (as Trace.comp.fsl).
+// Triangles only; opacity from the instances (as Trace.comp.fsl).
 #if defined(RAY_FLAG_SKIP_AABB)
-#define RT_RAY_FLAGS (RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_AABB)
+#define RT_RAY_FLAGS RAY_FLAG_SKIP_AABB
 #else
-#define RT_RAY_FLAGS RAY_FLAG_FORCE_OPAQUE
+#define RT_RAY_FLAGS RAY_FLAG_NONE
 #endif
 
 uint pcgHash(uint v)
@@ -185,6 +195,13 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
             ray.TMin = 0.0;
             ray.TMax = tMax;
             RayQueryAnyHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RT_RAY_FLAGS, ray, 2u, occluder) // casters only
+            RayQueryBeginForEachCandidate(occluder)
+            {
+                if (!cutAway(RayQueryCandidateInstanceID(occluder), RayQueryCandidatePrimitiveIndex(occluder), RayQueryCandidateBarycentrics(occluder)))
+                    RayQueryCommitCandidate(occluder);
+                RayQueryProceed(occluder);
+            }
+            RayQueryEndForEachCandidate(occluder)
             if (RayQueryIsHit(occluder))
                 result = float2(0.0, max(RayQueryRayT(occluder), 1e-3));
         }

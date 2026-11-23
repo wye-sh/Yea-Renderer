@@ -95,7 +95,10 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   buffers are rewritten in place; replaced ones freed once no frame in flight uses them; hits read the normal from
   the attributes stream, octahedral) and one
   top-level structure per frame in flight, its instances rewritten with `setInstances` and rebuilt every frame
-  (mask 1 every drawable, 2 shadow casters). The core's vertex and index buffers get the device-address and
+  (mask 1 every drawable, 2 shadow casters). Instances are forced opaque except alpha-tested ones
+  (`RenderCaster.masked`, with the frame's material maps): those are non-opaque, and every ray query (reflections,
+  their shadow rays, traced shadows) loops over their candidates, cutting them out by base colour alpha at mip 0 as
+  the raster passes do (`Shaders/Cutout.h.fsl`; the material + 1 rides in gRtInstances' w). The core's vertex and index buffers get the device-address and
   build-input flags and a uint view when the service exists. While it runs, the prepass writes `surface`
   (RGBA16F: x reflection roughness, yzw the normal; renderer_vrs reads x as its gloss). After the prepass, one
   full-size compute dispatch traces each pixel below `max_roughness` along one GGX visible-normal sample (R2

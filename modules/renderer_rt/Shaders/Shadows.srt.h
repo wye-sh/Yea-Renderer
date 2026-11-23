@@ -20,5 +20,11 @@ BEGIN_SRT(ShadowSrt)
         DECL_TEXTURE(PerFrame, Tex2D(float), gPrevZ)           // temporal: last frame's view depth
         DECL_RWTEXTURE(PerFrame, RWTex2D(float), gZOut)        // temporal (first shadow): this frame's
         DECL_RWTEXTURE(PerFrame, RWTex2DArray(half), gFinal)   // filter: rtShadows (the rays' texture: free by then)
+        // trace: cut-outs (Cutout.h.fsl), as Trace.srt.h's
+        DECL_BUFFER(PerFrame, Buffer(uint4), gRtInstances)
+        DECL_BUFFER(PerFrame, Buffer(uint), gIndices)
+        DECL_BUFFER(PerFrame, Buffer(uint), gAttributes)
+        DECL_BUFFER(PerFrame, Buffer(MaterialMapData), gMaterialMaps)
+        DECL_ARRAY_TEXTURES(PerFrame, Tex2D(float4), gTextures, MAX_TEXTURES)
     END_SRT_SET(PerFrame)
 END_SRT(ShadowSrt)

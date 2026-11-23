@@ -37,5 +37,7 @@ BEGIN_SRT(RtSrt)
         DECL_RWTEXTURE(PerFrame, RWTex2D(half4), gOutHalfRay)    // trace: the same
         DECL_TEXTURE(PerFrame, Tex2D(float4), gSkyEnv)           // renderer_sky (sky.x 1): its reflection image
         DECL_BUFFER(PerFrame, Buffer(float4), gSkySh)            // and its ambient (9 SH)
+        DECL_BUFFER(PerFrame, Buffer(MaterialMapData), gMaterialMaps) // cut-outs (Cutout.h.fsl): the core's material maps
+        DECL_ARRAY_TEXTURES(PerFrame, Tex2D(float4), gTextures, MAX_TEXTURES) // and its texture maps (bound when they change)
     END_SRT_SET(PerFrame)
 END_SRT(RtSrt)

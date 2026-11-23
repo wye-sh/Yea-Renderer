@@ -15,6 +15,7 @@
 #include <Common_3/Graphics/Interfaces/IRay.h>
 #include <Common_3/Resources/ResourceLoader/Interfaces/IResourceLoader.h>
 #include <Common_3/Graphics/FSL/defaults.h>
+#define MAX_TEXTURES RENDER_MAX_TEXTURES // the SRTs' texture arrays (cut-outs)
 #include "Shaders/Trace.srt.h"
 #include "Shaders/Shadows.srt.h"
 
@@ -115,6 +116,8 @@ enum { kShadowTrace, kShadowTemporal, kShadowFilter, kShadowShaders };
 Shader*        gShShader[kShadowShaders];
 Pipeline*      gShPipe[kShadowShaders];
 DescriptorSet* gShSet; // three per frame in flight, a pass each
+// The textureVersion each set's texture maps hold (cut-outs; 0: none yet): gSet's, then gShSet's.
+uint32_t       gTexBound[kMaxFrames * 7];
 Buffer*        gShCb[kMaxFrames];
 Buffer*        gNoShapes; // bound while the core has no shape buffer (every light kind 0)
 // All SHADER_RESOURCE between frames.
@@ -758,6 +761,23 @@ bool rt_prepare(uint64_t address)
 }
 
 // The traced shadows into rtShadows (rt_run, after the top-level structure's build): rays, accumulation, filter.
+// Set `index` of `set` gets the core's material maps for cut-outs (Cutout.h.fsl), and its texture maps when they
+// changed since that set last took them (1024 of them; gTexBound[bound]). Without them, no instance is cut out.
+void bindCutouts(const RenderFrame* F, DescriptorSet* set, uint32_t index, uint32_t bound, uint32_t mapsSlot, uint32_t texSlot)
+{
+    if (!F->materialMaps || !F->textures)
+        return;
+    DescriptorData p[2] = {};
+    p[0].mIndex = mapsSlot;
+    p[0].ppBuffers = (Buffer**)&F->materialMaps;
+    p[1].mIndex = texSlot;
+    p[1].ppTextures = (Texture**)F->textures;
+    p[1].mCount = RENDER_MAX_TEXTURES;
+    bool textures = gTexBound[bound] != F->textureVersion;
+    gTexBound[bound] = F->textureVersion;
+    updateDescriptorSet(gRenderer, index, set, textures ? 2 : 1, p);
+}
+
 void traceShadows(RenderFrame* F, Cmd* cmd, uint32_t fi)
 {
     uint32_t   w = gShIndex ^ 1;
@@ -804,7 +824,7 @@ void traceShadows(RenderFrame* F, Cmd* cmd, uint32_t fi)
     Texture* depth = F->depth->pTexture;
     Texture* surface = F->surface->pTexture;
     Texture* motion = F->motion->pTexture;
-    DescriptorData p[16] = {};
+    DescriptorData p[19] = {};
     p[0].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gScene);
     p[0].ppAccelerationStructures = &gTlas[fi];
     p[1].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gSd);
@@ -837,7 +857,18 @@ void traceShadows(RenderFrame* F, Cmd* cmd, uint32_t fi)
     p[14].ppTextures = &gShN[w ^ 1];
     p[15].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gSamplesOut);
     p[15].ppTextures = &gShN[w];
-    updateDescriptorSet(gRenderer, fi * 3, gShSet, 16, p);
+    // The trace's cut-outs (Cutout.h.fsl); the other passes read none of these.
+    Buffer* indices = F->indices;
+    Buffer* attributes = F->attributes;
+    p[16].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gRtInstances);
+    p[16].ppBuffers = &gInstBuf[fi];
+    p[17].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gIndices);
+    p[17].ppBuffers = &indices;
+    p[18].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gAttributes);
+    p[18].ppBuffers = &attributes;
+    updateDescriptorSet(gRenderer, fi * 3, gShSet, 19, p);
+    bindCutouts(F, gShSet, fi * 3, kMaxFrames * 4 + fi * 3, SRT_RES_IDX(ShadowSrt, PerFrame, gMaterialMaps),
+                SRT_RES_IDX(ShadowSrt, PerFrame, gTextures));
     updateDescriptorSet(gRenderer, fi * 3 + 1, gShSet, 16, p);
     p[9].ppTextures = &gShHist[w]; // the filter reads this frame's accumulation
     p[14].ppTextures = &gShN[w];
@@ -900,8 +931,10 @@ void rt_run(uint64_t address)
         gInstBuf[fi] = makeMapped((uint64_t)gInstCapacity[fi] * 16, 16, DESCRIPTOR_TYPE_BUFFER, "renderer_rt_instances");
     }
 
-    // Instances: each live instance with its mesh's bottom-level structure (built here when new).
-    uint32_t n = 0;
+    // Instances: each live instance with its mesh's bottom-level structure (built here when new). Only alpha-tested
+    // ones are non-opaque (their rays test the cut-out, Cutout.h.fsl), and only with the core's maps to test it by.
+    const bool cutouts = F->materialMaps && F->textures;
+    uint32_t   n = 0;
     for (uint32_t i = 0; i < count; ++i)
     {
         const RenderCaster& c = F->drawables[i];
@@ -914,11 +947,12 @@ void rt_run(uint64_t address)
         memcpy(desc.mTransform, F->instanceRows[c.instance].row, sizeof desc.mTransform);
         desc.mInstanceID = n;
         desc.mInstanceMask = c.castShadow ? 3u : 1u; // 1: seen in reflections, 2: casts shadows
-        desc.mFlags = ACCELERATION_STRUCTURE_INSTANCE_FLAG_FORCE_OPAQUE;
+        const bool cut = cutouts && c.masked;
+        desc.mFlags = cut ? ACCELERATION_STRUCTURE_INSTANCE_FLAG_FORCE_NON_OPAQUE : ACCELERATION_STRUCTURE_INSTANCE_FLAG_FORCE_OPAQUE;
         gInstCpu[n * 4 + 0] = c.instance;
         gInstCpu[n * 4 + 1] = c.firstIndex;
         gInstCpu[n * 4 + 2] = (uint32_t)c.vertexOffset;
-        gInstCpu[n * 4 + 3] = 0;
+        gInstCpu[n * 4 + 3] = cut ? F->instanceRows[c.instance].material + 1 : 0;
         n++;
     }
     if (!n || !gInstBuf[fi])
@@ -1053,6 +1087,9 @@ void rt_run(uint64_t address)
     p[20].ppTextures = &gTex;
     p[21].ppTextures = &gAccumZ[w ^ 1];
     updateDescriptorSet(gRenderer, fi * 4 + 3, gSet, 28, p);
+    // Cut-outs, for the passes that trace: the trace (and the probe pass, on its set) and the reconstruction.
+    for (uint32_t k = 0; k < 2; ++k)
+        bindCutouts(F, gSet, fi * 4 + k, fi * 4 + k, SRT_RES_IDX(RtSrt, PerFrame, gMaterialMaps), SRT_RES_IDX(RtSrt, PerFrame, gTextures));
 
     // Every target the passes write goes to UNORDERED_ACCESS at once; the tile flags stay there.
     BufferBarrier tb = { gTiles, gTilesState, RESOURCE_STATE_UNORDERED_ACCESS };
