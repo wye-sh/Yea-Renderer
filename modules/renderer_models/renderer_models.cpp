@@ -4,12 +4,14 @@
 // module's own targets).
 #include "yea_renderer_models.h"
 #include "models.h"
+#include "rmodel.h"
 
 #include <Common_3/Graphics/Interfaces/IGraphics.h>
 #include <yea/ui.h>
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 namespace renderer_models
@@ -245,16 +247,133 @@ void bounds(uint32_t mesh, float lo[3], float hi[3])
     }
 }
 
+bool cooked(const char* source)
+{
+    const size_t n = strlen(source);
+    return n > 7 && !strcmp(source + n - 7, ".rmodel");
+}
+
+void fail(Entry& e, const char* why)
+{
+    e.state = 2;
+    snprintf(e.error, sizeof e.error, "%s", why);
+    char line[300];
+    snprintf(line, sizeof line, "renderer_models: model %s (%s): %s", e.name, e.owner, e.error);
+    yea::log(line);
+}
+
+// A cooked model (rmodel.h) from its owner's Assets/: each part's LOD chain as the renderer's meshes, linked finest
+// first, and a material per part. Read here, in this module's own update; the renderer copies the data into its tables.
+void loadCooked(Entry& e)
+{
+    char path[1300];
+    snprintf(path, sizeof path, "%s/%s", e.assets, e.source);
+    FILE* f = e.assets[0] ? fopen(path, "rb") : nullptr;
+    if (!f)
+        return fail(e, "its file isn't in its module's Assets/");
+    fseek(f, 0, SEEK_END);
+    const long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t* data = size >= (long)sizeof(RmodelHeader) ? (uint8_t*)malloc((size_t)size) : nullptr;
+    const bool read = data && fread(data, 1, (size_t)size, f) == (size_t)size;
+    fclose(f);
+    RmodelHeader h = {};
+    if (read)
+        memcpy(&h, data, sizeof h);
+    auto inside = [&](uint64_t at, uint64_t bytes) { return at + bytes <= (uint64_t)size; };
+    const char* bad = !read                                   ? "its file couldn't be read"
+                      : h.magic != kRmodelMagic               ? "its file isn't a cooked model"
+                      : h.version != kRmodelVersion           ? "it was cooked for another version: cook it again"
+                      : !h.partCount || h.partCount > kMaxParts ? "it has no parts, or more than 64"
+                      : !inside(h.materials, (uint64_t)h.materialCount * sizeof(RmodelMaterial)) ||
+                              !inside(h.parts, (uint64_t)h.partCount * sizeof(RmodelPart)) ||
+                              !inside(h.lods, (uint64_t)h.lodCount * sizeof(RmodelLod)) ||
+                              !inside(h.positions, (uint64_t)h.vertexCount * 12) || !inside(h.attributes, (uint64_t)h.vertexCount * 20) ||
+                              !inside(h.indices, (uint64_t)h.indexCount * 4)
+                          ? "its file is cut short"
+                          : nullptr;
+    const RmodelPart*     parts = (const RmodelPart*)(data + (bad ? 0 : h.parts));
+    const RmodelLod*      lods = (const RmodelLod*)(data + (bad ? 0 : h.lods));
+    const RmodelMaterial* mats = (const RmodelMaterial*)(data + (bad ? 0 : h.materials));
+    for (uint32_t k = 0; !bad && k < h.partCount; ++k)
+    {
+        const RmodelPart& p = parts[k];
+        if (p.material >= h.materialCount || !p.lodCount || p.firstLod + p.lodCount > h.lodCount)
+            bad = "its file is damaged";
+        for (uint32_t l = p.firstLod; !bad && l < p.firstLod + p.lodCount; ++l)
+            if (lods[l].firstVertex + (uint64_t)lods[l].vertexCount > h.vertexCount || lods[l].firstIndex + (uint64_t)lods[l].indexCount > h.indexCount)
+                bad = "its file is damaged";
+    }
+    if (bad)
+    {
+        free(data);
+        return fail(e, bad);
+    }
+    uint32_t triangles = 0, made = 0;
+    for (uint32_t k = 0; k < h.partCount; ++k)
+    {
+        const RmodelPart& p = parts[k];
+        uint32_t          chain[32], n = 0;
+        for (uint32_t l = p.firstLod; l < p.firstLod + p.lodCount && n < 32; ++l)
+        {
+            const RmodelLod& lod = lods[l];
+            const uint32_t   m = renderer::mesh_packed((uint64_t)(uintptr_t)(data + h.positions + (size_t)lod.firstVertex * 12),
+                                                       (uint64_t)(uintptr_t)(data + h.attributes + (size_t)lod.firstVertex * 20), lod.vertexCount,
+                                                       (uint64_t)(uintptr_t)(data + h.indices + (size_t)lod.firstIndex * 4), lod.indexCount);
+            if (m == 0xFFFFFFFFu)
+                break; // the renderer's tables are full: the versions made so far still chain
+            chain[n++] = m;
+        }
+        if (!n)
+            break;
+        for (uint32_t i = 0; i < n; ++i)
+            renderer::mesh_lod(chain[i], lods[p.firstLod + i].error, i + 1 < n ? chain[i + 1] : 0xFFFFFFFFu);
+        const RmodelMaterial& mt = mats[p.material];
+        const yea_handle material = renderer::material_add({ mt.flatColor[0], mt.flatColor[1], mt.flatColor[2] }, mt.flatRoughness, mt.flatMetallic);
+        ModelPart* row = material == 0xFFFFFFFFu ? nullptr : ModelParts.add();
+        if (!row)
+            break;
+        row->key = e.key;
+        row->part = k;
+        row->mesh = e.mesh[k] = chain[0];
+        row->material = e.material[k] = material;
+        row->twoSided = e.twoSided[k] = mt.doubleSided ? 1 : 0;
+        row->lo = { h.lo[0], h.lo[1], h.lo[2] };
+        row->hi = { h.hi[0], h.hi[1], h.hi[2] };
+        triangles += lods[p.firstLod].indexCount / 3;
+        ++made;
+    }
+    free(data);
+    if (made < h.partCount)
+    {
+        // Partly made: what was made stays in the renderer's tables until its scene starts over; nothing of it is drawn.
+        for (uint32_t i = ModelParts.size(); i-- > 0;)
+            if (ModelParts[i].key == e.key)
+                ModelParts.remove(i);
+        return fail(e, "the renderer's mesh tables are full");
+    }
+    e.parts = h.partCount;
+    memcpy(e.lo, h.lo, sizeof e.lo);
+    memcpy(e.hi, h.hi, sizeof e.hi);
+    e.state = 1;
+    char line[300];
+    snprintf(line, sizeof line, "renderer_models: model %s (%s): %u parts, %u triangles, %u versions in all", e.name, e.owner, e.parts,
+             triangles, h.lodCount);
+    yea::log(line);
+}
+
 // Its parts in the renderer: found again (made in this scene before this module restarted) or made now.
 void build(Entry& e)
 {
     e.parts = 0;
+    e.kind = cooked(e.source) ? 1 : 0;
     for (uint32_t i = 0; i < ModelParts.size(); ++i)
         if (ModelParts[i].key == e.key && ModelParts[i].part < kMaxParts)
         {
             const ModelPart& p = ModelParts[i];
             e.mesh[p.part] = p.mesh;
             e.material[p.part] = p.material;
+            e.twoSided[p.part] = p.twoSided;
             e.parts = e.parts > p.part + 1 ? e.parts : p.part + 1;
             if (p.part == 0)
                 memcpy(e.lo, &p.lo, sizeof e.lo), memcpy(e.hi, &p.hi, sizeof e.hi);
@@ -264,15 +383,14 @@ void build(Entry& e)
         e.state = 1;
         return;
     }
+    if (e.kind == 1)
+        return renderer::scene_epoch() ? loadCooked(e) : void();
     const uint32_t mesh = builtin(e.source);
     if (mesh == 0xFFFFFFFEu)
     {
-        e.state = 2;
-        snprintf(e.error, sizeof e.error, "%s isn't a built-in shape (box, sphere, cylinder, cone, torus, plane)", e.source);
-        char line[300];
-        snprintf(line, sizeof line, "renderer_models: model %s (%s): %s", e.name, e.owner, e.error);
-        yea::log(line);
-        return;
+        char why[200];
+        snprintf(why, sizeof why, "%s isn't a built-in shape (box, sphere, cylinder, cone, torus, plane) or a cooked .rmodel", e.source);
+        return fail(e, why);
     }
     if (mesh == 0xFFFFFFFFu)
         return; // the renderer isn't running: tried again next frame
@@ -282,8 +400,8 @@ void build(Entry& e)
     ModelPart* p = ModelParts.add();
     if (!p)
         return;
-    e.kind = 0;
     e.parts = 1;
+    e.twoSided[0] = p->twoSided = 0;
     e.mesh[0] = p->mesh = mesh;
     e.material[0] = p->material = material;
     p->key = e.key;
@@ -339,7 +457,7 @@ void syncPlacements()
         const float      s = p.scale * e->knobs[mdl::KnobScale];
         const yea_float4 rot = qmul(p.rot, upTurn(*e));
         for (uint32_t k = 0; k < e->parts; ++k)
-            renderer::material_double_sided(e->material[k], e->knobs[mdl::KnobDoubleSided] > 0.5f);
+            renderer::material_double_sided(e->material[k], e->twoSided[k] || e->knobs[mdl::KnobDoubleSided] > 0.5f);
         for (uint32_t i = 0; i < PartInstances.size(); ++i)
             if (PartInstances[i].placement == row)
             {
@@ -537,7 +655,7 @@ void draw(uint32_t pass, const YeaFrame* frame)
     {
         p.mesh[k] = e->mesh[k];
         p.material[k] = e->material[k];
-        p.twoSided[k] = e->knobs[mdl::KnobDoubleSided] > 0.5f;
+        p.twoSided[k] = e->twoSided[k] || e->knobs[mdl::KnobDoubleSided] > 0.5f;
         for (int row = 0; row < 3; ++row)
         {
             for (int c = 0; c < 3; ++c)

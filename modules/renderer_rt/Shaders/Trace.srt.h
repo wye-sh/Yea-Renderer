@@ -15,7 +15,7 @@ BEGIN_SRT(RtSrt)
         DECL_BUFFER(PerFrame, Buffer(uint4), gRtInstances)
         DECL_BUFFER(PerFrame, Buffer(MaterialData), gMaterials)
         DECL_BUFFER(PerFrame, Buffer(LightData), gLights)
-        DECL_BUFFER(PerFrame, Buffer(uint), gVertices)
+        DECL_BUFFER(PerFrame, Buffer(uint), gAttributes) // RENDER_ATTRIBUTE_STRIDE: 5 u32 a vertex, [0] the normal
         DECL_BUFFER(PerFrame, Buffer(uint), gIndices)
         DECL_BUFFER(PerFrame, Buffer(float), gExposure)
         DECL_TEXTURE(PerFrame, Tex2D(float4), gHalfIn)   // resolve: the half-resolution traces

@@ -87,7 +87,6 @@ const uint32_t kFlagCulled = 1, kFlagHeatmap = 2, kFlagCascades = 4, kFlagShadow
 const uint32_t kMaxFrames = 4;
 const uint32_t kMaxUnculledLights = 256;
 const uint32_t kHistogramBins = 128;
-const uint32_t kVertexStride = 24;
 
 // --- GPU objects -------------------------------------------------------------------------------
 Renderer* gRenderer;
@@ -129,7 +128,12 @@ uint32_t*      gLookCpu;     // per GPU light: its image + 1, 0 none (gLightLook
 RenderGpuLightShape* gShapeCpu;
 v3                   gCamRight = { 1, 0, 0 }; // the view's right last frame, for a camera looking exactly straight down or up
 Buffer *       gDfg, *gExposure, *gHistogram, *gDummyU32, *gDummyViews, *gDummyProbes;
-Buffer *       gVertexBuf, *gIndexBuf;
+Buffer *       gPosBuf, *gAttrBuf, *gIndexBuf; // the vertex streams and indices (uploadMeshes)
+uint32_t       gVertexCap, gIndexCap;          // what they hold
+uint32_t       gMeshGen[1024];                 // each mesh row's data generation (RenderCaster::generation)
+// Read as vertices (indices) and in shaders (ray tracing) at once, so nobody barriers them.
+const ResourceState gGeometryState = (ResourceState)(RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | RESOURCE_STATE_SHADER_RESOURCE);
+const ResourceState gIndexState = (ResourceState)(RESOURCE_STATE_INDEX_BUFFER | RESOURCE_STATE_SHADER_RESOURCE);
 Buffer *       gPrevBuf[kMaxFrames]; // last frame's instance rows, for motion vectors
 
 uint32_t        gWidth, gHeight, gSamples;       // the targets as made (render size)
@@ -140,8 +144,8 @@ bool            gPipeMotion;
 TinyImageFormat gFrameFormat = TinyImageFormat_UNDEFINED;
 uint32_t        gFrameSamples;
 ResourceState   gDepthState, gExposureState;
-uint32_t        gUploadedVertices, gUploadedIndices;
-uint64_t        gUploadedMeshHash;
+uint32_t        gUploadedVertices, gUploadedIndices, gUploadedMeshes, gUploadedEpoch;
+uint64_t        gUploadedMeshHash; // of the Mesh rows uploaded
 
 // --- CPU scratch, made once in load() ----------------------------------------------------------
 struct InstanceInfo
@@ -293,10 +297,12 @@ void buildDfg(float* out)
 VertexLayout sceneLayout()
 {
     VertexLayout l = {};
-    l.mBindingCount = 2;
-    l.mBindings[0].mStride = kVertexStride;
-    l.mBindings[1].mStride = 4;
-    l.mBindings[1].mRate = VERTEX_BINDING_RATE_INSTANCE;
+    // Positions, attributes (only the normal read so far) and the instance-rate stream: bindGeometry's three buffers.
+    l.mBindingCount = 3;
+    l.mBindings[0].mStride = RENDER_POSITION_STRIDE;
+    l.mBindings[1].mStride = RENDER_ATTRIBUTE_STRIDE;
+    l.mBindings[2].mStride = 4;
+    l.mBindings[2].mRate = VERTEX_BINDING_RATE_INSTANCE;
     l.mAttribCount = 3;
     l.mAttribs[0] = {};
     l.mAttribs[0].mSemantic = SEMANTIC_POSITION;
@@ -305,13 +311,13 @@ VertexLayout sceneLayout()
     l.mAttribs[0].mLocation = 0;
     l.mAttribs[0].mOffset = 0;
     l.mAttribs[1].mSemantic = SEMANTIC_NORMAL;
-    l.mAttribs[1].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
-    l.mAttribs[1].mBinding = 0;
+    l.mAttribs[1].mFormat = TinyImageFormat_R16G16_SNORM; // octahedral
+    l.mAttribs[1].mBinding = 1;
     l.mAttribs[1].mLocation = 1;
-    l.mAttribs[1].mOffset = 12;
+    l.mAttribs[1].mOffset = 0;
     l.mAttribs[2].mSemantic = SEMANTIC_TEXCOORD1;
     l.mAttribs[2].mFormat = TinyImageFormat_R32_UINT;
-    l.mAttribs[2].mBinding = 1;
+    l.mAttribs[2].mBinding = 2;
     l.mAttribs[2].mLocation = 2;
     l.mAttribs[2].mOffset = 0;
     return l;
@@ -542,50 +548,112 @@ void createTargets(uint32_t w, uint32_t h, uint32_t samples, bool motion, uint32
     gTargetMotion = motion;
 }
 
-uint64_t meshHash()
+uint64_t meshHash(uint32_t rows)
 {
     uint64_t h = 0xcbf29ce484222325ull;
     const uint8_t* p = (const uint8_t*)Meshes.begin();
-    size_t         n = Meshes.size() * sizeof(Mesh);
+    size_t         n = rows * sizeof(Mesh);
     for (size_t i = 0; i < n; ++i)
         h = (h ^ p[i]) * 0x100000001b3ull;
     return h;
 }
 
-// Uploads the vertex and index tables when meshes were added (rare: a stall is fine).
+// Writes table rows [first, first + count) of the vertex streams and indices into the GPU buffers (the queue idle).
+void writeGeometry(uint32_t firstVertex, uint32_t vertexCount, uint32_t firstIndex, uint32_t indexCount)
+{
+    if (vertexCount)
+    {
+        BufferUpdateDesc pos = { gPosBuf, (uint64_t)firstVertex * RENDER_POSITION_STRIDE, (uint64_t)vertexCount * RENDER_POSITION_STRIDE };
+        pos.mCurrentState = gGeometryState;
+        beginUpdateResource(&pos);
+        BufferUpdateDesc attr = { gAttrBuf, (uint64_t)firstVertex * RENDER_ATTRIBUTE_STRIDE, (uint64_t)vertexCount * RENDER_ATTRIBUTE_STRIDE };
+        attr.mCurrentState = gGeometryState;
+        beginUpdateResource(&attr);
+        uint8_t* pd = (uint8_t*)pos.pMappedData;
+        uint8_t* ad = (uint8_t*)attr.pMappedData;
+        for (uint32_t i = 0; i < vertexCount; ++i)
+        {
+            const Vertex& v = Vertexes[firstVertex + i];
+            memcpy(pd + (size_t)i * RENDER_POSITION_STRIDE, &v.pos, 12);
+            uint32_t a[5] = { v.normal, v.tangent, 0, 0, v.color };
+            memcpy(a + 2, &v.uv, 8);
+            memcpy(ad + (size_t)i * RENDER_ATTRIBUTE_STRIDE, a, 20);
+        }
+        endUpdateResource(&pos);
+        endUpdateResource(&attr);
+    }
+    if (indexCount)
+    {
+        BufferUpdateDesc ind = { gIndexBuf, (uint64_t)firstIndex * 4, (uint64_t)indexCount * 4 };
+        ind.mCurrentState = gIndexState;
+        beginUpdateResource(&ind);
+        memcpy(ind.pMappedData, Indexes.begin() + firstIndex, (size_t)indexCount * 4);
+        endUpdateResource(&ind);
+    }
+}
+
+// Uploads the vertex and index tables when meshes were added (rare: a short stall is fine). Meshes only ever append
+// until the scene starts over, so new rows go into the buffers' spare room; the buffers are made again, with room to
+// grow, only when they are full or the scene started over.
 void uploadMeshes()
 {
-    uint64_t hash = meshHash();
-    if (Vertexes.size() == gUploadedVertices && Indexes.size() == gUploadedIndices && hash == gUploadedMeshHash)
+    uint32_t meshes = Meshes.size(), epoch = scene_epoch();
+    if (Vertexes.size() == gUploadedVertices && Indexes.size() == gUploadedIndices && meshes == gUploadedMeshes &&
+        epoch == gUploadedEpoch && meshHash(meshes) == gUploadedMeshHash)
         return;
     if (meshBuilding())
         return;
-    waitQueueIdle(gQueue);
-    freeBuffer(gVertexBuf);
-    freeBuffer(gIndexBuf);
-    gUploadedVertices = Vertexes.size();
-    gUploadedIndices = Indexes.size();
-    gUploadedMeshHash = hash;
-    if (!gUploadedVertices || !gUploadedIndices)
-        return;
-    // Mapped buffers the CPU writes directly: no copy queue to wait on.
-    // With ray queries also acceleration-structure build inputs, and read as uint arrays by renderer_rt.
-    uint32_t rtFlags = gRaytracing ? (uint32_t)(BUFFER_CREATION_FLAG_SHADER_DEVICE_ADDRESS | BUFFER_CREATION_FLAG_ACCELERATION_STRUCTURE_BUILD_INPUT) : 0;
-    uint32_t rtRead = gRaytracing ? (uint32_t)DESCRIPTOR_TYPE_BUFFER : 0;
-    gVertexBuf = makeBuffer((uint64_t)gUploadedVertices * kVertexStride, gRaytracing ? 4 : 0, DESCRIPTOR_TYPE_VERTEX_BUFFER | rtRead,
-                            RESOURCE_MEMORY_USAGE_CPU_TO_GPU, RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, "renderer_vertices", nullptr, false, rtFlags);
-    gIndexBuf = makeBuffer((uint64_t)gUploadedIndices * 4, gRaytracing ? 4 : 0, DESCRIPTOR_TYPE_INDEX_BUFFER | rtRead, RESOURCE_MEMORY_USAGE_CPU_TO_GPU,
-                           RESOURCE_STATE_INDEX_BUFFER, "renderer_indices", nullptr, false, rtFlags);
-    if (!gVertexBuf || !gIndexBuf || !gVertexBuf->pCpuMappedAddress || !gIndexBuf->pCpuMappedAddress)
+    uint32_t vertices = Vertexes.size(), indices = Indexes.size();
+    bool     append = gPosBuf && epoch == gUploadedEpoch && vertices >= gUploadedVertices && indices >= gUploadedIndices &&
+                  meshes >= gUploadedMeshes && meshHash(gUploadedMeshes) == gUploadedMeshHash && vertices <= gVertexCap &&
+                  indices <= gIndexCap;
+    waitQueueIdle(gQueue); // frames in flight may read the buffers (a copy into them must not overlap a draw)
+    uint32_t gen = (uint32_t)yea::host()->frame();
+    gen = gen ? gen : 1;
+    if (!append)
     {
-        yea::host()->log(2, "renderer: could not map the mesh buffers");
-        freeBuffer(gVertexBuf);
+        freeBuffer(gPosBuf);
+        freeBuffer(gAttrBuf);
         freeBuffer(gIndexBuf);
-        return;
+        gVertexCap = gIndexCap = 0;
+        gUploadedVertices = gUploadedIndices = 0;
+        if (vertices && indices)
+        {
+            // GPU-only (fast to read every pass), with half again as much room, so the next model appends without a remake.
+            // With ray queries also acceleration-structure build inputs, read as uint arrays by renderer_rt.
+            uint32_t vcap = vertices + vertices / 2 < 65536 ? 65536 : vertices + vertices / 2;
+            uint32_t icap = indices + indices / 2 < 196608 ? 196608 : indices + indices / 2;
+            uint32_t rtFlags = gRaytracing ? (uint32_t)(BUFFER_CREATION_FLAG_SHADER_DEVICE_ADDRESS | BUFFER_CREATION_FLAG_ACCELERATION_STRUCTURE_BUILD_INPUT) : 0;
+            gPosBuf = makeBuffer((uint64_t)vcap * RENDER_POSITION_STRIDE, 4, DESCRIPTOR_TYPE_VERTEX_BUFFER | DESCRIPTOR_TYPE_BUFFER,
+                                 RESOURCE_MEMORY_USAGE_GPU_ONLY, gGeometryState, "renderer_positions", nullptr, false, rtFlags);
+            gAttrBuf = makeBuffer((uint64_t)vcap * RENDER_ATTRIBUTE_STRIDE, 4, DESCRIPTOR_TYPE_VERTEX_BUFFER | DESCRIPTOR_TYPE_BUFFER,
+                                  RESOURCE_MEMORY_USAGE_GPU_ONLY, gGeometryState, "renderer_attributes", nullptr, false, rtFlags);
+            gIndexBuf = makeBuffer((uint64_t)icap * 4, 4, DESCRIPTOR_TYPE_INDEX_BUFFER | DESCRIPTOR_TYPE_BUFFER, RESOURCE_MEMORY_USAGE_GPU_ONLY,
+                                   gIndexState, "renderer_indices", nullptr, false, rtFlags);
+            waitForAllResourceLoads();
+            if (!gPosBuf || !gAttrBuf || !gIndexBuf)
+            {
+                yea::host()->log(2, "renderer: could not make the mesh buffers");
+                freeBuffer(gPosBuf);
+                freeBuffer(gAttrBuf);
+                freeBuffer(gIndexBuf);
+            }
+            else
+                gVertexCap = vcap, gIndexCap = icap;
+        }
     }
-    memcpy(gVertexBuf->pCpuMappedAddress, Vertexes.begin(), (size_t)gUploadedVertices * kVertexStride);
-    memcpy(gIndexBuf->pCpuMappedAddress, Indexes.begin(), (size_t)gUploadedIndices * 4);
-    waitForAllResourceLoads();
+    if (gPosBuf)
+    {
+        writeGeometry(gUploadedVertices, vertices - gUploadedVertices, gUploadedIndices, indices - gUploadedIndices);
+        waitForAllResourceLoads();
+        for (uint32_t m = append ? gUploadedMeshes : 0; m < meshes && m < 1024; ++m)
+            gMeshGen[m] = gen;
+    }
+    gUploadedVertices = gPosBuf ? vertices : 0;
+    gUploadedIndices = gPosBuf ? indices : 0;
+    gUploadedMeshes = meshes;
+    gUploadedEpoch = epoch;
+    gUploadedMeshHash = meshHash(meshes);
 }
 
 void quatRows(yea_float4 q, yea_float3 s, yea_float3 p, float out[3][4])
@@ -644,10 +712,10 @@ void sortLights(RenderLight* a, uint32_t n)
 
 void bindGeometry(Cmd* cmd, Buffer* stream, uint32_t first)
 {
-    Buffer*  bufs[2] = { gVertexBuf, stream };
-    uint32_t strides[2] = { kVertexStride, 4 };
-    uint64_t offsets[2] = { 0, (uint64_t)first * 4 };
-    cmdBindVertexBuffer(cmd, 2, bufs, strides, offsets);
+    Buffer*  bufs[3] = { gPosBuf, gAttrBuf, stream };
+    uint32_t strides[3] = { RENDER_POSITION_STRIDE, RENDER_ATTRIBUTE_STRIDE, 4 };
+    uint64_t offsets[3] = { 0, 0, (uint64_t)first * 4 };
+    cmdBindVertexBuffer(cmd, 3, bufs, strides, offsets);
 }
 
 // Single-sided instances with pipes[0] (back faces culled), then double-sided ones with pipes[1].
@@ -856,6 +924,10 @@ int load(int reloaded)
     // A new material layout starts its table empty: instances would point at materials that are
     // gone, so the scene starts over and its owner builds it again (as on a clear()).
     if (Materials.size() == 0 && Instances.size() > 0)
+        clear();
+    // So does a vertex or index layout change (the tables start empty while meshes still point into them).
+    if (Meshes.size() > 0 && (Meshes[Meshes.size() - 1].firstVertex + Meshes[Meshes.size() - 1].vertexCount > Vertexes.size() ||
+                              Meshes[Meshes.size() - 1].firstIndex + Meshes[Meshes.size() - 1].indexCount > Indexes.size()))
         clear();
     gRenderer = (Renderer*)host->renderer;
     gQueue = (Queue*)host->queue;
@@ -1126,8 +1198,10 @@ void unload()
     lightImagesFree();
     freeBuffer(gExposure);
     freeBuffer(gHistogram);
-    freeBuffer(gVertexBuf);
+    freeBuffer(gPosBuf);
+    freeBuffer(gAttrBuf);
     freeBuffer(gIndexBuf);
+    gVertexCap = gIndexCap = 0;
     DescriptorSet** sets[5] = { &gScenePersistent, &gSceneFrame, &gCompositeSet, &gExposureSet, &gTonemapSet };
     for (DescriptorSet** set : sets)
         if (*set)
@@ -1312,7 +1386,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     for (uint32_t row = 0; row < Instances.size(); ++row)
     {
         const Instance& in = Instances[row];
-        if (!in.alive || in.mesh >= meshCount || !gVertexBuf || Meshes[in.mesh].firstIndex + Meshes[in.mesh].indexCount > gUploadedIndices)
+        if (!in.alive || in.mesh >= meshCount || !gPosBuf || Meshes[in.mesh].firstIndex + Meshes[in.mesh].indexCount > gUploadedIndices)
             continue;
         RenderGpuInstance& g = gpuInst[count];
         quatRows(in.rot, in.scale, in.pos, g.row);
@@ -1420,6 +1494,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
             c.mesh = info.mesh;
             c.vertexCount = mesh.vertexCount;
             c.castShadow = (info.flags >> 1) & 1;
+            c.generation = gMeshGen[info.mesh];
         }
         if (info.flags & 2)
         {
@@ -1434,6 +1509,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
             c.mesh = info.mesh;
             c.vertexCount = mesh.vertexCount;
             c.castShadow = 1;
+            c.generation = gMeshGen[info.mesh];
         }
     }
     (void)casterStart;
@@ -1542,12 +1618,12 @@ void draw(uint32_t pass, const YeaFrame* yf)
     F.sunDir[0] = gf->sunDir[0][0];
     F.sunDir[1] = gf->sunDir[0][1];
     F.sunDir[2] = gf->sunDir[0][2];
-    F.vertices = gVertexBuf;
+    F.positions = gPosBuf;
+    F.attributes = gAttrBuf;
     F.indices = gIndexBuf;
     F.instances = gInstanceBuf[fi];
     F.instanceRows = gInstCpu;
     F.instanceCount = count;
-    F.vertexStride = kVertexStride;
     F.casters = gCasters;
     F.casterCount = casterTotal;
     F.casterRemoved = sceneState()->removed;
@@ -2024,7 +2100,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         timeEnd(cmd, fi, kTimeProbes);
     }
 
-    bool geometry = gVertexBuf && gIndexBuf && count > 0;
+    bool geometry = gPosBuf && gIndexBuf && count > 0;
     if (gDepthState != RESOURCE_STATE_DEPTH_WRITE)
         barrierRt(cmd, gDepth, gDepthState, RESOURCE_STATE_DEPTH_WRITE);
     BindRenderTargetsDesc bind = {};

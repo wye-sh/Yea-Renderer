@@ -90,7 +90,9 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
 - `renderer_rt`: ray-traced reflections, through Yea's ray-query service (`yea::raytracing()`, nullptr on GPUs
   without inline ray queries: the module then does nothing and `renderer_ssr` runs as before; with it, SSR is
   off). Owns the acceleration structures: one bottom-level structure per mesh (built on the frame's command list
-  when the mesh is new or its geometry moved; replaced ones freed once no frame in flight uses them) and one
+  from the positions stream when the mesh is new, its geometry moved or its caster's `generation` changed, as the
+  buffers are rewritten in place; replaced ones freed once no frame in flight uses them; hits read the normal from
+  the attributes stream, octahedral) and one
   top-level structure per frame in flight, its instances rewritten with `setInstances` and rebuilt every frame
   (mask 1 every drawable, 2 shadow casters). The core's vertex and index buffers get the device-address and
   build-input flags and a uint view when the service exists. While it runs, the prepass writes `surface`
@@ -199,7 +201,11 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
 - `renderer_models`: models, and the Model Viewer panel. A game's module declares each model with `MODEL(name, "source")`
   through `ModelLink.h` (`import renderer_models u64 api(u32 version) = 0`), registering in its own update (`mdl::update()`,
   which passes its own `yea::assets()`), and places it whole (`mdl::place`, `move`, `remove`, `placed`). Sources: a built-in
-  shape (box, sphere, cylinder, cone, torus, plane) until the cooked loader lands. Its tables: `Placement` (a row per
+  shape (box, sphere, cylinder, cone, torus, plane), or a cooked model, `models/<name>.rmodel` in the declaring module's
+  `Assets/` (`rmodel.h`; written by `tools/model_cook`), read in this module's own update from the owner's `yea::assets()`
+  path: each part (one per material) a LOD chain of the core's meshes (`mesh_packed`, linked with `mesh_lod`) and a material
+  from its factors (textures come with stage 2). A file that is missing, damaged or of another version fails that model only,
+  logged and shown in the Viewer. Its tables: `Placement` (a row per
   placement, keyed by the model's owner and name), `PartInstance` (the core's instances, one per part), `ModelPart` (each
   model's meshes and materials in the core, found again after a reload), state `Scene` (the core's scene_epoch they belong
   to: when it changes, every part and instance is made again). It builds and syncs in `YEA_PHASE_LATE`, after the game's
@@ -218,7 +224,13 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   preview pipelines and buffers are made in its own `load()` (`preview_core.h`); a failure turns only the preview off.
 - The core calls the others through optional imports with a `RenderFrame*` (as `u64`): `frame.h`, copied
   identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes`, `renderer_ssr`, `renderer_vrs`, `renderer_rt`, `renderer_upscale` and `renderer_post` (`mathx.h` into the
-  first three). Change all copies together and raise `RENDER_FRAME_VERSION`. Ray-traced shadows (frame v15): renderer_rt's `rt_pick`, called just
+  first three). Change all copies together and raise `RENDER_FRAME_VERSION`. Geometry (frame v16): two vertex streams, `positions`
+  (float3, `RENDER_POSITION_STRIDE`) and `attributes` (`RENDER_ATTRIBUTE_STRIDE`: octahedral normal and tangent snorm16x2,
+  uv0, rgba8 colour; frame.h says how to decode), and u32 `indices`. They are GPU-only, made with half again as much room
+  and appended to with the queue idle when meshes are added (remade only when full or the scene starts over), always in
+  vertex/index plus shader-resource state (never barriered), with RT build-input flags and 4-byte `Buffer(uint)` views
+  while ray queries are on. `RenderCaster.generation` changes whenever that mesh's data was written. Shadow maps bind
+  positions only; the scene, probes and preview bind positions and attributes. Ray-traced shadows (frame v15): renderer_rt's `rt_pick`, called just
   before `shadows_prepare`, marks the lights (`RenderLight.traced`) and the sun (`rtSunShadows`) it traces; renderer_shadows
   then draws no cascades for a traced sun and no tiles for traced lights, the core writes LightData params.w = 2 + n for
   them, and the forward pass reads `rtShadows` (slice 0 the sun, 1 + n light n) instead of their maps. While renderer_rt
@@ -229,9 +241,11 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
 
 Units: metres; sun intensity in lux, point, spot and area lights in candela (an area light's seen face-on; its
 surface's luminance is that over its area). Colours linear RGB.
-- Meshes: `mesh_box/sphere/plane/cylinder/cone/torus` (unit size, centred), or `mesh_begin`,
-  `mesh_vertex(pos, normal)` (returns a local index), `mesh_triangle`, `mesh_end` → mesh id. Meshes are
-  uploaded when they change (a stall: build them up front). A triangle faces where cross(b - a, c - a)
+- Meshes: `mesh_box/sphere/plane/cylinder/cone/torus` (unit size, centred, with UVs and tangents), or `mesh_begin`,
+  `mesh_vertex(pos, normal)` (returns a local index; no UVs), `mesh_triangle`, `mesh_end` → mesh id, or
+  `mesh_packed(positions, attributes, vertex_count, indices, index_count)` (pointers as u64, frame.h's packed layout; a
+  cooked mesh in one call) and `mesh_lod(mesh, error, simpler)` to chain versions. New meshes are appended to the GPU
+  buffers on the next frame (a short stall: build them up front). A triangle faces where cross(b - a, c - a)
   points (counter-clockwise around its outward normal); back faces are culled.
 - Mesh versions (LOD): the curved built-in shapes make a chain of simpler versions after the mesh they return
   (`MeshLod` table: each row's `next` and its surface `error` in object units; ~1/sqrt(2) the segments each, so the
@@ -313,6 +327,23 @@ ray-traced reflections and VRS, with half_resolution for AO, SSR and ray-traced 
 Debug views and show_ knobs never. renderer_rt's `enabled` needs `raytracing` and renderer_vrs' `shadingrate` (hidden and
 false without them); each still returns from `load()` before touching its service when that is nullptr, as `load()` runs
 either way.
+
+## Tools (never shipped)
+
+Run by agents in their orb; never compiled into a module, kept out of `licenses.json` (they ship nothing). Each vendored
+library keeps its licence file beside its source, since the component's repository redistributes it.
+- `tools/ltc_fit.cpp`: fits the area-light LTC tables (`modules/renderer/Assets/ltc.bin`). Our own code.
+- `tools/model_cook/` (`build.sh` → `build/tools/model_cook in.glb out.rmodel`): glTF/GLB to `.rmodel` with a report. Our
+  own code plus `vendor/cgltf` (MIT, Johannes Kuhlmann; v1.15), `vendor/meshoptimizer` (MIT, Arseny Kapoulkine; v1.3)
+  and `vendor/stb` (stb_image v2.34, MIT or public domain, Sean Barrett). Until the renderer reads textures (stage 2), each
+  material's colour, roughness and metallic are its factors times its textures' averages over their images.
+  It normalises units (node scales applied; warns past 500 m or under 1 cm) and axes (+Y up kept, Z negated into the
+  renderer's left-handed space, triangle order flipped), generates flat normals and MikkTSpace-compatible tangents where
+  missing, merges primitives by material into parts (64 at most), and builds each part's LOD chain with meshoptimizer's
+  attribute-aware simplifier (normals and UVs weighted; seams and hard edges only collapse along themselves; vertices on
+  a material border locked), half the triangles a level with its error in metres. A model sent in the chat or dropped
+  on the Model Viewer: cook it, put the `.rmodel` in the using module's `Assets/models/` (with its licence entry, or an
+  `own.txt` line when made in this project), add its `MODEL` line, publish, and pass the report on.
 
 ## Reset
 
@@ -407,7 +438,11 @@ Types: `sun`, `points`, `spots`, `rects`, `discs`, `spheres`, `tubes`, each off 
 emitters (their fittings stay). Four area lights at `area_luminance` (cd/m²; the pendant at three times it): a
 softbox on a stand by the sphere rows, a pendant disc over the white boxes, a fluorescent tube on the stone ledge,
 the glowing sphere on the steel drum, a 4 × 3 stained-glass panel on a stand opposite the softbox (a rect with a
-light_image, its panes glowing slabs in their colours, at twice `area_luminance`; under Rects), two reflection probes (the sphere rows, the whole yard), a free-look camera: holding its `look` action (left mouse button) after a press on the game
+light_image, its panes glowing slabs in their colours, at twice `area_luminance`; under Rects), two reflection probes (the sphere rows, the whole yard), four sample models (Khronos' glTF samples, CC0; cooked
+in `Assets/models/`, their sources fetched and checked at a pinned commit by `example/model_sources/fetch_and_cook.sh`,
+never kept in the repository): a street lamp by the white boxes, the flight helmet on the stone ledge, the water bottle
+in front, the boom box on the copper block, placed whole through renderer_models (`state Models`; their sizes are
+`default <model>_scale` lines), a free-look camera: holding its `look` action (left mouse button) after a press on the game
 asks the host for the mouse each frame (`yea::captureMouse(true)`: hidden, kept in the window) and turns by
 `yea_mouse_dx`/`yea_mouse_dy` (`look_sensitivity`); the move keys fly (WASD, Q/E down/up, `move_speed`).
 The host lets go when the button is up (it is no longer asked), F1 opens, focus is lost, or on a view switch

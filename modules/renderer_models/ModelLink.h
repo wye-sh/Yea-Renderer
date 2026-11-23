@@ -3,7 +3,7 @@
 // every knob of renderer_models' each block (chair_scale, chair_up_axis, chair_lod_quality, chair_cast_shadows,
 // chair_double_sided), tuned in the Model Viewer.
 //
-//   MODEL(chair, "models/chair.rmodel");   // a cooked model in this module's Assets/ (the cooker writes it)
+//   MODEL(chair, "models/chair.rmodel");   // a cooked model in this module's Assets/ (tools/model_cook writes it)
 //   MODEL(crate, "box");                   // a built-in shape: box, sphere, cylinder, cone, torus, plane
 //
 //   void update(uint32_t phase, float dt)

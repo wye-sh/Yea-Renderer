@@ -131,9 +131,16 @@ float3 skyIrradiance(float3 N)
     return lerp(down, up, N.y * 0.5 + 0.5);
 }
 
+// Vertex v's normal: octahedral snorm16x2 (x low, y high) in its attributes' first word, as frame.h packs it.
 float3 vertexNormal(uint v)
 {
-    return float3(asfloat(gVertices[v * 6u + 3u]), asfloat(gVertices[v * 6u + 4u]), asfloat(gVertices[v * 6u + 5u]));
+    uint   w = gAttributes[v * 5u];
+    float2 f = max(float2(float(int(w << 16u) >> 16), float(int(w) >> 16)) / 32767.0, float2(-1.0, -1.0));
+    float3 n = float3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    float  t = saturate(-n.z);
+    n.x += n.x >= 0.0 ? -t : t;
+    n.y += n.y >= 0.0 ? -t : t;
+    return normalize(n);
 }
 
 // GGX with height-correlated Smith visibility and Schlick's Fresnel, as the core's forward pass.

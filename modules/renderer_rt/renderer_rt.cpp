@@ -44,9 +44,9 @@ struct RtData
 struct Blas
 {
     AccelerationStructure* as;
-    Buffer*                vertices;
+    Buffer*                positions;
     Buffer*                indices;
-    uint32_t               firstIndex, indexCount, vertexOffset, vertexCount;
+    uint32_t               firstIndex, indexCount, vertexOffset, vertexCount, generation;
 };
 
 const uint32_t kMaxFrames = 4;
@@ -237,23 +237,24 @@ void freeRetired(uint64_t frame)
     gRetiredCount = kept;
 }
 
-// The mesh's bottom-level structure, made and built (on cmd) when it is new or its geometry moved.
+// The mesh's bottom-level structure, made and built (on cmd) when it is new or its geometry moved or was rewritten (the
+// caster's generation: buffers are reused in place, so the same addresses can hold new data).
 AccelerationStructure* meshBlas(Cmd* cmd, const RenderFrame* F, const RenderCaster& c)
 {
     if (c.mesh >= kMaxMeshes || !c.indexCount || !c.vertexCount)
         return nullptr;
     Blas& b = gBlas[c.mesh];
-    if (b.as && b.vertices == F->vertices && b.indices == F->indices && b.firstIndex == c.firstIndex && b.indexCount == c.indexCount &&
-        b.vertexOffset == (uint32_t)c.vertexOffset && b.vertexCount == c.vertexCount)
+    if (b.as && b.positions == F->positions && b.indices == F->indices && b.generation == c.generation && b.firstIndex == c.firstIndex &&
+        b.indexCount == c.indexCount && b.vertexOffset == (uint32_t)c.vertexOffset && b.vertexCount == c.vertexCount)
         return b.as;
     retire(b.as, F->frameNumber);
     b = Blas{};
     AccelerationStructureGeometryDesc g = {};
-    g.pVertexBuffer = F->vertices;
+    g.pVertexBuffer = F->positions;
     g.pIndexBuffer = F->indices;
-    g.mVertexOffset = (uint32_t)c.vertexOffset * F->vertexStride; // bytes
+    g.mVertexOffset = (uint32_t)c.vertexOffset * RENDER_POSITION_STRIDE; // bytes
     g.mVertexCount = c.vertexCount;
-    g.mVertexStride = F->vertexStride;
+    g.mVertexStride = RENDER_POSITION_STRIDE;
     g.mVertexFormat = TinyImageFormat_R32G32B32_SFLOAT;
     g.mIndexOffset = c.firstIndex * 4; // bytes
     g.mIndexCount = c.indexCount;
@@ -271,8 +272,9 @@ AccelerationStructure* meshBlas(Cmd* cmd, const RenderFrame* F, const RenderCast
     build.pAccelerationStructure = b.as;
     build.mIssueRWBarrier = true;
     cmdBuildAccelerationStructure(cmd, gRay, &build);
-    b.vertices = F->vertices;
+    b.positions = F->positions;
     b.indices = F->indices;
+    b.generation = c.generation;
     b.firstIndex = c.firstIndex;
     b.indexCount = c.indexCount;
     b.vertexOffset = (uint32_t)c.vertexOffset;
@@ -429,7 +431,7 @@ bool rt_prepare(uint64_t address)
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
     if (!gReady || !settings.enabled || !F || F->version != RENDER_FRAME_VERSION || !F->width || !F->height || !F->taaOn)
         return false;
-    if (yea::viewMode() || !F->surface || !F->previous || !F->drawableCount || !F->vertices || !F->indices || !F->instances ||
+    if (yea::viewMode() || !F->surface || !F->previous || !F->drawableCount || !F->positions || !F->attributes || !F->indices || !F->instances ||
         !F->materials || !F->lightBuffer || !F->exposure || !F->motion || F->frameIndex >= kMaxFrames)
         return false;
     if (F->width != gWidth || F->height != gHeight)
@@ -535,7 +537,7 @@ void rt_run(uint64_t address)
     uint32_t w = gAccumIndex ^ 1; // written this frame; gAccumIndex holds last frame's
     if (!gReady || !F || !gTex || F->rtReflection != gTex || !F->depth || !F->depth->pTexture || !F->surface ||
         !F->surface->pTexture || !F->motion || !F->motion->pTexture || !F->previous || !F->previous->pTexture || !F->instances ||
-        !F->materials || !F->lightBuffer || !F->vertices || !F->indices || !F->exposure)
+        !F->materials || !F->lightBuffer || !F->positions || !F->attributes || !F->indices || !F->exposure)
         return;
     Cmd*     cmd = F->cmd;
     uint32_t fi = F->frameIndex;
@@ -615,7 +617,7 @@ void rt_run(uint64_t address)
     Buffer*        instances = F->instances;
     Buffer*        materials = F->materials;
     Buffer*        lights = F->lightBuffer;
-    Buffer*        vertices = F->vertices;
+    Buffer*        attributes = F->attributes;
     Buffer*        indices = F->indices;
     Texture*       previous = F->previous->pTexture;
     Buffer*        exposure = F->exposure;
@@ -647,8 +649,8 @@ void rt_run(uint64_t address)
     p[7].ppBuffers = &materials;
     p[8].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gLights);
     p[8].ppBuffers = &lights;
-    p[9].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gVertices);
-    p[9].ppBuffers = &vertices;
+    p[9].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gAttributes);
+    p[9].ppBuffers = &attributes;
     p[10].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gIndices);
     p[10].ppBuffers = &indices;
     p[11].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gExposure);

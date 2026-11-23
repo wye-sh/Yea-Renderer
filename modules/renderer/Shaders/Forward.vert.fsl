@@ -8,7 +8,7 @@
 STRUCT(VSInput)
 {
     DATA(float3, Position, POSITION);
-    DATA(float3, Normal, NORMAL);
+    DATA(float2, Normal, NORMAL); // octahedral
     DATA(uint, Instance, TEXCOORD1);
 };
 
@@ -42,7 +42,7 @@ VSOutput VS_MAIN(VSInput In)
     float3 c0 = cross(b, c);
     float3 c1 = cross(c, a);
     float3 c2 = cross(a, b);
-    float3 n = In.Normal;
+    float3 n = octDecode(In.Normal);
     Out.Normal = float3(dot(c0, n), dot(c1, n), dot(c2, n));
     Out.Material = inst.misc.x;
 #ifdef MOTION

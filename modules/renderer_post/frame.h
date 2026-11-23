@@ -10,10 +10,17 @@ struct Buffer;
 struct RenderTarget;
 struct Texture;
 
-#define RENDER_FRAME_VERSION 15u
+#define RENDER_FRAME_VERSION 16u
 #define RENDER_RT_MAX_TRACED 8u
 #define RENDER_MAX_CASCADES  4u
 #define RENDER_VIEW_SHIFT    20u // shadow instance stream entry: instance | view << 20
+// Vertex streams (positions, attributes): bytes per vertex.
+#define RENDER_POSITION_STRIDE  12u // float3
+#define RENDER_ATTRIBUTE_STRIDE 20u // 5 u32: [0] normal, [1] tangent, [2..3] uv0 (float2), [4] colour (rgba8 unorm, r lowest).
+                                    // Normal and tangent: octahedral snorm16x2 (x the low 16 bits; value / 32767, at least
+                                    // -1); the tangent's bitangent sign is y's lowest bit (odd: -1; bitangent =
+                                    // cross(normal, tangent) * sign). Decode (f the two values): n = (f.x, f.y,
+                                    // 1 - |f.x| - |f.y|), t = saturate(-n.z), n.xy += n.xy >= 0 ? -t : t, normalize(n).
 
 // GPU layouts (match Shaders/Common.h.fsl in renderer). Matrices are 4 rows; shaders dot(row, p).
 struct RenderGpuInstance
@@ -75,7 +82,8 @@ struct RenderCaster
     uint32_t mesh;       // the core's mesh row
     uint32_t vertexCount; // the mesh's vertices, from vertexOffset
     uint32_t castShadow;  // it casts shadows (every caster does; a drawable may not)
-    uint32_t pad;
+    uint32_t generation;  // when its mesh's data was last written to the buffers (a frame number's low 32 bits, never 0):
+                          // the same generation, buffers and ranges mean the same data
 };
 
 // A visible local light, sorted by view depth (nearest first).
@@ -122,13 +130,15 @@ struct RenderFrame
     uint32_t sunShadow;
     float    sunDir[3]; // towards the sun
 
-    // Geometry, for shadow rendering. Vertex: float3 position, float3 normal (vertexStride bytes).
-    Buffer*               vertices;
-    Buffer*               indices;     // u32
+    // Geometry: two vertex streams (RENDER_POSITION_STRIDE, RENDER_ATTRIBUTE_STRIDE) and u32 indices, relative to a
+    // mesh's vertexOffset. GPU-only, kept in vertex (or index) and shader-resource state together: never barrier them.
+    // With ray queries also device-addressed acceleration-structure inputs, readable as Buffer(uint) (4-byte stride).
+    Buffer*               positions;
+    Buffer*               attributes;
+    Buffer*               indices;
     Buffer*               instances;   // RenderGpuInstance[]
     const RenderGpuInstance* instanceRows; // the same rows on the CPU, instanceCount of them
     uint32_t              instanceCount;
-    uint32_t              vertexStride;
     const RenderCaster* casters;
     uint32_t              casterCount;
     uint64_t              casterRemoved; // frame a caster was last removed

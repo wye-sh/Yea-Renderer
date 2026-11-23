@@ -230,7 +230,7 @@ bool preview_draw(uint64_t address)
 {
     RenderPreview* p = (RenderPreview*)(uintptr_t)address;
     if (!gReady || !gPreviewReady || !p || p->version != RENDER_PREVIEW_VERSION || !p->cmd || !p->hdr || !p->depth || !p->shadow ||
-        !p->out || !p->width || !p->height || !gVertexBuf || !gIndexBuf)
+        !p->out || !p->width || !p->height || !gPosBuf || !gIndexBuf)
         return false;
     Cmd*           cmd = p->cmd;
     const uint32_t fi = p->frameIndex % gFrames;

@@ -5,7 +5,7 @@
 STRUCT(VSInput)
 {
     DATA(float3, Position, POSITION);
-    DATA(float3, Normal, NORMAL);
+    DATA(float2, Normal, NORMAL); // octahedral
     DATA(uint, Entry, TEXCOORD1);
 };
 
@@ -32,7 +32,7 @@ VSOutput VS_MAIN(VSInput In)
     float3 a = inst.row0.xyz;
     float3 b = inst.row1.xyz;
     float3 c = inst.row2.xyz;
-    float3 n = In.Normal;
+    float3 n = octDecode(In.Normal);
     Out.Normal = float3(dot(cross(b, c), n), dot(cross(c, a), n), dot(cross(a, b), n));
     Out.Material = inst.misc.x;
     Out.View = In.Entry >> 20;

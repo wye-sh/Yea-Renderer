@@ -256,23 +256,24 @@ Pipeline* fullscreenPipeline(Shader* s, const char* name)
 Pipeline* capturePipeline(CullMode cull)
 {
     VertexLayout l = {};
-    l.mBindingCount = 2;
-    l.mBindings[0].mStride = 24; // RenderFrame::vertexStride: float3 position, float3 normal
-    l.mBindings[1].mStride = 4;
-    l.mBindings[1].mRate = VERTEX_BINDING_RATE_INSTANCE;
+    l.mBindingCount = 3; // the frame's positions and attributes, then the instance-rate stream
+    l.mBindings[0].mStride = RENDER_POSITION_STRIDE;
+    l.mBindings[1].mStride = RENDER_ATTRIBUTE_STRIDE;
+    l.mBindings[2].mStride = 4;
+    l.mBindings[2].mRate = VERTEX_BINDING_RATE_INSTANCE;
     l.mAttribCount = 3;
     l.mAttribs[0] = {};
     l.mAttribs[0].mSemantic = SEMANTIC_POSITION;
     l.mAttribs[0].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
     l.mAttribs[1] = {};
     l.mAttribs[1].mSemantic = SEMANTIC_NORMAL;
-    l.mAttribs[1].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
+    l.mAttribs[1].mFormat = TinyImageFormat_R16G16_SNORM; // octahedral
+    l.mAttribs[1].mBinding = 1;
     l.mAttribs[1].mLocation = 1;
-    l.mAttribs[1].mOffset = 12;
     l.mAttribs[2] = {};
     l.mAttribs[2].mSemantic = SEMANTIC_TEXCOORD1;
     l.mAttribs[2].mFormat = TinyImageFormat_R32_UINT;
-    l.mAttribs[2].mBinding = 1;
+    l.mAttribs[2].mBinding = 2;
     l.mAttribs[2].mLocation = 2;
 
     RasterizerStateDesc raster = {};
@@ -459,7 +460,7 @@ bool probes_prepare(uint64_t address)
 {
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
     gTodoCount = 0;
-    if (!gReady || !settings.enabled || !F || F->version != RENDER_FRAME_VERSION || !F->materials || !F->vertices)
+    if (!gReady || !settings.enabled || !F || F->version != RENDER_FRAME_VERSION || !F->materials || !F->positions || !F->attributes)
         return false;
     uint32_t octa = snapResolution(settings.resolution);
     if (octa != gOcta)
@@ -648,10 +649,10 @@ void probes_render(uint64_t address)
                     cmdBindDescriptorSet(cmd, fi, gCaptureSet);
                     cmdBindIndexBuffer(cmd, F->indices, INDEX_TYPE_UINT32, 0);
                 }
-                Buffer*    bufs[2] = { F->vertices, gStreamBuf[fi] };
-                uint32_t   strides[2] = { F->vertexStride, 4 };
-                uint64_t   offsets[2] = { 0, (uint64_t)run.streamStart * 4 };
-                cmdBindVertexBuffer(cmd, 2, bufs, strides, offsets);
+                Buffer*    bufs[3] = { F->positions, F->attributes, gStreamBuf[fi] };
+                uint32_t   strides[3] = { RENDER_POSITION_STRIDE, RENDER_ATTRIBUTE_STRIDE, 4 };
+                uint64_t   offsets[3] = { 0, 0, (uint64_t)run.streamStart * 4 };
+                cmdBindVertexBuffer(cmd, 3, bufs, strides, offsets);
                 cmdDrawIndexedInstanced(cmd, run.indexCount, run.firstIndex, run.count, (uint32_t)run.vertexOffset, 0);
             }
             cmdBindRenderTargets(cmd, nullptr);

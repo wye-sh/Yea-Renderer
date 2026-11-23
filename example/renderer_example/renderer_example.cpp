@@ -11,10 +11,12 @@
 
 namespace renderer_example
 {
-// Models for the Model Viewer (built-in shapes until the example has models of its own).
-MODEL(shape_box, "box");
-MODEL(shape_sphere, "sphere");
-MODEL(shape_torus, "torus");
+// Sample models (Khronos' glTF samples, CC0; example/model_sources/fetch_and_cook.sh cooks them), placed among the
+// shapes. Their sizes are their Scale knobs' defaults in module.yea (each file's own units kept, as cooked).
+MODEL(lantern, "models/Lantern.rmodel");
+MODEL(flight_helmet, "models/FlightHelmet.rmodel");
+MODEL(water_bottle, "models/WaterBottle.rmodel");
+MODEL(boom_box, "models/BoomBox.rmodel");
 
 namespace
 {
@@ -210,6 +212,21 @@ void addProbes()
 
 // The whole scene, from nothing. Not while the renderer is unloaded (a crash, a revert, a reload): its imports are
 // stubs then, and a scene built against them would hold invalid handles that never move what the renderer has.
+// The sample models, placed again whenever renderer_models lost them (Reset State, its scene starting over). A model's
+// front, its file's +Z, faces -Z as cooked; each is turned towards the start view.
+void placeModels()
+{
+    const yea_float4 toView = axisAngle({ 0, 1, 0 }, -2.17f);
+    if (!mdl::placed(models->lantern)) // a 3 m street lamp by the white boxes, its arm over the path
+        models->lantern = mdl::place(lantern, { -7.6f, -0.02f, 4.2f }, axisAngle({ 0, 1, 0 }, -0.5f));
+    if (!mdl::placed(models->flightHelmet)) // on its stand on the stone ledge, right of the tube light
+        models->flightHelmet = mdl::place(flight_helmet, { 4.6f, 0.5f, -7.4f }, toView);
+    if (!mdl::placed(models->waterBottle)) // on the floor in front, standing on its base
+        models->waterBottle = mdl::place(water_bottle, { 7.4f, 0.52f, 4.4f }, toView);
+    if (!mdl::placed(models->boomBox)) // on the copper block
+        models->boomBox = mdl::place(boom_box, { 5.0f, 1.4f, 2.0f }, toView);
+}
+
 void build(State* s)
 {
     s->built = 0;
@@ -636,6 +653,7 @@ void update(uint32_t phase, float dt)
         addProbes(); // renderer_probes came up after the scene was built: its import was a stub then
     if (!settings.benchmark_view)
         s->t += dt; // Benchmark View holds the lights and shapes still, so timings repeat
+    placeModels();
     syncLights(s);
     animate(s);
     moveCamera(s, dt);

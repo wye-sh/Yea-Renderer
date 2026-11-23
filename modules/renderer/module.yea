@@ -17,11 +17,16 @@ table MeshLod none 1024
   u32 next
   float error
 end
-table Vertex none 262144
+# A vertex as the GPU streams have it: its position, then its attributes packed as frame.h's RENDER_ATTRIBUTE_STRIDE says
+# (octahedral normal and tangent, uv0, colour).
+table Vertex none 1048576
   float3 pos
-  float3 normal
+  u32 normal
+  u32 tangent
+  float2 uv
+  u32 color
 end
-table Index none 1048576
+table Index none 4194304
   u32 v
 end
 table Material none 4096
@@ -87,6 +92,13 @@ export u32 mesh_vertex(float3 pos, float3 normal)
 # Only that side is drawn unless its material is double-sided.
 export void mesh_triangle(u32 a, u32 b, u32 c)
 export u32 mesh_end()
+# A cooked mesh in one call (renderer_models' loader): vertex_count positions (float3 each) and attributes (5 u32 each, as
+# frame.h's RENDER_ATTRIBUTE_STRIDE), index_count u32 indices from 0, its triangles counter-clockwise around their outward
+# normal. Its mesh, or 4294967295 when the tables are full or a mesh is being built.
+export u32 mesh_packed(u64 positions, u64 attributes, u32 vertex_count, u64 indices, u32 index_count)
+# Makes `simpler` the next version of `mesh` (its LOD chain, the finest first) and sets how far `mesh` strays from the
+# true shape (object units); `simpler` 4294967295 ends the chain there.
+export void mesh_lod(u32 mesh, float error, u32 simpler)
 
 export handle material_add(float3 albedo, float roughness, float metallic)
 export void material_set(handle m, float3 albedo, float roughness, float metallic)

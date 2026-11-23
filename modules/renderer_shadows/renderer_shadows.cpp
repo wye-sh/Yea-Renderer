@@ -219,8 +219,8 @@ void makePipelines(float slope)
     if (gClearPipe)
         removePipeline(gRenderer, gClearPipe);
     VertexLayout l = {};
-    l.mBindingCount = 2;
-    l.mBindings[0].mStride = 24;
+    l.mBindingCount = 2; // the frame's positions (nothing else is read), then the instance-rate stream
+    l.mBindings[0].mStride = RENDER_POSITION_STRIDE;
     l.mBindings[1].mStride = 4;
     l.mBindings[1].mRate = VERTEX_BINDING_RATE_INSTANCE;
     l.mAttribCount = 2;
@@ -611,8 +611,8 @@ void drawCasters(Cmd* cmd, const RenderFrame* F, uint32_t view, const RenderGpuS
         if (!count)
             return;
         const renderer::Mesh& m = renderer::Meshes[mesh];
-        Buffer*  bufs[2] = { F->vertices, streamBuf };
-        uint32_t strides[2] = { F->vertexStride, 4 };
+        Buffer*  bufs[2] = { F->positions, streamBuf };
+        uint32_t strides[2] = { RENDER_POSITION_STRIDE, 4 };
         uint64_t offsets[2] = { 0, (uint64_t)first * 4 };
         cmdBindVertexBuffer(cmd, 2, bufs, strides, offsets);
         cmdDrawIndexedInstanced(cmd, m.indexCount, m.firstIndex, count, m.firstVertex, 0);
@@ -1229,7 +1229,7 @@ void shadows_render(uint64_t address)
     uint32_t  fi = F->frameIndex;
     uint32_t* stream = gStreamCpu;
     gStreamUsed = 0;
-    bool geometry = F->vertices && F->indices && F->instances && F->casterCount;
+    bool geometry = F->positions && F->indices && F->instances && F->casterCount;
 
     DescriptorData p[2] = {};
     p[0].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gInstances);

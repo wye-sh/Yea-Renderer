@@ -22,6 +22,7 @@ struct Entry
     float    knobs[mdl::kKnobs];
     uint32_t parts;
     uint32_t mesh[kMaxParts], material[kMaxParts];
+    uint32_t twoSided[kMaxParts]; // its material is double-sided in the file (the Double Sided knob adds to it)
     float    lo[3], hi[3]; // its bounds as cooked (object units)
 };
 // Every model the view's modules declared, in the order declared (made in load()).

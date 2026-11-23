@@ -1,4 +1,14 @@
 // Layouts of the scene capture (the core's InstanceData, MaterialData and LightData).
+// A vertex's octahedral normal or tangent (frame.h's RENDER_ATTRIBUTE_STRIDE), as a unit vector.
+float3 octDecode(float2 f)
+{
+    float3 n = float3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    float  t = saturate(-n.z);
+    n.x += n.x >= 0.0 ? -t : t;
+    n.y += n.y >= 0.0 ? -t : t;
+    return normalize(n);
+}
+
 STRUCT(InstanceData)
 {
     DATA(float4, row0, None);

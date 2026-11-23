@@ -10,6 +10,8 @@ import renderer u32 mesh_plane() = 4294967295
 import renderer u32 mesh_cylinder(u32 segments) = 4294967295
 import renderer u32 mesh_cone(u32 segments) = 4294967295
 import renderer u32 mesh_torus(float thickness, u32 segments) = 4294967295
+import renderer u32 mesh_packed(u64 positions, u64 attributes, u32 vertex_count, u64 indices, u32 index_count) = 4294967295
+import renderer void mesh_lod(u32 mesh, float error, u32 simpler)
 import renderer handle material_add(float3 albedo, float roughness, float metallic) = 4294967295
 import renderer void material_double_sided(handle m, bool on)
 import renderer handle instance_add(u32 mesh, handle material) = 4294967295
@@ -46,6 +48,7 @@ table ModelPart none 4096
   u32 part
   u32 mesh
   u32 material
+  u32 twoSided
   float3 lo
   float3 hi
 end
