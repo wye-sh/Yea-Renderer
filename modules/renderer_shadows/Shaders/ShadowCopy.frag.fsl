@@ -1,0 +1,24 @@
+// The face's still casters' depth, from its square of the static atlas (cells of 128 texels).
+#include "ShadowCopy.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(FLAT(uint), Entry, TEXCOORD0);
+};
+
+STRUCT(PSOutput)
+{
+    DATA(float, Depth, SV_Depth);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+PSOutput PS_MAIN(VSOutput In)
+{
+    INIT_MAIN;
+    PSOutput Out;
+    int2 src = int2(int(In.Entry & 0xFFu), int((In.Entry >> 8) & 0xFFu)) * 128;
+    int2 dst = int2(int((In.Entry >> 16) & 0xFFu), int(In.Entry >> 24)) * 128;
+    Out.Depth = LoadTex2D(gStatic, NO_SAMPLER, int2(In.Position.xy) - dst + src, 0).r;
+    RETURN(Out);
+}

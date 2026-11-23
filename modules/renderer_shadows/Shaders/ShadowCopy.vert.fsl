@@ -1,0 +1,25 @@
+// A static-atlas square copied into the local atlas: a triangle over the viewport (the face's square; first vertex 0),
+// and an instance-rate stream entry: the static square's cell x, y in bits 0-7 and 8-15, the face's in 16-23 and 24-31.
+#include "ShadowCopy.srt.h"
+
+STRUCT(VSInput)
+{
+    DATA(uint, Entry, TEXCOORD1);
+};
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(FLAT(uint), Entry, TEXCOORD0);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN(VSInput In, SV_VertexID(uint) id)
+{
+    INIT_MAIN;
+    VSOutput Out;
+    float2 uv = float2(float((id << 1) & 2), float(id & 2));
+    Out.Position = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.5, 1.0);
+    Out.Entry = In.Entry;
+    RETURN(Out);
+}

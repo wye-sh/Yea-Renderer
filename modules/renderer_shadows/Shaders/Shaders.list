@@ -11,6 +11,14 @@
 #include "ShadowClear.vert.fsl"
 #end
 
+#vert renderer_shadow_copy.vert
+#include "ShadowCopy.vert.fsl"
+#end
+
+#frag renderer_shadow_copy.frag
+#include "ShadowCopy.frag.fsl"
+#end
+
 #vert renderer_shadow_masked.vert
 #define MASKED
 #include "Shadow.vert.fsl"
