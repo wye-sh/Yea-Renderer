@@ -89,19 +89,28 @@ uint32_t       gRasterNext;
 bool           gCaptureReady;
 uint32_t       gTexBound[kMaxFrames * 2]; // the core's textureVersion each capture set holds (0: none yet)
 
-// The sun's map: drawn when the sun, the casters, the probe box or the textures change (on raster frames only).
+// The sun's map, in two: gSun holds the still casters, drawn only when the sun, the still casters, the probe box, the view
+// or the textures change; gSunDyn the moving ones (skinned, or moved twice within kMovingFrames, so appearing or one
+// jump costs one redraw of the still map, as before), drawn every raster frame they are there. Both share one view, so
+// a texel's depth is the lesser of the two, as one map of every caster would hold: which map a caster is in changes
+// only the cost, never the light.
+const uint64_t kMovingFrames = 60;
+const uint32_t kMoveRows = 65536; // the core's Instance table
+uint64_t *     gLastMove, *gPrevMove; // per instance row: the last two `moved` values seen
 Shader*        gSunShader;
 Pipeline*      gSunPipe;
-RenderTarget*  gSun;
-Buffer*        gSunStream[kMaxFrames];
-uint32_t*      gSunStreamCpu;
-Run*           gSunRuns;
-uint32_t       gSunRunCount;
+RenderTarget * gSun, *gSunDyn;
+Buffer *       gSunStream[kMaxFrames], *gSunDynStream[kMaxFrames];
+uint32_t *     gSunStreamCpu, *gSunDynStreamCpu;
+Run *          gSunRuns, *gSunDynRuns;
+uint32_t       gSunRunCount, gSunDynRunCount;
 float          gSunView[3][4];
 float          gSunDir[3], gSunOrigin[3], gSunSpacing[3];
-uint64_t       gSunDrawn;     // the frame it was drawn (0: never)
-uint32_t       gSunTextures, gSunCasters;
-bool           gSunValid;
+float          gSunStill[6], gSunBox[6]; // the box of the probes and the still casters; the box the view was fitted to
+uint64_t       gSunDrawn;     // the frame the still map was drawn (0: never)
+uint64_t       gSunSig;       // the still casters: their count and a sum of hashes of their instances
+uint32_t       gSunTextures;
+bool           gSunValid, gSunDynOn; // gSunDynOn: gSunDyn holds this frame's moving casters
 
 // This frame's plan, from gi_prepare to gi_run.
 bool     gOn, gInitNow;
@@ -478,19 +487,26 @@ bool makeCapture()
     sd2.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
     sd2.pName = "renderer_gi_sun";
     addRenderTarget(gRenderer, &sd2, &gSun);
+    sd2.pName = "renderer_gi_sun_moving";
+    addRenderTarget(gRenderer, &sd2, &gSunDyn);
     for (uint32_t i = 0; i < gFrames; ++i)
+    {
         gSunStream[i] = makeBuffer((uint64_t)kMaxSunEntries * 4, 0, DESCRIPTOR_TYPE_VERTEX_BUFFER, cpu, RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
                                    "renderer_gi_sun_stream");
+        gSunDynStream[i] = makeBuffer((uint64_t)kMaxSunEntries * 4, 0, DESCRIPTOR_TYPE_VERTEX_BUFFER, cpu,
+                                      RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, "renderer_gi_sun_moving_stream");
+    }
     DescriptorSetDesc persistent = SRT_SET_DESC(GiCaptureSrt, Persistent, 1, 0);
     addDescriptorSet(gRenderer, &persistent, &gCapturePersistent);
     // Two a frame: the capture's, and the sun map's (which can't bind the map it draws).
     DescriptorSetDesc perFrame = SRT_SET_DESC(GiCaptureSrt, PerFrame, gFrames * 2, 0);
     addDescriptorSet(gRenderer, &perFrame, &gCaptureSet);
     waitForAllResourceLoads();
-    bool ok = gFaces && gFaceDepth && gNoAtlas && gNoViews && gNoSh && gNoDecals && gNoCells && gNoItems && gShadowCmp && gCapturePipe && gSunPipe && gSun && gCapturePersistent && gCaptureSet &&
+    bool ok = gFaces && gFaceDepth && gNoAtlas && gNoViews && gNoSh && gNoDecals && gNoCells && gNoItems && gShadowCmp && gCapturePipe && gSunPipe && gSun && gSunDyn && gCapturePersistent && gCaptureSet &&
               gNoViews->pCpuMappedAddress && gNoSh->pCpuMappedAddress;
     for (uint32_t i = 0; i < gFrames; ++i)
-        ok = ok && gStream[i] && gStream[i]->pCpuMappedAddress && gSunStream[i] && gSunStream[i]->pCpuMappedAddress;
+        ok = ok && gStream[i] && gStream[i]->pCpuMappedAddress && gSunStream[i] && gSunStream[i]->pCpuMappedAddress && gSunDynStream[i] &&
+                  gSunDynStream[i]->pCpuMappedAddress;
     if (!ok)
         return false;
     memset(gNoViews->pCpuMappedAddress, 0, sizeof(RenderGpuShadowView) * 4);
@@ -503,6 +519,10 @@ bool makeCapture()
     gRuns = new Run[kMaxRuns];
     gSunStreamCpu = new uint32_t[kMaxSunEntries];
     gSunRuns = new Run[kMaxRuns];
+    gSunDynStreamCpu = new uint32_t[kMaxSunEntries];
+    gSunDynRuns = new Run[kMaxRuns];
+    gLastMove = new uint64_t[kMoveRows]();
+    gPrevMove = new uint64_t[kMoveRows]();
     memset(gTexBound, 0, sizeof gTexBound);
     gSunDrawn = 0;
     gSunValid = false;
@@ -515,12 +535,20 @@ void freeCapture()
     delete[] gRuns;
     delete[] gSunStreamCpu;
     delete[] gSunRuns;
+    delete[] gSunDynStreamCpu;
+    delete[] gSunDynRuns;
+    delete[] gLastMove;
+    delete[] gPrevMove;
+    gLastMove = gPrevMove = nullptr;
+    gSunDynStreamCpu = nullptr;
+    gSunDynRuns = nullptr;
+    gSunDynOn = false;
     gStreamCpu = nullptr;
     gRuns = nullptr;
     gSunStreamCpu = nullptr;
     gSunRuns = nullptr;
     gSunValid = false;
-    RenderTarget** rts[] = { &gFaces, &gFaceDepth, &gNoAtlas, &gSun };
+    RenderTarget** rts[] = { &gFaces, &gFaceDepth, &gNoAtlas, &gSun, &gSunDyn };
     for (RenderTarget** r : rts)
     {
         if (*r)
@@ -528,7 +556,8 @@ void freeCapture()
         *r = nullptr;
     }
     Buffer** bufs[] = { &gNoViews, &gNoSh, &gNoDecals, &gNoCells, &gNoItems, &gStream[0], &gStream[1], &gStream[2], &gStream[3],
-                        &gSunStream[0], &gSunStream[1], &gSunStream[2], &gSunStream[3] };
+                        &gSunStream[0], &gSunStream[1], &gSunStream[2], &gSunStream[3],
+                        &gSunDynStream[0], &gSunDynStream[1], &gSunDynStream[2], &gSunDynStream[3] };
     for (Buffer** b : bufs)
     {
         if (*b)
@@ -606,102 +635,168 @@ uint32_t planCapture(const RenderFrame* F, uint32_t start, uint32_t count)
     return used;
 }
 
-// Whether the sun's map must be drawn again, and if so its view and casters: an orthographic view along the sun over the
-// box round the probe volume and every shadow caster (spheres over 200 m left out, as fitBox does), whole: outside its
-// rectangle no caster lies between a point and the sun, so the captures read it as lit, exactly.
+// The sun's casters split into still and moving (skinned, or moved within kMovingFrames: a caster that stops moves into
+// the still map once), each in runs of one mesh (the core sorts them by mesh). Returns whether the still map must be
+// drawn again; gSunDynOn says whether the moving map is drawn this frame. The view is orthographic along the sun over
+// the box round the probe volume and every shadow caster (spheres over 200 m left out, as fitBox does), whole: outside
+// its rectangle no caster lies between a point and the sun, so the captures read it as lit, exactly. It is refitted only
+// when the still box changes or a moving caster leaves the box it was fitted to (which then takes the moving casters'
+// spheres with a metre and a quarter of their radius to spare), so a moving caster never redraws the still casters.
+void sunRuns(const RenderCaster& cs, Run* runs, uint32_t* count, uint32_t* stream, uint32_t* used, Run** run)
+{
+    if (*used >= kMaxSunEntries)
+        return;
+    if (!*run || (*run)->firstIndex != cs.firstIndex || (*run)->vertexOffset != cs.vertexOffset || (*run)->indexCount != cs.indexCount)
+    {
+        if (*count >= kMaxRuns)
+            return;
+        *run = &runs[(*count)++];
+        **run = { cs.firstIndex, cs.indexCount, cs.vertexOffset, *used, 0 };
+    }
+    stream[(*used)++] = cs.instance;
+    (*run)->count++;
+}
+
 bool fitSun(const RenderFrame* F)
 {
+    gSunDynOn = false;
     if (!F->sunOn || !F->casters)
     {
         gSunValid = false;
         return false;
     }
-    uint64_t latest = F->casterRemoved;
+    const uint64_t now = F->frameNumber;
     for (uint32_t i = 0; i < F->casterCount; ++i)
-        latest = F->casters[i].moved > latest ? F->casters[i].moved : latest;
-    bool same = gSunValid && latest < gSunDrawn && F->casterCount == gSunCasters && F->textureVersion == gSunTextures &&
+    {
+        const RenderCaster& c = F->casters[i];
+        if (c.instance < kMoveRows && gLastMove[c.instance] != c.moved)
+            gPrevMove[c.instance] = gLastMove[c.instance], gLastMove[c.instance] = c.moved;
+    }
+    auto moving = [&](const RenderCaster& c) {
+        if (c.dynamic)
+            return true;
+        if (c.instance >= kMoveRows)
+            return c.moved + kMovingFrames > now;
+        return gPrevMove[c.instance] && gPrevMove[c.instance] + 2 * kMovingFrames > now && c.moved + kMovingFrames > now;
+    };
+    uint64_t latest = F->casterRemoved, sig = 0;
+    float    still[6], dyn[6];
+    uint32_t stillCount = 0;
+    for (int k = 0; k < 3; ++k)
+    {
+        still[k] = gOrigin[k];
+        still[k + 3] = gOrigin[k] + gSpacing[k] * (float)(gCount[k] - 1);
+        dyn[k] = 1e30f, dyn[k + 3] = -1e30f;
+    }
+    for (uint32_t i = 0; i < F->casterCount; ++i)
+    {
+        const RenderCaster& c = F->casters[i];
+        const float*        sp = c.sphere;
+        const bool          m = moving(c);
+        if (!m)
+        {
+            stillCount++;
+            latest = c.moved > latest ? c.moved : latest;
+            sig += (uint64_t)(c.instance + 1) * 0x9E3779B97F4A7C15ull;
+        }
+        if (sp[3] > 200.0f)
+            continue;
+        float* box = m ? dyn : still;
+        for (int k = 0; k < 3; ++k)
+        {
+            box[k] = fminf(box[k], sp[k] - sp[3]);
+            box[k + 3] = fmaxf(box[k + 3], sp[k] + sp[3]);
+        }
+    }
+    sig += stillCount;
+    bool refit = !gSunValid || memcmp(still, gSunStill, sizeof still) != 0;
+    for (int k = 0; k < 3 && !refit; ++k)
+        refit = dyn[k] < gSunBox[k] || dyn[k + 3] > gSunBox[k + 3];
+    bool same = !refit && latest < gSunDrawn && sig == gSunSig && F->textureVersion == gSunTextures &&
                 F->sunDir[0] * gSunDir[0] + F->sunDir[1] * gSunDir[1] + F->sunDir[2] * gSunDir[2] > 0.999999f;
     for (int k = 0; k < 3 && same; ++k)
         same = gSunOrigin[k] == gOrigin[k] && gSunSpacing[k] == gSpacing[k];
-    if (same)
-        return false;
-    float lo[3], hi[3];
-    for (int k = 0; k < 3; ++k)
+    if (!same)
     {
-        lo[k] = gOrigin[k];
-        hi[k] = gOrigin[k] + gSpacing[k] * (float)(gCount[k] - 1);
-    }
-    for (uint32_t i = 0; i < F->casterCount; ++i)
-    {
-        const float* c = F->casters[i].sphere;
-        if (c[3] > 200.0f)
-            continue;
-        for (int k = 0; k < 3; ++k)
+        // The box: the still one, and round the moving casters some room to move in.
+        memcpy(gSunStill, still, sizeof still);
+        memcpy(gSunBox, still, sizeof still);
+        for (uint32_t i = 0; i < F->casterCount; ++i)
         {
-            lo[k] = fminf(lo[k], c[k] - c[3]);
-            hi[k] = fmaxf(hi[k], c[k] + c[3]);
+            const RenderCaster& c = F->casters[i];
+            const float*        sp = c.sphere;
+            if (!moving(c) || sp[3] > 200.0f)
+                continue;
+            const float r = sp[3] * 1.25f + 1.0f;
+            for (int k = 0; k < 3; ++k)
+            {
+                gSunBox[k] = fminf(gSunBox[k], sp[k] - r);
+                gSunBox[k + 3] = fmaxf(gSunBox[k + 3], sp[k] + r);
+            }
         }
-    }
-    // The light's frame: f along the light, r and u across it.
-    const float f[3] = { -F->sunDir[0], -F->sunDir[1], -F->sunDir[2] };
-    const float up[3] = { fabsf(f[1]) < 0.99f ? 0.0f : 1.0f, fabsf(f[1]) < 0.99f ? 1.0f : 0.0f, 0.0f };
-    float       r[3] = { up[1] * f[2] - up[2] * f[1], up[2] * f[0] - up[0] * f[2], up[0] * f[1] - up[1] * f[0] };
-    const float rl = sqrtf(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
-    for (int k = 0; k < 3; ++k)
-        r[k] /= rl;
-    const float u[3] = { f[1] * r[2] - f[2] * r[1], f[2] * r[0] - f[0] * r[2], f[0] * r[1] - f[1] * r[0] };
-    const float* axes[3] = { r, u, f };
-    float        mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
-    for (int c = 0; c < 8; ++c)
-    {
-        const float p[3] = { c & 1 ? hi[0] : lo[0], c & 2 ? hi[1] : lo[1], c & 4 ? hi[2] : lo[2] };
+        // The light's frame: f along the light, r and u across it.
+        const float f[3] = { -F->sunDir[0], -F->sunDir[1], -F->sunDir[2] };
+        const float up[3] = { fabsf(f[1]) < 0.99f ? 0.0f : 1.0f, fabsf(f[1]) < 0.99f ? 1.0f : 0.0f, 0.0f };
+        float       r[3] = { up[1] * f[2] - up[2] * f[1], up[2] * f[0] - up[0] * f[2], up[0] * f[1] - up[1] * f[0] };
+        const float rl = sqrtf(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+        for (int k = 0; k < 3; ++k)
+            r[k] /= rl;
+        const float  u[3] = { f[1] * r[2] - f[2] * r[1], f[2] * r[0] - f[0] * r[2], f[0] * r[1] - f[1] * r[0] };
+        const float* axes[3] = { r, u, f };
+        float        mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
+        for (int c = 0; c < 8; ++c)
+        {
+            const float p[3] = { gSunBox[c & 1 ? 3 : 0], gSunBox[c & 2 ? 4 : 1], gSunBox[c & 4 ? 5 : 2] };
+            for (int a = 0; a < 3; ++a)
+            {
+                const float d = axes[a][0] * p[0] + axes[a][1] * p[1] + axes[a][2] * p[2];
+                mn[a] = fminf(mn[a], d);
+                mx[a] = fmaxf(mx[a], d);
+            }
+        }
+        // A texel's margin round the rectangle (so the edge isn't sampled), half a metre before the nearest caster.
+        for (int a = 0; a < 2; ++a)
+        {
+            const float pad = (mx[a] - mn[a]) * (2.0f / (float)kSunSize) + 0.01f;
+            mn[a] -= pad;
+            mx[a] += pad;
+        }
+        mn[2] -= 0.5f;
+        mx[2] += 0.01f;
         for (int a = 0; a < 3; ++a)
         {
-            const float d = axes[a][0] * p[0] + axes[a][1] * p[1] + axes[a][2] * p[2];
-            mn[a] = fminf(mn[a], d);
-            mx[a] = fmaxf(mx[a], d);
+            const float scale = a < 2 ? 2.0f / (mx[a] - mn[a]) : 1.0f / (mx[a] - mn[a]);
+            const float offset = a < 2 ? -(mx[a] + mn[a]) * 0.5f * scale : -mn[a] * scale;
+            gSunView[a][0] = axes[a][0] * scale, gSunView[a][1] = axes[a][1] * scale, gSunView[a][2] = axes[a][2] * scale;
+            gSunView[a][3] = offset;
         }
     }
-    // A texel's margin round the rectangle (so the edge isn't sampled), half a metre before the nearest caster.
-    for (int a = 0; a < 2; ++a)
+    // The casters into their runs: the still ones only when their map is drawn, the moving ones every frame.
+    uint32_t used = 0, dynUsed = 0;
+    Run *    run = nullptr, *dynRun = nullptr;
+    if (!same)
+        gSunRunCount = 0;
+    gSunDynRunCount = 0;
+    for (uint32_t i = 0; i < F->casterCount; ++i)
     {
-        const float pad = (mx[a] - mn[a]) * (2.0f / (float)kSunSize) + 0.01f;
-        mn[a] -= pad;
-        mx[a] += pad;
+        const RenderCaster& c = F->casters[i];
+        if (moving(c))
+            sunRuns(c, gSunDynRuns, &gSunDynRunCount, gSunDynStreamCpu, &dynUsed, &dynRun);
+        else if (!same)
+            sunRuns(c, gSunRuns, &gSunRunCount, gSunStreamCpu, &used, &run);
     }
-    mn[2] -= 0.5f;
-    mx[2] += 0.01f;
-    for (int a = 0; a < 3; ++a)
-    {
-        const float scale = a < 2 ? 2.0f / (mx[a] - mn[a]) : 1.0f / (mx[a] - mn[a]);
-        const float offset = a < 2 ? -(mx[a] + mn[a]) * 0.5f * scale : -mn[a] * scale;
-        gSunView[a][0] = axes[a][0] * scale, gSunView[a][1] = axes[a][1] * scale, gSunView[a][2] = axes[a][2] * scale;
-        gSunView[a][3] = offset;
-    }
-    // Its casters, in runs of one mesh (the core sorts them by mesh).
-    uint32_t used = 0;
-    gSunRunCount = 0;
-    Run* run = nullptr;
-    for (uint32_t i = 0; i < F->casterCount && used < kMaxSunEntries; ++i)
-    {
-        const RenderCaster& cs = F->casters[i];
-        if (!run || run->firstIndex != cs.firstIndex || run->vertexOffset != cs.vertexOffset || run->indexCount != cs.indexCount)
-        {
-            if (gSunRunCount >= kMaxRuns)
-                break;
-            run = &gSunRuns[gSunRunCount++];
-            *run = { cs.firstIndex, cs.indexCount, cs.vertexOffset, used, 0 };
-        }
-        gSunStreamCpu[used++] = cs.instance;
-        run->count++;
-    }
+    if (dynUsed)
+        memcpy(gSunDynStream[F->frameIndex]->pCpuMappedAddress, gSunDynStreamCpu, (size_t)dynUsed * 4);
+    gSunDynOn = dynUsed != 0;
+    if (same)
+        return false;
     memcpy(gSunStream[F->frameIndex]->pCpuMappedAddress, gSunStreamCpu, (size_t)used * 4);
     memcpy(gSunDir, F->sunDir, sizeof gSunDir);
     memcpy(gSunOrigin, gOrigin, sizeof gSunOrigin);
     memcpy(gSunSpacing, gSpacing, sizeof gSunSpacing);
-    gSunCasters = F->casterCount;
+    gSunSig = sig;
     gSunTextures = F->textureVersion;
-    gSunDrawn = F->frameNumber;
+    gSunDrawn = now;
     gSunValid = true;
     return true;
 }
@@ -727,11 +822,12 @@ void fillCapture(GiData* d, const RenderFrame* F, uint32_t start, uint32_t count
     d->shadow[0] = gSunValid ? 1.0f : 0.0f;
     d->shadow[1] = 1.0f / (float)kSunSize;
     d->shadow[2] = F->localTexel;
+    d->shadow[3] = gSunValid && gSunDynOn ? 1.0f : 0.0f;
     memcpy(d->sunView, gSunView, sizeof d->sunView);
 }
 
-// The capture's descriptors into set `index`, the sun's map bound as `sun` (the stand-in while it is being drawn).
-void writeCaptureSet(const RenderFrame* F, uint32_t index, Texture* sun)
+// The capture's descriptors into set `index`, the sun's maps bound as `sun` and `sunDyn` (stand-ins while they are drawn).
+void writeCaptureSet(const RenderFrame* F, uint32_t index, Texture* sun, Texture* sunDyn)
 {
     const bool maps = F->shadowViews && F->sunAtlas && F->localAtlas;
     Buffer*    views = maps ? F->shadowViews : gNoViews;
@@ -739,7 +835,7 @@ void writeCaptureSet(const RenderFrame* F, uint32_t index, Texture* sun)
     Texture*   local = maps ? F->localAtlas->pTexture : gNoAtlas->pTexture;
     Buffer*    lights = F->lightBuffer ? F->lightBuffer : gNoViews; // unread without lights (raster.z 0)
     Buffer*    shapes = F->lightShapes ? F->lightShapes : gNoViews;
-    DescriptorData d[17] = {};
+    DescriptorData d[18] = {};
     const bool     decals = F->worldDecalCount && F->worldDecals && F->decalCells && F->decalItems;
     Buffer*        decalBufs[3] = { decals ? F->worldDecals : gNoDecals, decals ? F->decalCells : gNoCells,
                                     decals ? F->decalItems : gNoItems };
@@ -775,53 +871,64 @@ void writeCaptureSet(const RenderFrame* F, uint32_t index, Texture* sun)
     d[11].ppBuffers = &gProbes;
     d[12].mIndex = SRT_RES_IDX(GiCaptureSrt, PerFrame, gMaterialMaps);
     d[12].ppBuffers = (Buffer**)&F->materialMaps;
-    uint32_t bindings = 16;
+    d[16].mIndex = SRT_RES_IDX(GiCaptureSrt, PerFrame, gGiSunDyn);
+    d[16].ppTextures = &sunDyn;
+    uint32_t bindings = 17;
     if (gTexBound[index] != F->textureVersion) // 1024 descriptors: only when the core's slots changed
     {
-        d[16].mIndex = SRT_RES_IDX(GiCaptureSrt, PerFrame, gTextures);
-        d[16].ppTextures = (Texture**)F->textures;
-        d[16].mCount = RENDER_MAX_TEXTURES;
+        d[17].mIndex = SRT_RES_IDX(GiCaptureSrt, PerFrame, gTextures);
+        d[17].ppTextures = (Texture**)F->textures;
+        d[17].mCount = RENDER_MAX_TEXTURES;
         gTexBound[index] = F->textureVersion;
-        bindings = 17;
+        bindings = 18;
     }
     updateDescriptorSet(gRenderer, index, gCaptureSet, bindings, d);
 }
 
-// The sun's map, from fitSun's casters.
-void recordSun(const RenderFrame* F)
+// One of the sun's maps (fitSun's runs into it, cleared to lit first).
+void recordSunMap(const RenderFrame* F, RenderTarget* map, Buffer* stream, const Run* runs, uint32_t runCount)
 {
-    Cmd*           cmd = F->cmd;
-    const uint32_t fi = F->frameIndex;
-    writeCaptureSet(F, fi * 2 + 1, gNoAtlas->pTexture);
-    barrierRt(cmd, gSun, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_DEPTH_WRITE);
+    Cmd* cmd = F->cmd;
+    barrierRt(cmd, map, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_DEPTH_WRITE);
     BindRenderTargetsDesc bind = {};
-    bind.mDepthStencil = { gSun, LOAD_ACTION_CLEAR };
+    bind.mDepthStencil = { map, LOAD_ACTION_CLEAR };
     bind.mDepthStencil.mStoreAction = STORE_ACTION_STORE;
     cmdBindRenderTargets(cmd, &bind);
     cmdSetViewport(cmd, 0, 0, (float)kSunSize, (float)kSunSize, 0, 1);
     cmdSetScissor(cmd, 0, 0, kSunSize, kSunSize);
     cmdBindPipeline(cmd, gSunPipe);
     cmdBindDescriptorSet(cmd, 0, gCapturePersistent);
-    cmdBindDescriptorSet(cmd, fi * 2 + 1, gCaptureSet);
+    cmdBindDescriptorSet(cmd, F->frameIndex * 2 + 1, gCaptureSet);
     cmdBindIndexBuffer(cmd, F->indices, INDEX_TYPE_UINT32, 0);
-    for (uint32_t r = 0; r < gSunRunCount; ++r)
+    for (uint32_t r = 0; r < runCount; ++r)
     {
-        const Run& run = gSunRuns[r];
-        Buffer*    bufs[3] = { F->positions, F->attributes, gSunStream[fi] };
+        const Run& run = runs[r];
+        Buffer*    bufs[3] = { F->positions, F->attributes, stream };
         uint32_t   strides[3] = { RENDER_POSITION_STRIDE, RENDER_ATTRIBUTE_STRIDE, 4 };
         uint64_t   offsets[3] = { 0, 0, (uint64_t)run.streamStart * 4 };
         cmdBindVertexBuffer(cmd, 3, bufs, strides, offsets);
         cmdDrawIndexedInstanced(cmd, run.indexCount, run.firstIndex, run.count, (uint32_t)run.vertexOffset, 0);
     }
     cmdBindRenderTargets(cmd, nullptr);
-    barrierRt(cmd, gSun, RESOURCE_STATE_DEPTH_WRITE, RESOURCE_STATE_SHADER_RESOURCE);
+    barrierRt(cmd, map, RESOURCE_STATE_DEPTH_WRITE, RESOURCE_STATE_SHADER_RESOURCE);
+}
+
+// The sun's maps that change this frame: the still one when fitSun says so, the moving one whenever it holds any.
+void recordSun(const RenderFrame* F, bool still)
+{
+    const uint32_t fi = F->frameIndex;
+    writeCaptureSet(F, fi * 2 + 1, gNoAtlas->pTexture, gNoAtlas->pTexture);
+    if (still)
+        recordSunMap(F, gSun, gSunStream[fi], gSunRuns, gSunRunCount);
+    if (gSunDynOn)
+        recordSunMap(F, gSunDyn, gSunDynStream[fi], gSunDynRuns, gSunDynRunCount);
 }
 
 void recordCapture(const RenderFrame* F, uint32_t count)
 {
     Cmd*           cmd = F->cmd;
     const uint32_t fi = F->frameIndex;
-    writeCaptureSet(F, fi * 2, gSun->pTexture);
+    writeCaptureSet(F, fi * 2, gSun->pTexture, gSunDyn->pTexture);
     barrierRt(cmd, gFaces, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_RENDER_TARGET);
     BindRenderTargetsDesc bind = {};
     bind.mRenderTargetCount = 1;
@@ -1043,8 +1150,8 @@ void gi_run(uint64_t address)
     }
     Cmd* cmd = F->cmd;
     cmdBeginDebugMarker(cmd, 0.9f, 0.6f, 0.3f, "Renderer GI");
-    if (drawSun)
-        recordSun(F);
+    if (drawSun || (raster && gSunDynOn))
+        recordSun(F, drawSun);
     if (raster)
         recordCapture(F, count);
     barrierTex(cmd, gIrr, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS);

@@ -62,9 +62,18 @@ float3 toAtlas(GiShadowView v, float3 P)
     return float3(v.rect.xy + (ndc.xy * float2(0.5, -0.5) + float2(0.5, 0.5)) * v.rect.zw, ndc.z);
 }
 
-// The sun's visibility from renderer_gi's own map, which holds every shadow caster over every place a probe can see
-// (renderer_gi.cpp fitSun): a 2 x 2 filtered compare. Outside its rectangle no caster lies between P and the sun, and
+// The sun's visibility from renderer_gi's own maps, which hold every shadow caster over every place a probe can see
+// (renderer_gi.cpp fitSun): a 2 x 2 filtered compare. Outside their rectangle no caster lies between P and the sun, and
 // past its far side every caster is nearer the sun than P (the depth clamped to 1 compares against them): both exact.
+// With moving casters in gGiSunDyn (shadow.w), each of the four texels compares against the nearer of the two maps'
+// depths, as one map of every caster would hold, then they are blended bilinearly.
+float sunTexel(int2 p, int n, float z)
+{
+    p = clamp(p, int2(0, 0), int2(n - 1, n - 1));
+    float d = min(LoadTex2D(gGiSun, NO_SAMPLER, p, 0).r, LoadTex2D(gGiSunDyn, NO_SAMPLER, p, 0).r);
+    return z <= d ? 1.0 : 0.0;
+}
+
 float sunVisibility(float3 P)
 {
     if (gGi.shadow.x < 0.5)
@@ -75,7 +84,16 @@ float sunVisibility(float3 P)
     float  t = gGi.shadow.y;
     if (uv.x < t || uv.y < t || uv.x > 1.0 - t || uv.y > 1.0 - t || a.z <= 0.0)
         return 1.0;
-    return CompareTex2D(gGiSun, gShadowCmp, float3(uv, min(a.z, 1.0)));
+    if (gGi.shadow.w < 0.5)
+        return CompareTex2D(gGiSun, gShadowCmp, float3(uv, min(a.z, 1.0)));
+    int    n = int(1.0 / t + 0.5);
+    float2 st = uv * float(n) - 0.5;
+    float2 f = st - floor(st);
+    int2   i = int2(floor(st));
+    float  z = min(a.z, 1.0);
+    float  top = lerp(sunTexel(i, n, z), sunTexel(i + int2(1, 0), n, z), f.x);
+    float  bottom = lerp(sunTexel(i + int2(0, 1), n, z), sunTexel(i + int2(1, 1), n, z), f.x);
+    return lerp(top, bottom, f.y);
 }
 
 float localVisibility(GiLight l, float3 P)
