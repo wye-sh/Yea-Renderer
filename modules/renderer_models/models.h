@@ -11,6 +11,7 @@ namespace renderer_models
 {
 constexpr uint32_t kMaxModels = 512;
 constexpr uint32_t kMaxParts = RENDER_PREVIEW_PARTS;
+constexpr uint32_t kNoClip = 0xFFFFFFFFu; // no clip: the rest pose
 
 struct Entry
 {
@@ -51,6 +52,12 @@ struct Preview
     uint32_t lodShown, triangles; // what the last draw drew
     const void* outTexture;  // what the panel shows: the target's Texture* (nullptr until made)
     uint32_t    outW, outH;
+    // A skinned model's clip in the preview (its own, not a placement's): the panel picks, update() plays it.
+    PlacementAnim anim;
+    uint32_t      animModel;    // whose clip `anim` is (0: none yet)
+    uint32_t      pickClip;     // picked in the panel: 1 the rest pose, clip c at c + 2; 0 none
+    uint32_t      playing;
+    float         speed, fade;  // speed 1 as authored; seconds faded from the clip before
 };
 extern Preview gPreview;
 

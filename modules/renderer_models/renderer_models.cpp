@@ -36,7 +36,6 @@ anim::Pose*        gPoses;   // scratch for one placement's evaluation (made in 
 anim::Pose*        gFrom;    // the clip it fades from,
 float*             gWorld;   // each node's model-space matrix (12 floats),
 float*             gPalette; // and each bone's (12 floats)
-constexpr uint32_t kNoClip = 0xFFFFFFFFu;
 
 void freeAnim(Entry& e)
 {
@@ -262,6 +261,37 @@ uint32_t clipHashed(const Entry& e, uint32_t hash)
             return c;
     return kNoClip;
 }
+// Clip c (kNoClip: the rest pose) from now, faded from what played over `fade` seconds; the same clip keeps its time.
+void startClip(PlacementAnim& a, uint32_t c, float speed, int loop, float fade)
+{
+    if (c != a.clip && fade > 0)
+        a.from = a.clip, a.fromTime = a.time, a.fromSpeed = a.speed, a.fromLoop = a.loop, a.fade = fade, a.faded = 0;
+    else if (c != a.clip)
+        a.from = kNoClip;
+    if (c != a.clip)
+        a.time = 0;
+    a.clip = c, a.speed = speed, a.loop = loop ? 1 : 0;
+}
+// Its clip (and the one it fades from) moved on by dt.
+void advanceClip(const Entry& e, PlacementAnim& a, float dt)
+{
+    auto step = [&](uint32_t clip, float& time, float speed, uint32_t loop) {
+        if (clip >= e.skel->clipCount)
+            return;
+        const float d = e.clips[clip].duration;
+        time += dt * speed;
+        if (d > 0)
+            time = loop ? (fmodf(time, d) + (time < 0 ? d : 0)) : (time < 0 ? 0 : (time > d ? d : time));
+    };
+    step(a.clip, a.time, a.speed, a.loop);
+    if (a.from != kNoClip)
+    {
+        step(a.from, a.fromTime, a.fromSpeed, a.fromLoop);
+        a.faded += dt;
+        if (a.faded >= a.fade)
+            a.from = kNoClip;
+    }
+}
 int apiPlay(uint32_t h, const char* clip, float speed, int loop, float fade)
 {
     PlacementAnim* a;
@@ -283,13 +313,7 @@ int apiPlay(uint32_t h, const char* clip, float speed, int loop, float fade)
     const uint32_t c = clipNamed(*e, clip);
     if (c == kNoClip && clip && clip[0])
         return 0;
-    if (c != a->clip && fade > 0)
-        a->from = a->clip, a->fromTime = a->time, a->fromSpeed = a->speed, a->fromLoop = a->loop, a->fade = fade, a->faded = 0;
-    else if (c != a->clip)
-        a->from = kNoClip;
-    if (c != a->clip)
-        a->time = 0;
-    a->clip = c, a->speed = speed, a->loop = loop ? 1 : 0;
+    startClip(*a, c, speed, loop, fade);
     return 1;
 }
 float apiTime(uint32_t h)
@@ -771,22 +795,26 @@ void animate(float dt)
             const uint32_t c = clipHashed(*e, a.want);
             a.clip = c != kNoClip ? c : 0, a.want = 0;
         }
-        auto advance = [&](uint32_t clip, float& time, float speed, uint32_t loop) {
-            if (clip >= e->skel->clipCount)
-                return;
-            const float d = e->clips[clip].duration;
-            time += dt * speed;
-            if (d > 0)
-                time = loop ? (fmodf(time, d) + (time < 0 ? d : 0)) : (time < 0 ? 0 : (time > d ? d : time));
-        };
-        advance(a.clip, a.time, a.speed, a.loop);
-        if (a.from != kNoClip)
+        advanceClip(*e, a, dt);
+    }
+    // The Model Viewer's own clip (its model's, whether placed or not), while it plays.
+    if (const Entry* e = byId(gPreview.model); e && e->anim && e->state == 1)
+    {
+        PlacementAnim& a = gPreview.anim;
+        if (gPreview.animModel != e->id) // another model chosen: its first clip, from the start
         {
-            advance(a.from, a.fromTime, a.fromSpeed, a.fromLoop);
-            a.faded += dt;
-            if (a.faded >= a.fade)
-                a.from = kNoClip;
+            a = PlacementAnim{};
+            a.from = kNoClip, a.clip = e->skel->clipCount ? 0 : kNoClip, a.speed = 1, a.loop = 1;
+            gPreview.animModel = e->id;
         }
+        if (gPreview.pickClip) // picked in the panel: 1 the rest pose, clip c at c + 2
+        {
+            const uint32_t c = gPreview.pickClip - 2;
+            startClip(a, gPreview.pickClip >= 2 && c < e->skel->clipCount ? c : kNoClip, a.speed, 1, gPreview.fade);
+            gPreview.pickClip = 0;
+        }
+        a.speed = gPreview.speed;
+        advanceClip(*e, a, gPreview.playing ? dt : 0.0f);
     }
     uint32_t last = 0xFFFFFFFFu, bones = 0; // a placement's parts come together: posed once for all of them
     for (uint32_t i = 0; i < PartInstances.size(); ++i)
@@ -902,6 +930,7 @@ int load(int reloaded)
     gPreview.distance = 1.35f;
     gPreview.lod = -1;
     gPreview.turntable = 1;
+    gPreview.playing = 1, gPreview.speed = 1.0f, gPreview.fade = 0.2f;
     gApi.instance = (uint64_t)host->frame() * 2654435761u ^ (uint64_t)(uintptr_t)gEntries; // models register again
     gInstance = gApi.instance;
     return 0;
@@ -1049,6 +1078,8 @@ void draw(uint32_t pass, const YeaFrame* frame)
     p.skyLuminance = 1.2f;
     p.lodQuality = e->knobs[mdl::KnobLodQuality];
     p.lod = gPreview.lod;
+    if (e->anim && gPreview.animModel == e->id && evaluate(*e, gPreview.anim)) // posed as its clip is now
+        p.palette = (uint64_t)(uintptr_t)gPalette, p.bones = e->skel->boneCount;
     if (renderer::preview_draw((uint64_t)(uintptr_t)&p))
         gPreview.lodShown = p.lodShown, gPreview.triangles = p.triangles;
 }

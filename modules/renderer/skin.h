@@ -30,4 +30,9 @@ bool     skinInstance(uint32_t row, uint32_t lod, SkinDraw& out);
 // from `state` to unordered access and back.
 void     skinRecord(Cmd* cmd, uint32_t fi, Buffer* positions, Buffer* attributes, uint32_t state);
 bool     skinJobs(); // anything to record this frame
+// The Model Viewer's preview (preview_draw): its skinned parts (meshes[k], the versions it draws) posed by `palette` into
+// a region kept after the instances', with a dispatch of its own; offsets[k] each part's first vertex there, -1 where it
+// draws its bind pose (not skinned, or no room or bones yet: a frame or two after it first asks). Allocates nothing.
+uint32_t skinPreview(Cmd* cmd, uint32_t fi, Buffer* positions, Buffer* attributes, uint32_t state, const uint32_t* meshes,
+                     uint32_t parts, const float* palette, uint32_t bones, int32_t* offsets);
 } // namespace renderer

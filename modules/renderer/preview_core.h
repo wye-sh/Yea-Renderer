@@ -370,18 +370,28 @@ bool preview_draw(uint64_t address)
         updateDescriptorSet(gRenderer, fi, gPreviewResolveFrame, 3, r);
     }
 
+    // A skinned model posed as its clip is now (v2), into the preview's own region of the pool.
+    int32_t posedAt[RENDER_PREVIEW_PARTS];
+    for (uint32_t k = 0; k < parts; ++k)
+        posedAt[k] = -1;
+    if (gSkinOn && p->bones && p->palette)
+        skinPreview(cmd, fi, gPosBuf, gAttrBuf, (uint32_t)gGeometryState, drawMesh, parts, (const float*)(uintptr_t)p->palette,
+                    p->bones, posedAt);
+
     auto drawParts = [&](bool shadow, uint32_t sided) {
         cmdBindIndexBuffer(cmd, gIndexBuf, INDEX_TYPE_UINT32, 0);
         for (uint32_t k = 0; k < parts; ++k)
         {
             if (drawMesh[k] == 0xFFFFFFFFu || (!shadow && (p->twoSided[k] ? 1u : 0u) != sided))
                 continue;
-            const Mesh& mesh = Meshes[drawMesh[k]];
-            bindGeometry(cmd, gPreviewStream[fi], k);
-            cmdDrawIndexedInstanced(cmd, mesh.indexCount, mesh.firstIndex, 1, mesh.firstVertex, 0);
+            const Mesh&    mesh = Meshes[drawMesh[k]];
+            const SkinDraw posed = { 0, 0, 0, posedAt[k], posedAt[k] }; // a posed part draws from its region
+            bindGeometry(cmd, gPreviewStream[fi], k, false, posedAt[k] >= 0 ? &posed : nullptr);
+            cmdDrawIndexedInstanced(cmd, mesh.indexCount, mesh.firstIndex, 1, posedAt[k] >= 0 ? 0 : mesh.firstVertex, 0);
         }
     };
     cmdBeginDebugMarker(cmd, 0.9f, 0.8f, 0.4f, "Renderer Model Viewer preview");
+
 
     // The key light's shadow map.
     barrierRt(cmd, p->shadow, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_DEPTH_WRITE);

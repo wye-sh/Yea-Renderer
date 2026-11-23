@@ -23,6 +23,8 @@ namespace
 constexpr uint32_t kMaxFrames = 4;
 constexpr uint32_t kPaletteFloats = 32768 * 12; // bones posed a frame, over every instance
 constexpr uint32_t kMaxJobs = 4096;
+constexpr uint32_t kPreviewBones = 1024; // the Model Viewer's model: bones posed at most
+constexpr uint32_t kPreviewJobs = 64;    // RENDER_PREVIEW_PARTS
 
 struct Pose // an instance row's palette this frame
 {
@@ -58,6 +60,14 @@ Job*           gJobs; // this frame's, from index 1 (index 0's first word: their
 uint32_t       gJobCount, gGroups;
 uint32_t       gBase, gCapacity, gCursor;
 uint64_t       gFrame;
+// The Model Viewer's preview: its own palette, jobs and set (its call comes inside renderer_models' draw, after or before
+// this frame's skin pass), and a region after the instances' sized by what it last asked for.
+DescriptorSet* gPreviewSet;
+Buffer*        gPreviewPaletteBuf[kMaxFrames];
+Buffer*        gPreviewJobBuf[kMaxFrames];
+uint32_t       gPreviewWant;      // vertices its skinned parts need
+uint64_t       gPreviewAsked;     // the frame it last asked
+uint32_t       gPreviewBase, gPreviewRoom;
 
 template<class T> uint32_t rowOf(const yea::Table<T>& t, yea_handle h)
 {
@@ -142,6 +152,8 @@ bool skinLoad(Renderer* renderer, uint32_t frames)
     addPipeline(gRenderer, &desc, &gPipe);
     DescriptorSetDesc set = SRT_SET_DESC(SkinSrt, PerFrame, gFrames, 0);
     addDescriptorSet(gRenderer, &set, &gSet);
+    addDescriptorSet(gRenderer, &set, &gPreviewSet);
+    gPreviewWant = 0, gPreviewAsked = 0, gPreviewBase = gPreviewRoom = 0;
     for (uint32_t i = 0; i < gFrames; ++i)
     {
         BufferLoadDesc d = {};
@@ -162,11 +174,24 @@ bool skinLoad(Renderer* renderer, uint32_t frames)
         d.mDesc.pName = "renderer_skin_jobs";
         d.ppBuffer = &gJobBuf[i];
         addResource(&d, nullptr);
+        d.mDesc.mFormat = TinyImageFormat_R32G32B32A32_SFLOAT;
+        d.mDesc.mSize = (uint64_t)kPreviewBones * 48;
+        d.mDesc.mElementCount = kPreviewBones * 3;
+        d.mDesc.pName = "renderer_skin_preview_palette";
+        d.ppBuffer = &gPreviewPaletteBuf[i];
+        addResource(&d, nullptr);
+        d.mDesc.mFormat = TinyImageFormat_R32G32B32A32_UINT;
+        d.mDesc.mSize = (uint64_t)(kPreviewJobs + 1) * sizeof(Job);
+        d.mDesc.mElementCount = (kPreviewJobs + 1) * 2;
+        d.mDesc.pName = "renderer_skin_preview_jobs";
+        d.ppBuffer = &gPreviewJobBuf[i];
+        addResource(&d, nullptr);
     }
     waitForAllResourceLoads();
-    bool ok = gPipe && gSet;
+    bool ok = gPipe && gSet && gPreviewSet;
     for (uint32_t i = 0; i < gFrames; ++i)
-        ok = ok && gPaletteBuf[i] && gPaletteBuf[i]->pCpuMappedAddress && gJobBuf[i] && gJobBuf[i]->pCpuMappedAddress;
+        ok = ok && gPaletteBuf[i] && gPaletteBuf[i]->pCpuMappedAddress && gJobBuf[i] && gJobBuf[i]->pCpuMappedAddress &&
+             gPreviewPaletteBuf[i] && gPreviewPaletteBuf[i]->pCpuMappedAddress && gPreviewJobBuf[i] && gPreviewJobBuf[i]->pCpuMappedAddress;
     return ok;
 }
 
@@ -178,7 +203,13 @@ void skinUnload()
             removeResource(gPaletteBuf[i]), gPaletteBuf[i] = nullptr;
         if (gJobBuf[i])
             removeResource(gJobBuf[i]), gJobBuf[i] = nullptr;
+        if (gPreviewPaletteBuf[i])
+            removeResource(gPreviewPaletteBuf[i]), gPreviewPaletteBuf[i] = nullptr;
+        if (gPreviewJobBuf[i])
+            removeResource(gPreviewJobBuf[i]), gPreviewJobBuf[i] = nullptr;
     }
+    if (gPreviewSet)
+        removeDescriptorSet(gRenderer, gPreviewSet), gPreviewSet = nullptr;
     if (gSkinBuf)
         removeResource(gSkinBuf), gSkinBuf = nullptr;
     if (gSet)
@@ -199,7 +230,7 @@ uint32_t skinNeed()
     gFrame = yea::host()->frame();
     if (!gPose || !SkinVertexes.size())
         return 0;
-    uint64_t need = 0;
+    uint64_t need = gPreviewAsked + 2 >= gFrame ? gPreviewWant : 0; // the preview's, while it is shown
     for (uint32_t row = 0; row < Instances.size(); ++row)
         if (posed(row))
             need += 2ull * Meshes[Instances[row].mesh].vertexCount;
@@ -208,7 +239,38 @@ uint32_t skinNeed()
 
 void skinBegin(uint32_t base, uint32_t capacity)
 {
-    gBase = base, gCapacity = capacity, gCursor = 0, gJobCount = 0, gGroups = 0;
+    // The preview's region at the end, while it is shown and fits; the instances' from the start, before it.
+    const uint32_t want = gPreviewAsked + 2 >= gFrame ? gPreviewWant : 0;
+    gPreviewRoom = want <= capacity ? want : 0;
+    gPreviewBase = base + capacity - gPreviewRoom;
+    gBase = base, gCapacity = capacity - gPreviewRoom, gCursor = 0, gJobCount = 0, gGroups = 0;
+    // The bones' buffer, made again whenever the table grew or the scene started over (rare: a model loading). Here, in
+    // the core's own draw: the preview's call (renderer_models' draw) never makes it.
+    const uint32_t rows = SkinVertexes.size(), epoch = scene_epoch();
+    if (!gPose || (gSkinBuf && rows == gSkinRows && epoch == gSkinEpoch) || (!rows && !gSkinBuf))
+        return;
+    if (gSkinBuf)
+    {
+        waitQueueIdle((Queue*)yea::host()->queue);
+        removeResource(gSkinBuf), gSkinBuf = nullptr;
+    }
+    gSkinRows = 0, gSkinEpoch = epoch;
+    if (!rows)
+        return;
+    BufferLoadDesc d = {};
+    d.mDesc.mDescriptors = DESCRIPTOR_TYPE_BUFFER;
+    d.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+    d.mDesc.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+    d.mDesc.mFormat = TinyImageFormat_R32G32B32A32_UINT;
+    d.mDesc.mSize = (uint64_t)rows * 16;
+    d.mDesc.mElementCount = rows;
+    d.mDesc.mStructStride = 16;
+    d.mDesc.pName = "renderer_skin_vertices";
+    d.pData = SkinVertexes.begin();
+    d.ppBuffer = &gSkinBuf;
+    addResource(&d, nullptr);
+    waitForAllResourceLoads();
+    gSkinRows = gSkinBuf ? rows : 0;
 }
 
 bool skinInstance(uint32_t row, uint32_t lod, SkinDraw& out)
@@ -242,34 +304,10 @@ void skinRecord(Cmd* cmd, uint32_t fi, Buffer* positions, Buffer* attributes, ui
     if (!gJobCount || !positions || !attributes)
         return;
     const ResourceState state = (ResourceState)stateBits;
-    // The bones' buffer, made again whenever the table grew or the scene started over (rare: a model loading).
-    const uint32_t rows = SkinVertexes.size(), epoch = scene_epoch();
-    if (!gSkinBuf || rows != gSkinRows || epoch != gSkinEpoch)
+    if (!gSkinBuf || gSkinRows != SkinVertexes.size()) // skinBegin made it, or couldn't
     {
-        if (gSkinBuf)
-        {
-            waitQueueIdle((Queue*)yea::host()->queue);
-            removeResource(gSkinBuf), gSkinBuf = nullptr;
-        }
-        BufferLoadDesc d = {};
-        d.mDesc.mDescriptors = DESCRIPTOR_TYPE_BUFFER;
-        d.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
-        d.mDesc.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
-        d.mDesc.mFormat = TinyImageFormat_R32G32B32A32_UINT;
-        d.mDesc.mSize = (uint64_t)rows * 16;
-        d.mDesc.mElementCount = rows;
-        d.mDesc.mStructStride = 16;
-        d.mDesc.pName = "renderer_skin_vertices";
-        d.pData = SkinVertexes.begin();
-        d.ppBuffer = &gSkinBuf;
-        addResource(&d, nullptr);
-        waitForAllResourceLoads();
-        gSkinRows = rows, gSkinEpoch = epoch;
-        if (!gSkinBuf)
-        {
-            gJobCount = 0;
-            return;
-        }
+        gJobCount = 0;
+        return;
     }
     memcpy(gPaletteBuf[fi]->pCpuMappedAddress, gPoseCpu, (size_t)gPoseUsed * sizeof(float));
     gJobs[0] = Job{};
@@ -294,5 +332,63 @@ void skinRecord(Cmd* cmd, uint32_t fi, Buffer* positions, Buffer* attributes, ui
     cmdDispatch(cmd, gGroups, 1, 1);
     BufferBarrier out[2] = { { positions, RESOURCE_STATE_UNORDERED_ACCESS, state }, { attributes, RESOURCE_STATE_UNORDERED_ACCESS, state } };
     cmdResourceBarrier(cmd, 2, out, 0, nullptr, 0, nullptr);
+}
+
+uint32_t skinPreview(Cmd* cmd, uint32_t fi, Buffer* positions, Buffer* attributes, uint32_t stateBits, const uint32_t* meshes,
+                     uint32_t parts, const float* palette, uint32_t bones, int32_t* offsets)
+{
+    for (uint32_t k = 0; k < parts; ++k)
+        offsets[k] = -1;
+    if (!gPipe || !gPreviewSet || !palette || !bones || bones > kPreviewBones || !positions || !attributes)
+        return 0;
+    // What its skinned parts need (asked for again each frame it shows; reserved from the core's next draw on).
+    uint64_t want = 0;
+    for (uint32_t k = 0; k < parts && k < kPreviewJobs; ++k)
+        if (meshes[k] < Meshes.size() && meshes[k] < MeshSkins.size() && MeshSkins[meshes[k]].firstSkin)
+            want += Meshes[meshes[k]].vertexCount;
+    gPreviewWant = want > 0x0FFFFFFFu ? 0x0FFFFFFFu : (uint32_t)want;
+    gPreviewAsked = yea::host()->frame();
+    if (!want || want > gPreviewRoom || !gSkinBuf || gSkinRows != SkinVertexes.size() || gSkinEpoch != scene_epoch())
+        return 0; // drawn in its bind pose until its region and bones are there (a frame or two)
+    Job*     jobs = (Job*)gPreviewJobBuf[fi]->pCpuMappedAddress;
+    uint32_t count = 0, groups = 0, cursor = 0;
+    for (uint32_t k = 0; k < parts && k < kPreviewJobs; ++k)
+    {
+        const uint32_t m = meshes[k];
+        if (m >= Meshes.size() || m >= MeshSkins.size() || !MeshSkins[m].firstSkin ||
+            MeshSkins[m].firstSkin - 1 + (uint64_t)Meshes[m].vertexCount > SkinVertexes.size())
+            continue;
+        const uint32_t n = Meshes[m].vertexCount;
+        offsets[k] = (int32_t)(gPreviewBase + cursor);
+        jobs[1 + count++] = { Meshes[m].firstVertex, n, gPreviewBase + cursor, groups, 0xFFFFFFFFu, MeshSkins[m].firstSkin - 1, 0, 0 };
+        groups += (n + 63) / 64;
+        cursor += n;
+    }
+    if (!count)
+        return 0;
+    jobs[0] = Job{};
+    jobs[0].src = count;
+    memcpy(gPreviewPaletteBuf[fi]->pCpuMappedAddress, palette, (size_t)bones * 12 * sizeof(float));
+    DescriptorData p[5] = {};
+    p[0].mIndex = SRT_RES_IDX(SkinSrt, PerFrame, gPositions);
+    p[0].ppBuffers = &positions;
+    p[1].mIndex = SRT_RES_IDX(SkinSrt, PerFrame, gAttributes);
+    p[1].ppBuffers = &attributes;
+    p[2].mIndex = SRT_RES_IDX(SkinSrt, PerFrame, gSkin);
+    p[2].ppBuffers = &gSkinBuf;
+    p[3].mIndex = SRT_RES_IDX(SkinSrt, PerFrame, gPalette);
+    p[3].ppBuffers = &gPreviewPaletteBuf[fi];
+    p[4].mIndex = SRT_RES_IDX(SkinSrt, PerFrame, gJobs);
+    p[4].ppBuffers = &gPreviewJobBuf[fi];
+    updateDescriptorSet(gRenderer, fi, gPreviewSet, 5, p);
+    const ResourceState state = (ResourceState)stateBits;
+    BufferBarrier in[2] = { { positions, state, RESOURCE_STATE_UNORDERED_ACCESS }, { attributes, state, RESOURCE_STATE_UNORDERED_ACCESS } };
+    cmdResourceBarrier(cmd, 2, in, 0, nullptr, 0, nullptr);
+    cmdBindPipeline(cmd, gPipe);
+    cmdBindDescriptorSet(cmd, fi, gPreviewSet);
+    cmdDispatch(cmd, groups, 1, 1);
+    BufferBarrier out[2] = { { positions, RESOURCE_STATE_UNORDERED_ACCESS, state }, { attributes, RESOURCE_STATE_UNORDERED_ACCESS, state } };
+    cmdResourceBarrier(cmd, 2, out, 0, nullptr, 0, nullptr);
+    return count;
 }
 } // namespace renderer

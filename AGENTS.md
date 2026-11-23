@@ -405,11 +405,15 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   modules moved things. Each MODEL line gets the knobs of its each block (scale, up_axis, lod_quality, cast_shadows,
   double_sided), shown only in the Model Viewer. The Model Viewer (`panels/Viewer.cpp`): a dropdown of the view's models
   (kind, triangles, a lit dot while placed), a canvas preview (drag orbits, the wheel zooms, a double-click goes back to
-  the front; the turntable and Front View icons), the LOD shown (Auto as `lod_error` picks at that size, or each LOD), the
+  the front; the turntable and Front View icons), the LOD shown (Auto as `lod_error` picks at that size, or each LOD), for
+  a skinned model its clips (a dropdown with Rest Pose, play and pause, From the Start, Speed, Crossfade: the preview's
+  own clip state in `gPreview.anim`, played in update and posed through `RenderPreview.palette`), the
   model's knobs; Add Models (the header's +) and drops go to the agents. The preview: this module makes its targets in
   its own `update()` at twice the canvas size (RGBA16F and D32 at 4 samples, a 1024² D32 shadow map, an RGBA8 sRGB out),
   and in `draw(YEA_PASS_RENDER)`, only on frames the panel showed it, calls the core's `preview_draw` (a `RenderPreview*`,
-  `preview.h`, copied identically into renderer and renderer_models: change both and raise `RENDER_PREVIEW_VERSION`),
+  `preview.h`, copied identically into renderer and renderer_models: change both and raise `RENDER_PREVIEW_VERSION`;
+  v2 adds a palette: `skinPreview` poses the skinned parts with its own jobs, palette and set into a region at the end
+  of the pool's dynamic area, reserved from the next core draw while the preview asks; bind pose until then),
   which draws the model alone with the core's meshes, materials, BRDF (`Shaders/Brdf.h.fsl`, shared with the forward
   pass) and tonemapper under a studio rig (a key light with a 16-tap filtered shadow map, a neutral grey sky for
   ambient and reflections, a floor showing only shadow and contact darkening), resolves its 4 samples tonemapped into

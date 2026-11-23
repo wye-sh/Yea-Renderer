@@ -21,6 +21,9 @@ YeaUiRow gRows[kMaxModels];
 uint32_t gIds[kMaxModels];
 char     gNames[kMaxModels][80], gRights[kMaxModels][48];
 char     gLodNames[9][16];
+constexpr uint32_t kClipRows = 256;
+YeaUiRow gClipRows[kClipRows + 1];
+char     gClipNames[kClipRows + 1][64], gClipRights[kClipRows + 1][16];
 
 // "old_chair": "Old Chair".
 void pretty(const char* in, char* out, size_t cap)
@@ -167,6 +170,36 @@ void panel_model_viewer()
         thousands(gPreview.triangles, tris, sizeof tris);
         snprintf(line, sizeof line, "LOD %u of %u \xC2\xB7 %s triangles", gPreview.lodShown, lods ? lods : 1, tris);
         u->label(line, 1);
+    }
+
+    // A skinned model's clips: which one plays in the preview, play and pause, back to its start, its speed, and how long
+    // it fades from the one before.
+    if (sel->anim && sel->state == 1 && gPreview.animModel == sel->id)
+    {
+        const PlacementAnim& a = gPreview.anim;
+        const uint32_t       clips = sel->skel->clipCount < kClipRows ? sel->skel->clipCount : kClipRows;
+        gClipRows[0] = { "Rest Pose", "", a.clip == kNoClip && gPreview.playing };
+        for (uint32_t c = 0; c < clips; ++c)
+        {
+            pretty(sel->clips[c].name, gClipNames[c + 1], sizeof gClipNames[c + 1]);
+            if (!gClipNames[c + 1][0])
+                snprintf(gClipNames[c + 1], sizeof gClipNames[c + 1], "Clip %u", c + 1);
+            snprintf(gClipRights[c + 1], sizeof gClipRights[c + 1], "%.2f s", sel->clips[c].duration);
+            gClipRows[c + 1] = { gClipNames[c + 1], gClipRights[c + 1], a.clip == c && gPreview.playing };
+        }
+        const int chosen = a.clip == kNoClip ? 0 : int(a.clip + 1);
+        const int picked = u->dropdown("##clip", gClipRows, int(clips + 1), chosen);
+        if (picked != chosen && picked >= 0 && picked <= int(clips))
+            gPreview.pickClip = uint32_t(picked) + 1; // 1 the rest pose, clip c at c + 2
+        YeaUiIcon transport[2] = { { "Resume", "Pause", "Play", "Pause", gPreview.playing ? 1 : 0 },
+                                   { "BackToStart", nullptr, "From the Start", nullptr, -1 } };
+        const int t = u->icons("##clipTransport", transport, 2);
+        if (t == 0)
+            gPreview.playing = !gPreview.playing;
+        if (t == 1)
+            gPreview.anim.time = 0, gPreview.anim.from = kNoClip;
+        u->slider("Speed##clip", &gPreview.speed, 0.0f, 2.0f, 0);
+        u->slider("Crossfade (s)##clip", &gPreview.fade, 0.0f, 1.0f, 0);
     }
 
     // Its knobs (renderer_models' each block makes them for its MODEL line).
