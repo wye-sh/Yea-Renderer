@@ -12,6 +12,9 @@ namespace renderer_models
 constexpr uint32_t kMaxModels = 512;
 constexpr uint32_t kMaxParts = RENDER_PREVIEW_PARTS;
 constexpr uint32_t kNoClip = 0xFFFFFFFFu; // no clip: the rest pose
+constexpr uint32_t kViewerSamples = 16;   // blend.h's kMaxSamples
+constexpr uint32_t kBlendClip = 0xFFFFFFFDu; // PlacementAnim's clip (or from): its blend space (PlacementBlend)
+constexpr uint32_t kViewerNodes = 1024;   // renderer_models' kMaxNodes
 
 struct Entry
 {
@@ -93,11 +96,32 @@ struct Preview
     int           layerOpen;
     uint32_t      layerPick, layerClip, layerSource, layerBone;
     float         layerWeight, layerTime;
-    int           layerAdditive;
+    int           layerAdditive;    // Its blend space (the panel's Blend Space row), as mdl::blendSpace plays one: blendCount samples, each clip
+    // blendClip[k] of model blendSource (key; 0 its own) at (blendX[k], blendY[k]), in blendDims dimensions; driven to
+    // the point (blendPx, blendPy). blendPick: 1 play it, 2 back to a clip (the panel's; 0 nothing new). `blend`: as a
+    // placement's PlacementBlend row (its set while it plays, point and phase, and the one it fades from).
+    int            blendOpen;
+    uint32_t       blendCount, blendDims, blendSource, blendPick, blendWas; // blendWas: pickClip's code for what played before
+    uint32_t       blendClip[kViewerSamples];
+    float          blendX[kViewerSamples], blendY[kViewerSamples], blendPx, blendPy;
+    PlacementBlend blend;
+    // Its skeleton over the preview (the Bones icon): each node's place on the canvas (0 to 1 across and down) as its
+    // last draw posed it, boneSeen where in front of the camera; boneNodes of them.
+    int      bones;
+    uint32_t boneNodes;
+    float    boneXY[kViewerNodes * 2];
+    uint8_t  boneSeen[kViewerNodes];
+    // What plays now travels (root motion as authored, the Scale knob's metres): per second, and its turn (degrees per
+    // second); motionShown 0 while it has no motion node.
+    uint32_t motionShown;
+    float    motionSpeed, motionTurn;
 };
 extern Preview gPreview;
 
 // A model's lods (its first part's chain), counted from the renderer's MeshLod table.
 uint32_t lodCount(const Entry& e);
 uint32_t triangles(const Entry& e); // its finest version's, every part
+// Clip c of model `src` (key; 0 e's own) as e plays it: how far it travels a second (the Scale knob's metres) and turns
+// (degrees a second). False: e has no motion node, or no such clip.
+bool clipTravel(const Entry& e, uint32_t src, uint32_t c, float& speed, float& turn);
 } // namespace renderer_models

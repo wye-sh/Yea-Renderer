@@ -525,7 +525,11 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   Targets list, a slider each, dragging one holds it until Follow the Clip; v3's `weights`; Clips From, another skinned model whose clips it plays retargeted; In Place, on by default, for
   a model with a motion node; a folding Layer: one of those clips over the preview's clip as `mdl::layer` plays it, From
   a bone down or the Whole Body, Weight, Additive, in `gPreview.layer*`, applied by evaluate's `applyLayer` and reset
-  with the model), the
+  with the model; a folding Blend Space: samples from those clips at points in 1D or 2D, a Point slider or a 2D pad,
+  Play the Blend Space and Back to the Clip, in `gPreview.blend*` and its own `PlacementBlend` (`gPreview.blend`, row
+  `kPreviewRow` to blendWeigh, blendOf and stepBlend; handle 0); the travel of what plays (clipTravel, or the blend
+  space at its point) under the clips; the Bones icon: each node projected in draw() as the core's preview camera
+  places it, `gPreview.boneXY`, drawn by the panel a frame later), the
   model's knobs; Add Models (the header's +) and drops go to the agents. The preview: this module makes its targets in
   its own `update()` at twice the canvas size (RGBA16F and D32 at 4 samples, a 1024² D32 shadow map, an RGBA8 sRGB out),
   and in `draw(YEA_PASS_RENDER)`, only on frames the panel showed it, calls the core's `preview_draw` (a `RenderPreview*`,

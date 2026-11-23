@@ -32,6 +32,7 @@ YeaUiRow gLayerRows[kClipRows + 1];
 constexpr uint32_t kBoneRows = 1024; // renderer_models' kMaxNodes
 YeaUiRow gBoneRows[kBoneRows + 1];
 char     gBoneNames[kBoneRows + 1][64];
+char     gSampleIds[kViewerSamples][4][24]; // a blend sample's controls' labels: clip, x, y, remove
 
 // "old_chair": "Old Chair".
 void pretty(const char* in, char* out, size_t cap)
@@ -148,17 +149,32 @@ void panel_model_viewer()
         {
             yea::canvasImage(gPreview.outTexture, 0, 0, in.w, in.h);
             gPreview.shown = 1;
+            // Its skeleton, as the last draw posed it: a line from each node to its parent, a dot at each.
+            if (gPreview.bones && sel->anim && gPreview.animModel == sel->id && gPreview.boneNodes == sel->skel->nodeCount)
+                for (uint32_t i = 0; i < gPreview.boneNodes; ++i)
+                {
+                    if (!gPreview.boneSeen[i])
+                        continue;
+                    const float x = gPreview.boneXY[i * 2] * in.w, y = gPreview.boneXY[i * 2 + 1] * in.h;
+                    const int32_t pa = sel->nodes[i].parent;
+                    if (pa >= 0 && uint32_t(pa) < gPreview.boneNodes && gPreview.boneSeen[pa])
+                        u->line(gPreview.boneXY[pa * 2] * in.w, gPreview.boneXY[pa * 2 + 1] * in.h, x, y, 1.5f, 1.0f, 0.85f, 0.3f, 0.9f);
+                    u->rect(x - 2, y - 2, 4, 4, 1.0f, 0.95f, 0.6f, 1.0f, 2);
+                }
         }
         else if (sel->state == 2)
             u->text(12.0f, in.h * 0.5f, sel->error, 13.0f, 0.95f, 0.6f, 0.55f, 1.0f);
     }
-    YeaUiIcon icons[2] = { { "Resume", "Pause", "Turn", "Hold Still", gPreview.turntable ? 1 : 0 },
-                           { "BackToStart", nullptr, "Front View", nullptr, -1 } };
-    const int pressed = u->icons("##view", icons, 2);
+    YeaUiIcon icons[3] = { { "Resume", "Pause", "Turn", "Hold Still", gPreview.turntable ? 1 : 0 },
+                           { "BackToStart", nullptr, "Front View", nullptr, -1 },
+                           { "Hidden", "Visible", "Show Bones", "Hide Bones", gPreview.bones ? 1 : 0 } };
+    const int pressed = u->icons("##view", icons, sel->anim ? 3 : 2);
     if (pressed == 0)
         gPreview.turntable = !gPreview.turntable;
     if (pressed == 1)
         gPreview.yaw = 35.0f, gPreview.pitch = 20.0f, gPreview.distance = 1.35f;
+    if (pressed == 2)
+        gPreview.bones = !gPreview.bones;
 
     // The version shown: Auto (as the game picks it at this size), or each one.
     const uint32_t lods = lodCount(*sel);
@@ -250,6 +266,12 @@ void panel_model_viewer()
         u->slider("Crossfade (s)##clip", &gPreview.fade, 0.0f, 1.0f, 0);
         if (from->motionNode != kNoClip) // its clips with their travel (as authored) or in place (root motion on)
             u->toggle("In Place##clip", &gPreview.inPlace);
+        if (gPreview.motionShown) // what plays travels, as authored
+        {
+            char line[96];
+            snprintf(line, sizeof line, "Travels %.2f m/s \xC2\xB7 turns %.0f\xC2\xB0/s", gPreview.motionSpeed, gPreview.motionTurn);
+            u->label(line, 1);
+        }
         // Its morph targets: each one's weight now; dragging one holds it there over the clip, until Follow the Clip.
         if (sel->targets && sel->skel->targetCount)
         {
@@ -298,6 +320,102 @@ void panel_model_viewer()
                     gPreview.layerBone = bp == 0 ? kNoClip : uint32_t(bp - 1);
                 u->slider("Weight##layer", &gPreview.layerWeight, 0.0f, 1.0f, 0);
                 u->toggle("Additive##layer", &gPreview.layerAdditive);
+            }
+        }
+        // A blend space, as mdl::blendSpace plays one: samples from the clips listed above, each at a point in one or
+        // two dimensions, then driven by a slider (1D) or a pad (2D) as mdl::blendAt drives it.
+        u->fold("Blend Space##blend", &gPreview.blendOpen);
+        if (gPreview.blendOpen && clips)
+        {
+            if (gPreview.blendSource != fromKey) // another model's clips listed: its samples start afresh
+                gPreview.blendCount = 0, gPreview.blendSource = fromKey;
+            const char* dims[2] = { "1D", "2D" };
+            gPreview.blendDims = uint32_t(u->tabs("##blendDims", dims, 2, gPreview.blendDims == 2 ? 1 : 0)) + 1;
+            const bool two = gPreview.blendDims == 2;
+            for (uint32_t k = 0; k < gPreview.blendCount; ++k)
+            {
+                char(&id)[4][24] = gSampleIds[k];
+                snprintf(id[0], sizeof id[0], "##bclip%u", k), snprintf(id[1], sizeof id[1], "X##bx%u", k);
+                snprintf(id[2], sizeof id[2], "Y##by%u", k), snprintf(id[3], sizeof id[3], "Remove##brm%u", k);
+                const float w3[3] = { 2, 1.4f, 1 }, w4[4] = { 2, 1.2f, 1.2f, 1 };
+                u->row(two ? 4 : 3, two ? w4 : w3);
+                const int c = u->dropdown(id[0], gClipRows + 1, int(clips), int(gPreview.blendClip[k]));
+                if (c >= 0 && c < int(clips))
+                    gPreview.blendClip[k] = uint32_t(c);
+                u->slider(id[1], &gPreview.blendX[k], -4.0f, 4.0f, 0);
+                if (two)
+                    u->slider(id[2], &gPreview.blendY[k], -4.0f, 4.0f, 0);
+                if (u->button(id[3], 0, 1))
+                {
+                    for (uint32_t j = k + 1; j < gPreview.blendCount; ++j)
+                        gPreview.blendClip[j - 1] = gPreview.blendClip[j], gPreview.blendX[j - 1] = gPreview.blendX[j],
+                                              gPreview.blendY[j - 1] = gPreview.blendY[j];
+                    --gPreview.blendCount, --k;
+                }
+            }
+            if (u->button("Add Sample##blend", 0, gPreview.blendCount < kViewerSamples))
+            {
+                const uint32_t k = gPreview.blendCount++;
+                gPreview.blendClip[k] = shown && a.clip < clips ? a.clip : 0;
+                gPreview.blendX[k] = float(k), gPreview.blendY[k] = 0;
+            }
+            if (gPreview.blendCount)
+            {
+                float lo[2] = { 1e30f, 1e30f }, hi[2] = { -1e30f, -1e30f };
+                for (uint32_t k = 0; k < gPreview.blendCount; ++k)
+                {
+                    const float v[2] = { gPreview.blendX[k], gPreview.blendY[k] };
+                    for (int d = 0; d < 2; ++d)
+                        lo[d] = fminf(lo[d], v[d]), hi[d] = fmaxf(hi[d], v[d]);
+                }
+                for (int d = 0; d < 2; ++d) // a little room past the samples
+                {
+                    const float m = fmaxf(0.25f * (hi[d] - lo[d]), 0.5f);
+                    lo[d] -= m, hi[d] += m;
+                }
+                if (!two)
+                    u->slider("Point##blend", &gPreview.blendPx, lo[0], hi[0], 0), gPreview.blendPy = 0;
+                else
+                {
+                    YeaUiCanvas pad;
+                    u->canvas("##blendPad", 180.0f, &pad);
+                    if (pad.w > 0 && pad.h > 0)
+                    {
+                        auto px = [&](float x) { return 8 + (x - lo[0]) / (hi[0] - lo[0]) * (pad.w - 16); };
+                        auto py = [&](float y) { return pad.h - 8 - (y - lo[1]) / (hi[1] - lo[1]) * (pad.h - 16); };
+                        if (pad.down)
+                        {
+                            gPreview.blendPx = lo[0] + (pad.mx - 8) / (pad.w - 16) * (hi[0] - lo[0]);
+                            gPreview.blendPy = lo[1] + (pad.h - 8 - pad.my) / (pad.h - 16) * (hi[1] - lo[1]);
+                            gPreview.blendPx = fminf(fmaxf(gPreview.blendPx, lo[0]), hi[0]);
+                            gPreview.blendPy = fminf(fmaxf(gPreview.blendPy, lo[1]), hi[1]);
+                        }
+                        u->rect(0, 0, pad.w, pad.h, 0.12f, 0.12f, 0.14f, 1.0f, 6);
+                        if (lo[0] < 0 && hi[0] > 0)
+                            u->line(px(0), 4, px(0), pad.h - 4, 1, 0.3f, 0.3f, 0.34f, 1);
+                        if (lo[1] < 0 && hi[1] > 0)
+                            u->line(4, py(0), pad.w - 4, py(0), 1, 0.3f, 0.3f, 0.34f, 1);
+                        for (uint32_t k = 0; k < gPreview.blendCount; ++k)
+                        {
+                            const float x = px(gPreview.blendX[k]), y = py(gPreview.blendY[k]);
+                            u->rect(x - 3, y - 3, 6, 6, 0.6f, 0.75f, 1.0f, 1.0f, 3);
+                            const uint32_t c = gPreview.blendClip[k] < clips ? gPreview.blendClip[k] : 0;
+                            u->text(x + 6, y, gClipNames[c + 1], 11.0f, 0.75f, 0.8f, 0.9f, 1.0f);
+                        }
+                        const float x = px(gPreview.blendPx), y = py(gPreview.blendPy);
+                        u->rect(x - 5, y - 5, 10, 10, 1.0f, 0.8f, 0.3f, 1.0f, 5);
+                    }
+                    char at[64];
+                    snprintf(at, sizeof at, "Point %.2f, %.2f", gPreview.blendPx, gPreview.blendPy);
+                    u->label(at, 1);
+                }
+                if (a.clip != kBlendClip)
+                {
+                    if (u->button("Play the Blend Space##blend", 1, 1))
+                        gPreview.blendPick = 1;
+                }
+                else if (u->button("Back to the Clip##blend", 0, 1))
+                    gPreview.blendPick = 2;
             }
         }
     }

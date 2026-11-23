@@ -54,7 +54,6 @@ anim::Pose*        gLayerRefs; // kLayerRefs x kMaxNodes
 uint32_t           gLayerRefNext;
 uint8_t*           gLayerMask;              // the nodes it covers
 constexpr uint32_t kMaskPending = 0xFFFFFFFEu; // a layer's bone named while its model loads
-constexpr uint32_t kBlendClip = 0xFFFFFFFDu;   // PlacementAnim's clip (or from): its blend space (PlacementBlend)
 anim::Pose*        gBlendPoses;   // a blend space's sample as sampled (made in load())
 float*             gBlendWeights; // and its morph weights
 // Blend spaces' triangulations, two a placement row (made in load()): kept while their samples stay the same.
@@ -63,8 +62,9 @@ struct BlendTris
     uint32_t placement, set, n;
     blend::Tris tris;
 };
-constexpr uint32_t kBlendRows = 4096;
+constexpr uint32_t kBlendRows = 4096, kPreviewRow = kBlendRows; // and one more: the Model Viewer's
 BlendTris*         gBlendTris;
+static_assert(kViewerSamples == blend::kMaxSamples && kViewerNodes == kMaxNodes, "models.h's sizes");
 float*             gSrcWeights;
 retarget::Scratch  gRt;
 // Inertialized transitions (the transitions knob's Inertial; made in load()): a placement in one keeps its offsets
@@ -781,29 +781,35 @@ void motionOf(const Entry& e, const Entry* s, uint32_t clip, float from, float s
 struct BlendSet
 {
     uint32_t n;
-    uint32_t row[blend::kMaxSamples];
+    uint32_t clip[blend::kMaxSamples], source[blend::kMaxSamples]; // each sample's clip of model source (key; 0 e's)
     float    w[blend::kMaxSamples], dur[blend::kMaxSamples];
     float    length; // its weighted length (seconds): one cycle of its phase at speed 1
 };
 // Set `set` of placement h (row `row`) weighed at (x, y), from e (whose clips its samples' sources are retargeted onto):
-// samples still waiting on their names, or whose clip isn't there, are left out. False: none to weigh.
+// samples still waiting on their names, or whose clip isn't there, are left out. False: none to weigh. h 0: the Model
+// Viewer's (row kPreviewRow), its samples the panel's list.
 bool blendWeigh(const Entry& e, uint32_t row, uint32_t h, uint32_t set, uint32_t dims, float x, float y, BlendSet& b)
 {
     b.n = 0, b.length = 0;
     float p[blend::kMaxSamples * 2];
-    for (uint32_t i = 0; set && i < PlacementBlendSamples.size() && b.n < blend::kMaxSamples; ++i)
+    auto  take = [&](uint32_t source, uint32_t clip, float sx, float sy) {
+        const Entry* src = sourceOf(e, source);
+        if (!src || clip >= src->skel->clipCount)
+            return;
+        b.clip[b.n] = clip, b.source[b.n] = source, b.dur[b.n] = src->clips[clip].duration;
+        p[b.n * 2] = sx, p[b.n * 2 + 1] = sy, ++b.n;
+    };
+    for (uint32_t i = 0; set && !h && i < gPreview.blendCount && i < blend::kMaxSamples; ++i)
+        take(gPreview.blendSource, gPreview.blendClip[i], gPreview.blendX[i], gPreview.blendY[i]);
+    for (uint32_t i = 0; set && h && i < PlacementBlendSamples.size() && b.n < blend::kMaxSamples; ++i)
     {
         const PlacementBlendSample& S = PlacementBlendSamples[i];
-        if (S.placement != h || S.set != set || S.want)
-            continue;
-        const Entry* src = sourceOf(e, S.source);
-        if (!src || S.clip >= src->skel->clipCount)
-            continue;
-        b.row[b.n] = i, b.dur[b.n] = src->clips[S.clip].duration, p[b.n * 2] = S.x, p[b.n * 2 + 1] = S.y, ++b.n;
+        if (S.placement == h && S.set == set && !S.want)
+            take(S.source, S.clip, S.x, S.y);
     }
     if (!b.n)
         return false;
-    if (dims == 2 && gBlendTris && row < kBlendRows)
+    if (dims == 2 && gBlendTris && row <= kBlendRows)
     {
         BlendTris& t = gBlendTris[row * 2 + (set & 1)];
         if (t.placement != h || t.set != set || t.n != b.n)
@@ -833,11 +839,10 @@ bool blendSample(const Entry& e, const BlendSet& b, float phase, bool loop, bool
         const float wk = b.w[k];
         if (!(wk > 1e-6f))
             continue;
-        const PlacementBlendSample& S = PlacementBlendSamples[b.row[k]];
-        const bool                  first = total == 0;
-        anim::Pose*                 to = first ? out : gBlendPoses;
-        float*                      tw = first ? w : gBlendWeights;
-        sampleAs(e, sourceOf(e, S.source), S.clip, phase * b.dur[k], loop, still, to, nt ? tw : nullptr);
+        const bool  first = total == 0;
+        anim::Pose* to = first ? out : gBlendPoses;
+        float*      tw = first ? w : gBlendWeights;
+        sampleAs(e, sourceOf(e, b.source[k]), b.clip[k], phase * b.dur[k], loop, still, to, nt ? tw : nullptr);
         for (uint32_t j = 0; j < n; ++j)
         {
             anim::Pose& o = out[j];
@@ -885,9 +890,8 @@ void blendMotion(const Entry& e, const BlendSet& b, float phase, float step, boo
     {
         if (!(b.w[k] > 1e-6f))
             continue;
-        const PlacementBlendSample& S = PlacementBlendSamples[b.row[k]];
-        float                       m[4];
-        motionOf(e, sourceOf(e, S.source), S.clip, phase * b.dur[k], step * b.dur[k], loop, m);
+        float m[4];
+        motionOf(e, sourceOf(e, b.source[k]), b.clip[k], phase * b.dur[k], step * b.dur[k], loop, m);
         for (int c = 0; c < 4; ++c)
             out[c] += b.w[k] * m[c];
         total += b.w[k];
@@ -896,11 +900,17 @@ void blendMotion(const Entry& e, const BlendSet& b, float phase, float step, boo
         out[c] /= total;
 }
 // The blend space a placement's clip (from: the one it fades from) is: its set and point now. False: not a blend space.
+// A row's blend space: a placement's, or the Model Viewer's (kPreviewRow); nullptr none.
+PlacementBlend* blendFor(uint32_t row)
+{
+    return row < PlacementBlends.size() ? &PlacementBlends[row] : row == kPreviewRow ? &gPreview.blend : nullptr;
+}
 bool blendOf(const PlacementAnim& a, uint32_t row, bool from, uint32_t& set, uint32_t& dims, float& x, float& y, float& phase)
 {
-    if ((from ? a.from : a.clip) != kBlendClip || row >= PlacementBlends.size())
+    const PlacementBlend* bp = blendFor(row);
+    if ((from ? a.from : a.clip) != kBlendClip || !bp)
         return false;
-    const PlacementBlend& b = PlacementBlends[row];
+    const PlacementBlend& b = *bp;
     set = from ? b.from : b.set, dims = from ? b.fromDims : b.dims, x = from ? b.fromX : b.x, y = from ? b.fromY : b.y;
     phase = from ? b.fromPhase : b.phase;
     return set != 0;
@@ -914,7 +924,7 @@ void playMotion(const Entry& e, uint32_t row, const PlacementAnim& a, bool from,
     if (blendOf(a, row, from, set, dims, x, y, phase))
     {
         out[0] = out[1] = out[2] = out[3] = 0;
-        const uint32_t h = row | (Placements[row].gen & 0xFFFu) << 20;
+        const uint32_t h = row == kPreviewRow ? 0 : row | (Placements[row].gen & 0xFFFu) << 20;
         if (blendWeigh(e, row, h, set, dims, x, y, b) && b.length > 0)
             blendMotion(e, b, phase, dt * (from ? a.fromSpeed : a.speed) / b.length, from ? a.fromLoop : a.loop, out);
         return;
@@ -927,11 +937,57 @@ void playMotion(const Entry& e, uint32_t row, const PlacementAnim& a, bool from,
 // A placement leaving its blend space for a clip: the space kept as what it fades from (play()'s fade, if any).
 void leaveBlend(uint32_t row, PlacementAnim& a)
 {
-    if (a.clip != kBlendClip || row >= PlacementBlends.size())
+    PlacementBlend* bp = blendFor(row);
+    if (a.clip != kBlendClip || !bp)
         return;
-    PlacementBlend& b = PlacementBlends[row];
+    PlacementBlend& b = *bp;
     b.from = b.set, b.fromDims = b.dims, b.fromX = b.x, b.fromY = b.y, b.fromPhase = b.phase;
     b.set = 0, b.hash = 0;
+}
+// A placement (or the Viewer) taking blend space `set` (its samples already there) as its clip, faded from what played:
+// another blend space in step with it, or a clip (`ready`: its models loaded, else nothing to fade from). rClip and
+// rFrom: whose clips its clip and the one it fades from are (PlacementRetarget's, or the Viewer's).
+void enterBlend(PlacementAnim& a, PlacementBlend& b, uint32_t& rClip, uint32_t& rFrom, uint32_t set, uint32_t dims, uint32_t hash,
+                float speed, int loop, float fade, bool ready)
+{
+    if (a.clip == kBlendClip && b.set) // another blend space: faded from the old, in step with it
+    {
+        b.from = b.set, b.fromDims = b.dims, b.fromX = b.x, b.fromY = b.y, b.fromPhase = b.phase;
+        a.from = fade > 0 ? kBlendClip : kNoClip, a.fromSpeed = a.speed, a.fromLoop = a.loop, a.fade = fade, a.faded = 0, rFrom = 0;
+    }
+    else // from a clip: faded from it (while the model still loads, nothing to fade from), the phase from the start
+    {
+        if (fade > 0 && ready && a.clip != kNoClip && !a.want)
+            a.from = a.clip, a.fromTime = a.time, a.fromSpeed = a.speed, a.fromLoop = a.loop, a.fade = fade, a.faded = 0, rFrom = rClip;
+        else
+            a.from = kNoClip;
+        b.phase = 0, b.x = b.tx, b.y = b.ty;
+    }
+    b.set = set, b.dims = dims, b.hash = hash;
+    a.clip = kBlendClip, a.want = 0, a.time = 0, a.speed = speed, a.loop = loop ? 1 : 0, rClip = 0;
+}
+// Its blend space moved on by dt: the point followed toward the one asked for, and the phase (its own, and that of the
+// one it fades from) by the weighted length of what plays, so every sample keeps step. h its handle (0 the Viewer's).
+void stepBlend(const Entry& e, uint32_t row, uint32_t h, PlacementAnim& a, PlacementBlend& b, float dt)
+{
+    const float k = b.smooth > 0 ? 1 - expf(-3.0f * dt / b.smooth) : 1.0f; // most of the way in `smooth` s
+    b.x += (b.tx - b.x) * k, b.y += (b.ty - b.y) * k;
+    if (a.clip != kBlendClip)
+        b.set = 0, b.hash = 0;
+    if (a.from != kBlendClip)
+        b.from = 0;
+    BlendSet w;
+    auto     step = [&](float& phase, float speed, uint32_t loop, uint32_t set, uint32_t dims, float x, float y) {
+        if (!set || !blendWeigh(e, row, h, set, dims, x, y, w) || !(w.length > 0))
+            return 0.0f;
+        phase += dt * speed / w.length;
+        phase = loop ? phase - floorf(phase) : fminf(fmaxf(phase, 0.0f), 1.0f);
+        return phase * w.length;
+    };
+    if (b.set)
+        a.time = step(b.phase, a.speed, a.loop, b.set, b.dims, b.x, b.y); // clipTime: its phase times its length
+    if (b.from)
+        step(b.fromPhase, a.fromSpeed, a.fromLoop, b.from, b.fromDims, b.fromX, b.fromY);
 }
 
 // --- Foot IK (mdl::footIk) -----------------------------------------------------------------------------------------
@@ -1242,7 +1298,7 @@ bool evaluate(const Entry& e, const PlacementAnim& a, const float* held = nullpt
 {
     const uint32_t n = e.skel->nodeCount, nt = e.targets ? e.skel->targetCount : 0;
     const bool     fading = a.from != kNoClip && a.fade > 0 && a.faded < a.fade;
-    const uint32_t row = placement ? placementRow(placement) : 0xFFFFFFFFu;
+    const uint32_t row = placement ? placementRow(placement) : view ? kPreviewRow : 0xFFFFFFFFu;
     // its clip (or the one it fades from), or its blend space, `shift` seconds of it from now
     auto side = [&](bool from, anim::Pose* out, float* w, float shift) {
         uint32_t set, dims;
@@ -1636,21 +1692,7 @@ int apiBlendSpace(uint32_t h, uint32_t model, const mdl::BlendSample* samples, u
         S->placement = h, S->set = set, S->source = key, S->clip = clips[i], S->want = ready ? 0 : clipHash(samples[i].clip, 48);
         S->x = samples[i].x, S->y = samples[i].y;
     }
-    if (a.clip == kBlendClip && b.set) // another blend space: faded from the old, in step with it
-    {
-        b.from = b.set, b.fromDims = b.dims, b.fromX = b.x, b.fromY = b.y, b.fromPhase = b.phase;
-        a.from = fade > 0 ? kBlendClip : kNoClip, a.fromSpeed = a.speed, a.fromLoop = a.loop, a.fade = fade, a.faded = 0, r.from = 0;
-    }
-    else // from a clip: faded from it (while the model still loads, nothing to fade from), the phase from the start
-    {
-        if (fade > 0 && ready && a.clip != kNoClip && !a.want)
-            a.from = a.clip, a.fromTime = a.time, a.fromSpeed = a.speed, a.fromLoop = a.loop, a.fade = fade, a.faded = 0, r.from = r.clip;
-        else
-            a.from = kNoClip;
-        b.phase = 0, b.x = b.tx, b.y = b.ty;
-    }
-    b.set = set, b.dims = dims, b.hash = hash;
-    a.clip = kBlendClip, a.want = 0, a.time = 0, a.speed = speed, a.loop = loop ? 1 : 0, r.clip = 0;
+    enterBlend(a, b, r.clip, r.from, set, dims, hash, speed, loop, fade, ready);
     return 1;
 }
 void apiBlendAt(uint32_t h, float x, float y, float smooth)
@@ -2234,31 +2276,9 @@ void animate(float dt)
             Placements[row].dirty = 1; // drawn moved on by it (syncPlacements, next)
         }
         advanceClip(ce, fe, a, dt);
-        // Its blend space: the point followed toward the game's, and the phase (its own, and that of the one it fades
-        // from) moved on by the weighted length of what plays, so every sample keeps step.
+        // Its blend space: the point followed toward the game's, and the phase moved on.
         if (row < PlacementBlends.size())
-        {
-            PlacementBlend& b = PlacementBlends[row];
-            const float     k = b.smooth > 0 ? 1 - expf(-3.0f * dt / b.smooth) : 1.0f; // most of the way in `smooth` s
-            b.x += (b.tx - b.x) * k, b.y += (b.ty - b.y) * k;
-            if (a.clip != kBlendClip)
-                b.set = 0, b.hash = 0;
-            if (a.from != kBlendClip)
-                b.from = 0;
-            const uint32_t h = row | (Placements[row].gen & 0xFFFu) << 20;
-            BlendSet       w;
-            auto           step = [&](float& phase, float speed, uint32_t loop, uint32_t set, uint32_t dims, float x, float y) {
-                if (!set || !blendWeigh(*e, row, h, set, dims, x, y, w) || !(w.length > 0))
-                    return 0.0f;
-                phase += dt * speed / w.length;
-                phase = loop ? phase - floorf(phase) : fminf(fmaxf(phase, 0.0f), 1.0f);
-                return phase * w.length;
-            };
-            if (b.set)
-                a.time = step(b.phase, a.speed, a.loop, b.set, b.dims, b.x, b.y); // clipTime: its phase times its length
-            if (b.from)
-                step(b.fromPhase, a.fromSpeed, a.fromLoop, b.from, b.fromDims, b.fromX, b.fromY);
-        }
+            stepBlend(*e, row, row | (Placements[row].gen & 0xFFFu) << 20, a, PlacementBlends[row], dt);
     }
     // The Model Viewer's own clip (its model's, whether placed or not), while it plays.
     if (const Entry* e = byId(gPreview.model); e && e->anim && e->state == 1)
@@ -2272,12 +2292,47 @@ void animate(float dt)
             gPreview.animModel = e->id;
             gPreview.clipsFrom = gPreview.srcClip = gPreview.srcFrom = 0;
             gPreview.layerClip = gPreview.layerBone = kNoClip, gPreview.layerSource = 0, gPreview.layerTime = 0;
+            gPreview.blend = PlacementBlend{}, gPreview.blendCount = 0, gPreview.blendPick = 0, gPreview.blendSource = 0;
         }
         const Entry* from = gPreview.clipsFrom ? byId(gPreview.clipsFrom) : e; // whose clips the panel lists
         if (!from || !from->anim || from->state != 1)
             from = e, gPreview.clipsFrom = 0;
+        // Its blend space: played when the panel asks (or its samples changed while it plays, then at once, in step),
+        // left for the clip it played before when the panel stops it, driven to the panel's point.
+        PlacementBlend& pb = gPreview.blend;
+        if (const Entry* bs = gPreview.blendCount ? sourceOf(*e, gPreview.blendSource) : nullptr; bs && bs != e)
+            mapFor(*e, *bs, true);
+        if (gPreview.blendPick == 2)
+            gPreview.pickClip = a.clip == kBlendClip ? gPreview.blendWas : 0, gPreview.blendPick = 0;
+        if (gPreview.blendCount > blend::kMaxSamples)
+            gPreview.blendCount = blend::kMaxSamples;
+        {
+            uint32_t hash = 2166136261u ^ gPreview.blendSource ^ gPreview.blendDims * 16777619u;
+            for (uint32_t i = 0; i < gPreview.blendCount; ++i)
+            {
+                uint32_t xy[2];
+                memcpy(xy, &gPreview.blendX[i], 4), memcpy(xy + 1, &gPreview.blendY[i], 4);
+                hash = ((hash ^ gPreview.blendClip[i]) * 16777619u ^ xy[0]) * 16777619u ^ xy[1];
+            }
+            hash = hash ? hash : 1;
+            const bool playing = a.clip == kBlendClip && pb.set;
+            if (!gPreview.blendCount && playing) // its last sample taken out: the clip before
+                gPreview.pickClip = gPreview.blendWas;
+            else if (gPreview.blendCount && ((gPreview.blendPick == 1 && !playing) || (playing && pb.hash != hash)))
+            {
+                if (!playing)
+                    gPreview.blendWas = a.clip == kNoClip ? 1 : a.clip + 2;
+                const uint32_t set = ++pb.next ? pb.next : ++pb.next;
+                pb.tx = gPreview.blendPx, pb.ty = gPreview.blendPy, pb.smooth = 0;
+                enterBlend(a, pb, gPreview.srcClip, gPreview.srcFrom, set, gPreview.blendDims == 2 ? 2 : 1, hash, a.speed, 1,
+                           playing ? 0.0f : gPreview.fade, true);
+            }
+            gPreview.blendPick = 0;
+        }
+        pb.tx = gPreview.blendPx, pb.ty = gPreview.blendPy, pb.smooth = 0;
         if (gPreview.pickClip) // picked in the panel: 1 the rest pose, clip c at c + 2
         {
+            leaveBlend(kPreviewRow, a);
             const uint32_t c = gPreview.pickClip - 2;
             startClip(a, gPreview.srcClip, gPreview.srcFrom, gPreview.pickClip >= 2 && c < from->skel->clipCount ? c : kNoClip,
                       from == e ? 0 : from->key, a.speed, 1, gPreview.fade);
@@ -2290,6 +2345,23 @@ void animate(float dt)
             mapFor(*e, *fe, true);
         a.speed = gPreview.speed;
         advanceClip(ce, fe, a, gPreview.playing ? dt : 0.0f);
+        stepBlend(*e, kPreviewRow, 0, a, pb, gPreview.playing ? dt : 0.0f);
+        // How far what plays travels (a clip, or the blend space at its point), shown under the clips.
+        gPreview.motionShown = 0;
+        if (a.clip == kBlendClip && pb.set)
+        {
+            BlendSet b;
+            float    m[4];
+            if (e->motionNode != kNoClip && blendWeigh(*e, kPreviewRow, 0, pb.set, pb.dims, pb.x, pb.y, b) && b.length > 0)
+            {
+                blendMotion(*e, b, 0, 1, true, m);
+                const float sc = e->knobs[mdl::KnobScale] > 0 ? e->knobs[mdl::KnobScale] : 1.0f;
+                gPreview.motionSpeed = sc * sqrtf(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]) / b.length;
+                gPreview.motionTurn = m[3] * 57.2957795f / b.length, gPreview.motionShown = 1;
+            }
+        }
+        else if (a.clip != kNoClip)
+            gPreview.motionShown = clipTravel(*e, gPreview.srcClip, a.clip, gPreview.motionSpeed, gPreview.motionTurn);
         // Its layer: picked in the panel (from the models whose clips it lists), its time moved on as its clip's.
         if (gPreview.layerPick)
         {
@@ -2456,6 +2528,17 @@ void makeTargets(uint32_t w, uint32_t h)
 }
 } // namespace
 
+bool clipTravel(const Entry& e, uint32_t src, uint32_t c, float& speed, float& turn)
+{
+    const Entry* s = sourceOf(e, src);
+    if (!s || !s->anim || c >= s->skel->clipCount || s->motionNode == kNoClip || !(s->clips[c].duration > 0))
+        return false;
+    const float d = s->clips[c].duration, sc = e.knobs[mdl::KnobScale] > 0 ? e.knobs[mdl::KnobScale] : 1.0f;
+    float       m[4];
+    motionOf(e, s, c, 0, d, true, m);
+    speed = sc * sqrtf(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]) / d, turn = m[3] * 57.2957795f / d;
+    return true;
+}
 uint32_t lodCount(const Entry& e)
 {
     if (!e.parts)
@@ -2497,7 +2580,7 @@ int load(int reloaded)
     gLayerMask = new uint8_t[kMaxNodes];
     gBlendPoses = new anim::Pose[kMaxNodes];
     gBlendWeights = new float[kRmodelMaxTargets];
-    gBlendTris = new BlendTris[kBlendRows * 2]();
+    gBlendTris = new BlendTris[(kBlendRows + 1) * 2]();
     gSrcWeights = new float[kRmodelMaxTargets];
     gInertPool = new float[kInertFloats];
     gInertSlot = new InertSlot[kInertSlots];
@@ -2688,6 +2771,36 @@ void draw(uint32_t pass, const YeaFrame* frame)
                  gPreview.srcFrom, -1, &gPreview)) // posed as its clip (and its layer) is now
     {
         p.palette = (uint64_t)(uintptr_t)gPalette, p.bones = e->skel->boneCount;
+        // Its skeleton for the panel's overlay: each node placed as the preview places the model, through the
+        // preview's camera (the core's previewCamera: looking at the origin, right = up x forward).
+        gPreview.boneNodes = 0;
+        if (gPreview.bones && p.parts && gTargetW && gTargetH)
+        {
+            const float* m = p.transform[0];
+            const float  el = sqrtf(p.eye[0] * p.eye[0] + p.eye[1] * p.eye[1] + p.eye[2] * p.eye[2]);
+            const float  f[3] = { -p.eye[0] / el, -p.eye[1] / el, -p.eye[2] / el }, hp[3] = { fabsf(f[1]) < 0.99f ? 0.0f : 1.0f,
+                                                                                          fabsf(f[1]) < 0.99f ? 1.0f : 0.0f, 0 };
+            float rt[3] = { hp[1] * f[2] - hp[2] * f[1], hp[2] * f[0] - hp[0] * f[2], hp[0] * f[1] - hp[1] * f[0] };
+            const float rl = sqrtf(rt[0] * rt[0] + rt[1] * rt[1] + rt[2] * rt[2]);
+            for (float& c : rt)
+                c /= rl;
+            const float up[3] = { f[1] * rt[2] - f[2] * rt[1], f[2] * rt[0] - f[0] * rt[2], f[0] * rt[1] - f[1] * rt[0] };
+            const float p11 = 1.0f / tanf(p.fov * 0.5f * 0.01745329f), p00 = p11 * float(gTargetH) / float(gTargetW);
+            const uint32_t n = e->skel->nodeCount < kViewerNodes ? e->skel->nodeCount : kViewerNodes;
+            for (uint32_t i = 0; i < n; ++i)
+            {
+                const float* g = &gWorld[i * 12];
+                float        d[3];
+                for (int k = 0; k < 3; ++k)
+                    d[k] = m[k * 4] * g[3] + m[k * 4 + 1] * g[7] + m[k * 4 + 2] * g[11] + m[k * 4 + 3] - p.eye[k];
+                const float z = f[0] * d[0] + f[1] * d[1] + f[2] * d[2];
+                const float xv = rt[0] * d[0] + rt[1] * d[1] + rt[2] * d[2], yv = up[0] * d[0] + up[1] * d[1] + up[2] * d[2];
+                gPreview.boneSeen[i] = z > 1e-4f;
+                gPreview.boneXY[i * 2] = z > 1e-4f ? 0.5f + 0.5f * p00 * xv / z : 0;
+                gPreview.boneXY[i * 2 + 1] = z > 1e-4f ? 0.5f - 0.5f * p11 * yv / z : 0;
+            }
+            gPreview.boneNodes = n;
+        }
         if (e->targets)
         {
             p.weights = (uint64_t)(uintptr_t)gWeights, p.targets = e->skel->targetCount;
