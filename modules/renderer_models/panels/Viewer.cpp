@@ -9,6 +9,7 @@
 #include <yea/ui.h>
 
 #include <ctype.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -200,6 +201,26 @@ void panel_model_viewer()
             gPreview.anim.time = 0, gPreview.anim.from = kNoClip;
         u->slider("Speed##clip", &gPreview.speed, 0.0f, 2.0f, 0);
         u->slider("Crossfade (s)##clip", &gPreview.fade, 0.0f, 1.0f, 0);
+        // Its morph targets: each one's weight now; dragging one holds it there over the clip, until Follow the Clip.
+        if (sel->targets && sel->skel->targetCount)
+        {
+            u->fold("Morph Targets##morph", &gPreview.morphOpen);
+            if (gPreview.morphOpen)
+            {
+                for (uint32_t t = 0; t < sel->skel->targetCount && t < kRmodelMaxTargets; ++t)
+                {
+                    char name[64], label[96];
+                    pretty(sel->targets[t].name, name, sizeof name);
+                    snprintf(label, sizeof label, "%s##morph%u", name[0] ? name : "Target", t);
+                    float     w = gPreview.morphHeld[t] ? gPreview.morph[t] : gPreview.morphNow[t];
+                    const float lo = fminf(0.0f, sel->targets[t].lo), hi = fmaxf(1.0f, sel->targets[t].hi);
+                    if (u->slider(label, &w, lo, hi, 0))
+                        gPreview.morph[t] = w, gPreview.morphHeld[t] = 1;
+                }
+                if (u->button("Follow the Clip##morph", 0, 1))
+                    memset(gPreview.morphHeld, 0, sizeof gPreview.morphHeld);
+            }
+        }
     }
 
     // Its knobs (renderer_models' each block makes them for its MODEL line).

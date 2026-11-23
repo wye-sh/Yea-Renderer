@@ -784,6 +784,9 @@ void clear()
     Decals.clear();
     MeshSkins.clear();
     SkinVertexes.clear();
+    MeshMorphs.clear();
+    MorphVertexes.clear();
+    MorphDeltas.clear();
     build()->active = 0;
     sceneState()->removed = yea::host()->frame();
     newEpoch();

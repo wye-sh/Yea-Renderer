@@ -8,6 +8,8 @@ BEGIN_SRT(SkinSrt)
         DECL_RWBUFFER(PerFrame, RWBuffer(uint), gAttributes) // RENDER_ATTRIBUTE_STRIDE: 5 uints a vertex
         DECL_BUFFER(PerFrame, Buffer(uint4), gSkin)          // a vertex's bones (u16 pairs) and weights (unorm16 pairs)
         DECL_BUFFER(PerFrame, Buffer(float4), gPalette)      // 3 rows a bone, model space
-        DECL_BUFFER(PerFrame, Buffer(uint4), gJobs)          // [0].x the job count ([0] and [1] its header); job k at 2 + 2k (skin.cpp's Job)
+        DECL_BUFFER(PerFrame, Buffer(uint4), gJobs)          // [0].x the job count ([0] to [2] its header); job k at 3 + 3k (skin.cpp's Job)
+        DECL_BUFFER(PerFrame, Buffer(uint), gMorphVertices)  // a vertex's deltas: first (low 24 bits, from the job's) and count
+        DECL_BUFFER(PerFrame, Buffer(uint4), gMorphDeltas)   // position offset (xyz floats), w target | normal offset snorm8x3
     END_SRT_SET(PerFrame)
 END_SRT(SkinSrt)

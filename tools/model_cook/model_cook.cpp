@@ -71,6 +71,7 @@ struct Vertex // a corner with everything that tells two apart (welded by bytes)
     uint32_t color;
     uint16_t bones[4]; // skinned models only (all zero otherwise)
     uint16_t weights[4];
+    uint32_t morph; // morphed vertices: 1 + its gMorphVerts index (0: it doesn't morph)
 };
 
 struct Part
@@ -85,6 +86,7 @@ struct Part
         std::vector<float>    positions;  // float3
         std::vector<uint32_t> attributes; // 5 each
         std::vector<RmodelSkinVertex> skin; // skinned models
+        std::vector<uint32_t> morph;        // each vertex's Vertex::morph
         std::vector<uint32_t> indices;
         float                 error;
     };
@@ -93,6 +95,22 @@ struct Part
 
 std::vector<std::string> gNotes, gWarnings;
 uint32_t                 gDraco; // primitives decoded from Draco
+
+// Morph targets (rmodel v4): the model's, merged by name over its meshes, and each morphed vertex's deltas (renderer space).
+struct MorphTarget
+{
+    std::string name;
+    float       weight = 0;        // default
+    float       lo = 0, hi = 0;    // the weights it takes (default and clips)
+    float       reach = 0;         // its largest position delta (metres), for measuring clips
+};
+struct MorphDeltaSrc
+{
+    uint32_t target;
+    float    p[3], n[3];
+};
+std::vector<MorphTarget>                gTargets;
+std::vector<std::vector<MorphDeltaSrc>> gMorphVerts;
 
 void note(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 void note(const char* fmt, ...)
@@ -209,6 +227,8 @@ struct SrcMesh
     std::vector<uint32_t> col;      // rgba8 per vertex; empty: white
     std::vector<uint16_t> bones, weights; // 4 each per vertex (skeleton bones, unorm16), skinned models only
     std::vector<float>    dracoJoints, dracoWeights; // a Draco primitive's JOINTS_n/WEIGHTS_n, set after set (4 a vertex)
+    std::vector<uint32_t> targets;  // morph targets: each of its own as a gTargets index
+    std::vector<float>    dpos, dnor; // per target, per vertex: 3 each (dnor empty when it has no normals)
     std::vector<uint32_t> idx;      // a triangle list
 };
 
@@ -218,6 +238,7 @@ struct Clip
     std::string                                   name;
     float                                         duration;
     std::function<void(float, anim::Pose*)>       source; // every node's exact local pose at a time
+    std::function<void(float, float*)>            weights; // every morph target's exact weight at a time (null: defaults)
     bool                                          stepped = false; // it has step keys (jumps)
     float                                         keyRate = 0;     // the file's keys are evenly spaced at it (0: they aren't)
 };
@@ -424,6 +445,49 @@ void addMesh(const SrcMesh& src, std::vector<Part>& parts, bool& flatNormals, bo
         part = &parts.back();
         part->material = src.material;
     }
+    // Its morphed vertices' deltas, into gMorphVerts once a vertex (its corners share them): positions through the
+    // world transform's linear part, normals through its normal matrix, Z negated as the vertices are.
+    const size_t          ntargets = src.targets.size();
+    const bool            mnor = src.dnor.size() == ntargets * vcount * 3 && nor;
+    std::vector<uint32_t> morphIndex(ntargets ? vcount : 0, 0xFFFFFFFFu);
+    auto                  morphOf = [&](uint32_t v) -> uint32_t {
+        if (!ntargets || src.dpos.size() != ntargets * vcount * 3)
+            return 0;
+        if (morphIndex[v] != 0xFFFFFFFFu)
+            return morphIndex[v];
+        std::vector<MorphDeltaSrc> list;
+        for (size_t k = 0; k < ntargets; ++k)
+        {
+            const float*  dp = &src.dpos[(k * vcount + v) * 3];
+            const float*  dn = mnor ? &src.dnor[(k * vcount + v) * 3] : nullptr;
+            MorphDeltaSrc d = {};
+            d.target = src.targets[k];
+            d.p[0] = m[0] * dp[0] + m[4] * dp[1] + m[8] * dp[2];
+            d.p[1] = m[1] * dp[0] + m[5] * dp[1] + m[9] * dp[2];
+            d.p[2] = -(m[2] * dp[0] + m[6] * dp[1] + m[10] * dp[2]);
+            if (dn)
+            {
+                for (int r = 0; r < 3; ++r)
+                    d.n[r] = (c[r][0] * dn[0] + c[r][1] * dn[1] + c[r][2] * dn[2]) * ds;
+                d.n[2] = -d.n[2];
+                // The normal matrix keeps directions, not lengths: scale it as the bind normal was normalised.
+                const float* n0 = &src.nor[v * 3];
+                float        t0[3];
+                for (int r = 0; r < 3; ++r)
+                    t0[r] = (c[r][0] * n0[0] + c[r][1] * n0[1] + c[r][2] * n0[2]) * ds;
+                const float len = sqrtf(t0[0] * t0[0] + t0[1] * t0[1] + t0[2] * t0[2]);
+                for (int r = 0; r < 3; ++r)
+                    d.n[r] = len > 0 ? d.n[r] / len : 0;
+            }
+            const float mp = fabsf(d.p[0]) + fabsf(d.p[1]) + fabsf(d.p[2]), mn = fabsf(d.n[0]) + fabsf(d.n[1]) + fabsf(d.n[2]);
+            if (mp > 1e-9f || mn > 1e-5f)
+                list.push_back(d);
+        }
+        if (list.empty())
+            return morphIndex[v] = 0;
+        gMorphVerts.push_back(std::move(list));
+        return morphIndex[v] = (uint32_t)gMorphVerts.size();
+    };
     const size_t first = part->corners.size();
     for (size_t t = 0; t + 2 < src.idx.size(); t += 3)
     {
@@ -463,6 +527,7 @@ void addMesh(const SrcMesh& src, std::vector<Part>& parts, bool& flatNormals, bo
             o.color = col ? src.col[v] : 0xFFFFFFFFu;
             if (skinned)
                 memcpy(o.bones, &src.bones[v * 4], 8), memcpy(o.weights, &src.weights[v * 4], 8);
+            o.morph = morphOf(v);
             part->corners.push_back(o);
         }
     }
@@ -681,8 +746,6 @@ bool gltfPrimitive(const cgltf_data* data, const cgltf_primitive& prim, const fl
     }
     memcpy(out.m, world, sizeof out.m);
     out.material = prim.material ? (uint32_t)(prim.material - data->materials) : (uint32_t)data->materials_count;
-    if (prim.targets_count)
-        warn("morph targets are ignored");
     if (attribute(prim, cgltf_attribute_type_texcoord, 1))
         warn("a second UV set is ignored");
     if (prim.has_draco_mesh_compression)
@@ -693,6 +756,8 @@ bool gltfPrimitive(const cgltf_data* data, const cgltf_primitive& prim, const fl
             return false;
         }
         gDraco++;
+        if (prim.targets_count)
+            warn("a Draco-compressed primitive's morph targets are ignored");
         gltfSkin(prim, out, palette, rigidBone);
         return true;
     }
@@ -732,6 +797,73 @@ bool gltfPrimitive(const cgltf_data* data, const cgltf_primitive& prim, const fl
     triangleList(prim.type, raw, out.idx);
     gltfSkin(prim, out, palette, rigidBone);
     return true;
+}
+
+// Morph targets (v4): each mesh's targets as the model's, merged by name over its meshes (a head's and its teeth's
+// \"jawOpen\" are one), their defaults from the mesh's weights. Unnamed targets are their mesh's own.
+std::vector<std::vector<uint32_t>> gMeshTargets; // cgltf mesh index -> gTargets indices, one per target
+void gltfTargets(const cgltf_data* data)
+{
+    gMeshTargets.assign(data->meshes_count, {});
+    for (cgltf_size i = 0; i < data->meshes_count; ++i)
+    {
+        const cgltf_mesh& mesh = data->meshes[i];
+        size_t            count = 0;
+        for (cgltf_size j = 0; j < mesh.primitives_count; ++j)
+            count = mesh.primitives[j].targets_count > count ? mesh.primitives[j].targets_count : count;
+        for (size_t k = 0; k < count; ++k)
+        {
+            std::string name = k < mesh.target_names_count && mesh.target_names[k] && mesh.target_names[k][0]
+                                   ? std::string(mesh.target_names[k])
+                                   : std::string(mesh.name && mesh.name[0] ? mesh.name : "mesh" + std::to_string(i)) + "." + std::to_string(k);
+            if (name.size() > 47)
+                name.resize(47);
+            uint32_t id = 0xFFFFFFFFu;
+            for (uint32_t t = 0; t < gTargets.size(); ++t)
+                if (gTargets[t].name == name)
+                    id = t;
+            if (id == 0xFFFFFFFFu)
+            {
+                MorphTarget t;
+                t.name = name;
+                t.weight = k < mesh.weights_count ? mesh.weights[k] : 0.0f;
+                t.lo = t.hi = t.weight;
+                gTargets.push_back(t);
+                id = (uint32_t)gTargets.size() - 1;
+            }
+            gMeshTargets[i].push_back(id);
+        }
+    }
+}
+// A primitive's morph targets' deltas (positions and normals; tangents follow the morphed normal in the renderer).
+void gltfMorphs(const cgltf_data* data, const cgltf_mesh* mesh, const cgltf_primitive& prim, SrcMesh& out)
+{
+    const size_t vcount = out.pos.size() / 3;
+    if (!mesh || !prim.targets_count || prim.has_draco_mesh_compression || !vcount)
+        return;
+    const std::vector<uint32_t>& ids = gMeshTargets[mesh - data->meshes];
+    out.targets.assign(ids.begin(), ids.begin() + (prim.targets_count < ids.size() ? prim.targets_count : ids.size()));
+    out.dpos.assign(out.targets.size() * vcount * 3, 0.0f);
+    bool normals = !out.nor.empty(), tangents = false;
+    if (normals)
+        out.dnor.assign(out.targets.size() * vcount * 3, 0.0f);
+    for (size_t k = 0; k < out.targets.size(); ++k)
+    {
+        const cgltf_morph_target& mt = prim.targets[k];
+        for (cgltf_size a = 0; a < mt.attributes_count; ++a)
+        {
+            const cgltf_attribute& at = mt.attributes[a];
+            float*                 dst = at.type == cgltf_attribute_type_position ? &out.dpos[k * vcount * 3]
+                                         : at.type == cgltf_attribute_type_normal && normals ? &out.dnor[k * vcount * 3]
+                                                                                             : nullptr;
+            tangents = tangents || at.type == cgltf_attribute_type_tangent;
+            if (!dst || !at.data || at.data->count != vcount)
+                continue;
+            cgltf_accessor_unpack_floats(at.data, dst, vcount * 3); // applies sparse deltas, unlike read_float
+        }
+    }
+    if (tangents)
+        note("morph targets: their tangent deltas are left out (the renderer turns each tangent with its morphed normal)");
 }
 
 // Skinned glTF models: every node into the skeleton (parents first), with the map from cgltf's nodes to its.
@@ -781,11 +913,17 @@ void gltfSkeleton(const cgltf_data* data)
         int                path, interp; // 0 t, 1 r, 2 s; 0 step, 1 linear, 2 cubic
         std::vector<float> in, out;
     };
-    bool morphs = false;
+    struct WeightTrack // a node's mesh's weights (n of them a key)
+    {
+        std::vector<uint32_t> targets;
+        int                   interp;
+        std::vector<float>    in, out;
+    };
     for (cgltf_size a = 0; a < data->animations_count; ++a)
     {
         const cgltf_animation& an = data->animations[a];
         auto                   tracks = std::make_shared<std::vector<Track>>();
+        auto                   wtracks = std::make_shared<std::vector<WeightTrack>>();
         float                  duration = 0;
         for (cgltf_size c = 0; c < an.channels_count; ++c)
         {
@@ -794,7 +932,20 @@ void gltfSkeleton(const cgltf_data* data)
                 continue;
             if (ch.target_path == cgltf_animation_path_type_weights)
             {
-                morphs = true;
+                if (!ch.target_node->mesh || gMeshTargets[ch.target_node->mesh - data->meshes].empty())
+                    continue;
+                WeightTrack wt;
+                wt.targets = gMeshTargets[ch.target_node->mesh - data->meshes];
+                wt.interp = ch.sampler->interpolation == cgltf_interpolation_type_step ? 0 : (ch.sampler->interpolation == cgltf_interpolation_type_linear ? 1 : 2);
+                wt.in.resize(ch.sampler->input->count);
+                for (cgltf_size k = 0; k < wt.in.size(); ++k)
+                    cgltf_accessor_read_float(ch.sampler->input, k, &wt.in[k], 1);
+                wt.out.resize(ch.sampler->output->count);
+                cgltf_accessor_unpack_floats(ch.sampler->output, wt.out.data(), wt.out.size());
+                if (wt.in.empty() || wt.out.size() < wt.in.size() * wt.targets.size() * (wt.interp == 2 ? 3 : 1))
+                    continue;
+                duration = fmaxf(duration, wt.in.back());
+                wtracks->push_back(std::move(wt));
                 continue;
             }
             Track tr;
@@ -816,27 +967,67 @@ void gltfSkeleton(const cgltf_data* data)
             duration = fmaxf(duration, tr.in.back());
             tracks->push_back(std::move(tr));
         }
-        if (tracks->empty())
+        if (tracks->empty() && wtracks->empty())
             continue;
         Clip clip;
         clip.name = an.name && an.name[0] ? an.name : "clip" + std::to_string(a);
         clip.duration = duration;
-        float step = 0; // the smallest gap between keys, then whether every key falls on it
+        std::vector<std::pair<const std::vector<float>*, int>> inputs; // every track's key times and interpolation
         for (const Track& tr : *tracks)
+            inputs.push_back({ &tr.in, tr.interp });
+        for (const WeightTrack& wt : *wtracks)
+            inputs.push_back({ &wt.in, wt.interp });
+        float step = 0; // the smallest gap between keys, then whether every key falls on it
+        for (const auto& in : inputs)
         {
-            clip.stepped = clip.stepped || (tr.interp == 0 && tr.in.size() > 1);
-            for (size_t k = 1; k < tr.in.size(); ++k)
-                if (tr.in[k] - tr.in[k - 1] > 1e-4f && (step == 0 || tr.in[k] - tr.in[k - 1] < step))
-                    step = tr.in[k] - tr.in[k - 1];
+            clip.stepped = clip.stepped || (in.second == 0 && in.first->size() > 1);
+            for (size_t k = 1; k < in.first->size(); ++k)
+                if ((*in.first)[k] - (*in.first)[k - 1] > 1e-4f && (step == 0 || (*in.first)[k] - (*in.first)[k - 1] < step))
+                    step = (*in.first)[k] - (*in.first)[k - 1];
         }
         bool even = step > 0;
-        for (const Track& tr : *tracks)
-            for (size_t k = 0; k < tr.in.size() && even; ++k)
+        for (const auto& in : inputs)
+            for (size_t k = 0; k < in.first->size() && even; ++k)
             {
-                const float x = (tr.in[k] - tr.in[0]) / step;
-                even = fabsf(x - roundf(x)) < 0.01f && fabsf(tr.in[0] - (*tracks)[0].in[0]) < 1e-4f;
+                const float x = ((*in.first)[k] - (*in.first)[0]) / step;
+                even = fabsf(x - roundf(x)) < 0.01f && fabsf((*in.first)[0] - (*inputs[0].first)[0]) < 1e-4f;
             }
         clip.keyRate = even ? 1.0f / step : 0;
+        if (!wtracks->empty())
+            clip.weights = [wtracks](float t, float* out) {
+                for (size_t i = 0; i < gTargets.size(); ++i)
+                    out[i] = gTargets[i].weight;
+                for (const WeightTrack& wt : *wtracks)
+                {
+                    const size_t n = wt.targets.size(), keys = wt.in.size(), stride = wt.interp == 2 ? n * 3 : n, at = wt.interp == 2 ? n : 0;
+                    for (size_t j = 0; j < n; ++j)
+                    {
+                        auto  value = [&](size_t k) { return wt.out[k * stride + at + j]; };
+                        float v;
+                        if (t <= wt.in[0] || keys == 1)
+                            v = value(0);
+                        else if (t >= wt.in[keys - 1])
+                            v = value(keys - 1);
+                        else
+                        {
+                            const size_t k = (size_t)(std::upper_bound(wt.in.begin(), wt.in.end(), t) - wt.in.begin()) - 1;
+                            const float  td = wt.in[k + 1] - wt.in[k], f = td > 0 ? (t - wt.in[k]) / td : 0;
+                            const float  a = value(k), b = value(k + 1);
+                            if (wt.interp == 0)
+                                v = a;
+                            else if (wt.interp == 2)
+                            {
+                                const float bo = wt.out[k * stride + 2 * n + j], ai = wt.out[(k + 1) * stride + j];
+                                const float f2 = f * f, f3 = f2 * f;
+                                v = (2 * f3 - 3 * f2 + 1) * a + td * (f3 - 2 * f2 + f) * bo + (-2 * f3 + 3 * f2) * b + td * (f3 - f2) * ai;
+                            }
+                            else
+                                v = a + (b - a) * f;
+                        }
+                        out[wt.targets[j]] = v;
+                    }
+                }
+            };
         clip.source = [tracks](float t, anim::Pose* poses) {
             anim::restPoses(gSkel.nodes.data(), (uint32_t)gSkel.nodes.size(), poses);
             for (const Track& tr : *tracks)
@@ -897,8 +1088,6 @@ void gltfSkeleton(const cgltf_data* data)
         };
         gSkel.clips.push_back(std::move(clip));
     }
-    if (morphs)
-        warn("morph target animation is ignored");
 }
 
 void visit(const cgltf_data* data, const cgltf_node* node, std::vector<SrcMesh>& meshes, uint32_t& meshNodes)
@@ -933,6 +1122,8 @@ void visit(const cgltf_data* data, const cgltf_node* node, std::vector<SrcMesh>&
             meshes.emplace_back();
             if (!gltfPrimitive(data, node->mesh->primitives[i], m, meshes.back(), node->skin && gSkel.on ? &palette : nullptr, rigid))
                 meshes.pop_back();
+            else
+                gltfMorphs(data, node->mesh, node->mesh->primitives[i], meshes.back());
         }
     }
     for (cgltf_size i = 0; i < node->children_count; ++i)
@@ -1163,6 +1354,7 @@ Part::Level compact(const Part& p, const uint32_t* indices, size_t count, float 
             memcpy(sv.bones, v.bones, 8), memcpy(sv.weights, v.weights, 8);
             l.skin.push_back(sv);
         }
+        l.morph.push_back(v.morph);
     }
     return l;
 }
@@ -1189,17 +1381,32 @@ void buildLods(Part& p, const std::unordered_map<uint64_t, uint32_t>& owners)
             if (ba != bb || bb != bc)
                 lock[a] = lock[b] = lock[c] = meshopt_SimplifyVertex_Lock;
         }
-    // Normals and UVs weigh in the error, so shading and texturing hold.
-    const size_t       stride = gSkel.on ? 6 : 5;
+    // Normals and UVs weigh in the error, so shading and texturing hold. With morph targets, how far each vertex morphs
+    // (over the part's furthest), so the moving parts of a face keep their detail longer than the still ones.
+    const bool         morphs = !gTargets.empty();
+    const size_t       stride = (gSkel.on ? 6 : 5) + (morphs ? 1 : 0);
     std::vector<float> attrs(n * stride);
+    float              furthest = 0;
+    auto               reach = [&](const Vertex& v) {
+        float r = 0;
+        if (v.morph)
+            for (const MorphDeltaSrc& d : gMorphVerts[v.morph - 1])
+                r += sqrtf(d.p[0] * d.p[0] + d.p[1] * d.p[1] + d.p[2] * d.p[2]);
+        return r;
+    };
+    if (morphs)
+        for (const Vertex& v : p.vertices)
+            furthest = fmaxf(furthest, reach(v));
     for (size_t i = 0; i < n; ++i)
     {
         memcpy(&attrs[i * stride], p.vertices[i].n, 12);
         memcpy(&attrs[i * stride + 3], p.vertices[i].uv, 8);
         if (gSkel.on)
             attrs[i * stride + 5] = p.vertices[i].weights[0] / 65535.0f;
+        if (morphs)
+            attrs[i * stride + stride - 1] = furthest > 0 ? reach(p.vertices[i]) / furthest : 0;
     }
-    const float weights[6] = { 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 1.0f };
+    const float weights[7] = { 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 1.0f, 1.0f };
     const float scale = meshopt_simplifyScale(p.vertices[0].p, n, sizeof(Vertex)); // relative error to metres
 
     p.levels.push_back(compact(p, p.indices.data(), p.indices.size(), 0));
@@ -1489,10 +1696,16 @@ int main(int argc, char** argv)
             fprintf(stderr, "error: its EXT_meshopt_compression data didn't decode\n");
             return done(1);
         }
-        if (data->skins_count || data->animations_count)
+        gltfTargets(data);
+        if (gTargets.size() > kRmodelMaxTargets)
+        {
+            fprintf(stderr, "error: %zu morph targets; a model may have %u\n", gTargets.size(), kRmodelMaxTargets);
+            return done(1);
+        }
+        if (data->skins_count || data->animations_count || !gTargets.empty())
         {
             gltfSkeleton(data);
-            gSkel.on = data->skins_count || clipsMoveMeshes();
+            gSkel.on = data->skins_count || !gTargets.empty() || clipsMoveMeshes();
         }
         const cgltf_scene* sc = data->scene ? data->scene : (data->scenes_count ? &data->scenes[0] : nullptr);
         if (sc)
@@ -1588,9 +1801,38 @@ int main(int argc, char** argv)
         for (int a = 0; a < 3; ++a)
             size = fmaxf(size, mhi[a] - mlo[a]);
         const float tolerance = fmaxf(cook_anim::kMaxError, size * cook_anim::kRelativeError);
+        // Morph targets: each one's largest position delta (for measuring weights at the skin), defaults, and the range of
+        // weights its clips take.
+        const uint32_t     nt = (uint32_t)gTargets.size();
+        std::vector<float> reach(nt, 0.0f), defaults(nt), wlo(nt), whi(nt);
+        for (const auto& list : gMorphVerts)
+            for (const MorphDeltaSrc& d : list)
+                reach[d.target] = fmaxf(reach[d.target], sqrtf(d.p[0] * d.p[0] + d.p[1] * d.p[1] + d.p[2] * d.p[2]));
+        for (uint32_t t = 0; t < nt; ++t)
+            defaults[t] = wlo[t] = whi[t] = gTargets[t].weight, gTargets[t].reach = reach[t];
         for (const Clip& c : gSkel.clips)
             clips.push_back(cook_anim::encode(c.name.c_str(), c.duration, gSkel.nodes.data(), nn, gSkel.bones.data(), nb, verts, vpart, lo, hi,
-                                              c.source, tolerance, c.stepped, c.keyRate));
+                                              c.source, tolerance, c.stepped, c.keyRate, nt, c.weights, defaults.data(), reach.data(),
+                                              wlo.data(), whi.data()));
+        for (uint32_t t = 0; t < nt; ++t)
+            gTargets[t].lo = wlo[t], gTargets[t].hi = whi[t];
+        // Bounds: what the morphs can add at the weights they take (before the pose; bones rarely scale them up).
+        if (nt)
+        {
+            std::vector<float> pad(parts.size(), 0.0f);
+            for (uint32_t k = 0; k < parts.size(); ++k)
+                for (uint32_t m : parts[k].levels[0].morph)
+                {
+                    float r = 0;
+                    if (m)
+                        for (const MorphDeltaSrc& d : gMorphVerts[m - 1])
+                            r += sqrtf(d.p[0] * d.p[0] + d.p[1] * d.p[1] + d.p[2] * d.p[2]) * fmaxf(fabsf(wlo[d.target]), fabsf(whi[d.target]));
+                    pad[k] = fmaxf(pad[k], r);
+                }
+            for (uint32_t k = 0; k < parts.size(); ++k)
+                for (int a = 0; a < 3; ++a)
+                    lo[k * 3 + a] -= pad[k], hi[k * 3 + a] += pad[k];
+        }
         for (size_t i = 0; i < clips.size(); ++i)
             if (gSkel.clips[i].stepped)
                 note("clip %s has step keys: each jump blends over one frame (%.1f ms)", clips[i].clip.name, 1000.0f / clips[i].clip.rate);
@@ -1689,15 +1931,51 @@ int main(int argc, char** argv)
     h.attributes = (uint32_t)at, at = align16(at + (size_t)h.vertexCount * 20);
     h.indices = (uint32_t)at, at = align16(at + (size_t)h.indexCount * 4);
     RmodelSkeleton sk = {};
+    RmodelMorphs   mo = {};
+    // Morph targets: every morphed vertex's deltas once (LODs share them), the target and normal packed beside each.
+    std::vector<RmodelMorphDelta> deltas;
+    std::vector<uint32_t>         deltaFirst(gMorphVerts.size());
+    for (size_t i = 0; i < gMorphVerts.size(); ++i)
+    {
+        deltaFirst[i] = (uint32_t)deltas.size();
+        for (const MorphDeltaSrc& d : gMorphVerts[i])
+        {
+            RmodelMorphDelta o = {};
+            memcpy(o.p, d.p, 12);
+            o.packed = d.target;
+            for (int k = 0; k < 3; ++k)
+            {
+                const float q = fmaxf(-1.0f, fminf(1.0f, d.n[k] * 0.5f));
+                o.packed |= (uint32_t)(uint8_t)(int8_t)lroundf(q * 127.0f) << (8 * (k + 1));
+            }
+            deltas.push_back(o);
+        }
+    }
+    if (deltas.size() >= (1u << 24))
+    {
+        fprintf(stderr, "error: %zu morph deltas; a model may have 16 million\n", deltas.size());
+        return done(1);
+    }
     if (gSkel.on)
     {
         h.flags |= RmodelSkinned;
         h.skin = (uint32_t)at, at = align16(at + (size_t)h.vertexCount * sizeof(RmodelSkinVertex));
+        if (!gTargets.empty())
+        {
+            mo.refs = (uint32_t)at, at = align16(at + (size_t)h.vertexCount * 4);
+            mo.deltas = (uint32_t)at, at = align16(at + deltas.size() * sizeof(RmodelMorphDelta));
+            mo.deltaCount = (uint32_t)deltas.size();
+        }
         h.skeleton = (uint32_t)at, at = align16(at + sizeof sk);
         sk.nodeCount = (uint32_t)gSkel.nodes.size(), sk.boneCount = (uint32_t)gSkel.bones.size(), sk.clipCount = (uint32_t)clips.size();
         sk.nodes = (uint32_t)at, at = align16(at + gSkel.nodes.size() * sizeof(RmodelNode));
         sk.bones = (uint32_t)at, at = align16(at + gSkel.bones.size() * sizeof(RmodelBone));
         sk.clips = (uint32_t)at, at = align16(at + clips.size() * sizeof(RmodelClip));
+        if (!gTargets.empty())
+        {
+            sk.targetCount = (uint32_t)gTargets.size();
+            sk.targets = (uint32_t)at, at = align16(at + sizeof mo + gTargets.size() * sizeof(RmodelMorphTarget));
+        }
         for (cook_anim::Encoded& c : clips)
             c.clip.offset = at, at = align16(at + c.data.size());
     }
@@ -1726,7 +2004,26 @@ int main(int argc, char** argv)
             memcpy(&file[h.indices + (size_t)fl.firstIndex * 4], l.indices.data(), l.indices.size() * 4);
             if (gSkel.on)
                 memcpy(&file[h.skin + (size_t)fl.firstVertex * sizeof(RmodelSkinVertex)], l.skin.data(), l.skin.size() * sizeof(RmodelSkinVertex));
+            if (mo.refs)
+                for (size_t i = 0; i < l.morph.size(); ++i)
+                {
+                    const uint32_t m = l.morph[i];
+                    const uint32_t ref = m ? deltaFirst[m - 1] | (uint32_t)gMorphVerts[m - 1].size() << 24 : 0;
+                    memcpy(&file[mo.refs + ((size_t)fl.firstVertex + i) * 4], &ref, 4);
+                }
         }
+    if (mo.refs)
+    {
+        memcpy(&file[mo.deltas], deltas.data(), deltas.size() * sizeof(RmodelMorphDelta));
+        memcpy(&file[sk.targets], &mo, sizeof mo);
+        for (size_t t = 0; t < gTargets.size(); ++t)
+        {
+            RmodelMorphTarget o = {};
+            snprintf(o.name, sizeof o.name, "%s", gTargets[t].name.c_str());
+            o.weight = gTargets[t].weight, o.lo = gTargets[t].lo, o.hi = gTargets[t].hi;
+            memcpy(&file[sk.targets + sizeof mo + t * sizeof o], &o, sizeof o);
+        }
+    }
     if (gSkel.on)
     {
         memcpy(&file[h.skeleton], &sk, sizeof sk);
@@ -1806,6 +2103,14 @@ int main(int argc, char** argv)
         for (const cook_anim::Encoded& c : clips)
             printf("  %s: %.2f s, %u frames at %.0f a second, %.1f KB, within %.2f mm\n", c.clip.name, c.clip.duration, c.clip.frames,
                    c.clip.frames > 1 ? c.clip.rate : 0.0f, c.data.size() / 1024.0, c.error * 1000.0f);
+        if (!gTargets.empty())
+        {
+            printf("morph targets: %zu, %zu deltas over %zu vertices (%.1f KB):", gTargets.size(), deltas.size(), gMorphVerts.size(),
+                   deltas.size() * 16 / 1024.0);
+            for (const MorphTarget& t : gTargets)
+                printf(" %s (%.2f, clips %.2f to %.2f, up to %.1f mm);", t.name.c_str(), t.weight, t.lo, t.hi, t.reach * 1000.0f);
+            printf("\n");
+        }
         if (over > 1.0f)
             warn("a clip strays %.1fx its tolerance (%.2g mm) at its best rate: very fast motion", over, clips.empty() ? 0.0 : clips[0].tolerance * 1000.0);
     }

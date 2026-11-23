@@ -1,4 +1,4 @@
-// Animation clips in a cooked model (rmodel.h, v3): sampling a clip into local poses, and poses into the skinning
+// Animation clips in a cooked model (rmodel.h, v3; v4's morph weights): sampling a clip into local poses, and poses into the skinning
 // palette. Shared by renderer_models (the runtime) and the model cooker (its encoder checks itself against this decoder).
 // Header-only; nothing here allocates.
 //
@@ -131,6 +131,30 @@ inline bool sampleClip(const uint8_t* data, const RmodelClip& c, uint32_t nodeCo
                 for (int i = 0; i < 3; ++i)
                     dst[i] = tr.base[i] + tr.extent[i] * ((float)a[i] * (1 - f) + (float)b[i] * f) * (1.0f / 65535.0f);
         }
+    return true;
+}
+
+// Every morph target's weight at `time` into `out` (targetCount floats): the tracks after the nodes' (v4), lerped.
+inline bool sampleWeights(const uint8_t* data, const RmodelClip& c, uint32_t nodeCount, uint32_t targetCount, float time, bool loop,
+                          float* out)
+{
+    if (c.codec != RmodelCodecQuantized)
+        return false;
+    uint32_t f0, f1;
+    float    f;
+    frameAt(c, time, loop, f0, f1, f);
+    const RmodelTrack* tracks = (const RmodelTrack*)data + nodeCount * 3;
+    for (uint32_t t = 0; t < targetCount; ++t)
+    {
+        const RmodelTrack& tr = tracks[t];
+        if (tr.data == 0xFFFFFFFFu)
+        {
+            out[t] = tr.base[0];
+            continue;
+        }
+        const uint16_t* u = (const uint16_t*)(data + tr.data);
+        out[t] = tr.base[0] + tr.extent[0] * ((float)u[f0] * (1 - f) + (float)u[f1] * f) * (1.0f / 65535.0f);
+    }
     return true;
 }
 

@@ -1,4 +1,5 @@
-// One thread a vertex: its position, normal and tangent blended by up to 4 bones (linear blend skinning), its uv and
+// One thread a vertex: its morph targets' offsets added by their weights (position and normal), then its position, normal
+// and tangent blended by up to 4 bones (linear blend skinning), its uv and
 // colour copied, written to its instance's region (this frame's copy; both copies when the region is new, so last
 // frame's positions read the same and nothing smears).
 #include "Common.h.fsl"
@@ -30,12 +31,13 @@ void CS_MAIN(SV_GroupID(uint3) group, SV_GroupThreadID(uint3) thread)
     INIT_MAIN;
     uint jobs = gJobs[0].x;
     uint j = 0u;
-    // Job k's two uint4s are at 2 + 2k (the first two hold the count): the last whose first group is at or before ours.
+    // Job k's three uint4s are at 3 + 3k (the first three hold the count): the last whose first group is at or before ours.
     for (uint k = 1u; k < jobs; ++k)
-        if (gJobs[2u + k * 2u].w <= group.x)
+        if (gJobs[3u + k * 3u].w <= group.x)
             j = k;
-    uint4 a = gJobs[2u + j * 2u]; // source vertex, count, destination, first group
-    uint4 b = gJobs[3u + j * 2u]; // second destination (or 0xFFFFFFFF), first skin vertex, palette (float4s)
+    uint4 a = gJobs[3u + j * 3u]; // source vertex, count, destination, first group
+    uint4 b = gJobs[4u + j * 3u]; // second destination (or 0xFFFFFFFF), first skin vertex, palette (float4s)
+    uint4 c = gJobs[5u + j * 3u]; // first morph vertex (0xFFFFFFFF none), first delta, weights (float4s), targets
     uint  v = (group.x - a.w) * 64u + thread.x;
     if (v >= a.y)
     {
@@ -43,6 +45,30 @@ void CS_MAIN(SV_GroupID(uint3) group, SV_GroupThreadID(uint3) thread)
     }
     uint   src = a.x + v;
     float4 p = float4(asfloat(gPositions[src * 3u]), asfloat(gPositions[src * 3u + 1u]), asfloat(gPositions[src * 3u + 2u]), 1.0);
+    uint   na = gAttributes[src * 5u];
+    uint   ta = gAttributes[src * 5u + 1u];
+    float3 n = octDecode(unpackSnorm2(na));
+    // Morph targets, before the bones (glTF's order): every delta of this vertex, weighted.
+    if (c.x != 0xFFFFFFFFu)
+    {
+        uint ref = gMorphVertices[c.x + v];
+        uint first = c.y + (ref & 0xFFFFFFu);
+        uint count = ref >> 24;
+        for (uint i = 0u; i < count; ++i)
+        {
+            uint4 d = gMorphDeltas[first + i];
+            uint  tg = d.w & 0xFFu;
+            if (tg >= c.w)
+                continue;
+            float4 w4 = gPalette[c.z + (tg >> 2u)];
+            uint   lane = tg & 3u;
+            float  w = lane == 0u ? w4.x : (lane == 1u ? w4.y : (lane == 2u ? w4.z : w4.w));
+            p.xyz += w * asfloat(d.xyz);
+            int3 q = int3(int(d.w << 16) >> 24, int(d.w << 8) >> 24, int(d.w) >> 24);
+            n += w * (float3(q) * (2.0 / 127.0));
+        }
+        n = normalize(n + float3(1e-20, 0.0, 0.0));
+    }
     uint4  s = gSkin[b.y + v];
     uint   bones[4] = { s.x & 0xFFFFu, s.x >> 16, s.y & 0xFFFFu, s.y >> 16 };
     float  weights[4] = { float(s.z & 0xFFFFu), float(s.z >> 16), float(s.w & 0xFFFFu), float(s.w >> 16) };
@@ -62,9 +88,6 @@ void CS_MAIN(SV_GroupID(uint3) group, SV_GroupThreadID(uint3) thread)
     float3 c0 = cross(r1.xyz, r2.xyz);
     float3 c1 = cross(r2.xyz, r0.xyz);
     float3 c2 = cross(r0.xyz, r1.xyz);
-    uint   na = gAttributes[src * 5u];
-    uint   ta = gAttributes[src * 5u + 1u];
-    float3 n = octDecode(unpackSnorm2(na));
     n = normalize(float3(dot(c0, n), dot(c1, n), dot(c2, n)));
     float3 t = octDecode(unpackSnorm2(ta));
     t = float3(dot(r0.xyz, t), dot(r1.xyz, t), dot(r2.xyz, t));

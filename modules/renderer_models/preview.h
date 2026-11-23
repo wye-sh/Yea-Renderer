@@ -10,7 +10,7 @@
 
 #include <stdint.h>
 
-#define RENDER_PREVIEW_VERSION 2u
+#define RENDER_PREVIEW_VERSION 3u
 #define RENDER_PREVIEW_PARTS 64u
 
 struct Cmd;
@@ -43,4 +43,7 @@ struct RenderPreview
     // read during the call; 0 bones draws the bind pose. preview_draw poses its skinned parts into a region of its own.
     uint32_t      bones, pad;
     uint64_t      palette;
+    // Its morph targets' weights (v3): `targets` floats, read during the call; 0 draws no morph.
+    uint32_t      targets, pad2;
+    uint64_t      weights;
 };

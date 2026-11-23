@@ -36,12 +36,13 @@ anim::Pose*        gPoses;   // scratch for one placement's evaluation (made in 
 anim::Pose*        gFrom;    // the clip it fades from,
 float*             gWorld;   // each node's model-space matrix (12 floats),
 float*             gPalette; // and each bone's (12 floats)
+float *            gWeights, *gFromWeights; // a placement's morph weights, and those of the clip it fades from
 
 void freeAnim(Entry& e)
 {
     free(e.anim);
     e.anim = nullptr;
-    e.skel = nullptr, e.nodes = nullptr, e.bones = nullptr, e.clips = nullptr;
+    e.skel = nullptr, e.nodes = nullptr, e.bones = nullptr, e.clips = nullptr, e.targets = nullptr;
 }
 
 uint32_t fnv(const char* a, const char* b)
@@ -321,10 +322,35 @@ float apiTime(uint32_t h)
     PlacementAnim* a;
     return animOf(h, &a) ? a->time : 0.0f;
 }
-// One placement's pose now into gPoses (its clip, faded from the one before): false when it isn't skinned.
-bool evaluate(const Entry& e, const PlacementAnim& a)
+// One placement's pose now into gPoses (its clip, faded from the one before), and its morph weights into gWeights
+// (the same, then what the game holds: `held` weights, `isHeld` where it does): false when it isn't skinned.
+bool evaluate(const Entry& e, const PlacementAnim& a, const float* held = nullptr, const uint8_t* isHeld = nullptr, uint32_t placement = 0)
 {
-    const uint32_t n = e.skel->nodeCount;
+    const uint32_t n = e.skel->nodeCount, nt = e.targets ? e.skel->targetCount : 0;
+    auto           weigh = [&](uint32_t clip, float time, bool loop, float* out) {
+        if (clip >= e.skel->clipCount ||
+            !anim::sampleWeights(e.anim + (e.clips[clip].offset - e.animBase), e.clips[clip], n, nt, time, loop, out))
+            for (uint32_t t = 0; t < nt; ++t)
+                out[t] = e.targets[t].weight;
+    };
+    if (nt)
+    {
+        weigh(a.clip, a.time, a.loop, gWeights);
+        if (a.from != kNoClip && a.fade > 0 && a.faded < a.fade)
+        {
+            weigh(a.from, a.fromTime, a.fromLoop, gFromWeights);
+            float f = a.faded / a.fade;
+            f = f * f * (3 - 2 * f);
+            for (uint32_t t = 0; t < nt; ++t)
+                gWeights[t] = gFromWeights[t] + (gWeights[t] - gFromWeights[t]) * f;
+        }
+        for (uint32_t t = 0; held && t < nt; ++t)
+            if (isHeld[t])
+                gWeights[t] = held[t];
+        for (uint32_t i = 0; placement && i < MorphOverrides.size(); ++i)
+            if (MorphOverrides[i].placement == placement && MorphOverrides[i].target < nt)
+                gWeights[MorphOverrides[i].target] = MorphOverrides[i].weight;
+    }
     auto           sample = [&](uint32_t clip, float time, bool loop, anim::Pose* out) {
         if (clip >= e.skel->clipCount ||
             !anim::sampleClip(e.anim + (e.clips[clip].offset - e.animBase), e.clips[clip], n, time, loop, out))
@@ -366,6 +392,52 @@ int        apiJoint(uint32_t h, const char* name, float* out)
     anim::mul34(m, &gWorld[node * 12], out);
     return 1;
 }
+uint32_t morphNamed(const Entry& e, const char* name)
+{
+    for (uint32_t t = 0; e.targets && name && t < e.skel->targetCount; ++t)
+        if (!strncmp(e.targets[t].name, name, sizeof e.targets[t].name))
+            return t;
+    return kNoClip;
+}
+int apiMorph(uint32_t h, const char* target, float weight)
+{
+    PlacementAnim* a;
+    Entry*         e = animOf(h, &a);
+    const uint32_t t = e ? morphNamed(*e, target) : kNoClip;
+    if (t == kNoClip || !(weight == weight))
+        return 0;
+    for (uint32_t i = 0; i < MorphOverrides.size(); ++i)
+        if (MorphOverrides[i].placement == h && MorphOverrides[i].target == t)
+            return MorphOverrides[i].weight = weight, 1;
+    MorphOverride* o = MorphOverrides.add();
+    if (!o)
+        return 0;
+    o->placement = h, o->target = t, o->weight = weight;
+    return 1;
+}
+void apiUnmorph(uint32_t h, const char* target)
+{
+    PlacementAnim* a;
+    Entry*         e = animOf(h, &a);
+    const uint32_t t = e && target ? morphNamed(*e, target) : kNoClip;
+    for (uint32_t i = MorphOverrides.size(); i-- > 0;)
+        if (MorphOverrides[i].placement == h && (!target || MorphOverrides[i].target == t))
+            MorphOverrides.remove(i);
+}
+uint32_t apiMorphs(uint32_t model)
+{
+    const Entry* e = byId(model);
+    return e && e->targets ? e->skel->targetCount : 0;
+}
+const char* apiMorphTarget(uint32_t model, uint32_t index, float* weight)
+{
+    const Entry* e = byId(model);
+    if (!e || !e->targets || index >= e->skel->targetCount)
+        return nullptr;
+    if (weight)
+        *weight = e->targets[index].weight;
+    return e->targets[index].name;
+}
 uint32_t apiClips(uint32_t model)
 {
     const Entry* e = byId(model);
@@ -381,7 +453,8 @@ const char* apiClip(uint32_t model, uint32_t index, float* duration)
     return e->clips[index].name;
 }
 mdl::Api gApi = { mdl::kApi, sizeof(mdl::Api), 0,       apiBegin, apiDefine, apiEnd,   apiKnobs, apiPlace, apiMove,
-                  apiRemove, apiPlaced,        apiCount, apiInfo,  apiPlay,   apiTime,  apiJoint, apiClips, apiClip };
+                  apiRemove, apiPlaced,        apiCount, apiInfo,  apiPlay,   apiTime,  apiJoint, apiClips, apiClip,
+                  apiMorph,  apiUnmorph,       apiMorphs, apiMorphTarget };
 
 // --- Building models in the renderer's scene (this module's own update) ------------------------------------------
 
@@ -483,7 +556,8 @@ void loadCooked(Entry& e)
             if (t >= (int32_t)h.textureCount)
                 bad = "its file is damaged";
     // Skinned (v3): its skeleton and clips, kept (the span from the skeleton to the textures).
-    const bool skinned = !bad && h.version >= 3 && (h.flags & RmodelSkinned);
+    const bool          skinned = !bad && h.version >= 3 && (h.flags & RmodelSkinned);
+    const RmodelMorphs* morphs = nullptr;
     if (skinned)
     {
         const RmodelSkeleton* sk = inside(h.skeleton, sizeof(RmodelSkeleton)) && h.skeleton < h.textures ? (const RmodelSkeleton*)(data + h.skeleton) : nullptr;
@@ -505,10 +579,39 @@ void loadCooked(Entry& e)
         for (uint32_t i = 0; !bad && i < sk->boneCount; ++i)
             if (bones[i].node >= sk->nodeCount)
                 bad = "its file is damaged";
+        // Morph targets (v4): their names inside the kept span, every vertex's deltas inside the file.
+        const uint32_t      nt = !bad && h.version >= 4 ? sk->targetCount : 0;
+        const RmodelMorphs* mo = nullptr;
+        if (nt)
+        {
+            mo = nt <= kRmodelMaxTargets && sk->targets >= h.skeleton &&
+                         sk->targets + sizeof(RmodelMorphs) + (uint64_t)nt * sizeof(RmodelMorphTarget) <= h.textures
+                     ? (const RmodelMorphs*)(data + sk->targets)
+                     : nullptr;
+            bad = !mo || !inside(mo->refs, (uint64_t)h.vertexCount * 4) || !inside(mo->deltas, (uint64_t)mo->deltaCount * sizeof(RmodelMorphDelta))
+                      ? "its file is damaged"
+                      : nullptr;
+            const uint32_t*         refs = bad ? nullptr : (const uint32_t*)(data + mo->refs);
+            const RmodelMorphDelta* ds = bad ? nullptr : (const RmodelMorphDelta*)(data + mo->deltas);
+            for (uint32_t v = 0; !bad && v < h.vertexCount; ++v)
+                if ((uint64_t)(refs[v] & 0xFFFFFFu) + (refs[v] >> 24) > mo->deltaCount)
+                    bad = "its file is damaged";
+            for (uint32_t d = 0; !bad && d < mo->deltaCount; ++d)
+                if ((ds[d].packed & 0xFFu) >= nt)
+                    bad = "its file is damaged";
+        }
+        morphs = mo;
         for (uint32_t i = 0; !bad && i < sk->clipCount; ++i)
             if (clips[i].offset < h.skeleton || clips[i].offset + clips[i].bytes > h.textures || !clips[i].frames ||
-                clips[i].bytes < (uint64_t)sk->nodeCount * 3 * sizeof(RmodelTrack))
+                clips[i].bytes < (uint64_t)(sk->nodeCount * 3 + nt) * sizeof(RmodelTrack))
                 bad = "its file is damaged";
+        for (uint32_t i = 0; !bad && i < sk->clipCount; ++i)
+            for (uint32_t t = 0; !bad && t < nt; ++t)
+            {
+                const RmodelTrack& tr = ((const RmodelTrack*)(data + clips[i].offset))[sk->nodeCount * 3 + t];
+                if (tr.data != 0xFFFFFFFFu && tr.data + (uint64_t)clips[i].frames * 2 > clips[i].bytes)
+                    bad = "its file is damaged";
+            }
         // Every track's samples inside its clip, and every bone a vertex names in the skeleton.
         for (uint32_t i = 0; !bad && i < sk->clipCount; ++i)
             for (uint32_t t = 0; !bad && t < sk->nodeCount * 3; ++t)
@@ -536,6 +639,7 @@ void loadCooked(Entry& e)
                 e.nodes = (const RmodelNode*)(e.anim + (e.skel->nodes - h.skeleton));
                 e.bones = (const RmodelBone*)(e.anim + (e.skel->bones - h.skeleton));
                 e.clips = (const RmodelClip*)(e.anim + (e.skel->clips - h.skeleton));
+                e.targets = morphs ? (const RmodelMorphTarget*)(e.anim + (e.skel->targets - h.skeleton) + sizeof(RmodelMorphs)) : nullptr;
             }
         }
     }
@@ -581,8 +685,13 @@ void loadCooked(Entry& e)
             if (m == 0xFFFFFFFFu)
                 break; // the renderer's tables are full: the versions made so far still chain
             if (skinned) // its bones, and the bounds every clip reaches (the part's, as cooked)
+            {
                 renderer::mesh_skin(m, (uint64_t)(uintptr_t)(data + h.skin + (size_t)lod.firstVertex * sizeof(RmodelSkinVertex)),
                                     { p.lo[0], p.lo[1], p.lo[2] }, { p.hi[0], p.hi[1], p.hi[2] });
+                if (morphs) // its morph targets' deltas (the renderer keeps those this version's vertices name)
+                    renderer::mesh_morph(m, (uint64_t)(uintptr_t)(data + morphs->refs + (size_t)lod.firstVertex * 4),
+                                         (uint64_t)(uintptr_t)(data + morphs->deltas), morphs->deltaCount);
+            }
             chain[n++] = m;
         }
         if (!n)
@@ -664,6 +773,9 @@ void loadAnim(Entry& e)
             e.nodes = (const RmodelNode*)(e.anim + (sk->nodes - h.skeleton));
             e.bones = (const RmodelBone*)(e.anim + (sk->bones - h.skeleton));
             e.clips = (const RmodelClip*)(e.anim + (sk->clips - h.skeleton));
+            const bool morphed = h.version >= 4 && sk->targetCount && sk->targetCount <= kRmodelMaxTargets && sk->targets >= h.skeleton &&
+                                 sk->targets + sizeof(RmodelMorphs) + (uint64_t)sk->targetCount * sizeof(RmodelMorphTarget) <= h.textures;
+            e.targets = morphed ? (const RmodelMorphTarget*)(e.anim + (sk->targets - h.skeleton) + sizeof(RmodelMorphs)) : nullptr;
         }
     }
     fclose(f);
@@ -805,6 +917,7 @@ void animate(float dt)
         {
             a = PlacementAnim{};
             a.from = kNoClip, a.clip = e->skel->clipCount ? 0 : kNoClip, a.speed = 1, a.loop = 1;
+            memset(gPreview.morphHeld, 0, sizeof gPreview.morphHeld);
             gPreview.animModel = e->id;
         }
         if (gPreview.pickClip) // picked in the panel: 1 the rest pose, clip c at c + 2
@@ -816,19 +929,25 @@ void animate(float dt)
         a.speed = gPreview.speed;
         advanceClip(*e, a, gPreview.playing ? dt : 0.0f);
     }
-    uint32_t last = 0xFFFFFFFFu, bones = 0; // a placement's parts come together: posed once for all of them
+    // Held weights of placements that are gone go with them.
+    for (uint32_t i = MorphOverrides.size(); i-- > 0;)
+        if (placementRow(MorphOverrides[i].placement) == 0xFFFFFFFFu)
+            MorphOverrides.remove(i);
+    uint32_t last = 0xFFFFFFFFu, bones = 0, targets = 0; // a placement's parts come together: posed once for all of them
     for (uint32_t i = 0; i < PartInstances.size(); ++i)
     {
         const uint32_t row = PartInstances[i].placement;
         if (row != last)
         {
-            last = row, bones = 0;
+            last = row, bones = 0, targets = 0;
             const Entry* e = row < rows && Placements[row].alive ? byKey(Placements[row].key) : nullptr;
-            if (e && e->anim && e->state == 1 && evaluate(*e, PlacementAnims[row]))
-                bones = e->skel->boneCount;
+            if (e && e->anim && e->state == 1 && evaluate(*e, PlacementAnims[row], nullptr, nullptr, row | (Placements[row].gen & 0xFFFu) << 20))
+                bones = e->skel->boneCount, targets = e->targets ? e->skel->targetCount : 0;
         }
         if (bones)
             renderer::instance_pose(PartInstances[i].instance, (uint64_t)(uintptr_t)gPalette, bones);
+        if (bones && targets)
+            renderer::instance_morph(PartInstances[i].instance, (uint64_t)(uintptr_t)gWeights, targets);
     }
 }
 
@@ -924,6 +1043,8 @@ int load(int reloaded)
     gFrom = new anim::Pose[kMaxNodes];
     gWorld = new float[kMaxNodes * 12];
     gPalette = new float[kMaxBones * 12];
+    gWeights = new float[kRmodelMaxTargets];
+    gFromWeights = new float[kRmodelMaxTargets];
     gPreview = Preview{};
     gPreview.yaw = 35.0f;
     gPreview.pitch = 20.0f;
@@ -946,6 +1067,9 @@ void unload()
     delete[] gFrom;
     delete[] gWorld;
     delete[] gPalette;
+    delete[] gWeights;
+    delete[] gFromWeights;
+    gWeights = gFromWeights = nullptr;
     gPoses = gFrom = nullptr;
     gWorld = gPalette = nullptr;
     gEntries = nullptr;
@@ -1078,8 +1202,15 @@ void draw(uint32_t pass, const YeaFrame* frame)
     p.skyLuminance = 1.2f;
     p.lodQuality = e->knobs[mdl::KnobLodQuality];
     p.lod = gPreview.lod;
-    if (e->anim && gPreview.animModel == e->id && evaluate(*e, gPreview.anim)) // posed as its clip is now
+    if (e->anim && gPreview.animModel == e->id && evaluate(*e, gPreview.anim, gPreview.morph, gPreview.morphHeld)) // posed as its clip is now
+    {
         p.palette = (uint64_t)(uintptr_t)gPalette, p.bones = e->skel->boneCount;
+        if (e->targets)
+        {
+            p.weights = (uint64_t)(uintptr_t)gWeights, p.targets = e->skel->targetCount;
+            memcpy(gPreview.morphNow, gWeights, e->skel->targetCount * sizeof(float));
+        }
+    }
     if (renderer::preview_draw((uint64_t)(uintptr_t)&p))
         gPreview.lodShown = p.lodShown, gPreview.triangles = p.triangles;
 }

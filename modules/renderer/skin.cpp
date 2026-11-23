@@ -30,17 +30,21 @@ struct Pose // an instance row's palette this frame
 {
     uint32_t offset, bones; // into gPoseCpu (floats)
     uint64_t frame;
+    uint32_t weights, targets; // its morph weights in gPoseCpu (floats, from a float4), when weightFrame is this frame
+    uint64_t weightFrame;
 };
 struct Last // where an instance row drew from last frame
 {
     uint32_t base, lod, gen;
     uint64_t frame;
 };
-struct Job // skin.comp's two uint4s
+struct Job // skin.comp's three uint4s
 {
     uint32_t src, count, dst, firstGroup;
     uint32_t dst2, skin, palette, pad;
+    uint32_t morph, delta, weights, pad2; // morph: its first MorphVertex row (0xFFFFFFFF none); weights in float4s
 };
+constexpr uint32_t kNoMorph = 0xFFFFFFFFu;
 
 Renderer*      gRenderer;
 uint32_t       gFrames;
@@ -51,6 +55,8 @@ Buffer*        gPaletteBuf[kMaxFrames];
 Buffer*        gJobBuf[kMaxFrames];
 Buffer*        gSkinBuf; // the SkinVertex table on the GPU
 uint32_t       gSkinRows, gSkinEpoch; // what it holds
+Buffer *       gMorphVertBuf, *gMorphDeltaBuf; // the MorphVertex and MorphDelta tables on the GPU (one row at least)
+uint32_t       gMorphRows, gMorphDeltaRows, gMorphEpoch;
 float*         gPoseCpu;              // this frame's palettes (made in load(); instance_pose copies into it)
 uint32_t       gPoseUsed;
 uint64_t       gPoseFrame;
@@ -128,6 +134,63 @@ void instance_pose(yea_handle h, uint64_t palette, uint32_t bones)
     gPoseUsed += bones * 12;
 }
 
+void mesh_morph(uint32_t mesh, uint64_t refs, uint64_t deltas, uint32_t deltaCount)
+{
+    const uint32_t*         r = (const uint32_t*)(uintptr_t)refs;
+    const RenderMorphDelta* d = (const RenderMorphDelta*)(uintptr_t)deltas;
+    if (!r || !d || mesh >= Meshes.size() || mesh >= MeshSkins.size() || !MeshSkins[mesh].firstSkin)
+        return; // morphs ride the skin pass: a mesh without a skin has none
+    const uint32_t n = Meshes[mesh].vertexCount;
+    uint64_t       need = 0;
+    for (uint32_t v = 0; v < n; ++v)
+    {
+        const uint32_t first = r[v] & 0xFFFFFFu, count = r[v] >> 24;
+        if ((uint64_t)first + count > deltaCount)
+            return; // damaged: it stays unmorphed
+        need += count;
+    }
+    if (MorphVertexes.size() + (uint64_t)n > MorphVertexes.capacity() || MorphDeltas.size() + need > MorphDeltas.capacity() || need >= (1u << 24))
+        return; // the tables are full: it stays unmorphed
+    while (MeshMorphs.size() <= mesh && MeshMorphs.add())
+        MeshMorphs[MeshMorphs.size() - 1] = MeshMorph{};
+    if (mesh >= MeshMorphs.size())
+        return;
+    MeshMorphs[mesh].firstVertex = MorphVertexes.size() + 1;
+    MeshMorphs[mesh].firstDelta = MorphDeltas.size();
+    // Only the deltas this version's vertices name, in its vertices' order.
+    uint32_t at = 0;
+    for (uint32_t v = 0; v < n; ++v)
+    {
+        const uint32_t first = r[v] & 0xFFFFFFu, count = r[v] >> 24;
+        MorphVertexes.add()->ref = count ? at | count << 24 : 0;
+        for (uint32_t k = 0; k < count; ++k)
+        {
+            MorphDelta* o = MorphDeltas.add();
+            o->p = { d[first + k].p[0], d[first + k].p[1], d[first + k].p[2] };
+            o->packed = d[first + k].packed;
+        }
+        at += count;
+    }
+}
+
+void instance_morph(yea_handle h, uint64_t weights, uint32_t count)
+{
+    const uint32_t row = rowOf(Instances, h);
+    const float*   w = (const float*)(uintptr_t)weights;
+    if (row == 0xFFFFFFFFu || !w || !count || count > 255 || !gPoseCpu)
+        return;
+    const uint64_t frame = yea::host()->frame();
+    if (frame != gPoseFrame)
+        gPoseFrame = frame, gPoseUsed = 0;
+    const uint32_t room = (count + 3) & ~3u; // whole float4s, so the palettes after it stay aligned
+    if (gPoseUsed + room > kPaletteFloats)
+        return;
+    memcpy(gPoseCpu + gPoseUsed, w, count * sizeof(float));
+    memset(gPoseCpu + gPoseUsed + count, 0, (room - count) * sizeof(float));
+    gPose[row].weights = gPoseUsed, gPose[row].targets = count, gPose[row].weightFrame = frame;
+    gPoseUsed += room;
+}
+
 // --- The GPU side ------------------------------------------------------------------------------
 
 bool skinLoad(Renderer* renderer, uint32_t frames)
@@ -154,6 +217,7 @@ bool skinLoad(Renderer* renderer, uint32_t frames)
     addDescriptorSet(gRenderer, &set, &gSet);
     addDescriptorSet(gRenderer, &set, &gPreviewSet);
     gPreviewWant = 0, gPreviewAsked = 0, gPreviewBase = gPreviewRoom = 0;
+    gMorphRows = gMorphDeltaRows = gMorphEpoch = 0;
     for (uint32_t i = 0; i < gFrames; ++i)
     {
         BufferLoadDesc d = {};
@@ -212,6 +276,10 @@ void skinUnload()
         removeDescriptorSet(gRenderer, gPreviewSet), gPreviewSet = nullptr;
     if (gSkinBuf)
         removeResource(gSkinBuf), gSkinBuf = nullptr;
+    if (gMorphVertBuf)
+        removeResource(gMorphVertBuf), gMorphVertBuf = nullptr;
+    if (gMorphDeltaBuf)
+        removeResource(gMorphDeltaBuf), gMorphDeltaBuf = nullptr;
     if (gSet)
         removeDescriptorSet(gRenderer, gSet), gSet = nullptr;
     if (gPipe)
@@ -247,7 +315,43 @@ void skinBegin(uint32_t base, uint32_t capacity)
     // The bones' buffer, made again whenever the table grew or the scene started over (rare: a model loading). Here, in
     // the core's own draw: the preview's call (renderer_models' draw) never makes it.
     const uint32_t rows = SkinVertexes.size(), epoch = scene_epoch();
-    if (!gPose || (gSkinBuf && rows == gSkinRows && epoch == gSkinEpoch) || (!rows && !gSkinBuf))
+    if (!gPose)
+        return;
+    // The morph tables likewise (a row at least each, so the skin pass always has them to bind).
+    const uint32_t mrows = MorphVertexes.size(), drows = MorphDeltas.size();
+    if (!gMorphVertBuf || !gMorphDeltaBuf || mrows != gMorphRows || drows != gMorphDeltaRows || epoch != gMorphEpoch)
+    {
+        if (gMorphVertBuf || gMorphDeltaBuf)
+            waitQueueIdle((Queue*)yea::host()->queue);
+        if (gMorphVertBuf)
+            removeResource(gMorphVertBuf), gMorphVertBuf = nullptr;
+        if (gMorphDeltaBuf)
+            removeResource(gMorphDeltaBuf), gMorphDeltaBuf = nullptr;
+        static const uint32_t zero[4] = {};
+        BufferLoadDesc        d = {};
+        d.mDesc.mDescriptors = DESCRIPTOR_TYPE_BUFFER;
+        d.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+        d.mDesc.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+        d.mDesc.mFormat = TinyImageFormat_R32_UINT;
+        d.mDesc.mSize = (uint64_t)(mrows ? mrows : 1) * 4;
+        d.mDesc.mElementCount = mrows ? mrows : 1;
+        d.mDesc.mStructStride = 4;
+        d.mDesc.pName = "renderer_morph_vertices";
+        d.pData = mrows ? (const void*)MorphVertexes.begin() : (const void*)zero;
+        d.ppBuffer = &gMorphVertBuf;
+        addResource(&d, nullptr);
+        d.mDesc.mFormat = TinyImageFormat_R32G32B32A32_UINT;
+        d.mDesc.mSize = (uint64_t)(drows ? drows : 1) * 16;
+        d.mDesc.mElementCount = drows ? drows : 1;
+        d.mDesc.mStructStride = 16;
+        d.mDesc.pName = "renderer_morph_deltas";
+        d.pData = drows ? (const void*)MorphDeltas.begin() : (const void*)zero;
+        d.ppBuffer = &gMorphDeltaBuf;
+        addResource(&d, nullptr);
+        waitForAllResourceLoads();
+        gMorphRows = gMorphVertBuf && gMorphDeltaBuf ? mrows : 0xFFFFFFFFu, gMorphDeltaRows = drows, gMorphEpoch = epoch;
+    }
+    if ((gSkinBuf && rows == gSkinRows && epoch == gSkinEpoch) || (!rows && !gSkinBuf))
         return;
     if (gSkinBuf)
     {
@@ -291,8 +395,12 @@ bool skinInstance(uint32_t row, uint32_t lod, SkinDraw& out)
     const bool fresh = l.base != base || l.lod != lod || l.gen != in.gen || l.frame + 1 != gFrame;
     l = { base, lod, in.gen, gFrame };
     Job& j = gJobs[1 + gJobCount++];
+    const bool morphed = gPose[row].weightFrame == gFrame && lod < MeshMorphs.size() && MeshMorphs[lod].firstVertex &&
+                         MeshMorphs[lod].firstVertex - 1 + (uint64_t)count <= MorphVertexes.size();
     j = { Meshes[lod].firstVertex, count, (uint32_t)out.current, gGroups,
-          fresh ? (uint32_t)out.previous : 0xFFFFFFFFu, MeshSkins[lod].firstSkin - 1, gPose[row].offset / 4, 0 };
+          fresh ? (uint32_t)out.previous : 0xFFFFFFFFu, MeshSkins[lod].firstSkin - 1, gPose[row].offset / 4, 0,
+          morphed ? MeshMorphs[lod].firstVertex - 1 : kNoMorph, morphed ? MeshMorphs[lod].firstDelta : 0, gPose[row].weights / 4,
+          morphed ? gPose[row].targets : 0 };
     gGroups += (count + 63) / 64;
     return true;
 }
@@ -304,8 +412,8 @@ void skinRecord(Cmd* cmd, uint32_t fi, Buffer* positions, Buffer* attributes, ui
     if (!gJobCount || !positions || !attributes)
         return;
     const ResourceState state = (ResourceState)stateBits;
-    if (!gSkinBuf || gSkinRows != SkinVertexes.size()) // skinBegin made it, or couldn't
-    {
+    if (!gSkinBuf || gSkinRows != SkinVertexes.size() || !gMorphVertBuf || !gMorphDeltaBuf || gMorphRows != MorphVertexes.size())
+    { // skinBegin made them, or couldn't
         gJobCount = 0;
         return;
     }
@@ -313,7 +421,7 @@ void skinRecord(Cmd* cmd, uint32_t fi, Buffer* positions, Buffer* attributes, ui
     gJobs[0] = Job{};
     gJobs[0].src = gJobCount; // skin.comp's [0].x
     memcpy(gJobBuf[fi]->pCpuMappedAddress, gJobs, (size_t)(gJobCount + 1) * sizeof(Job));
-    DescriptorData p[5] = {};
+    DescriptorData p[7] = {};
     p[0].mIndex = SRT_RES_IDX(SkinSrt, PerFrame, gPositions);
     p[0].ppBuffers = &positions;
     p[1].mIndex = SRT_RES_IDX(SkinSrt, PerFrame, gAttributes);
@@ -324,7 +432,11 @@ void skinRecord(Cmd* cmd, uint32_t fi, Buffer* positions, Buffer* attributes, ui
     p[3].ppBuffers = &gPaletteBuf[fi];
     p[4].mIndex = SRT_RES_IDX(SkinSrt, PerFrame, gJobs);
     p[4].ppBuffers = &gJobBuf[fi];
-    updateDescriptorSet(gRenderer, fi, gSet, 5, p);
+    p[5].mIndex = SRT_RES_IDX(SkinSrt, PerFrame, gMorphVertices);
+    p[5].ppBuffers = &gMorphVertBuf;
+    p[6].mIndex = SRT_RES_IDX(SkinSrt, PerFrame, gMorphDeltas);
+    p[6].ppBuffers = &gMorphDeltaBuf;
+    updateDescriptorSet(gRenderer, fi, gSet, 7, p);
     BufferBarrier in[2] = { { positions, state, RESOURCE_STATE_UNORDERED_ACCESS }, { attributes, state, RESOURCE_STATE_UNORDERED_ACCESS } };
     cmdResourceBarrier(cmd, 2, in, 0, nullptr, 0, nullptr);
     cmdBindPipeline(cmd, gPipe);
@@ -335,11 +447,12 @@ void skinRecord(Cmd* cmd, uint32_t fi, Buffer* positions, Buffer* attributes, ui
 }
 
 uint32_t skinPreview(Cmd* cmd, uint32_t fi, Buffer* positions, Buffer* attributes, uint32_t stateBits, const uint32_t* meshes,
-                     uint32_t parts, const float* palette, uint32_t bones, int32_t* offsets)
+                     uint32_t parts, const float* palette, uint32_t bones, const float* weights, uint32_t targets, int32_t* offsets)
 {
     for (uint32_t k = 0; k < parts; ++k)
         offsets[k] = -1;
-    if (!gPipe || !gPreviewSet || !palette || !bones || bones > kPreviewBones || !positions || !attributes)
+    targets = targets > 255 ? 0 : targets;
+    if (!gPipe || !gPreviewSet || !palette || !bones || bones + (targets + 11) / 12 > kPreviewBones || !positions || !attributes)
         return 0;
     // What its skinned parts need (asked for again each frame it shows; reserved from the core's next draw on).
     uint64_t want = 0;
@@ -348,7 +461,8 @@ uint32_t skinPreview(Cmd* cmd, uint32_t fi, Buffer* positions, Buffer* attribute
             want += Meshes[meshes[k]].vertexCount;
     gPreviewWant = want > 0x0FFFFFFFu ? 0x0FFFFFFFu : (uint32_t)want;
     gPreviewAsked = yea::host()->frame();
-    if (!want || want > gPreviewRoom || !gSkinBuf || gSkinRows != SkinVertexes.size() || gSkinEpoch != scene_epoch())
+    if (!want || want > gPreviewRoom || !gSkinBuf || gSkinRows != SkinVertexes.size() || gSkinEpoch != scene_epoch() || !gMorphVertBuf ||
+        !gMorphDeltaBuf || gMorphRows != MorphVertexes.size())
         return 0; // drawn in its bind pose until its region and bones are there (a frame or two)
     Job*     jobs = (Job*)gPreviewJobBuf[fi]->pCpuMappedAddress;
     uint32_t count = 0, groups = 0, cursor = 0;
@@ -360,7 +474,11 @@ uint32_t skinPreview(Cmd* cmd, uint32_t fi, Buffer* positions, Buffer* attribute
             continue;
         const uint32_t n = Meshes[m].vertexCount;
         offsets[k] = (int32_t)(gPreviewBase + cursor);
-        jobs[1 + count++] = { Meshes[m].firstVertex, n, gPreviewBase + cursor, groups, 0xFFFFFFFFu, MeshSkins[m].firstSkin - 1, 0, 0 };
+        const bool morphed = weights && targets && m < MeshMorphs.size() && MeshMorphs[m].firstVertex &&
+                             MeshMorphs[m].firstVertex - 1 + (uint64_t)n <= MorphVertexes.size();
+        jobs[1 + count++] = { Meshes[m].firstVertex, n, gPreviewBase + cursor, groups, 0xFFFFFFFFu, MeshSkins[m].firstSkin - 1, 0, 0,
+                              morphed ? MeshMorphs[m].firstVertex - 1 : kNoMorph, morphed ? MeshMorphs[m].firstDelta : 0,
+                              (bones * 12) / 4, morphed ? targets : 0 };
         groups += (n + 63) / 64;
         cursor += n;
     }
@@ -369,7 +487,9 @@ uint32_t skinPreview(Cmd* cmd, uint32_t fi, Buffer* positions, Buffer* attribute
     jobs[0] = Job{};
     jobs[0].src = count;
     memcpy(gPreviewPaletteBuf[fi]->pCpuMappedAddress, palette, (size_t)bones * 12 * sizeof(float));
-    DescriptorData p[5] = {};
+    if (weights && targets) // the weights after the palette (whole float4s: bones * 12 floats already are)
+        memcpy((float*)gPreviewPaletteBuf[fi]->pCpuMappedAddress + bones * 12, weights, (size_t)targets * sizeof(float));
+    DescriptorData p[7] = {};
     p[0].mIndex = SRT_RES_IDX(SkinSrt, PerFrame, gPositions);
     p[0].ppBuffers = &positions;
     p[1].mIndex = SRT_RES_IDX(SkinSrt, PerFrame, gAttributes);
@@ -380,7 +500,11 @@ uint32_t skinPreview(Cmd* cmd, uint32_t fi, Buffer* positions, Buffer* attribute
     p[3].ppBuffers = &gPreviewPaletteBuf[fi];
     p[4].mIndex = SRT_RES_IDX(SkinSrt, PerFrame, gJobs);
     p[4].ppBuffers = &gPreviewJobBuf[fi];
-    updateDescriptorSet(gRenderer, fi, gPreviewSet, 5, p);
+    p[5].mIndex = SRT_RES_IDX(SkinSrt, PerFrame, gMorphVertices);
+    p[5].ppBuffers = &gMorphVertBuf;
+    p[6].mIndex = SRT_RES_IDX(SkinSrt, PerFrame, gMorphDeltas);
+    p[6].ppBuffers = &gMorphDeltaBuf;
+    updateDescriptorSet(gRenderer, fi, gPreviewSet, 7, p);
     const ResourceState state = (ResourceState)stateBits;
     BufferBarrier in[2] = { { positions, state, RESOURCE_STATE_UNORDERED_ACCESS }, { attributes, state, RESOURCE_STATE_UNORDERED_ACCESS } };
     cmdResourceBarrier(cmd, 2, in, 0, nullptr, 0, nullptr);

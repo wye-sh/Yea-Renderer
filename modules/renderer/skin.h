@@ -4,6 +4,12 @@
 #include <stdint.h>
 
 struct Renderer;
+// rmodel.h's RmodelMorphDelta, as mesh_morph reads it.
+struct RenderMorphDelta
+{
+    float    p[3];
+    uint32_t packed; // target | normal offset snorm8 x, y, z (over +-2) << 8, 16, 24
+};
 struct Cmd;
 struct Buffer;
 
@@ -34,5 +40,5 @@ bool     skinJobs(); // anything to record this frame
 // a region kept after the instances', with a dispatch of its own; offsets[k] each part's first vertex there, -1 where it
 // draws its bind pose (not skinned, or no room or bones yet: a frame or two after it first asks). Allocates nothing.
 uint32_t skinPreview(Cmd* cmd, uint32_t fi, Buffer* positions, Buffer* attributes, uint32_t state, const uint32_t* meshes,
-                     uint32_t parts, const float* palette, uint32_t bones, int32_t* offsets);
+                     uint32_t parts, const float* palette, uint32_t bones, const float* weights, uint32_t targets, int32_t* offsets);
 } // namespace renderer

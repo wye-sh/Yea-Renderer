@@ -7,7 +7,8 @@
 // sets the floor), the clip is resampled at twice the rate (up to 240), so fast motion keeps its shape, as long as each
 // doubling still helps. A clip with step keys (glTF STEP) is sampled at 120 or more and measured on its frames only: a
 // jump blends over one frame (8 ms or less).
-// The report gives each clip's rate and worst error.
+// The report gives each clip's rate and worst error. Morph weights (v4) are sampled at the same rate, one quantised track
+// a target, and their error counts at the skin too: each weight's error times its target's largest delta.
 #pragma once
 
 #include "../../modules/renderer_models/anim.h"
@@ -26,6 +27,8 @@ struct SkinnedVertex // a vertex at bind time and its bones, for measuring
     uint16_t bones[4];
     uint16_t weights[4];
 };
+
+using WeightSource = std::function<void(float, float*)>; // every morph target's exact weight at a time
 
 struct Encoded
 {
@@ -59,7 +62,8 @@ inline void skin(const std::vector<SkinnedVertex>& verts, const float* pal, std:
 
 // One clip at `rate`: `source(t, poses)` gives every node's exact local pose at time t (renderer space).
 inline Encoded encodeAt(const char* name, float duration, float rate, uint32_t nodeCount,
-                        const std::function<void(float, anim::Pose*)>& source)
+                        const std::function<void(float, anim::Pose*)>& source, uint32_t targetCount, const WeightSource& weights,
+                        const float* defaults)
 {
     Encoded e;
     const uint32_t frames = duration > 0 ? (uint32_t)ceilf(duration * rate - 1e-4f) + 1 : 1;
@@ -71,9 +75,18 @@ inline Encoded encodeAt(const char* name, float duration, float rate, uint32_t n
     std::vector<anim::Pose> exact((size_t)frames * nodeCount);
     for (uint32_t f = 0; f < frames; ++f)
         source(frames > 1 ? duration * (float)f / (float)(frames - 1) : 0, &exact[(size_t)f * nodeCount]);
-    e.rawBytes = (size_t)frames * nodeCount * 40;
+    e.rawBytes = (size_t)frames * (nodeCount * 40 + targetCount * 4);
+    std::vector<float> exactW((size_t)frames * targetCount);
+    for (uint32_t f = 0; f < frames && targetCount; ++f)
+    {
+        float* w = &exactW[(size_t)f * targetCount];
+        if (weights)
+            weights(frames > 1 ? duration * (float)f / (float)(frames - 1) : 0, w);
+        else
+            memcpy(w, defaults, targetCount * sizeof(float));
+    }
 
-    std::vector<RmodelTrack> tracks(nodeCount * 3);
+    std::vector<RmodelTrack> tracks(nodeCount * 3 + targetCount);
     std::vector<uint16_t>    samples;
     for (uint32_t n = 0; n < nodeCount; ++n)
         for (uint32_t k = 0; k < 3; ++k)
@@ -134,6 +147,27 @@ inline Encoded encodeAt(const char* name, float duration, float rate, uint32_t n
                     samples.push_back((uint16_t)(u * 65535.0f + 0.5f));
                 }
         }
+    for (uint32_t t = 0; t < targetCount; ++t) // a weight a frame, over its own range
+    {
+        RmodelTrack& tr = tracks[nodeCount * 3 + t];
+        float        lo = exactW[t], hi = lo;
+        for (uint32_t f = 1; f < frames; ++f)
+            lo = fminf(lo, exactW[(size_t)f * targetCount + t]), hi = fmaxf(hi, exactW[(size_t)f * targetCount + t]);
+        tr.base[0] = lo;
+        if (hi - lo <= 1e-6f * fmaxf(1.0f, fabsf(lo)))
+        {
+            tr.data = 0xFFFFFFFFu;
+            continue;
+        }
+        tr.extent[0] = hi - lo;
+        tr.data = (uint32_t)(samples.size() * 2);
+        for (uint32_t f = 0; f < frames; ++f)
+        {
+            float u = (exactW[(size_t)f * targetCount + t] - lo) / tr.extent[0];
+            u = u < 0 ? 0 : (u > 1 ? 1 : u);
+            samples.push_back((uint16_t)(u * 65535.0f + 0.5f));
+        }
+    }
     const size_t head = tracks.size() * sizeof(RmodelTrack);
     for (RmodelTrack& tr : tracks)
         if (tr.data != 0xFFFFFFFFu)
@@ -151,9 +185,11 @@ inline Encoded encodeAt(const char* name, float duration, float rate, uint32_t n
 // grows lo/hi (per part: `part[v]` names a vertex's part) by every decoded frame's pose, so culling bounds hold the motion.
 inline float measure(const Encoded& e, const RmodelNode* nodes, uint32_t nodeCount, const RmodelBone* bones, uint32_t boneCount,
                      const std::vector<SkinnedVertex>& verts, const std::vector<uint32_t>& part, float (*lo)[3], float (*hi)[3],
-                     const std::function<void(float, anim::Pose*)>& source, bool framesOnly)
+                     const std::function<void(float, anim::Pose*)>& source, bool framesOnly, uint32_t targetCount,
+                     const WeightSource& weights, const float* reach, float* wlo, float* whi)
 {
     std::vector<anim::Pose> a(nodeCount), b(nodeCount);
+    std::vector<float>      wa(targetCount), wb(targetCount);
     std::vector<float>      world(nodeCount * 12), pa(boneCount * 12), pb(boneCount * 12), sa, sb;
     float                   worst = 0;
     const uint32_t          steps = e.clip.frames > 1 ? (e.clip.frames - 1) * 4 : 0;
@@ -164,6 +200,17 @@ inline float measure(const Encoded& e, const RmodelNode* nodes, uint32_t nodeCou
             continue;
         anim::sampleClip(e.data.data(), e.clip, nodeCount, t, false, a.data());
         source(t, b.data());
+        float weightError = 0; // metres at the skin, at worst, from the weights alone
+        if (targetCount)
+        {
+            anim::sampleWeights(e.data.data(), e.clip, nodeCount, targetCount, t, false, wa.data());
+            if (weights)
+                weights(t, wb.data());
+            else
+                wb = wa;
+            for (uint32_t k = 0; k < targetCount; ++k)
+                weightError += fabsf(wa[k] - wb[k]) * reach[k], wlo[k] = fminf(wlo[k], wb[k]), whi[k] = fmaxf(whi[k], wb[k]);
+        }
         anim::palette(nodes, nodeCount, bones, boneCount, a.data(), world.data(), pa.data());
         anim::palette(nodes, nodeCount, bones, boneCount, b.data(), world.data(), pb.data());
         skin(verts, pa.data(), sa);
@@ -171,7 +218,7 @@ inline float measure(const Encoded& e, const RmodelNode* nodes, uint32_t nodeCou
         for (size_t i = 0; i < verts.size(); ++i)
         {
             const float dx = sa[i * 3] - sb[i * 3], dy = sa[i * 3 + 1] - sb[i * 3 + 1], dz = sa[i * 3 + 2] - sb[i * 3 + 2];
-            worst = fmaxf(worst, sqrtf(dx * dx + dy * dy + dz * dz));
+            worst = fmaxf(worst, sqrtf(dx * dx + dy * dy + dz * dz) + weightError);
             if ((s & 3) == 0)
                 for (int k = 0; k < 3; ++k)
                     lo[part[i]][k] = fminf(lo[part[i]][k], sa[i * 3 + k]), hi[part[i]][k] = fmaxf(hi[part[i]][k], sa[i * 3 + k]);
@@ -187,7 +234,8 @@ inline float measure(const Encoded& e, const RmodelNode* nodes, uint32_t nodeCou
 inline Encoded encode(const char* name, float duration, const RmodelNode* nodes, uint32_t nodeCount, const RmodelBone* bones,
                       uint32_t boneCount, const std::vector<SkinnedVertex>& verts, const std::vector<uint32_t>& part,
                       std::vector<float>& lo, std::vector<float>& hi, const std::function<void(float, anim::Pose*)>& source,
-                      float tolerance, bool stepped, float keyRate)
+                      float tolerance, bool stepped, float keyRate, uint32_t targetCount, const WeightSource& weights,
+                      const float* defaults, const float* reach, float* wlo, float* whi)
 {
     std::vector<float> rates;
     if (stepped)
@@ -203,9 +251,10 @@ inline Encoded encode(const char* name, float duration, const RmodelNode* nodes,
     for (float rate : rates)
     {
         std::vector<float> l = lo, h = hi;
-        Encoded            e = encodeAt(name, duration, rate, nodeCount, source);
+        Encoded            e = encodeAt(name, duration, rate, nodeCount, source, targetCount, weights, defaults);
         e.tolerance = tolerance;
-        e.error = measure(e, nodes, nodeCount, bones, boneCount, verts, part, (float(*)[3])l.data(), (float(*)[3])h.data(), source, stepped);
+        e.error = measure(e, nodes, nodeCount, bones, boneCount, verts, part, (float(*)[3])l.data(), (float(*)[3])h.data(), source, stepped,
+                          targetCount, weights, reach, wlo, whi);
         if (!have || e.error < best.error * 0.75f)
             best = std::move(e), bestLo = std::move(l), bestHi = std::move(h), have = true;
         if (best.error <= tolerance || best.clip.frames <= 1)

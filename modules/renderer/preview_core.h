@@ -376,7 +376,7 @@ bool preview_draw(uint64_t address)
         posedAt[k] = -1;
     if (gSkinOn && p->bones && p->palette)
         skinPreview(cmd, fi, gPosBuf, gAttrBuf, (uint32_t)gGeometryState, drawMesh, parts, (const float*)(uintptr_t)p->palette,
-                    p->bones, posedAt);
+                    p->bones, (const float*)(uintptr_t)p->weights, p->targets, posedAt);
 
     auto drawParts = [&](bool shadow, uint32_t sided) {
         cmdBindIndexBuffer(cmd, gIndexBuf, INDEX_TYPE_UINT32, 0);

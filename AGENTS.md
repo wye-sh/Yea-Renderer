@@ -394,7 +394,10 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   `Info.kind` 2) play their first clip, looping, once placed: `mdl::play(h, "Run", speed, loop, fade)` switches clip
   (crossfaded, 0.2 s by default; nullptr or "" the rest pose; a name asked for while loading is taken once loaded),
   `mdl::clipTime(h)`, `mdl::joint(h, "hand_r", m)` a joint's world 3x4 this frame (attach things to it); clips and joints
-  are named as in the source. `ModelLink.h`'s `hasAnim(a)` says the module has them (Api's size). Clips are sampled with
+  are named as in the source. `ModelLink.h`'s `hasAnim(a)` says the module has them (Api's size). Morph targets
+  (rmodel v4, `hasMorph(a)`): a clip's weight tracks play and crossfade with its pose; `mdl::morph(h, "Smile", w)` holds a
+  target over the clip (table `MorphOverride`, emptied with its placement and by Reset), `mdl::unmorph(h[, name])` hands
+  it back. Clips are sampled with
   `anim.h` (shared with the cooker: smallest-three rotations, quantised tracks, `sampleClip`, `blendPoses`, `palette`)
   in `YEA_PHASE_LATE` into scratch made in load(), and each part instance gets the palette through `instance_pose`.
   Its tables: `Placement` (a row per
@@ -407,7 +410,8 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   (kind, triangles, a lit dot while placed), a canvas preview (drag orbits, the wheel zooms, a double-click goes back to
   the front; the turntable and Front View icons), the LOD shown (Auto as `lod_error` picks at that size, or each LOD), for
   a skinned model its clips (a dropdown with Rest Pose, play and pause, From the Start, Speed, Crossfade: the preview's
-  own clip state in `gPreview.anim`, played in update and posed through `RenderPreview.palette`), the
+  own clip state in `gPreview.anim`, played in update and posed through `RenderPreview.palette`; a folding Morph
+  Targets list, a slider each, dragging one holds it until Follow the Clip; v3's `weights`), the
   model's knobs; Add Models (the header's +) and drops go to the agents. The preview: this module makes its targets in
   its own `update()` at twice the canvas size (RGBA16F and D32 at 4 samples, a 1024² D32 shadow map, an RGBA8 sRGB out),
   and in `draw(YEA_PASS_RENDER)`, only on frames the panel showed it, calls the core's `preview_draw` (a `RenderPreview*`,
@@ -436,7 +440,10 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   caster at its own vertexOffset, one at a time (renderer_shadows, renderer_gi's sun map, renderer_rt's per-instance
   refitted structures), never shared or cached by mesh. MOTION variants bind a fourth stream, `PrevPosition` (binding 3,
   last frame's copy; the static pool for still meshes), so moving limbs leave true motion vectors; the see-through
-  pipelines keep the three-stream layout. Instance flag 32 is skinned (16 see-through).
+  pipelines keep the three-stream layout. Instance flag 32 is skinned (16 see-through). Morph targets ride the same
+  pass: tables `MeshMorph`, `MorphVertex` (a u32 a vertex: first delta and count) and `MorphDelta` (16 bytes: position
+  offset, target and snorm8 normal offset), sent to the GPU only when they change; each job's third uint4 names them and
+  the weights (after the palettes in the same buffer); deltas are added before the bones, the tangent re-orthogonalised.
   Texture maps (frame v21): `materialMaps` (a material's maps, Common.h.fsl MaterialMapData) and `textures`
   (RENDER_MAX_TEXTURES, a stand-in where empty or loading, all SHADER_RESOURCE), rebound only when `textureVersion`
   changes; FrameData.textures.x is the mip bias. Probes clip cut-outs and read base colour and emissive maps; masked
@@ -465,6 +472,8 @@ surface's luminance is that over its area). Colours linear RGB.
   than the screen's (a finer caster would shadow the screen's surface). A version change counts as a move for the
   cached shadow maps. Custom meshes have one version. Request finer segments for close-ups freely: far away it costs
   nothing.
+- Morphs (renderer_models calls these): `mesh_morph(mesh, refs, deltas, count)` after `mesh_skin` (a morphed mesh is
+  always skinned), `instance_morph(i, weights, count)` each frame with `instance_pose` (without it: no morph).
 - Skins (renderer_models calls these): `mesh_skin(mesh, skin, lo, hi)` (per vertex u16x4 bones and unorm16x4 weights
   summing to 65535; lo and hi the bounds its clips reach, so culling never loses a limb), `instance_pose(i, palette,
   bones)` each frame it is posed (3 rows of 4 floats a bone, model space; an instance not posed this frame draws its
@@ -590,7 +599,10 @@ library keeps its licence file beside its source, since the component's reposito
   Skins and clips (rmodel v3, `cook_anim.h`): up to 4 bones a vertex; meshes under animated nodes without a skin are
   bound whole to their node; every node's pose resampled at the file's key rate, else the lowest of 30 to 240 a second
   whose decoded skin stays within 1 mm of the source (or 2.5e-4 of the model's size); LODs keep influence borders.
-  glTF through cgltf, FBX through ufbx's evaluator; empty takes skipped.
+  glTF through cgltf, FBX through ufbx's evaluator; empty takes skipped. Morph targets (rmodel v4, glTF): position and
+  normal deltas (tangent deltas left out), merged by target name over the model's meshes, defaults from mesh.weights,
+  one quantised weight track a target per clip, measured at the skin (weight error times the target's reach); bounds
+  grow by what the morphs reach; how far a vertex morphs weighs in the simplifier. A model with targets cooks skinned.
   It normalises units (node scales applied; warns past 500 m or under 1 cm) and axes (+Y up kept, Z negated into the
   renderer's left-handed space, triangle order flipped), generates flat normals and MikkTSpace-compatible tangents where
   missing, merges primitives by material into parts (64 at most), and builds each part's LOD chain with meshoptimizer's

@@ -30,6 +30,9 @@ import renderer void instance_remove(handle i)
 # bounds its animation reaches; and an instance's palette this frame (3x4 rows a bone, model space).
 import renderer void mesh_skin(u32 mesh, u64 skin, float3 lo, float3 hi)
 import renderer void instance_pose(handle i, u64 palette, u32 bones)
+# Morph targets (renderer 4.13.0): a skinned mesh's deltas, and an instance's weights this frame.
+import renderer void mesh_morph(u32 mesh, u64 refs, u64 deltas, u32 delta_count)
+import renderer void instance_morph(handle i, u64 weights, u32 count)
 import renderer u32 scene_epoch() = 0
 import renderer bool preview_draw(u64 preview) = false
 import table renderer Mesh
@@ -62,6 +65,13 @@ table PlacementAnim none 4096
   u32 fromLoop
   float fade
   float faded
+end
+# A placement's morph targets set by the game (mdl::morph): the placement's handle, the target, its weight, held over
+# whatever its clip says until cleared.
+table MorphOverride none 4096
+  u32 placement
+  u32 target
+  float weight
 end
 # The renderer's instances a placement draws with, one per part of its model.
 table PartInstance none 65536

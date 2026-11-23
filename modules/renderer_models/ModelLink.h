@@ -15,7 +15,9 @@
 //
 // Skinned models play their first clip, looping, once placed. mdl::play(h, "Run") switches clip (fading over a
 // fraction of a second by default), mdl::clipTime(h) gives how far in it is, and mdl::joint(h, "hand_r", m) a joint's
-// world transform (3x4 rows), to attach something to it. Clips and joints are named as in the source file.
+// world transform (3x4 rows), to attach something to it. Clips and joints are named as in the source file. A model
+// with morph targets (blend shapes: a face's smile, a blink) follows its clip's weights; mdl::morph(h, "Smile", 0.8f)
+// holds one at a weight over them, mdl::unmorph(h, "Smile") (or every one, with no name) hands it back to the clip.
 //
 // Placements are kept by renderer_models (through its reloads); Reset State empties them, so place again whenever
 // mdl::placed(h) is false. The handle is 0 while renderer_models isn't running.
@@ -23,6 +25,7 @@
 
 #include <yea/base.h>
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -100,8 +103,15 @@ struct Api
     int (*joint)(uint32_t placement, const char* name, float* out); // 12 floats, 3x4 rows, world; 0 no such joint
     uint32_t (*clips)(uint32_t model); // its clips, for a panel
     const char* (*clip)(uint32_t model, uint32_t index, float* duration);
+    // Morph targets (later in Api: check `size`). morph: a target's weight held over its clip's; 0 no such target.
+    // unmorph: a target (nullptr: every one) back to its clip's.
+    int (*morph)(uint32_t placement, const char* target, float weight);
+    void (*unmorph)(uint32_t placement, const char* target);
+    uint32_t (*morphs)(uint32_t model); // its targets, for a panel
+    const char* (*morphTarget)(uint32_t model, uint32_t index, float* weight); // its name, and its default weight
 };
-inline bool hasAnim(const Api* a) { return a->size >= sizeof(Api); }
+inline bool hasAnim(const Api* a) { return a->size >= offsetof(Api, morph); }
+inline bool hasMorph(const Api* a) { return a->size >= sizeof(Api); }
 
 struct Model;
 namespace detail
@@ -265,5 +275,19 @@ inline bool joint(uint32_t placement, const char* name, float out[12])
 {
     const Api* a = detail::api();
     return a && placement && hasAnim(a) && a->joint(placement, name, out);
+}
+// A morph target held at `weight` (usually 0 to 1) over what its clip says. False: no such target (or no morphs, or
+// renderer_models isn't running).
+inline bool morph(uint32_t placement, const char* target, float weight)
+{
+    const Api* a = detail::api();
+    return a && placement && hasMorph(a) && a->morph(placement, target, weight);
+}
+// A held target (nullptr: every one) back to its clip's weight.
+inline void unmorph(uint32_t placement, const char* target = nullptr)
+{
+    const Api* a = detail::api();
+    if (a && placement && hasMorph(a))
+        a->unmorph(placement, target);
 }
 } // namespace mdl

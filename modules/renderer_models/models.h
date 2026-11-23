@@ -34,6 +34,7 @@ struct Entry
     const RmodelNode*     nodes;
     const RmodelBone*     bones;
     const RmodelClip*     clips;
+    const RmodelMorphTarget* targets; // its morph targets (skel->targetCount of them; v4), in `anim`
 };
 // Every model the view's modules declared, in the order declared (made in load()).
 extern Entry*   gEntries;
@@ -58,6 +59,11 @@ struct Preview
     uint32_t      pickClip;     // picked in the panel: 1 the rest pose, clip c at c + 2; 0 none
     uint32_t      playing;
     float         speed, fade;  // speed 1 as authored; seconds faded from the clip before
+    // Its morph targets: a weight the panel holds (morphHeld) over what the clip says.
+    float         morph[kRmodelMaxTargets];
+    uint8_t       morphHeld[kRmodelMaxTargets];
+    float         morphNow[kRmodelMaxTargets]; // the weights its last draw showed
+    int           morphOpen;                   // its Morph Targets row unfolded
 };
 extern Preview gPreview;
 

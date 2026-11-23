@@ -13,12 +13,18 @@
 // children, each with its rest pose), the bones (the skinning palette: a node and its inverse bind matrix; a vertex names
 // up to 4 bones) and the clips. A posed vertex is sum(weight * world(bone.node) * bone.invBind * position). Rigid meshes
 // under an animated node are skinned to one bone with weight 1, so every mesh of an animated model moves the same way.
+//
+// v4 adds morph targets (blend shapes): RmodelSkeleton's `targetCount` and `targets` (an RmodelMorphs header, then its
+// RmodelMorphTarget names and default weights). Each vertex has a u32 in `refs` saying where its RmodelMorphDelta rows
+// are (RmodelMorphs). A morphed vertex is (bind position + sum(weight[target] * delta)) before skinning; its normal the same, then
+// normalised. A model with morph targets is always cooked skinned (a mesh without a skin bound whole to its node). Each
+// clip holds a weight track per target after its node tracks. A v3 file is a v4 file without targets.
 #pragma once
 
 #include <stdint.h>
 
 constexpr uint32_t kRmodelMagic = 0x4C444D52u; // "RMDL"
-constexpr uint32_t kRmodelVersion = 3;
+constexpr uint32_t kRmodelVersion = 4;
 constexpr uint32_t kRmodelOldest = 2; // the oldest version the loader still reads
 
 struct RmodelHeader
@@ -107,9 +113,33 @@ struct RmodelSkinVertex
 
 struct RmodelSkeleton
 {
-    uint32_t nodeCount, boneCount, clipCount, pad;
-    uint32_t nodes, bones, clips, pad2; // offsets: RmodelNode[], RmodelBone[], RmodelClip[]
+    uint32_t nodeCount, boneCount, clipCount, targetCount; // targetCount: morph targets (v4; 0 before)
+    uint32_t nodes, bones, clips, targets; // offsets: RmodelNode[], RmodelBone[], RmodelClip[], RmodelMorphs (0: none)
 };
+
+// Morph targets (v4). `refs` is a u32 a vertex (h.vertexCount, the vertices' order): its deltas' first row (the low 24
+// bits, from `deltas`) and their count (the top 8; 0: it doesn't morph). A vertex's deltas name distinct targets.
+// RmodelMorphTarget[targetCount] follows this header.
+struct RmodelMorphs
+{
+    uint32_t refs, deltas, deltaCount, pad; // offsets from the file's start
+};
+struct RmodelMorphTarget
+{
+    char  name[48];
+    float weight; // its default (glTF's mesh.weights): what it is when no clip says
+    float lo, hi; // the weights its clips reach, with the default (bounds use them)
+    float pad;
+};
+// A vertex's offset for one target, in the model's space as the vertices are: position (metres) and normal (the morphed
+// normal minus the bind one, each component snorm8 over +-2) in `packed` with the target: target | nx << 8 | ny << 16 |
+// nz << 24.
+struct RmodelMorphDelta
+{
+    float    p[3];
+    uint32_t packed;
+};
+constexpr uint32_t kRmodelMaxTargets = 255;
 
 // A node of the hierarchy, in the renderer's space: its rest pose relative to its parent (scale, then rotation, then
 // translation). Parents come before their children; the roots' parent is -1, and their transforms are in model space.
@@ -147,7 +177,7 @@ struct RmodelClip
 };
 
 // RmodelCodecQuantized's tracks: three a node (translation, rotation, scale), nodeCount * 3 of them at the clip's offset,
-// then their samples. A constant track has `data` 0xFFFFFFFF and its value in `base` (xyz, or the quaternion). Otherwise
+// then (v4) one a morph target (its weight: base[0] + extent[0] * u / 65535, one u16 a frame), then their samples. A constant track has `data` 0xFFFFFFFF and its value in `base` (xyz, or the quaternion). Otherwise
 // `data` is the byte offset, from the clip's offset, of `frames` samples of three u16 each: a translation or scale is
 // base + extent * u / 65535; a rotation is smallest-three (anim.h's decodeRotation).
 struct RmodelTrack
@@ -168,3 +198,6 @@ static_assert(sizeof(RmodelNode) == 96, "rmodel node");
 static_assert(sizeof(RmodelBone) == 64, "rmodel bone");
 static_assert(sizeof(RmodelClip) == 80, "rmodel clip");
 static_assert(sizeof(RmodelTrack) == 32, "rmodel track");
+static_assert(sizeof(RmodelMorphs) == 16, "rmodel morphs");
+static_assert(sizeof(RmodelMorphTarget) == 64, "rmodel morph target");
+static_assert(sizeof(RmodelMorphDelta) == 16, "rmodel morph delta");
