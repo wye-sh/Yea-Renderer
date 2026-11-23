@@ -609,11 +609,13 @@ bool rt_pick(uint64_t address)
         return false;
     uint32_t most = settings.traced_lights < 0 ? 0 : (uint32_t)settings.traced_lights;
     most = most > RENDER_RT_MAX_TRACED ? RENDER_RT_MAX_TRACED : most;
-    if (F->width != gShWidth || F->height != gShHeight || 1 + most != gShLayers)
+    // The sun and each traced light a layer; at least 2 (a 1-layer texture gets a 2D view, which array slots reject).
+    uint32_t layers = most + 1 < 2 ? 2 : most + 1;
+    if (F->width != gShWidth || F->height != gShHeight || layers != gShLayers)
     {
         waitQueueIdle(gQueue);
         freeShadowTextures();
-        createShadowTextures(F->width, F->height, 1 + most);
+        createShadowTextures(F->width, F->height, layers);
     }
     if (!gRtShadows)
         return false;
