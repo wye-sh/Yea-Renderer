@@ -6,6 +6,7 @@
 #include "yea_renderer.h"
 #include <yea/shadingrate.h>
 #include <yea/raytracing.h>
+#include <yea/pipelines.h>
 #include "frame.h"
 #include "preview.h"
 #include "mathx.h"
@@ -15,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <chrono>
+#include <thread>
 
 #include <Common_3/Graphics/Interfaces/IGraphics.h>
 #include <Common_3/Resources/ResourceLoader/Interfaces/IResourceLoader.h>
@@ -181,6 +183,20 @@ uint32_t        gPipesMade, gWarmFrames;           // scene pipelines made since
 double          gWarmMs, gWarmWorstMs;           // their time in all, and the most in one frame
 uint32_t        gHeldFrames;                     // frames that held cut-outs back, their pipelines still warming
 PipelineCache*  gPipeCache;
+// Yea's background compiles (SDK 158; nullptr on an older host, which warms here, kWarmMs a frame). The frame that makes
+// the pipelines queues every variant on Yea's threads, then waits only for those it draws with; later frames take the
+// rest as they finish. A variant still compiling when a frame needs it is waited for, never compiled twice (Direct3D 12
+// forbids loading one pipeline from a library on two threads at once).
+const YeaPipelines* gPipes;
+bool                gPipesFailed;                // a queued compile failed: the rest are made here, as without the service
+struct PendingPipe
+{
+    Pipeline** slot;
+    uint64_t   handle;
+};
+PendingPipe gPending[64];
+uint32_t    gPendingCount;
+double      gWarmStart;                          // when the variants were queued (clockMs)
 bool            gPipeCacheDirty;
 char            gPipeCachePath[1024];
 TinyImageFormat gFrameFormat = TinyImageFormat_UNDEFINED;
@@ -381,8 +397,12 @@ VertexLayout sceneLayout()
     return l;
 }
 
+void cancelPipelines();
+
 void destroyScenePipelines()
 {
+    if (gPipes)
+        cancelPipelines();
     for (uint32_t s = 0; s < 4; ++s)
     {
         freePipeline(gDepthPipe[s]);
@@ -494,19 +514,86 @@ void pipeCacheSave()
 
 // With `until` (clockMs), it stops making pipelines once past it, after one at least, and returns true while some
 // asked for are still missing; without (0), it makes every one asked for.
-bool createScenePipelines(uint32_t samples, bool motion, bool masked, uint32_t forward, double until = 0)
+int pendingOf(Pipeline** slot)
 {
+    for (uint32_t k = 0; k < gPendingCount; ++k)
+        if (gPending[k].slot == slot)
+            return (int)k;
+    return -1;
+}
+
+// A finished background compile into its slot (1), or not yet (0); -1: it failed, and the slot is left empty.
+int takePending(uint32_t k, bool wait)
+{
+    void* out = nullptr;
+    int   r;
+    while ((r = gPipes->ready(gPending[k].handle, &out)) == 0 && wait)
+        std::this_thread::yield();
+    if (r == 0)
+        return 0;
+    if (r == 1)
+    {
+        *gPending[k].slot = (Pipeline*)out;
+        ++gPipesMade;
+    }
+    else if (!gPipesFailed)
+    {
+        gPipesFailed = true;
+        yea::log("renderer: a background pipeline compile failed: the rest are made on the main thread");
+    }
+    gPending[k] = gPending[--gPendingCount];
+    return r;
+}
+
+// Each frame: the compiles that finished.
+void pollPipelines()
+{
+    for (uint32_t k = gPendingCount; k-- > 0;)
+        takePending(k, false);
+}
+
+// Every queued compile dropped (before the pipelines are destroyed, or the shaders and cache go).
+void cancelPipelines()
+{
+    for (uint32_t k = 0; k < gPendingCount; ++k)
+        gPipes->cancel(gPending[k].handle);
+    gPendingCount = 0;
+}
+
+// queue: hand every missing pipeline to Yea's compile threads (when it has them) and return at once, true while any is
+// still compiling. Otherwise each missing one is made now (waiting for it when it is already compiling); with `until`
+// (clockMs), it stops once past it, after one at least, and returns true while some asked for are still missing.
+bool createScenePipelines(uint32_t samples, bool motion, bool masked, uint32_t forward, double until = 0, bool queue = false)
+{
+    if (queue && (!gPipes || gPipesFailed))
+        return true; // nothing to queue to: warming makes them, a few a frame
     uint32_t made = 0;
     bool     left = false;
-    auto     make = [&](PipelineDesc& d, Pipeline*& p) {
+    auto make = [&](PipelineDesc& d, Pipeline*& p) {
         if (p)
             return;
+        d.pCache = gPipeCache;
+        const int k = gPipes ? pendingOf(&p) : -1;
+        if (k >= 0 && (queue || until > 0))
+        {
+            left = true; // still compiling: later
+            return;
+        }
+        if (k >= 0 && takePending((uint32_t)k, true) == 1) // needed now: wait for this one only
+            return;
+        if (queue && gPendingCount < sizeof gPending / sizeof gPending[0])
+            if (uint64_t h = gPipes->add(&d))
+            {
+                gPending[gPendingCount++] = { &p, h };
+                gPipeCacheDirty = true;
+                left = true;
+                return;
+            }
         if (until > 0 && made > 0 && clockMs() >= until)
         {
             left = true;
             return;
         }
-        d.pCache = gPipeCache;
         addPipeline(gRenderer, &d, &p);
         gPipeCacheDirty = true;
         ++made;
@@ -644,18 +731,32 @@ bool createScenePipelines(uint32_t samples, bool motion, bool masked, uint32_t f
     return left;
 }
 
-// One frame's warming: the variants not made yet, within kWarmMs. Logs once when all are made.
-void warmScenePipelines(uint32_t samples, bool motion)
+uint32_t warmForward()
 {
-    const double t0 = clockMs();
-    uint32_t     forward = kForwardLean | kForwardFull;
+    uint32_t forward = kForwardLean | kForwardFull;
 #if !defined(YEA_GAME_RELEASE)
     forward |= kForwardDepth; // F1's view modes
 #endif
-    // What any scene draws with first (the prepass and the lean forward shader, cut-outs included), then the rest.
-    gWarmLeft = createScenePipelines(samples, motion, true, kForwardLean, t0 + kWarmMs);
-    if (!gWarmLeft)
-        gWarmLeft = clockMs() >= t0 + kWarmMs || createScenePipelines(samples, motion, true, forward, t0 + kWarmMs);
+    return forward;
+}
+
+// One frame's warming: with Yea's compile threads, the finished ones taken (all were queued when the pipelines were
+// remade); without, the variants not made yet within kWarmMs. Logs once when all are made.
+void warmScenePipelines(uint32_t samples, bool motion)
+{
+    const double t0 = clockMs();
+    if (gPipes && !gPipesFailed)
+    {
+        pollPipelines();
+        gWarmLeft = createScenePipelines(samples, motion, true, warmForward(), 0, true); // queues only what isn't yet
+    }
+    else
+    {
+        // What any scene draws with first (the prepass and the lean forward shader, cut-outs included), then the rest.
+        gWarmLeft = createScenePipelines(samples, motion, true, kForwardLean, t0 + kWarmMs);
+        if (!gWarmLeft)
+            gWarmLeft = clockMs() >= t0 + kWarmMs || createScenePipelines(samples, motion, true, warmForward(), t0 + kWarmMs);
+    }
     const double ms = clockMs() - t0;
     gWarmMs += ms;
     gWarmWorstMs = ms > gWarmWorstMs ? ms : gWarmWorstMs;
@@ -663,8 +764,11 @@ void warmScenePipelines(uint32_t samples, bool motion)
     if (gWarmLeft)
         return;
     char line[200];
-    snprintf(line, sizeof line, "renderer: scene pipelines warmed in %.0f ms over %u frames (at most %.1f ms a frame)%s; cut-outs held back %u frames",
-             gWarmMs, gWarmFrames, gWarmWorstMs, gPipeCache ? "" : "; no pipeline cache", gHeldFrames);
+    snprintf(line, sizeof line,
+             "renderer: scene pipelines warmed in %.0f ms (%.0f ms of it on the main thread, at most %.1f ms a frame, over %u frames%s)%s; "
+             "cut-outs held back %u frames",
+             clockMs() - gWarmStart, gWarmMs, gWarmWorstMs, gWarmFrames, gPipes && !gPipesFailed ? "; compiled on Yea's threads" : "",
+             gPipeCache ? "" : "; no pipeline cache", gHeldFrames);
     yea::log(line);
     pipeCacheSave();
 }
@@ -1190,6 +1294,9 @@ int load(int reloaded)
     gQueue = (Queue*)host->queue;
     gFrames = host->framesInFlight < kMaxFrames ? host->framesInFlight : kMaxFrames;
     pipeCacheOpen();
+    gPipes = yea::pipelines();
+    gPipesFailed = false;
+    gPendingCount = 0;
     getTimestampFrequency(gQueue, &gTimeTicks);
     for (uint32_t i = 0; i < gFrames && gTimeTicks > 0; ++i)
     {
@@ -1435,10 +1542,7 @@ void unload()
         if (gTimePool[i])
             exitQueryPool(gRenderer, gTimePool[i]), gTimePool[i] = nullptr;
     pipeCacheSave();
-    destroyScenePipelines();
-    if (gPipeCache)
-        removePipelineCache(gRenderer, gPipeCache);
-    gPipeCache = nullptr;
+    destroyScenePipelines(); // drops queued compiles; one already compiling ends when its shader is removed (below)
     freePipeline(gCompositePipe);
     freePipeline(gAdaptPipe);
     freePipeline(gTonemapPipe);
@@ -1506,6 +1610,10 @@ void unload()
         if (gHistogramShader[i])
             removeShader(gRenderer, gHistogramShader[i]), gHistogramShader[i] = nullptr;
     }
+    // After the shaders: removeShader waited for every compile still reading them, so none uses the cache now.
+    if (gPipeCache)
+        removePipelineCache(gRenderer, gPipeCache);
+    gPipeCache = nullptr;
 }
 
 void update(uint32_t phase, float dt) {}
@@ -1614,7 +1722,14 @@ void draw(uint32_t pass, const YeaFrame* yf)
     {
         waitQueueIdle(gQueue);
         destroyScenePipelines();
-        createScenePipelines(samples, taa, masked, kForwardLean); // what the first frame with a scene draws with
+        gWarmStart = clockMs();
+        // With Yea's compile threads: what the first frame draws with queued first, then the cut-out set (a model's
+        // material may turn up any frame), then every other variant, and only the first waited for (they compile side
+        // by side). Without, those made here and the rest warmed later.
+        createScenePipelines(samples, taa, masked, kForwardLean, 0, true);
+        createScenePipelines(samples, taa, true, kForwardLean, 0, true);
+        createScenePipelines(samples, taa, true, warmForward(), 0, true);
+        createScenePipelines(samples, taa, masked, kForwardLean);
         gFrameFormat = TinyImageFormat_UNDEFINED;
         gWarmLeft = true; // from the next frame
         gWarmFrames = 0;
