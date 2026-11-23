@@ -443,11 +443,14 @@ AccelerationStructure* buildBlas(Cmd* cmd, const RenderFrame* F, const RenderCas
     return b.as;
 }
 
-// The same triangles (a refit can move its vertices to another offset, not change them).
+// The same triangles in the same buffers (a refit can move its vertices to another offset, not change them). The
+// caster's generation, not the Buffer pointers, says the buffers are the ones it was built from: the core remakes them
+// on a scene change, and a new one can come back at the old one's address (a refit or rebuild of the old structure then
+// reads a freed index buffer).
 bool sameTopology(const Blas& b, const RenderFrame* F, const RenderCaster& c)
 {
-    return b.as && b.positions == F->positions && b.indices == F->indices && b.firstIndex == c.firstIndex &&
-           b.indexCount == c.indexCount && b.vertexCount == c.vertexCount;
+    return b.as && b.generation == c.generation && b.positions == F->positions && b.indices == F->indices &&
+           b.firstIndex == c.firstIndex && b.indexCount == c.indexCount && b.vertexCount == c.vertexCount;
 }
 
 bool sameGeometry(const Blas& b, const RenderFrame* F, const RenderCaster& c)
@@ -639,7 +642,7 @@ AccelerationStructure* meshBlas(Cmd* cmd, const RenderFrame* F, const RenderCast
         return nullptr;
     }
     Blas& b = gBlas[c.mesh];
-    if (sameGeometry(b, F, c) && b.generation == c.generation)
+    if (sameGeometry(b, F, c))
         return b.as;
     retire(b.as, F->frameNumber);
     return buildBlas(cmd, F, c, b, ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE);

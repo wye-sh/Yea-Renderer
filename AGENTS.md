@@ -162,7 +162,9 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   a refitted tree reaches its worst within 15 frames, 4% dearer to trace on average, 26% at worst, so the interval
   only caps drift that keeps growing, such as root motion); on older hosts, or once a refit is refused, one per posed
   copy (keyed by `vertexOffset` too), built afresh each frame. Never refitted or built over while a frame in flight may
-  trace it; dropped 8 frames after their last use. While any are traced, the module logs their refit and rebuild GPU
+  trace it, nor once its caster's `generation` changed (the core's remade buffers can come back at the old Buffer
+  pointers, so only the generation says the old structure's index and vertex addresses are dead); dropped 8 frames
+  after their last use. While any are traced, the module logs their refit and rebuild GPU
   time every 10 s (`skinned ray structures`). One
   top-level structure per frame in flight, its instances rewritten with `setInstances` and rebuilt every frame
   (mask 1 every drawable, 2 shadow casters, 4 shadow casters that aren't glass: what GI probe rays hit, 8 every glass
