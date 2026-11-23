@@ -22,15 +22,17 @@ BEGIN_SRT(RtSrt)
         DECL_TEXTURE(PerFrame, Tex2D(float4), gFullIn)   // resolve: the pixels traced at full resolution
         DECL_TEXTURE(PerFrame, Tex2D(float2), gMotion)   // resolve: last frame's motion vectors (the forward pass writes them later)
         DECL_TEXTURE(PerFrame, Tex2D(float4), gHistory)  // resolve: last frame's accumulated reflections
-        DECL_TEXTURE(PerFrame, Tex2D(float), gHistoryZ)  // and the view depth they were for
+        DECL_TEXTURE(PerFrame, Tex2D(float2), gHistoryZ) // x the view depth they were for, y their samples
         DECL_RWBUFFER(PerFrame, RWBuffer(uint), gTiles)  // per 8 x 8 tile, 6 flags (RtData tiles and zero): any
                                                          // pixel to trace (two frames' worth), and whether the history
                                                          // textures' tile is all zero (each before and after its write)
         DECL_RWTEXTURE(PerFrame, RWTex2D(half4), gOutHalf) // trace: the half-resolution samples
         DECL_RWTEXTURE(PerFrame, RWTex2D(half4), gOutFull) // trace: the pixels traced at full resolution
         DECL_RWTEXTURE(PerFrame, RWTex2D(half4), gOut)     // resolve: this frame's accumulated reflections
-        DECL_RWTEXTURE(PerFrame, RWTex2D(float), gOutZ)
+        DECL_RWTEXTURE(PerFrame, RWTex2D(half2), gOutZ)
         DECL_BUFFER(PerFrame, Buffer(ShadowView), gShadowViews) // trace: renderer_shadows' views (a dummy without them)
         DECL_TEXTURE(PerFrame, Depth2D(float), gLocalAtlas)     // and its local lights' atlas
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gHalfRayIn)        // reconstruct: the half-resolution rays' directions, w 1 / their pdf
+        DECL_RWTEXTURE(PerFrame, RWTex2D(half4), gOutHalfRay)    // trace: the same
     END_SRT_SET(PerFrame)
 END_SRT(RtSrt)

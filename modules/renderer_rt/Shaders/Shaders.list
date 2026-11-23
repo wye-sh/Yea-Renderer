@@ -11,6 +11,11 @@
 #include "Trace.comp.fsl"
 #end
 
+#comp FT_RAYTRACING renderer_rt_reconstruct.comp
+#define TRACE_RECONSTRUCT
+#include "Trace.comp.fsl"
+#end
+
 #comp FT_RAYTRACING renderer_rt_resolve.comp
 #define TRACE_RESOLVE
 #include "Trace.comp.fsl"

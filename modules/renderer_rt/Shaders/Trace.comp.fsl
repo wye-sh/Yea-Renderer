@@ -69,11 +69,20 @@ STRUCT(ShadowView)
 
 float noise2(float2 p) { return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715)))); }
 
-// Pixel p's sample for this frame: interleaved gradient noise across the screen (so neighbours differ), stepped
+// Pixel p's sample for this frame: a hash of its position (so neighbours' samples are unrelated: interleaved
+// gradient noise lined them up, and what the history hadn't averaged out showed as diagonal streaks), stepped
 // through the R2 sequence over frames (so a pixel's samples cover the lobe evenly, not at random).
+uint pcgHash(uint v)
+{
+    uint s = v * 747796405u + 2891336453u;
+    uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+
 float2 sample2(int2 p)
 {
-    float2 offset = float2(noise2(float2(p)), noise2(float2(p.yx) + 17.0));
+    uint   h = pcgHash(uint(p.x) + pcgHash(uint(p.y)));
+    float2 offset = float2(float(h & 0xFFFFu), float(h >> 16u)) * (1.0 / 65536.0);
     return frac(offset + float(gRt.counts.y) * float2(0.7548776662, 0.5698402910));
 }
 
@@ -223,6 +232,14 @@ float4 clipOf(float4 rows[4], float3 W)
 
 // A hit that still has to be lit where it is (what the screen doesn't show): its position and distance, normal
 // (towards the ray), the ray's direction and how much of it the screen shows, that screen colour, its material.
+float ggxD(float NoH, float a2)
+{
+    float d = (NoH * a2 - NoH) * NoH + 1.0;
+    return a2 / (PI * d * d);
+}
+
+float smithG1(float NoV, float a2) { return 2.0 * NoV / (NoV + sqrt(a2 + (1.0 - a2) * NoV * NoV)); }
+
 STRUCT(Hit)
 {
     DATA(float4, result, None); // the finished sample (rgb, a distance; 0: not traced, RT_MISS: the sky); a < 0: light it
@@ -231,6 +248,7 @@ STRUCT(Hit)
     DATA(float4, ray, None);    // xyz the ray's direction, w the screen's share
     DATA(float4, screen, None); // rgb the screen's colour
     DATA(uint, material, None);
+    DATA(float, invPdf, None);  // 1 / the probability the ray was cast with (GGX visible normals), for its reuse
 };
 
 // Traces pixel p's reflected ray (surface and d: its surface and depth). What the screen shows, the sky and
@@ -244,6 +262,7 @@ Hit traceRay(int2 p, float4 surface, float d)
     o.ray = float4(0.0, 0.0, 0.0, 0.0);
     o.screen = float4(0.0, 0.0, 0.0, 0.0);
     o.material = 0u;
+    o.invPdf = 0.0;
     int2   size = int2(gRt.screen.xy);
     float  rough = surface.x;
     if (d <= 0.0 || rough >= gRt.camPos.w)
@@ -270,6 +289,10 @@ Hit traceRay(int2 p, float4 surface, float d)
         float3 Rj = reflect(-V, tx * h.x + ty * h.y + N * h.z);
         if (dot(Rj, N) > 0.0)
             R = Rj;
+        // G1(V) D(H) / (4 N.V), as reconstruct weighs the ray by (1 / it, as a half can't hold it at grazing angles).
+        float a2 = alpha * alpha;
+        float pdf = smithG1(v.z, a2) * ggxD(saturate(dot(N, normalize(V + R))), a2) / (4.0 * v.z);
+        o.invPdf = pdf > 0.0 ? 1.0 / pdf : 0.0;
     }
 
     RayDesc ray;
@@ -278,6 +301,7 @@ Hit traceRay(int2 p, float4 surface, float d)
     ray.TMin = 0.0;
     ray.TMax = gRt.params.x;
     RayQueryClosestHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RT_RAY_FLAGS, ray, 1u, hit)
+    o.ray = float4(R, 0.0); // kept for the half-resolution rays' reuse
     bool debug = (gRt.counts.z & FLAG_DEBUG) != 0u;
     if (!RayQueryIsHit(hit))
     {
@@ -406,7 +430,10 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
             if (h.result.a < 0.0)
                 h.result = lightHit(h.pos, h.normal, h.ray, h.screen.rgb, h.material, isHalf ? b : p);
             if (isHalf)
+            {
                 Write2D(gOutHalf, b, h.result);
+                Write2D(gOutHalfRay, b, float4(h.ray.xyz, h.invPdf));
+            }
             else
                 Write2D(gOutFull, p, h.result);
         }
@@ -419,80 +446,147 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
 }
 #endif
 
-#if defined(TRACE_RESOLVE)
-// A full-resolution pixel from the four nearest half-resolution samples, each weighted by how close it lies,
-// by how well its depth and normal match this pixel's, so reflections don't bleed across edges or creases,
-// and by its inverse brightness (Karis 2014), so one bright sample can't spread over its neighbours. Pixels no
-// sample matches are traced here.
-float4 upsample(int2 p, float4 surface, float d)
+#if defined(TRACE_RECONSTRUCT)
+// Pixel p's world position from its depth d, as it was drawn (with the TAA jitter), as traceRay finds it.
+float3 worldAt(int2 p, float d)
+{
+    float  z = gRt.forward.w / d;
+    float2 u = float2(p) + 0.5 - gRt.screen.zw;
+    float2 ndc = float2(u.x / gRt.screen.x * 2.0 - 1.0, 1.0 - u.y / gRt.screen.y * 2.0);
+    return gRt.camPos.xyz + gRt.right.xyz * (ndc.x * z / gRt.right.w) + gRt.up.xyz * (ndc.y * z / gRt.up.w) + gRt.forward.xyz * z;
+}
+
+// A full-resolution pixel's reflection from the half-resolution rays around it (Stachowiak, "Stochastic
+// Screen-Space Reflections", 2015): every ray of the 3 x 3 nearest is reused, turned towards what it found as seen
+// from this pixel, and weighted by this pixel's own GGX lobe over the probability the ray was cast with (its
+// visible-normal sample at its own pixel). So each pixel gets nine rays a frame where it had one in four, and the
+// weights follow its own lobe, which keeps the reflection as sharp as its roughness: a ray outside the lobe counts
+// for nothing. Rays from across an edge or crease (depth, normal) are left out, and each is also weighted by its
+// inverse brightness (Karis 2014), so one bright ray can't spread. Pixels no ray fits are traced here.
+float4 reconstruct(int2 p, float4 surface, float d)
 {
     int2   size = int2(gRt.screen.xy);
     int2   o = blockOffset();
     int2   halfSize = (size + int2(1, 1)) / 2;
-    int2   base = (p - o) >> 1;
-    float2 f = float2(p - o) * 0.5 - float2(base);
+    int2   c = clamp((p - o + int2(1, 1)) >> 1, int2(0, 0), halfSize - int2(1, 1)); // the nearest ray
     float  zp = gRt.forward.w / d;
+    float3 Pp = worldAt(p, d);
     float3 Np = normalize(surface.yzw);
+    float3 Vp = normalize(gRt.camPos.xyz - Pp);
+    float  NoVp = max(dot(Np, Vp), 1e-4);
+    float  ap = surface.x * surface.x;
+    float  a2p = ap * ap;
     float  exposure = gExposure[1];
     float4 sum = float4(0.0, 0.0, 0.0, 0.0);
     float  wsum = 0.0;
-    float  match = 0.0; // the weights before the brightness one: whether any sample fits
-    for (uint i = 0u; i < 4u; ++i)
+    float  match = 0.0; // the edge weights alone: whether any ray fits
+    for (int j = -1; j <= 1; ++j)
     {
-        int2   dq = int2(int(i & 1u), int(i >> 1u));
-        int2   q = clamp(base + dq, int2(0, 0), halfSize - int2(1, 1));
-        float4 v = LoadTex2D(gHalfIn, NO_SAMPLER, q, 0);
-        if (v.a <= 0.0)
-            continue;
-        int2   s = min(q * 2 + o, size - int2(1, 1));
-        float  zs = gRt.forward.w / max(LoadTex2D(gDepth, NO_SAMPLER, s, 0).r, 1e-7);
-        float3 Ns = normalize(LoadTex2D(gSurface, NO_SAMPLER, s, 0).yzw);
-        float  bx = dq.x == 1 ? f.x : 1.0 - f.x;
-        float  by = dq.y == 1 ? f.y : 1.0 - f.y;
-        float  w = (bx * by + 0.05) * saturate(1.0 - abs(zs - zp) / (0.02 * zp + 0.02)) * pow(saturate(dot(Ns, Np)), 32.0);
-        match += w;
-        w /= 1.0 + luminance(v.rgb) * exposure;
-        sum += v * w;
-        wsum += w;
+        for (int i = -1; i <= 1; ++i)
+        {
+            int2   q = c + int2(i, j);
+            if (q.x < 0 || q.y < 0 || q.x >= halfSize.x || q.y >= halfSize.y)
+                continue;
+            float4 v = LoadTex2D(gHalfIn, NO_SAMPLER, q, 0);
+            if (v.a <= 0.0)
+                continue;
+            int2   s = min(q * 2 + o, size - int2(1, 1));
+            float  ds = LoadTex2D(gDepth, NO_SAMPLER, s, 0).r;
+            float4 ss = LoadTex2D(gSurface, NO_SAMPLER, s, 0);
+            float  zs = gRt.forward.w / max(ds, 1e-7);
+            float3 Ns = normalize(ss.yzw);
+            float  edge = saturate(1.0 - abs(zs - zp) / (0.02 * zp + 0.02)) * pow(saturate(dot(Ns, Np)), 32.0);
+            match += edge;
+            if (edge <= 0.0)
+                continue;
+            // The ray, and 1 / the probability it was cast with (the trace's).
+            float4 Ls = LoadTex2D(gHalfRayIn, NO_SAMPLER, q, 0);
+            float3 Ps = worldAt(s, ds);
+            // Towards what it found, from here (the sky: the same direction).
+            float3 L = Ls.xyz;
+            if (v.a < RT_MISS * 0.5)
+                L = normalize(Ps + Ns * (0.001 * zs + 0.004) + Ls.xyz * v.a - Pp);
+            float NoL = dot(Np, L);
+            if (NoL <= 0.0 || Ls.w <= 0.0)
+                continue;
+            // This pixel's lobe: D(H) times the height-correlated Smith visibility times N.L (Fresnel cancels out).
+            float  NoH = saturate(dot(Np, normalize(Vp + L)));
+            float  gv = NoL * sqrt(NoVp * NoVp * (1.0 - a2p) + a2p);
+            float  gl = NoVp * sqrt(NoL * NoL * (1.0 - a2p) + a2p);
+            float  lobe = ggxD(NoH, a2p) * (0.5 / max(gv + gl, 1e-5)) * NoL;
+            float  w = edge * lobe * Ls.w / (1.0 + luminance(v.rgb) * exposure);
+            sum += v * w;
+            wsum += w;
+        }
     }
-    if (match < 0.02)
+    if (match < 0.02 || wsum <= 0.0)
         return tracePixel(p, surface, d);
     return sum / wsum;
 }
 
+// The reconstruction, one full-size pass between the trace and the resolve: each glossy pixel traced at half
+// resolution gets its reflection from the rays around it, written beside the full-resolution traces (gOutFull),
+// so the resolve reads every pixel's from one texture. Tiles with nothing to reflect return at once.
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) id, SV_GroupID(uint3) gid)
+{
+    INIT_MAIN;
+    int2 size = int2(gRt.screen.xy);
+    int2 p = int2(id.xy);
+    if (p.x >= size.x || p.y >= size.y || gTiles[gRt.tiles.z + gid.y * gRt.tiles.x + gid.x] == 0u)
+        RETURN();
+    float4 surface = LoadTex2D(gSurface, NO_SAMPLER, p, 0);
+    if (surface.x >= gRt.camPos.w || surface.x < gRt.params.z)
+        RETURN(); // not glossy, or traced at full resolution
+    float d = LoadTex2D(gDepth, NO_SAMPLER, p, 0).r;
+    if (d > 0.0)
+        Write2D(gOutFull, p, reconstruct(p, surface, d));
+    RETURN();
+}
+#endif
+
+#if defined(TRACE_RESOLVE)
 // This frame's reflection at pixel q (surface and d: its surface and depth): traced at full resolution by the
-// trace pass, upsampled from the half-resolution samples, or nothing.
+// trace pass, reconstructed from the half-resolution rays, or nothing.
 float4 currentAt(int2 q, float4 surface, float d)
 {
     if (d <= 0.0 || surface.x >= gRt.camPos.w)
         return float4(0.0, 0.0, 0.0, 0.0);
-    if (surface.x < gRt.params.z)
-        return LoadTex2D(gFullIn, NO_SAMPLER, q, 0);
-    return upsample(q, surface, d);
+    return LoadTex2D(gFullIn, NO_SAMPLER, q, 0);
 }
 
 // The reflections' temporal accumulation, in the same pass: each pixel's history is found where the reflected
 // image was last frame (reprojecting the reflection's virtual image, P plus the hit distance along the view
 // ray, for smooth surfaces; the surface itself for rough ones), dropped where that surface wasn't there last
 // frame (its depth), clipped to this frame's neighbourhood spread (mean +- 1.25 deviations, YCoCg) and blended
-// in a compressed space (c / (1 + max(c)), so a bright sample counts no more than a white one), with more
-// history the rougher, noisier and stiller the surface. At half resolution the spread comes from the traced
-// samples themselves (3 x 3 of them, 6 x 6 pixels): upsampled neighbours share samples, and their spread is too
-// narrow to hold the history. TAA then anti-aliases the frame as before.
+// in a compressed space (c / (1 + max(c)), so a bright sample counts no more than a white one) at 1 / samples, the
+// samples the pixel's history holds: up to more the rougher, noisier and stiller the surface. At half resolution the
+// spread comes from the traced rays themselves (5 x 5 of them, 10 x 10 pixels): reconstructed neighbours share rays,
+// and their spread is too narrow to hold the history (a box that also widened to a still pixel's own spread over
+// time held it, but let a switched-off light linger for tens of frames). TAA then anti-aliases the frame as before.
 #define CLIP_WIDTH 1.25
+// Samples a still pixel's history may hold, whatever its roughness: enough that a still view settles completely
+// (mirrors too: their jittered samples differ across the pixel). Anything that moves at all (0.01 pixel), or that
+// the clip finds changed, keeps history_frames (less on mirrors).
+#define STILL_SAMPLES 128.0
+// How far outside the clip box (in its half-widths) a still pixel's history must lie to count as changed: noise
+// alone pokes just past the box now and then, and dropping the history for it showed as flicker.
+#define STILL_SNAP 1.5
 
 float3 compressColor(float3 c) { return c / (1.0 + max(c.r, max(c.g, c.b))); }
 float3 expandColor(float3 c) { return c / max(1.0 - max(c.r, max(c.g, c.b)), 1e-4); }
 float3 toYCoCg(float3 c) { return float3(dot(c, float3(0.25, 0.5, 0.25)), dot(c, float3(0.5, 0.0, -0.5)), dot(c, float3(-0.25, 0.5, -0.25))); }
 float3 fromYCoCg(float3 c) { return float3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z); }
 
-float3 clipToBox(float3 h, float3 lo, float3 hi)
+// h clipped towards the box's centre; m says how far outside it was, in the box's half-widths (over 1: clipped).
+float3 clipToBox(float3 h, float3 lo, float3 hi, out float m)
 {
     float3 centre = 0.5 * (lo + hi);
     float3 extent = 0.5 * (hi - lo) + float3(1e-5, 1e-5, 1e-5);
     float3 v = h - centre;
     float3 a = abs(v / extent);
-    float  m = max(a.x, max(a.y, a.z));
+    m = max(a.x, max(a.y, a.z));
     return m > 1.0 ? centre + v / m : h;
 }
 
@@ -524,9 +618,10 @@ void resolve(int2 p)
     int2   halfSize = (size + int2(1, 1)) / 2;
     int2   centre = fromHalf ? clamp(p >> 1, int2(0, 0), halfSize - int2(1, 1)) : p;
     int2   last = fromHalf ? halfSize - int2(1, 1) : size - int2(1, 1);
-    for (int y = -1; y <= 1; ++y)
+    int    reach = fromHalf ? 2 : 1;
+    for (int y = -reach; y <= reach; ++y)
     {
-        for (int x = -1; x <= 1; ++x)
+        for (int x = -reach; x <= reach; ++x)
         {
             if (x == 0 && y == 0 && !fromHalf)
                 continue;
@@ -555,9 +650,12 @@ void resolve(int2 p)
     float3 mean = m1 / n;
     float3 width = sqrt(max(m2 / n - mean * mean, float3(0.0, 0.0, 0.0))) * CLIP_WIDTH;
 
-    // This pixel's world position (undoing the jitter it was drawn with), and where it and its reflection were.
+    // Where this pixel and its reflection were last frame, from the pixel's centre: the accumulated reflection is
+    // the pixel's own (as TAA's history is), and this frame's jittered sample is one sample of it. So a still view
+    // reads its history in place, not shifted by the jitter (which blurred it a little more every frame and, past
+    // half a pixel, read as motion and cut the history short).
     float  z = gRt.forward.w / d;
-    float2 u = float2(p) + 0.5 - gRt.screen.zw;
+    float2 u = float2(p) + 0.5;
     float2 ndc = float2(u.x / gRt.screen.x * 2.0 - 1.0, 1.0 - u.y / gRt.screen.y * 2.0);
     float3 P = gRt.camPos.xyz + gRt.right.xyz * (ndc.x * z / gRt.right.w) + gRt.up.xyz * (ndc.y * z / gRt.up.w) + gRt.forward.xyz * z;
     float3 toP = normalize(P - gRt.camPos.xyz);
@@ -567,24 +665,31 @@ void resolve(int2 p)
     float2 uvS = uvOf(pcS);
     float2 uvPrev = pcV.w > gRt.forward.w ? lerp(uvS, uvOf(pcV), mirrorish) : uvS;
 
-    // More history the rougher (noisier) the surface; little on mirrors, which are exact, and on what moves.
+    // More history the rougher (noisier) the surface; little on mirrors, which are exact, and on what moves. Where
+    // neither the surface nor its reflection moved, up to STILL_SAMPLES, so a still view settles.
     float  frames = 1.0 + (gRt.temporal.x - 1.0) * saturate(rough * 8.0);
+    float  stillFrames = STILL_SAMPLES;
     float2 uvNow = (float2(p) + 0.5) / gRt.screen.xy;
     float2 moved = (LoadTex2D(gMotion, NO_SAMPLER, p, 0).xy - (uvNow - uvS)) * gRt.screen.xy;
+    float2 shift = (uvPrev - uvNow) * gRt.screen.xy;
+    bool   still = dot(moved, moved) < 1e-4 && dot(shift, shift) < 1e-4;
     if (dot(moved, moved) > 0.25)
         frames = min(frames, 4.0);
 
     float3 result = c;
+    float  samples = 1.0;
+    float  samplesPrev = 0.0;
     bool   valid = gRt.temporal.y > 0.5 && pcS.w > gRt.forward.w && inScreen(uvS) && inScreen(uvPrev);
     if (valid)
     {
         // Was this surface there last frame? Its depth then against the depth kept there (none where the
         // history holds nothing).
         int2  qs = clamp(int2(uvS * gRt.screen.xy), int2(0, 0), size - int2(1, 1));
-        float zPrev = LoadTex2D(gHistory, NO_SAMPLER, qs, 0).a > 0.0 ? LoadTex2D(gHistoryZ, NO_SAMPLER, qs, 0).r : 0.0;
-        valid = abs(zPrev - pcS.w) < 0.04 * pcS.w + 0.02;
+        float2 zn = LoadTex2D(gHistory, NO_SAMPLER, qs, 0).a > 0.0 ? LoadTex2D(gHistoryZ, NO_SAMPLER, qs, 0).xy : float2(0.0, 0.0);
+        valid = abs(zn.x - pcS.w) < 0.04 * pcS.w + 0.02;
+        samplesPrev = zn.y;
     }
-    if (valid && frames > 1.0)
+    if (valid && max(frames, still ? stillFrames : 1.0) > 1.0)
     {
         // Bilinear, over the history texels that hold reflections only.
         float2 pos = uvPrev * gRt.screen.xy - 0.5;
@@ -602,18 +707,25 @@ void resolve(int2 p)
         }
         if (sum.w > 0.05)
         {
-            float3 history = clipToBox(toYCoCg(sum.rgb / sum.w), mean - width, mean + width);
-            result = lerp(history, c, 1.0 / frames);
+            float  outside;
+            float3 history = clipToBox(toYCoCg(sum.rgb / sum.w), mean - width, mean + width, outside);
+            bool   clipped = outside > STILL_SNAP;
+            // As many samples as the history holds plus this one, up to the cap: after a disocclusion the
+            // history fills in evenly (1/2, 1/3, ...) instead of leaning on its first sample. A history the clip
+            // found changed (a light moved) goes back to history_frames at once, so nothing trails.
+            float cap = still && !clipped ? stillFrames : frames;
+            samples = min(min(samplesPrev, cap - 1.0) + 1.0, cap);
+            result = lerp(history, c, 1.0 / samples);
         }
     }
     Write2D(gOut, p, float4(max(expandColor(fromYCoCg(result)), float3(0.0, 0.0, 0.0)) / exposure, cur.a));
-    Write2D(gOutZ, p, z);
+    Write2D(gOutZ, p, float2(z, samples));
 }
 
-// The resolve, one full-size pass: this frame's reflection per pixel (the full-resolution trace, or the upsampled
-// half-resolution one) accumulated with last frame's into gOut. A tile with nothing to reflect writes zeros only
-// when the texture doesn't hold zeros there already (gTiles), so most of a frame without glossy surfaces
-// costs two reads per tile. Flags are read and written in different places, so no thread waits for another.
+// The resolve, one full-size pass: this frame's reflection per pixel (the full-resolution trace, or the one
+// reconstructed from the half-resolution rays) accumulated with last frame's into gOut. A tile with nothing to
+// reflect writes zeros only when the texture doesn't hold zeros there already (gTiles), so most of a frame without
+// glossy surfaces costs two reads per tile. Flags are read and written in different places, so no thread waits for another.
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(8, 8, 1)
 void CS_MAIN(SV_DispatchThreadID(uint3) id, SV_GroupID(uint3) gid, SV_GroupIndex(uint) gi)
