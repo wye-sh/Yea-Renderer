@@ -599,6 +599,11 @@ bool rt_pick(uint64_t address)
 {
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
     gPickCount = 0;
+    if (gReady && !settings.shadows && gShLayers)
+    {
+        waitQueueIdle(gQueue); // switched off: their memory back (frames in flight may still read them)
+        freeShadowTextures();
+    }
     if (!gReady || !settings.shadows || !F || F->version != RENDER_FRAME_VERSION || !F->width || !F->height || !F->taaOn ||
         yea::viewMode())
         return false;

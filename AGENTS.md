@@ -143,7 +143,7 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   `max_roughness` (`gTiles`, flag sets double-buffered so no thread reads a flag another rewrites); the resolve skips
   the rest and writes their zeros only when the history there isn't zero already. Every GPU object is freed
   in `unload()` (device-loss recovery unloads modules); nothing GPU-side is in tables.
-  Ray-traced shadows (`shadows`, on; `traced_lights`, 4): `rt_pick` takes the sun and up to `traced_lights` visible
+  Ray-traced shadows (`shadows`, off until measured on the user's GPU; `traced_lights`, 4): `rt_pick` takes the sun and up to `traced_lights` visible
   casting lights, area lights first (their PCSS costs most, and rays give their real shape), needing TAA and no debug
   view. After the top-level build, `Shaders/Shadows.comp.fsl`'s three full-size passes, each over every traced shadow
   (dispatch z, layers of 2D arrays matched to last frame's by light id): a trace (one any-hit ray a pixel, mask 2, to a

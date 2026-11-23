@@ -41,8 +41,9 @@ setting int probe_rays 0 0 9
 category Ray-Traced Shadows
 # Shadows found by tracing rays towards each light's real shape (the sun's disc, a lamp's sphere, an area
 # light's panel, disc or tube): sharp where they touch, softer further away. Only on GPUs with ray tracing,
-# with Anti-aliasing (TAA) on; elsewhere, and for lights not traced, shadow maps.
-setting bool shadows true
+# with Anti-aliasing (TAA) on; elsewhere, and for lights not traced, shadow maps. Off by default until measured on
+# the user's GPU (test_renderer_rays).
+setting bool shadows false
 needs shadows raytracing
 player shadows
 # How many lights besides the sun get traced shadows (area lights first); the rest keep shadow maps.
