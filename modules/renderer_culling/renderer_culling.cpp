@@ -39,7 +39,7 @@ Buffer*        gCb[kMaxFrames];
 Buffer*        gBins[kMaxFrames];
 Buffer*        gDecalBins[kMaxFrames];
 Buffer*        gNoDecals; // stands in for the core's decal spheres while it has none
-Buffer*        gMasks, *gDecalMasks;
+Buffer*        gMasks, *gSideMasks, *gDecalMasks; // gSideMasks: by the tiles' sides alone (frame v27 sideMasks)
 uint64_t       gDecalMaskBytes;
 uint64_t       gMaskBytes;
 ResourceState  gMaskState;
@@ -137,11 +137,13 @@ void unload()
     }
     if (gMasks)
         removeResource(gMasks);
+    if (gSideMasks)
+        removeResource(gSideMasks);
     if (gDecalMasks)
         removeResource(gDecalMasks);
     if (gNoDecals)
         removeResource(gNoDecals);
-    gMasks = gDecalMasks = gNoDecals = nullptr;
+    gMasks = gSideMasks = gDecalMasks = gNoDecals = nullptr;
     gMaskBytes = gDecalMaskBytes = 0;
     if (gSet)
         removeDescriptorSet(gRenderer, gSet);
@@ -194,17 +196,21 @@ bool cull_prepare(uint64_t address)
         waitQueueIdle(gQueue);
         if (gMasks)
             removeResource(gMasks);
+        if (gSideMasks)
+            removeResource(gSideMasks);
         if (gDecalMasks)
             removeResource(gDecalMasks);
         gMaskBytes = bytes + bytes / 4;
         gDecalMaskBytes = decalBytes + decalBytes / 4;
         gMasks = makeBuffer(gMaskBytes, 4, DESCRIPTOR_TYPE_BUFFER | DESCRIPTOR_TYPE_RW_BUFFER, RESOURCE_MEMORY_USAGE_GPU_ONLY,
                             RESOURCE_STATE_SHADER_RESOURCE, "renderer_tile_masks");
+        gSideMasks = makeBuffer(gMaskBytes, 4, DESCRIPTOR_TYPE_BUFFER | DESCRIPTOR_TYPE_RW_BUFFER, RESOURCE_MEMORY_USAGE_GPU_ONLY,
+                                RESOURCE_STATE_SHADER_RESOURCE, "renderer_side_masks");
         gDecalMasks = makeBuffer(gDecalMaskBytes, 4, DESCRIPTOR_TYPE_BUFFER | DESCRIPTOR_TYPE_RW_BUFFER, RESOURCE_MEMORY_USAGE_GPU_ONLY,
                                  RESOURCE_STATE_SHADER_RESOURCE, "renderer_decal_masks");
         waitForAllResourceLoads();
         gMaskState = RESOURCE_STATE_SHADER_RESOURCE;
-        if (!gMasks || !gDecalMasks)
+        if (!gMasks || !gSideMasks || !gDecalMasks)
         {
             gMaskBytes = gDecalMaskBytes = 0;
             return false;
@@ -284,6 +290,7 @@ bool cull_prepare(uint64_t address)
     cd->counts[2] = decals;
 
     F->tileMasks = gMasks;
+    F->sideMasks = gSideMasks;
     F->zbins = gBins[F->frameIndex];
     F->tileSize = ts;
     F->tilesX = tilesX;
@@ -306,7 +313,7 @@ void cull_run(uint64_t address)
     if (!gReady || !F || F->tileMasks != gMasks)
         return;
     Cmd* cmd = F->cmd;
-    DescriptorData p[6] = {};
+    DescriptorData p[7] = {};
     p[0].mIndex = SRT_RES_IDX(CullSrt, PerFrame, gCull);
     p[0].ppBuffers = &gCb[F->frameIndex];
     p[1].mIndex = SRT_RES_IDX(CullSrt, PerFrame, gLights);
@@ -319,17 +326,21 @@ void cull_run(uint64_t address)
     p[4].ppBuffers = &gDecalSpheres;
     p[5].mIndex = SRT_RES_IDX(CullSrt, PerFrame, gDecalMasks);
     p[5].ppBuffers = &gDecalMasks;
-    updateDescriptorSet(gRenderer, F->frameIndex, gSet, 6, p);
+    p[6].mIndex = SRT_RES_IDX(CullSrt, PerFrame, gSideMasks);
+    p[6].ppBuffers = &gSideMasks;
+    updateDescriptorSet(gRenderer, F->frameIndex, gSet, 7, p);
 
     cmdBeginDebugMarker(cmd, 0.3f, 1.0f, 0.5f, "Renderer light culling");
-    BufferBarrier b[2] = { { gMasks, gMaskState, RESOURCE_STATE_UNORDERED_ACCESS }, { gDecalMasks, gMaskState, RESOURCE_STATE_UNORDERED_ACCESS } };
-    cmdResourceBarrier(cmd, 2, b, 0, nullptr, 0, nullptr);
+    BufferBarrier b[3] = { { gMasks, gMaskState, RESOURCE_STATE_UNORDERED_ACCESS }, { gDecalMasks, gMaskState, RESOURCE_STATE_UNORDERED_ACCESS },
+                           { gSideMasks, gMaskState, RESOURCE_STATE_UNORDERED_ACCESS } };
+    cmdResourceBarrier(cmd, 3, b, 0, nullptr, 0, nullptr);
     cmdBindPipeline(cmd, gPipe[sampleIndex(F->sampleCount)]);
     cmdBindDescriptorSet(cmd, F->frameIndex, gSet);
     cmdDispatch(cmd, F->tilesX, F->tilesY, 1);
     b[0] = { gMasks, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE };
     b[1] = { gDecalMasks, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE };
-    cmdResourceBarrier(cmd, 2, b, 0, nullptr, 0, nullptr);
+    b[2] = { gSideMasks, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE };
+    cmdResourceBarrier(cmd, 3, b, 0, nullptr, 0, nullptr);
     gMaskState = RESOURCE_STATE_SHADER_RESOURCE;
     cmdEndDebugMarker(cmd);
 }

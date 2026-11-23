@@ -1,7 +1,8 @@
 // One group per screen tile: the tile's depth range from the prepass (sky pixels left out), then
 // every light's sphere against the tile's four side planes and depth range, into a bitmask
 // (Drobot 2017). The pixel shader ANDs it with its Z-bin's light range. The core's decals the same way, into their own
-// DECAL_WORDS words a tile.
+// DECAL_WORDS words a tile. A second mask by the side planes alone (past the near plane), sky tiles too, for surfaces in
+// front of the opaque depth (glass), which the depth range leaves out.
 #define MAX_WORDS 128u
 #define DECAL_WORDS 8u
 
@@ -27,6 +28,7 @@ STRUCT(CullLight)
 GroupShared(uint, gsMinDepth);
 GroupShared(uint, gsMaxDepth);
 GroupShared(uint, gsMask[MAX_WORDS]);
+GroupShared(uint, gsSide[MAX_WORDS]);
 GroupShared(uint, gsDecal[DECAL_WORDS]);
 
 ROOT_SIGNATURE(ComputeRootSignature)
@@ -42,7 +44,10 @@ void CS_MAIN(SV_GroupID(uint3) gid, SV_GroupThreadID(uint3) tid, SV_GroupIndex(u
         gsMaxDepth = 0u;
     }
     for (uint w = gi; w < words; w += 256u)
+    {
         gsMask[w] = 0u;
+        gsSide[w] = 0u;
+    }
     if (gi < DECAL_WORDS)
         gsDecal[gi] = 0u;
     GroupMemoryBarrier();
@@ -82,35 +87,37 @@ void CS_MAIN(SV_GroupID(uint3) gid, SV_GroupThreadID(uint3) tid, SV_GroupIndex(u
     }
     GroupMemoryBarrier();
 
-    if (gsMaxDepth != 0u)
+    // The tile's four side planes (through the camera); its depth range only where it has opaque pixels.
+    bool   opaque = gsMaxDepth != 0u;
+    float  near = gCull.proj.z;
+    float  zNear = opaque ? near / asfloat(gsMaxDepth) : 0.0;
+    float  zFar = opaque ? near / max(asfloat(gsMinDepth), 1e-7) : 0.0;
+    float2 size = float2(gCull.size.xy);
+    float  x0 = float(gid.x * ts) / size.x * 2.0 - 1.0;
+    float  x1 = float(min((gid.x + 1u) * ts, gCull.size.x)) / size.x * 2.0 - 1.0;
+    float  yTop = 1.0 - float(gid.y * ts) / size.y * 2.0;
+    float  yBot = 1.0 - float(min((gid.y + 1u) * ts, gCull.size.y)) / size.y * 2.0;
+    float  p00 = gCull.proj.x;
+    float  p11 = gCull.proj.y;
+    float3 nl = normalize(float3(p00, 0.0, -x0));
+    float3 nr = normalize(float3(-p00, 0.0, x1));
+    float3 nb = normalize(float3(0.0, p11, -yBot));
+    float3 nt = normalize(float3(0.0, -p11, yTop));
+    for (uint i = gi; i < gCull.counts.x; i += 256u)
     {
-        float near = gCull.proj.z;
-        float zNear = near / asfloat(gsMaxDepth);
-        float zFar = near / max(asfloat(gsMinDepth), 1e-7);
-        float2 size = float2(gCull.size.xy);
-        float x0 = float(gid.x * ts) / size.x * 2.0 - 1.0;
-        float x1 = float(min((gid.x + 1u) * ts, gCull.size.x)) / size.x * 2.0 - 1.0;
-        float yTop = 1.0 - float(gid.y * ts) / size.y * 2.0;
-        float yBot = 1.0 - float(min((gid.y + 1u) * ts, gCull.size.y)) / size.y * 2.0;
-        float p00 = gCull.proj.x;
-        float p11 = gCull.proj.y;
-        float3 nl = normalize(float3(p00, 0.0, -x0));
-        float3 nr = normalize(float3(-p00, 0.0, x1));
-        float3 nb = normalize(float3(0.0, p11, -yBot));
-        float3 nt = normalize(float3(0.0, -p11, yTop));
-        for (uint i = gi; i < gCull.counts.x; i += 256u)
-        {
-            float4 sp = gLights[i].sphere;
-            float4 wc = float4(sp.xyz, 1.0);
-            float3 c = float3(dot(gCull.view[0], wc), dot(gCull.view[1], wc), dot(gCull.view[2], wc));
-            float  r = sp.w;
-            if (c.z + r < zNear || c.z - r > zFar)
-                continue;
-            if (dot(nl, c) < -r || dot(nr, c) < -r || dot(nb, c) < -r || dot(nt, c) < -r)
-                continue;
-            uint prev;
+        float4 sp = gLights[i].sphere;
+        float4 wc = float4(sp.xyz, 1.0);
+        float3 c = float3(dot(gCull.view[0], wc), dot(gCull.view[1], wc), dot(gCull.view[2], wc));
+        float  r = sp.w;
+        if (c.z + r < near || dot(nl, c) < -r || dot(nr, c) < -r || dot(nb, c) < -r || dot(nt, c) < -r)
+            continue;
+        uint prev;
+        AtomicOr(gsSide[i >> 5], 1u << (i & 31u), prev);
+        if (opaque && c.z + r >= zNear && c.z - r <= zFar)
             AtomicOr(gsMask[i >> 5], 1u << (i & 31u), prev);
-        }
+    }
+    if (opaque)
+    {
         for (uint k = gi; k < gCull.counts.z; k += 256u)
         {
             float4 sp = gDecals[k];
@@ -129,7 +136,10 @@ void CS_MAIN(SV_GroupID(uint3) gid, SV_GroupThreadID(uint3) tid, SV_GroupIndex(u
 
     uint base = (gid.y * gCull.size.w + gid.x) * words;
     for (uint w2 = gi; w2 < words; w2 += 256u)
+    {
         gTileMasks[base + w2] = gsMask[w2];
+        gSideMasks[base + w2] = gsSide[w2];
+    }
     if (gi < DECAL_WORDS)
         gDecalMasks[(gid.y * gCull.size.w + gid.x) * DECAL_WORDS + gi] = gsDecal[gi];
     RETURN();

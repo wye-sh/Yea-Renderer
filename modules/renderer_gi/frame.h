@@ -10,7 +10,7 @@ struct Buffer;
 struct RenderTarget;
 struct Texture;
 
-#define RENDER_FRAME_VERSION 26u
+#define RENDER_FRAME_VERSION 27u
 #define RENDER_RT_MAX_TRACED 8u
 #define RENDER_MAX_CASCADES  4u
 #define RENDER_MAX_TEXTURES  1024u // texture maps the shaders' array holds (the core's Texture table)
@@ -427,5 +427,10 @@ struct RenderFrame
     RenderTarget* tintDepth;
     RenderTarget* tintColor;
     Buffer*       shadowTints;
+    // Out from renderer_culling (frame v27): the lights by the screen tiles' sides alone, for surfaces in front of the
+    // opaque scene (glass), which tileMasks' depth ranges leave out: u32[tilesX * tilesY * wordsPerTile] as tileMasks, a
+    // light's bit set where its sphere reaches the tile's four side planes past the near plane, sky tiles too. ANDed with
+    // the z-bin's range as tileMasks are. SHADER_RESOURCE after cull_run; set whenever tileMasks is.
+    Buffer*       sideMasks;
 };
 #define RENDER_RT_MISS 60000.0f

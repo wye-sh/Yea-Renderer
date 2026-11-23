@@ -11,7 +11,8 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   tonemap, composite. Code: `renderer.cpp` (frame), `scene.cpp` (exports), `textures.cpp` (texture maps), `Shaders/`
   (`Material.h.fsl`: the maps, shared by every pass that shades materials or clips cut-outs).
 - `renderer_culling`: Z-bins (CPU, lights sorted by view depth) and per-tile light bitmasks (compute,
-  tile depth range from the prepass). Switch off: every pixel loops all visible lights (capped at 256). The core's
+  tile depth range from the prepass), plus `sideMasks` (frame v27): the same by the tiles' side planes alone, sky tiles
+  too, for see-through surfaces. Switch off: every pixel loops all visible lights (capped at 256). The core's
   decals (frame v23 `decalSpheres`, in paint order) are binned the same way into `decalMasks` (8 words a tile) and
   `decalBins`; without culling the forward pass tries every decal in view.
 - See-through surfaces (the core, frame v23): `material_blend(m, opacity)` (Table `MaterialBlend`; GpuMaterialMap
@@ -21,7 +22,7 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   T = (1 - coverage)(1 - the specular's directional albedo) per channel, then add its own light; the Forge has no
   dual-source blending), a double-sided one's far side first. Lit as every surface (Forward.frag TRANSLUCENT: no AO,
   contact, traced shadows or traced reflections, which are the opaque scene's pixels; maps kept via keepShadowMaps;
-  lights from the z-bin alone), fog and aerial perspective kept exact (f(c) - T f(0)). With one sample a pixel they draw
+  lights from `sideMasks` ANDed with the z-bin, as tileMasks for opaque ones), fog and aerial perspective kept exact (f(c) - T f(0)). With one sample a pixel they draw
   in the see-through pass after the forward pass (timed "see-through"; BLEND_PASS: no depth target, the depth test
   against gSceneDepth in the shader) into hdr, `reactive` and `transparency` (R8, max-blended coverage; frame
   `reactive` is now the core's, particles and glass, `transparency` glass alone, for DLSS `transparency` and FSR's

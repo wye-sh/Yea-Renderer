@@ -3074,7 +3074,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     F.decalItems = gWorldCount ? gDecalItemBuf[fi] : nullptr;
     memcpy(F.decalGrid, gDecalGrid, sizeof F.decalGrid);
     F.decalsChanged = gDecalsChanged;
-    bool culled = (gOk.culling ? renderer_culling::cull_prepare((uint64_t)(uintptr_t)&F) : false) && F.tileMasks && F.zbins && F.wordsPerTile;
+    bool culled = (gOk.culling ? renderer_culling::cull_prepare((uint64_t)(uintptr_t)&F) : false) && F.tileMasks && F.sideMasks && F.zbins && F.wordsPerTile;
     // Decals need culling's bins with it; without culling the forward pass tries every one.
     const bool decals = decalCount && (!culled || (F.decalMasks && F.decalBins));
     if (!culled && F.lightCount > kMaxUnculledLights)
@@ -3450,9 +3450,10 @@ void draw(uint32_t pass, const YeaFrame* yf)
         Texture* sun = shadows ? F.sunAtlas->pTexture : gDummyDepth->pTexture;
         Texture* local = shadows ? F.localAtlas->pTexture : gDummyDepth->pTexture;
         Buffer*  masks = culled ? F.tileMasks : gDummyU32;
+        Buffer*  sideMasks = culled ? F.sideMasks : gDummyU32;
         Buffer*  bins = culled ? F.zbins : gDummyU32;
         Buffer*  views = shadows ? F.shadowViews : gDummyViews;
-        DescriptorData p[41] = {};
+        DescriptorData p[42] = {};
         Texture*       ssrDepth = ssr ? F.ssrDepth : gDummyDepth->pTexture;
         Texture*       previous = ssr ? F.previous->pTexture : gDummyColor->pTexture;
         Texture*       probeTex = probes ? F.probes->pTexture : gDummyArray->pTexture;
@@ -3561,14 +3562,16 @@ void draw(uint32_t pass, const YeaFrame* yf)
         p[38].ppTextures = &tintDepth;
         p[39].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gTintColor);
         p[39].ppTextures = &tintColor;
-        uint32_t bindings = 40;
+        p[40].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gSideMasks);
+        p[40].ppBuffers = &sideMasks;
+        uint32_t bindings = 41;
         if (gTexturesBound[fi] != F.textureVersion)
         {
-            p[40].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gTextures);
-            p[40].ppTextures = (Texture**)F.textures;
-            p[40].mCount = RENDER_MAX_TEXTURES;
+            p[41].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gTextures);
+            p[41].ppTextures = (Texture**)F.textures;
+            p[41].mCount = RENDER_MAX_TEXTURES;
             gTexturesBound[fi] = F.textureVersion;
-            bindings = 41;
+            bindings = 42;
         }
         updateDescriptorSet(gRenderer, fi, gSceneFrame, bindings, p);
 

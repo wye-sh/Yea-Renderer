@@ -649,20 +649,10 @@ float4 PS_MAIN(VSOutput In)
 
     // Local lights.
     uint lightCount = 0u;
-#ifdef TRANSLUCENT
     if ((gFrame.counts.z & FLAG_CULLED) != 0u)
     {
-        // The depth bin alone: the screen tiles' depth ranges end at the opaque scene, which this surface is in front of.
-        uint bin = gZBins[min(uint(max(viewZ, 0.0) * gFrame.misc.x), gFrame.tiles.w - 1u)];
-        uint last = min(bin >> 16, gFrame.counts.x - 1u);
-        for (uint k = bin & 0xFFFFu; k <= last && gFrame.counts.x > 0u; ++k)
-            color += shadeLocalLight(k, s, color);
-    }
-    else if (false)
-#else
-    if ((gFrame.counts.z & FLAG_CULLED) != 0u)
-#endif
-    {
+        // See-through surfaces take renderer_culling's masks by the tiles' sides alone: the depth ranges of tileMasks end
+        // at the opaque scene, which they are in front of.
         uint binIndex = min(uint(max(viewZ, 0.0) * gFrame.misc.x), gFrame.tiles.w - 1u);
         uint bin = gZBins[binIndex];
         uint first = bin & 0xFFFFu;
@@ -675,7 +665,11 @@ float4 PS_MAIN(VSOutput In)
             uint  w1 = last >> 5;
             for (uint w = w0; w <= w1; ++w)
             {
+#ifdef TRANSLUCENT
+                uint mask = gSideMasks[base + w];
+#else
                 uint mask = gTileMasks[base + w];
+#endif
                 uint lo = w == w0 ? (first & 31u) : 0u;
                 uint hi = w == w1 ? (last & 31u) : 31u;
                 mask &= (0xFFFFFFFFu << lo) & (0xFFFFFFFFu >> (31u - hi));

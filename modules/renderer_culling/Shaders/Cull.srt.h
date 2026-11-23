@@ -12,5 +12,6 @@ BEGIN_SRT(CullSrt)
         DECL_RWBUFFER(PerFrame, RWBuffer(uint), gTileMasks)
         DECL_BUFFER(PerFrame, Buffer(float4), gDecals)         // the core's decals' spheres (frame.h decalSphereBuffer)
         DECL_RWBUFFER(PerFrame, RWBuffer(uint), gDecalMasks)   // DECAL_WORDS a tile
+        DECL_RWBUFFER(PerFrame, RWBuffer(uint), gSideMasks)    // as gTileMasks, by the tile's sides alone (glass)
     END_SRT_SET(PerFrame)
 END_SRT(CullSrt)
