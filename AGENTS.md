@@ -113,8 +113,8 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   directions kept in an RGBA16F half-size texture), each turned towards its hit from this pixel and weighted by this
   pixel's GGX lobe over the ray's own sampling probability (Stachowiak 2015's ray reuse), by depth and normal match and
   by inverse brightness (pixels no ray fits are traced there). One full-size resolve then accumulates the reflections
-  over frames (two RGBA16F histories plus RG16F view depth and samples held, alternating, kept only where alpha > 0;
-  `rtReflection` is this frame's): history reprojected from the pixel's centre (not its jittered sample) by the
+  over frames (two RGBA16F histories, alpha the hit distance averaged as the colour is, plus RG16F view depth and
+  samples held, alternating, kept only where alpha > 0): history reprojected from the pixel's centre (not its jittered sample) by the
   reflection's virtual image (smooth) or the surface (rough), dropped where the surface's depth doesn't match,
   clipped to the neighbourhood's spread in YCoCg (at half resolution, of the 5x5 traced rays around), blended in
   compressed colour at 1/samples: up to `history_frames` (full from roughness 0.125, 4 on moving things, less on
@@ -130,6 +130,13 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   leaves about 1% that fades over its 128 frames). Each pixel's n-th sample is a hash of its position (interleaved
   gradient noise lined up into diagonal streaks) plus R2's exact n-th point, n the frames it is traced (a
   half-resolution pixel's frame number / 4: the frame number % 64 gave it every fourth R2 point, a third of its lobe).
+  Then a full-size filter writes `rtReflection` (the trace's texture, free by then; the histories stay unfiltered, so
+  nothing is filtered twice or trails): each glossy pixel above `full_below` averaged over its gloss footprint (hit
+  distance x roughness² / (eye to surface + hit distance), capped at 1.5 px: up to 5x5 taps) by a fixed Gaussian,
+  weighted by plane, normal within the lobe, roughness and hit distance; mirror-like pixels copied (3.10.3: where a
+  pixel's rays fall either side of a bright edge in what is reflected, its settled history was off by a fixed amount
+  of its own, a frozen grain; on a glossy close-up it halved, below what one ray a frame accumulated without limit
+  gives. Larger radii blurred small reflected highlights for no less grain).
   Without the accumulation, 1 spp reflections flickered (fireflies). The trace marks each 8x8 tile holding a pixel below
   `max_roughness` (`gTiles`, flag sets double-buffered so no thread reads a flag another rewrites); the resolve skips
   the rest and writes their zeros only when the history there isn't zero already. Every GPU object is freed
@@ -325,7 +332,7 @@ resolution plus 6 small passes per mip, sun cascades whose view or casters chang
 exposure dispatches, with ray-traced reflections (instead of the SSR depth copy and march) one top-level
 rebuild, a trace dispatch (a closest-hit ray per glossy pixel, a quarter of them with half_resolution except
 mirror-like ones; where the hit isn't on screen a shadow map lookup per lit light with a map, a ray for the sun and for mapless casters), with half_resolution a
-full-size reconstruction (nine rays reused per glossy pixel) and a full-size resolve (temporal accumulation; tiles with no glossy pixel cost a read or two), one full-screen TAA resolve (when on; with an upscaler, its dispatch at the display size and a one-thread
+full-size reconstruction (nine rays reused per glossy pixel) a full-size resolve (temporal accumulation; tiles with no glossy pixel cost a read or two) and a full-size filter (up to 25 taps per glossy pixel, a write elsewhere), one full-screen TAA resolve (when on; with an upscaler, its dispatch at the display size and a one-thread
 exposure copy instead, every scene pass then at the render size), one full-screen composite. The Model Viewer's preview costs
 nothing unless its panel is open and showing a model: then, per frame, one 1024² shadow map pass and one 4-sample pass of
 that model at twice the canvas size, and a resolve (about 6 MB of targets at a 520 × 320 canvas). No per-frame allocation. GPU memory at the defaults:

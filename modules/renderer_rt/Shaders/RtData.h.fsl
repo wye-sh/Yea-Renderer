@@ -27,6 +27,8 @@ STRUCT(RtData)
                                      // y normal bias (texels), z 1 / atlas size, w light size for contact-hardening (0: off)
     DATA(uint4, shadowMode, None);   // x filter taps, y how hits are shadowed (SHADOWS_*), z receiver-plane bias,
                                      // w 1 when the atlas is drawn this frame
+    DATA(float4, denoise, None);     // the filter: x footprint scale, y largest radius (px), z roughness at or below
+                                     // which pixels are copied (full_below: mirror-like)
     DATA(float4, taps[32], None);    // xy: the filters' Vogel disk, unturned (as the core's)
     DATA(uint4, probe, None);        // TEMPORARY (probe_rays): x shadow rays per pixel to measure, 0 none
 };
