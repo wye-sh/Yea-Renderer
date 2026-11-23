@@ -68,7 +68,11 @@ const uint32_t kMaxFrames = 4;
 const uint32_t kMaxMeshes = 1024;
 const uint32_t kMaxRetired = 256;
 const uint32_t kMaxInstances = 65536; // the core's Instance table
-const uint32_t kFlagScreen = 1, kFlagDebug = 4, kFlagMaps = 8;
+const uint32_t kFlagScreen = 1, kFlagDebug = 4, kFlagMaps = 8, kFlagGlass = 16;
+// gRtInstances' w (Shaders/Cutout.h.fsl): the material + 1 in its low bits, and flags.
+const uint32_t kInstCut = 0x20000000u, kInstTwoSided = 0x40000000u, kInstGlass = 0x80000000u;
+// Instance masks (Shaders/Trace.comp.fsl): 1 seen in reflections, 2 casts shadows (glass too), 4 opaque and casts (GI).
+const uint8_t kMaskReflected = 1, kMaskCasts = 2, kMaskGi = 4;
 // How hits are shadowed (Trace.comp.fsl SHADOWS_*): as the scene, rays for every light, none.
 enum { kShadowsScene, kShadowsRays, kShadowsOff };
 
@@ -132,6 +136,15 @@ Texture*       gShHist[2];  // RG16F arrays: accumulated (visibility, blocker di
 Texture*       gShN[2];     // R16F arrays: the samples each holds
 Texture*       gShZ[2];     // R32F: the view depth they were for
 Texture*       gRtShadows;  // R16F array: this frame's rays (the blocker's distance, 0 lit), then rtShadows
+// Glass in them (frame rtShadowTint, Shadows.comp.fsl): made once some glass casts a traced shadow, at their size.
+Texture*       gShTint;        // RGBA16F array: this frame's rays' colour through glass (a: the nearest layer), then rtShadowTint
+Texture*       gShTintHist[2]; // RGBA16F arrays: accumulated (rgb over the unblocked rays, a the layer's distance)
+Texture*       gNoTint[2];     // 2 x 2 x 2 stand-ins bound without glass: [0] read (SHADER_RESOURCE), [1] written (UNORDERED_ACCESS)
+Buffer*        gNoRefraction;  // and for frame refraction (two float4) and dfg (float2) while the frame has none
+Buffer*        gNoDfg;
+bool           gTintNow;       // rt_prepare: glass casts traced shadows this frame
+bool           gGlassNow;      // rt_prepare: glass is in this frame's top-level structure
+uint64_t       gTintFrame;     // the frame the tint history was written (0: none)
 uint32_t       gShWidth, gShHeight, gShLayers; // the arrays' size: layers the sun and traced_lights
 uint32_t       gShIndex;    // the history written last
 uint64_t       gShFrame;    // the frame it was written (0: none)
@@ -225,7 +238,8 @@ Texture* makeTexture(uint32_t w, uint32_t h, const char* name, TinyImageFormat f
     return t;
 }
 
-Texture* makeArray(uint32_t w, uint32_t h, uint32_t layers, TinyImageFormat format, const char* name)
+Texture* makeArray(uint32_t w, uint32_t h, uint32_t layers, TinyImageFormat format, const char* name,
+                   ResourceState state = RESOURCE_STATE_SHADER_RESOURCE)
 {
     Texture*    t = nullptr;
     TextureDesc d = {};
@@ -235,7 +249,7 @@ Texture* makeArray(uint32_t w, uint32_t h, uint32_t layers, TinyImageFormat form
     d.mArraySize = layers;
     d.mSampleCount = SAMPLE_COUNT_1;
     d.mFormat = format;
-    d.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+    d.mStartState = state;
     d.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
     d.pName = name;
     TextureLoadDesc l = {};
@@ -248,7 +262,7 @@ Texture* makeArray(uint32_t w, uint32_t h, uint32_t layers, TinyImageFormat form
 
 void freeShadowTextures()
 {
-    Texture** all[7] = { &gShHist[0], &gShHist[1], &gShN[0], &gShN[1], &gShZ[0], &gShZ[1], &gRtShadows };
+    Texture** all[10] = { &gShHist[0], &gShHist[1], &gShN[0], &gShN[1], &gShZ[0], &gShZ[1], &gRtShadows, &gShTint, &gShTintHist[0], &gShTintHist[1] };
     for (Texture** t : all)
     {
         if (*t)
@@ -258,6 +272,27 @@ void freeShadowTextures()
     gShWidth = gShHeight = gShLayers = 0;
     gShFrame = 0;
     gShIdCount = 0;
+    gTintFrame = 0;
+}
+
+// The glass colour's textures, at the shadows' size (24 bytes a pixel a traced shadow): false when they couldn't be made.
+bool createTintTextures()
+{
+    if (gShTint)
+        return true;
+    gShTint = makeArray(gShWidth, gShHeight, gShLayers, TinyImageFormat_R16G16B16A16_SFLOAT, "renderer_rt_shadow_tint");
+    gShTintHist[0] = makeArray(gShWidth, gShHeight, gShLayers, TinyImageFormat_R16G16B16A16_SFLOAT, "renderer_rt_shadow_tint_history");
+    gShTintHist[1] = makeArray(gShWidth, gShHeight, gShLayers, TinyImageFormat_R16G16B16A16_SFLOAT, "renderer_rt_shadow_tint_history");
+    if (gShTint && gShTintHist[0] && gShTintHist[1])
+        return true;
+    Texture** all[3] = { &gShTint, &gShTintHist[0], &gShTintHist[1] };
+    for (Texture** t : all)
+    {
+        if (*t)
+            removeResource(*t);
+        *t = nullptr;
+    }
+    return false;
 }
 
 // Formats as the shaders' views: RWTex2DArray(half2) is rg16f on Vulkan, half4 rgba16f, half r16f; RWTex2D(float) r32f.
@@ -484,14 +519,21 @@ DynamicBlas* dynamicBlas(const RenderFrame* F, const RenderCaster& c, uint32_t& 
     return e;
 }
 
-// Every skinned caster's structure for this frame: the refits first, then the builds, each timed.
-void skinnedBlas(RenderFrame* F, uint32_t casters)
+// Caster i of this frame's instances: the drawables, then (glass) the see-through ones.
+const RenderCaster& casterAt(const RenderFrame* F, uint32_t drawables, uint32_t i)
+{
+    return i < drawables ? F->drawables[i] : F->seeThrough[i - drawables];
+}
+
+// Every skinned caster's structure for this frame (the first `drawables` of `casters` drawables, the rest glass): the
+// refits first, then the builds, each timed.
+void skinnedBlas(RenderFrame* F, uint32_t drawables, uint32_t casters)
 {
     Cmd*           cmd = F->cmd;
     const uint32_t fi = F->frameIndex;
     uint32_t       builds = 0, skinned = 0;
     for (uint32_t i = 0; i < casters; ++i)
-        skinned += F->drawables[i].dynamic ? 1u : 0u;
+        skinned += casterAt(F, drawables, i).dynamic ? 1u : 0u;
     gSkinInstances = skinned;
     if (!skinned)
         return;
@@ -502,7 +544,7 @@ void skinnedBlas(RenderFrame* F, uint32_t casters)
     }
     for (uint32_t i = 0; i < casters; ++i)
     {
-        const RenderCaster& c = F->drawables[i];
+        const RenderCaster& c = casterAt(F, drawables, i);
         if (c.dynamic && c.mesh < kMaxMeshes && c.indexCount && c.vertexCount)
             dynamicBlas(F, c, builds);
     }
@@ -759,10 +801,19 @@ int load(int reloaded)
     for (uint32_t i = 0; i < gFrames; ++i)
         gShCb[i] = makeMapped(sizeof(ShadowData) < 256 ? 256 : (sizeof(ShadowData) + 255) / 256 * 256, 0, DESCRIPTOR_TYPE_UNIFORM_BUFFER,
                               "renderer_rt_shadow_cb");
+    gNoTint[0] = makeArray(2, 2, 2, TinyImageFormat_R16G16B16A16_SFLOAT, "renderer_rt_no_tint");
+    gNoTint[1] = makeArray(2, 2, 2, TinyImageFormat_R16G16B16A16_SFLOAT, "renderer_rt_no_tint_rw", RESOURCE_STATE_UNORDERED_ACCESS);
+    gNoRefraction = makeMapped(2 * 16, 16, DESCRIPTOR_TYPE_BUFFER, "renderer_rt_no_refraction");
+    gNoDfg = makeMapped(2 * 8, 8, DESCRIPTOR_TYPE_BUFFER, "renderer_rt_no_dfg");
+    if (gNoRefraction)
+        memset(gNoRefraction->pCpuMappedAddress, 0, 2 * 16);
+    if (gNoDfg)
+        memset(gNoDfg->pCpuMappedAddress, 0, 2 * 8);
     gNoShapes = makeMapped(sizeof(RenderGpuLightShape) * 4, sizeof(RenderGpuLightShape), DESCRIPTOR_TYPE_BUFFER, "renderer_rt_no_shapes");
     if (gNoShapes)
         memset(gNoShapes->pCpuMappedAddress, 0, sizeof(RenderGpuLightShape) * 4);
-    gReady = gSet != nullptr && gGiSet != nullptr && gShSet != nullptr && gNoShapes != nullptr;
+    gReady = gSet != nullptr && gGiSet != nullptr && gShSet != nullptr && gNoShapes != nullptr && gNoTint[0] && gNoTint[1] && gNoRefraction &&
+             gNoDfg;
     yea::log(gReady ? "renderer_rt: ray-traced reflections on" : "renderer_rt: the trace pipeline failed");
     return gReady ? 0 : 1;
 }
@@ -803,6 +854,17 @@ void unload()
     }
     if (gShSet)
         removeDescriptorSet(gRenderer, gShSet);
+    for (Texture*& t : gNoTint)
+    {
+        if (t)
+            removeResource(t);
+        t = nullptr;
+    }
+    if (gNoRefraction)
+        removeResource(gNoRefraction);
+    if (gNoDfg)
+        removeResource(gNoDfg);
+    gNoRefraction = gNoDfg = nullptr;
     if (gNoShapes)
         removeResource(gNoShapes);
     gShSet = nullptr;
@@ -920,10 +982,19 @@ uint32_t giAcross(uint32_t rays)
     return groups <= 65535 ? groups : 4096;
 }
 
+// Glass (frame seeThrough) goes in the top-level structure: with the maps, refraction and dfg its layers are read by.
+bool glassInRays(const RenderFrame* F)
+{
+    return F->seeThrough && F->seeThroughCount && F->materialMaps && F->textures && F->refraction && F->dfg;
+}
+
 bool rt_prepare(uint64_t address)
 {
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
     bool shadows = gPickCount && F && gPickFrame == F->frameNumber;
+    gTintNow = gGlassNow = false;
+    if (F && F->version == RENDER_FRAME_VERSION)
+        F->rtShadowTint = nullptr;
     bool gi = F && F->version == RENDER_FRAME_VERSION && F->giProbeCount && F->giRaysPerProbe && F->giProbeData && F->giRayOut;
     if (!gReady || (!settings.enabled && !shadows && !gi) || !F || F->version != RENDER_FRAME_VERSION || !F->width || !F->height || !F->taaOn)
         return false;
@@ -980,8 +1051,19 @@ bool rt_prepare(uint64_t address)
     memcpy(d.fogAlbedo, F->fogAlbedo, sizeof d.fogAlbedo);
     d.counts[0] = F->allLightCount;
     d.counts[1] = (uint32_t)F->frameNumber;
+    const bool glass = glassInRays(F);
+    gGlassNow = glass;
     d.counts[2] = (settings.screen_colors ? kFlagScreen : 0) | (settings.show_hits ? kFlagDebug : 0) |
-                  (F->materialMaps && F->textures ? kFlagMaps : 0);
+                  (F->materialMaps && F->textures ? kFlagMaps : 0) | (glass ? kFlagGlass : 0);
+    // Traced shadows tinted by glass: set now, beside rtShadows (the core binds it before rt_run fills it).
+    if (glass && shadows && F->rtShadows && F->rtShadows == gRtShadows)
+    {
+        bool casts = false;
+        for (uint32_t i = 0; i < F->seeThroughCount && !casts; ++i)
+            casts = F->seeThrough[i].castShadow != 0;
+        gTintNow = casts && createTintTextures();
+        F->rtShadowTint = gTintNow ? gShTint : nullptr;
+    }
     // Hits are shadowed as the scene is: from the local lights' maps (the same filter, normal bias and
     // contact-hardening as the forward pass), a ray where a light casts but has no map, a ray for the sun. When the
     // scene gains a ray-traced shadow mode, picking it here (kShadowsRays) is all reflections need.
@@ -1087,6 +1169,9 @@ void traceShadows(RenderFrame* F, Cmd* cmd, uint32_t fi)
     d.misc[0] = (uint32_t)F->frameNumber;
     d.misc[1] = gPickCount;
     d.misc[2] = gShFrame && gShFrame + 1 == F->frameNumber ? 0 : 1;
+    // Glass's colour (rt_prepare set rtShadowTint): its history only when it was written last frame too.
+    const bool tint = gTintNow && F->rtShadowTint == gShTint && gShTint;
+    d.misc[3] = tint ? 1u | (gTintFrame && gTintFrame + 1 == F->frameNumber ? 2u : 0u) : 0u;
     // Each shadow's history: the layer that held the same light last frame, if any.
     for (uint32_t s = 0; s < gPickCount; ++s)
     {
@@ -1105,7 +1190,7 @@ void traceShadows(RenderFrame* F, Cmd* cmd, uint32_t fi)
     Texture* depth = F->depth->pTexture;
     Texture* surface = F->surface->pTexture;
     Texture* motion = F->motion->pTexture;
-    DescriptorData p[19] = {};
+    DescriptorData p[28] = {};
     p[0].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gScene);
     p[0].ppAccelerationStructures = &gTlas[fi];
     p[1].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gSd);
@@ -1147,13 +1232,42 @@ void traceShadows(RenderFrame* F, Cmd* cmd, uint32_t fi)
     p[17].ppBuffers = &indices;
     p[18].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gAttributes);
     p[18].ppBuffers = &attributes;
-    updateDescriptorSet(gRenderer, fi * 3, gShSet, 19, p);
+    // Glass (Hit.h.fsl) and its colour: stand-ins without it.
+    Buffer*  instances = F->instances;
+    Buffer*  materials = F->materials;
+    Buffer*  refraction = tint ? F->refraction : gNoRefraction;
+    Buffer*  dfg = tint ? F->dfg : gNoDfg;
+    Texture* tintRays = tint ? gShTint : gNoTint[1];
+    Texture* tintRead = tint ? gShTint : gNoTint[0];
+    Texture* tintLast = tint ? gShTintHist[w ^ 1] : gNoTint[0];
+    Texture* tintNow = tint ? gShTintHist[w] : gNoTint[1];
+    p[19].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gInstances);
+    p[19].ppBuffers = &instances;
+    p[20].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gMaterials);
+    p[20].ppBuffers = &materials;
+    p[21].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gRefraction);
+    p[21].ppBuffers = &refraction;
+    p[22].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gDfg);
+    p[22].ppBuffers = &dfg;
+    p[23].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gTintRawOut);
+    p[23].ppTextures = &tintRays;
+    p[24].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gTintRaw);
+    p[24].ppTextures = &tintRead;
+    p[25].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gTintHistory);
+    p[25].ppTextures = &tintLast;
+    p[26].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gTintHistoryOut);
+    p[26].ppTextures = &tintNow;
+    p[27].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gTintFinal);
+    p[27].ppTextures = &tintRays;
+    updateDescriptorSet(gRenderer, fi * 3, gShSet, 28, p);
     bindCutouts(F, gShSet, fi * 3, kMaxFrames * 4 + fi * 3, SRT_RES_IDX(ShadowSrt, PerFrame, gMaterialMaps),
                 SRT_RES_IDX(ShadowSrt, PerFrame, gTextures));
-    updateDescriptorSet(gRenderer, fi * 3 + 1, gShSet, 16, p);
+    updateDescriptorSet(gRenderer, fi * 3 + 1, gShSet, 28, p);
     p[9].ppTextures = &gShHist[w]; // the filter reads this frame's accumulation
     p[14].ppTextures = &gShN[w];
-    updateDescriptorSet(gRenderer, fi * 3 + 2, gShSet, 16, p);
+    Texture* tintFiltered = tint ? gShTintHist[w] : gNoTint[0];
+    p[25].ppTextures = &tintFiltered;
+    updateDescriptorSet(gRenderer, fi * 3 + 2, gShSet, 28, p);
 
     uint32_t gx = (F->width + 7) / 8, gy = (F->height + 7) / 8;
     cmdBeginDebugMarker(cmd, 0.5f, 0.8f, 1.0f, "Renderer ray-traced shadows");
@@ -1162,11 +1276,18 @@ void traceShadows(RenderFrame* F, Cmd* cmd, uint32_t fi)
                              { gShN[w], RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS },
                              { gShZ[w], RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS } };
     cmdResourceBarrier(cmd, 0, nullptr, 4, in, 0, nullptr);
+    if (tint)
+    {
+        TextureBarrier t[2] = { { gShTint, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS },
+                                { gShTintHist[w], RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS } };
+        cmdResourceBarrier(cmd, 0, nullptr, 2, t, 0, nullptr);
+    }
     cmdBindPipeline(cmd, gShPipe[kShadowTrace]);
     cmdBindDescriptorSet(cmd, fi * 3, gShSet);
     cmdDispatch(cmd, gx, gy, gPickCount);
-    TextureBarrier rays[1] = { { gRtShadows, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE } };
-    cmdResourceBarrier(cmd, 0, nullptr, 1, rays, 0, nullptr);
+    TextureBarrier rays[2] = { { gRtShadows, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE },
+                               { gShTint, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE } };
+    cmdResourceBarrier(cmd, 0, nullptr, tint ? 2 : 1, rays, 0, nullptr);
     cmdBindPipeline(cmd, gShPipe[kShadowTemporal]);
     cmdBindDescriptorSet(cmd, fi * 3 + 1, gShSet);
     cmdDispatch(cmd, gx, gy, gPickCount);
@@ -1176,11 +1297,20 @@ void traceShadows(RenderFrame* F, Cmd* cmd, uint32_t fi)
                                { gShZ[w], RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE },
                                { gRtShadows, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS } };
     cmdResourceBarrier(cmd, 0, nullptr, 4, hist, 0, nullptr);
+    if (tint)
+    {
+        TextureBarrier t[2] = { { gShTintHist[w], RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE },
+                                { gShTint, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS } };
+        cmdResourceBarrier(cmd, 0, nullptr, 2, t, 0, nullptr);
+    }
     cmdBindPipeline(cmd, gShPipe[kShadowFilter]);
     cmdBindDescriptorSet(cmd, fi * 3 + 2, gShSet);
     cmdDispatch(cmd, gx, gy, gPickCount);
-    TextureBarrier out[1] = { { gRtShadows, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE } };
-    cmdResourceBarrier(cmd, 0, nullptr, 1, out, 0, nullptr);
+    TextureBarrier out[2] = { { gRtShadows, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE },
+                              { gShTint, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE } };
+    cmdResourceBarrier(cmd, 0, nullptr, tint ? 2 : 1, out, 0, nullptr);
+    if (tint)
+        gTintFrame = F->frameNumber;
     cmdEndDebugMarker(cmd);
     gShIndex = w;
     gShFrame = F->frameNumber;
@@ -1200,27 +1330,33 @@ void rt_run(uint64_t address)
     Cmd*     cmd = F->cmd;
     uint32_t fi = F->frameIndex;
     uint32_t count = F->drawableCount < gDescCapacity ? F->drawableCount : gDescCapacity;
+    // Glass after them (rt_prepare's flag: the same test), as room allows.
+    const bool glass = gGlassNow && glassInRays(F);
+    uint32_t   all = count + (glass ? (F->seeThroughCount < gDescCapacity - count ? F->seeThroughCount : gDescCapacity - count) : 0);
     freeRetired(F->frameNumber);
     skinnedTimes(cmd, fi);
 
     cmdBeginDebugMarker(cmd, 0.5f, 0.8f, 1.0f, "Renderer ray-traced reflections");
     // Room for this frame's instances (grown rarely; the old top-level structure of this frame slot is done).
-    if (count > gInstCapacity[fi])
+    if (all > gInstCapacity[fi])
     {
         if (gInstBuf[fi])
             removeResource(gInstBuf[fi]);
-        gInstCapacity[fi] = grow(count);
+        gInstCapacity[fi] = grow(all);
         gInstBuf[fi] = makeMapped((uint64_t)gInstCapacity[fi] * 16, 16, DESCRIPTOR_TYPE_BUFFER, "renderer_rt_instances");
     }
 
     // Instances: each live instance with its mesh's bottom-level structure (built here when new). Only alpha-tested
-    // ones are non-opaque (their rays test the cut-out, Cutout.h.fsl), and only with the core's maps to test it by.
+    // ones and glass are non-opaque (their rays test the cut-out, Cutout.h.fsl, or pass the glass, Hit.h.fsl), and only
+    // with the core's maps to test them by. Glass is seen in reflections and, where it casts, by shadow rays (tinting
+    // them), never by GI's rays (mask 4).
     const bool cutouts = F->materialMaps && F->textures;
     uint32_t   n = 0;
-    skinnedBlas(F, count);
-    for (uint32_t i = 0; i < count; ++i)
+    skinnedBlas(F, count, all);
+    for (uint32_t i = 0; i < all; ++i)
     {
-        const RenderCaster& c = F->drawables[i];
+        const bool          isGlass = i >= count;
+        const RenderCaster& c = casterAt(F, count, i);
         AccelerationStructure* blas = meshBlas(cmd, F, c);
         if (!blas || c.instance >= F->instanceCount)
             continue;
@@ -1229,13 +1365,14 @@ void rt_run(uint64_t address)
         desc.pBottomAS = blas;
         memcpy(desc.mTransform, F->instanceRows[c.instance].row, sizeof desc.mTransform);
         desc.mInstanceID = n;
-        desc.mInstanceMask = c.castShadow ? 3u : 1u; // 1: seen in reflections, 2: casts shadows
+        desc.mInstanceMask = kMaskReflected | (c.castShadow ? kMaskCasts | (isGlass ? 0 : kMaskGi) : 0);
         const bool cut = cutouts && c.masked;
-        desc.mFlags = cut ? ACCELERATION_STRUCTURE_INSTANCE_FLAG_FORCE_NON_OPAQUE : ACCELERATION_STRUCTURE_INSTANCE_FLAG_FORCE_OPAQUE;
+        desc.mFlags = cut || isGlass ? ACCELERATION_STRUCTURE_INSTANCE_FLAG_FORCE_NON_OPAQUE : ACCELERATION_STRUCTURE_INSTANCE_FLAG_FORCE_OPAQUE;
         gInstCpu[n * 4 + 0] = c.instance;
         gInstCpu[n * 4 + 1] = c.firstIndex;
         gInstCpu[n * 4 + 2] = (uint32_t)c.vertexOffset;
-        gInstCpu[n * 4 + 3] = cut ? F->instanceRows[c.instance].material + 1 : 0;
+        gInstCpu[n * 4 + 3] = (cut || isGlass ? F->instanceRows[c.instance].material + 1 : 0) | (cut ? kInstCut : 0) |
+                              (isGlass ? kInstGlass | (c.twoSided ? kInstTwoSided : 0) : 0);
         n++;
     }
     dropDynamic(F->frameNumber);
@@ -1292,10 +1429,16 @@ void rt_run(uint64_t address)
     bool           maps = F->localAtlas && F->localAtlas->pTexture && F->shadowViews;
     Texture*       atlas = maps ? F->localAtlas->pTexture : gDummyAtlas->pTexture;
     Buffer*        views = maps ? F->shadowViews : gDummyViews;
-    DescriptorData p[33] = {};
+    DescriptorData p[35] = {};
     Buffer*        positions = F->positions;
     p[32].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gPositions);
     p[32].ppBuffers = &positions;
+    Buffer*        refraction = glass ? F->refraction : gNoRefraction;
+    Buffer*        dfg = glass ? F->dfg : gNoDfg;
+    p[33].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gRefraction);
+    p[33].ppBuffers = &refraction;
+    p[34].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gDfg);
+    p[34].ppBuffers = &dfg;
     bool           gi = gGiFrame == F->frameNumber && F->giProbeCount && F->giProbeData && F->giRayOut;
     Buffer*        giProbes = F->giProbeData ? F->giProbeData : gNoSkySh;
     Texture*       giIrr = F->giIrradiance && F->giDistance ? F->giIrradiance : gNoSky;
@@ -1372,7 +1515,7 @@ void rt_run(uint64_t address)
     if (gi)
     {
         // renderer_gi's probe rays (a thread each; renderer_gi reads them in gi_run, after this).
-        updateDescriptorSet(gRenderer, fi, gGiSet, 33, p);
+        updateDescriptorSet(gRenderer, fi, gGiSet, 35, p);
         bindCutouts(F, gGiSet, fi, kMaxFrames * 7 + fi, SRT_RES_IDX(RtSrt, PerFrame, gMaterialMaps), SRT_RES_IDX(RtSrt, PerFrame, gTextures));
         uint32_t       groups = (F->giProbeCount * F->giRaysPerProbe + 63) / 64, across = giAcross(F->giProbeCount * F->giRaysPerProbe);
         BufferBarrier  rb = { F->giRayOut, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS };
@@ -1390,19 +1533,19 @@ void rt_run(uint64_t address)
         cmdEndDebugMarker(cmd);
         return;
     }
-    updateDescriptorSet(gRenderer, fi * 4, gSet, 33, p);
+    updateDescriptorSet(gRenderer, fi * 4, gSet, 35, p);
     p[12].ppTextures = &gHalf;
     p[24].ppTextures = &gHalfRay;
-    updateDescriptorSet(gRenderer, fi * 4 + 1, gSet, 33, p);
+    updateDescriptorSet(gRenderer, fi * 4 + 1, gSet, 35, p);
     p[13].ppTextures = &gTex;
-    updateDescriptorSet(gRenderer, fi * 4 + 2, gSet, 33, p);
+    updateDescriptorSet(gRenderer, fi * 4 + 2, gSet, 35, p);
     // The filter reads this frame's accumulation and writes the trace texture, free by then, as rtReflection.
     p[13].ppTextures = &gAccum[w ^ 1];
     p[15].ppTextures = &gAccum[w];
     p[16].ppTextures = &gAccumZ[w];
     p[20].ppTextures = &gTex;
     p[21].ppTextures = &gAccumZ[w ^ 1];
-    updateDescriptorSet(gRenderer, fi * 4 + 3, gSet, 33, p);
+    updateDescriptorSet(gRenderer, fi * 4 + 3, gSet, 35, p);
     // Cut-outs, for the passes that trace: the trace (and the probe pass, on its set) and the reconstruction.
     for (uint32_t k = 0; k < 2; ++k)
         bindCutouts(F, gSet, fi * 4 + k, fi * 4 + k, SRT_RES_IDX(RtSrt, PerFrame, gMaterialMaps), SRT_RES_IDX(RtSrt, PerFrame, gTextures));

@@ -44,5 +44,7 @@ BEGIN_SRT(RtSrt)
         DECL_TEXTURE(PerFrame, Tex2D(float4), gGiDistance)       // and their distances
         DECL_RWBUFFER(PerFrame, RWBuffer(float4), gGiRayOut)     // the GI pass: each probe ray's radiance and distance
         DECL_BUFFER(PerFrame, Buffer(uint), gPositions)          // hits' texture mips: float3 a vertex (RENDER_POSITION_STRIDE)
+        DECL_BUFFER(PerFrame, Buffer(float4), gRefraction)       // glass (frame refraction): two float4 a material
+        DECL_BUFFER(PerFrame, Buffer(float2), gDfg)              // the core's split-sum table (frame dfg)
     END_SRT_SET(PerFrame)
 END_SRT(RtSrt)

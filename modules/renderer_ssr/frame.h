@@ -10,12 +10,13 @@ struct Buffer;
 struct RenderTarget;
 struct Texture;
 
-#define RENDER_FRAME_VERSION 24u
+#define RENDER_FRAME_VERSION 25u
 #define RENDER_RT_MAX_TRACED 8u
 #define RENDER_MAX_CASCADES  4u
 #define RENDER_MAX_TEXTURES  1024u // texture maps the shaders' array holds (the core's Texture table)
 #define RENDER_MAX_BLEND_RUNS 64u  // depths blended surfaces split the particles at (frame v23)
 #define RENDER_MAX_DECALS     256u // decals drawn in a frame (frame v23)
+#define RENDER_MAX_WORLD_DECALS 1024u // decals captures and ray hits see (frame v25)
 #define RENDER_VIEW_SHIFT    20u // shadow instance stream entry: instance | view << 20
 // Vertex streams (positions, attributes): bytes per vertex.
 #define RENDER_POSITION_STRIDE  12u // float3
@@ -372,5 +373,34 @@ struct RenderFrame
     Buffer*      decalSphereBuffer; // the same, float4 each, SHADER_RESOURCE
     Buffer*      decalMasks;        // set by cull_prepare: RENDER_MAX_DECALS / 32 bitmask words per tile (tiles as tileMasks)
     Buffer*      decalBins;         // set by cull_prepare: per z-bin (as zbins), the first decal in it | the last << 16
+    // See-through instances (frame v25): every live blended instance (material_blend), on screen or not, laid out as
+    // drawables (by mesh; the core's LOD), set before shadows_prepare. They are in neither casters nor drawables, so probes,
+    // GI captures and shadow maps skip them. castShadow is its instance_shadow.
+    const RenderCaster* seeThrough;
+    uint32_t            seeThroughCount;
+    // Two float4 a material (renderer's Shaders/Scene.srt.h gRefraction): x ior, y thickness, z shape (0 thin, 1 solid),
+    // w 1 given; rgb tint (1, 1, 1 when not given). With materialMaps' misc.z (opacity, times the base colour's alpha), a
+    // layer lets through (1 - coverage) * tint * (1 - its specular reflection). SHADER_RESOURCE.
+    Buffer*             refraction;
+    // Set by renderer_rt's rt_prepare beside rtShadows, filled by rt_run: RGBA16F at rtShadows' size and layers (alpha: renderer_rt's own), the mean colour glass lets through over a pixel's
+    // shadow rays that no opaque surface blocked (visibility x tint is the light that arrives; white where no glass).
+    // SHADER_RESOURCE for the forward pass. nullptr when no see-through instance with castShadow is traced this frame.
+    Texture*            rtShadowTint;
+    // Decals where the camera's view doesn't reach (frame v25): reflection probe and GI captures, ray hits. Every live
+    // decal (with the core's decals knob on), in the order they paint, at most RENDER_MAX_WORLD_DECALS, as the core's
+    // DecalData (renderer's Shaders/Decal.h.fsl, whose copy paints them: decalsAt), with a world grid over them: cell
+    // (x, y, z), x fastest, spans decalGrid[0].xyz + (x, y, z) / decalGrid[0].w; decalCells[cell] = (first, count) of its
+    // decals in decalItems, each an index into worldDecals, in paint order. Set before shadows_prepare; SHADER_RESOURCE.
+    // worldDecalCount 0: none (the buffers are then nullptr). decalsChanged: the frame they last changed (added, moved,
+    // repainted, removed, or a map of one loaded), when captures of what they paint go stale.
+    uint32_t worldDecalCount;
+    Buffer*  worldDecals;
+    Buffer*  decalCells;    // uint2 a cell
+    Buffer*  decalItems;    // uint
+    float    decalGrid[2][4]; // [0] xyz the grid's world corner, w cells a metre; [1] xyz its cells along x, y, z
+    uint64_t decalsChanged;
+    // The core's split-sum table (renderer's Shaders/Brdf.h.fsl dfgLookup, gDfg): 32 x 32 float2, SHADER_RESOURCE, the same
+    // every frame, so passes outside the core weigh specular reflection and transmission (glass) by the same numbers.
+    Buffer*  dfg;
 };
 #define RENDER_RT_MISS 60000.0f

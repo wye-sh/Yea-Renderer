@@ -25,6 +25,21 @@ STRUCT(LightShape) // the core's RenderGpuLightShape
                             // kind 0 its own radius (0: none)
 };
 
+STRUCT(InstanceData) // as Trace.comp.fsl's (the core's)
+{
+    DATA(float4, row0, None);
+    DATA(float4, row1, None);
+    DATA(float4, row2, None);
+    DATA(uint4, misc, None); // x material
+};
+
+STRUCT(MaterialData) // as Trace.comp.fsl's (the core's)
+{
+    DATA(float4, albedoRough, None);
+    DATA(float4, params, None);  // x metallic, y f0 (dielectric)
+    DATA(float4, emissive, None);
+};
+
 STRUCT(MaterialMapData) // as Trace.comp.fsl's (the core's)
 {
     DATA(uint4, maps, None);
@@ -37,6 +52,7 @@ STRUCT(MaterialMapData) // as Trace.comp.fsl's (the core's)
 #include "ShadowData.h.fsl"
 #include "Shadows.srt.h"
 #include "Cutout.h.fsl"
+#include "Hit.h.fsl"
 
 #define PI 3.14159265
 #define NO_LIGHT 0xFFFFFFFFu
@@ -125,6 +141,7 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
         RETURN();
     float  d = LoadTex2D(gDepth, NO_SAMPLER, p, 0).r;
     float2 result = float2(1.0, 0.0); // where the light can't reach, nothing to shadow: lit (the light adds nothing)
+    float4 tint = float4(1.0, 1.0, 1.0, 0.0); // what glass lets through, and the nearest layer's distance (0: none)
     if (d > 0.0)
     {
         float3 P = worldAt(p, d);
@@ -197,7 +214,20 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
             RayQueryAnyHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RT_RAY_FLAGS, ray, 2u, occluder) // casters only
             RayQueryBeginForEachCandidate(occluder)
             {
-                if (!cutAway(RayQueryCandidateInstanceID(occluder), RayQueryCandidatePrimitiveIndex(occluder), RayQueryCandidateBarycentrics(occluder)))
+                uint   ci = RayQueryCandidateInstanceID(occluder);
+                uint   cp = RayQueryCandidatePrimitiveIndex(occluder);
+                float2 cb = RayQueryCandidateBarycentrics(occluder);
+                if (isGlass(ci))
+                {
+                    // Glass passes the ray on, tinted by each layer that counts (any order: a product).
+                    float3 through = cutAway(ci, cp, cb) ? float3(1.0, 1.0, 1.0) : glassThrough(ci, cp, cb, L);
+                    if (min(through.r, min(through.g, through.b)) < 1.0)
+                    {
+                        float ct = RayQueryCandidateRayT(occluder);
+                        tint = float4(tint.rgb * through, tint.w > 0.0 ? min(tint.w, ct) : max(ct, 1e-3));
+                    }
+                }
+                else if (!cutAway(ci, cp, cb))
                     RayQueryCommitCandidate(occluder);
                 RayQueryProceed(occluder);
             }
@@ -207,6 +237,8 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
         }
     }
     Write3D(gRawOut, int3(p, int(s)), result.y); // the blocker's distance alone: x is 1 exactly where it is 0
+    if (gSd.misc.w != 0u)
+        Write3D(gTintRawOut, int3(p, int(s)), tint);
     RETURN();
 }
 #endif
@@ -234,26 +266,42 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
     float2 raw;
     raw.y = LoadTex3D(gRaw, NO_SAMPLER, int3(p, int(s)), 0).x;
     raw.x = raw.y > 0.0 ? 0.0 : 1.0;
+    bool tinted = gSd.misc.w != 0u;
     if (d <= 0.0)
     {
         Write3D(gHistoryOut, int3(p, int(s)), float2(1.0, 0.0));
         Write3D(gSamplesOut, int3(p, int(s)), 0.0);
+        if (tinted)
+            Write3D(gTintHistoryOut, int3(p, int(s)), float4(1.0, 1.0, 1.0, 0.0));
         RETURN();
     }
-    // This frame's rays around: their mean and spread, which the history must lie near.
-    float m1 = 0.0, m2 = 0.0, n = 0.0;
+    // This frame's rays around: their mean and spread, which the history must lie near (the glass colour's over the
+    // rays no opaque surface blocked).
+    float  m1 = 0.0, m2 = 0.0, n = 0.0;
+    float3 t1 = float3(0.0, 0.0, 0.0), t2 = float3(0.0, 0.0, 0.0);
+    float  tn = 0.0;
     for (int y = -2; y <= 2; ++y)
     {
         for (int x = -2; x <= 2; ++x)
         {
-            float v = LoadTex3D(gRaw, NO_SAMPLER, int3(clamp(p + int2(x, y), int2(0, 0), size - int2(1, 1)), int(s)), 0).x > 0.0 ? 0.0 : 1.0;
+            int3  q = int3(clamp(p + int2(x, y), int2(0, 0), size - int2(1, 1)), int(s));
+            float v = LoadTex3D(gRaw, NO_SAMPLER, q, 0).x > 0.0 ? 0.0 : 1.0;
             m1 += v;
             m2 += v * v;
             n += 1.0;
+            if (tinted && v > 0.0)
+            {
+                float3 c = LoadTex3D(gTintRaw, NO_SAMPLER, q, 0).rgb;
+                t1 += c;
+                t2 += c * c;
+                tn += 1.0;
+            }
         }
     }
     float mean = m1 / n;
     float spread = sqrt(max(m2 / n - mean * mean, 0.0));
+    bool   haveHistory = false;
+    int2   hq = int2(0, 0);
 
     float4 result = float4(raw.x, raw.y, 1.0, 0.0);
     if (gSd.misc.z == 0u && slot.w == 0u)
@@ -267,6 +315,8 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
             // A surface was there last frame (as the reflections' test, by view depth).
             if (zPrev > 0.0 && abs(zPrev - z) < 0.04 * z + 0.02)
             {
+                haveHistory = true;
+                hq = q;
                 float4 h = float4(LoadTex3D(gHistory, NO_SAMPLER, int3(q, int(slot.y)), 0).xy,
                                   LoadTex3D(gSamples, NO_SAMPLER, int3(q, int(slot.y)), 0).x, 0.0);
                 float  samples = min(h.z + 1.0, gSd.params.x);
@@ -289,11 +339,78 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
     }
     Write3D(gHistoryOut, int3(p, int(s)), result.xy);
     Write3D(gSamplesOut, int3(p, int(s)), result.z);
+    if (tinted)
+    {
+        // The glass colour, accumulated as the visibility (its frames, held to this frame's rays around), but only from
+        // rays no opaque surface blocked (it is the colour of the light that arrives), its history as long as the glass
+        // edge's own penumbra allows.
+        float4 rawT = LoadTex3D(gTintRaw, NO_SAMPLER, int3(p, int(s)), 0);
+        float3 tMean = tn > 0.0 ? t1 / tn : float3(1.0, 1.0, 1.0);
+        float3 tSpread = tn > 0.0 ? sqrt(max(t2 / tn - tMean * tMean, float3(0.0, 0.0, 0.0))) : float3(0.0, 0.0, 0.0);
+        float4 tOut = float4(raw.x > 0.5 ? rawT.rgb : tMean, rawT.a);
+        if (haveHistory && (gSd.misc.w & 2u) != 0u)
+        {
+            float4 hT = LoadTex3D(gTintHistory, NO_SAMPLER, int3(hq, int(slot.y)), 0);
+            float3 kept = tn > 0.0 ? clamp(hT.rgb, tMean - 1.5 * tSpread - 0.1, tMean + 1.5 * tSpread + 0.1) : hT.rgb;
+            float  samples = result.z;
+            float  layer = rawT.a > 0.0 ? rawT.a : hT.a;
+            if (layer > 0.0)
+                samples = min(samples, clamp(HISTORY_PER_PX * penumbraPx(worldAt(p, d), slot, layer), HISTORY_MIN, gSd.params.x));
+            tOut.rgb = raw.x > 0.5 ? lerp(kept, rawT.rgb, 1.0 / samples) : kept;
+            tOut.a = rawT.a > 0.0 ? (hT.a > 0.0 ? lerp(hT.a, rawT.a, 1.0 / samples) : rawT.a) : hT.a;
+        }
+        Write3D(gTintHistoryOut, int3(p, int(s)), tOut);
+    }
     RETURN();
 }
 #endif
 
 #if defined(SHADOW_FILTER)
+// The glass colour at p into rtShadowTint's slice: averaged as the visibility over the glass edge's penumbra (its
+// layer's distance), each neighbour weighed by its visibility too (the colour is that of the light that arrives).
+void filterTint(int2 p, uint s, uint4 slot, int2 size, float d, float3 c)
+{
+    float4 t = LoadTex3D(gTintHistory, NO_SAMPLER, int3(p, int(s)), 0);
+    if (d <= 0.0 || t.a <= 0.0)
+    {
+        Write3D(gTintFinal, int3(p, int(slot.x)), float4(t.rgb, 1.0));
+        return;
+    }
+    float3 P = worldAt(p, d);
+    float  eye = length(P - gSd.camPos.xyz);
+    float  radius = min(gSd.params.y * penumbraPx(P, slot, t.a) * (1.0 + 2.0 / max(c.z, 1.0)), gSd.params.z);
+    if (radius < 0.5)
+    {
+        Write3D(gTintFinal, int3(p, int(slot.x)), float4(t.rgb, 1.0));
+        return;
+    }
+    float3 N = normalize(LoadTex2D(gSurface, NO_SAMPLER, p, 0).yzw);
+    float  stride = radius / 2.0;
+    float  sigma2 = 0.5 * radius * radius;
+    float  planeTol = 0.01 * eye + 0.01;
+    float  own = max(c.x, 1e-3);
+    float4 sum = float4(t.rgb * own, own);
+    for (int y = -2; y <= 2; ++y)
+    {
+        for (int x = -2; x <= 2; ++x)
+        {
+            if (x == 0 && y == 0)
+                continue;
+            float2 o = float2(float(x), float(y)) * stride;
+            int2   q = clamp(p + int2(round(o)), int2(0, 0), size - int2(1, 1));
+            float  dq = LoadTex2D(gDepth, NO_SAMPLER, q, 0).r;
+            if (dq <= 0.0)
+                continue;
+            float3 Nq = normalize(LoadTex2D(gSurface, NO_SAMPLER, q, 0).yzw);
+            float  plane = abs(dot(N, worldAt(q, dq) - P));
+            float  w = exp(-dot(o, o) / sigma2 - plane / planeTol) * pow(saturate(dot(N, Nq)), 32.0) *
+                      LoadTex3D(gHistory, NO_SAMPLER, int3(q, int(s)), 0).x;
+            sum += float4(LoadTex3D(gTintHistory, NO_SAMPLER, int3(q, int(s)), 0).rgb, 1.0) * w;
+        }
+    }
+    Write3D(gTintFinal, int3(p, int(slot.x)), float4(sum.rgb / sum.w, 1.0));
+}
+
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(8, 8, 1)
 void CS_MAIN(SV_DispatchThreadID(uint3) id)
@@ -307,6 +424,8 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
         RETURN();
     float3 c = float3(LoadTex3D(gHistory, NO_SAMPLER, int3(p, int(s)), 0).xy, LoadTex3D(gSamples, NO_SAMPLER, int3(p, int(s)), 0).x);
     float  d = LoadTex2D(gDepth, NO_SAMPLER, p, 0).r;
+    if (gSd.misc.w != 0u)
+        filterTint(p, s, slot, size, d, c);
     if (d <= 0.0 || c.y <= 0.0)
     {
         Write3D(gFinal, int3(p, int(slot.x)), c.x); // nothing in the way of any ray: no penumbra to smooth

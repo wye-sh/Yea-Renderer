@@ -229,8 +229,8 @@ void placeModels()
 }
 
 // Glass: a clear pane between the start view and the steam, a teal one behind it (the steam drawn between them), a frosted
-// one beside them, and a solid glass ball on the floor that bends the floor and shapes behind it as a lens. See-through
-// surfaces cast no shadows yet.
+// one beside them, and a solid glass ball on the floor that bends the floor and shapes behind it as a lens.
+// Their shadows: tinted where shadows are ray-traced (renderer_rt), none from shadow maps yet.
 void addGlass()
 {
     gGlassBuilt = settings.glass;
@@ -256,8 +256,6 @@ void addGlass()
     renderer::instance_place(panes[1], { -0.73f, 0.95f, 1.54f }, facing, { 2.0f, 1.9f, 0.02f });
     renderer::instance_place(panes[2], { -0.6f, 0.6f, 5.6f }, kNoRotation, { 1.2f, 1.2f, 1.2f });
     renderer::instance_place(panes[3], { 4.3f, 0.95f, 4.3f }, facing, { 1.6f, 1.9f, 0.02f });
-    for (yea_handle h : panes)
-        renderer::instance_shadow(h, false);
 }
 
 // Decals painted over the floor, the copper block and the stone ledge.

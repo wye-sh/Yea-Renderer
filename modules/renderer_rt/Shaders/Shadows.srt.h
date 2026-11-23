@@ -26,5 +26,15 @@ BEGIN_SRT(ShadowSrt)
         DECL_BUFFER(PerFrame, Buffer(uint), gAttributes)
         DECL_BUFFER(PerFrame, Buffer(MaterialMapData), gMaterialMaps)
         DECL_ARRAY_TEXTURES(PerFrame, Tex2D(float4), gTextures, MAX_TEXTURES)
+        // Glass (misc.w 1; Hit.h.fsl): the trace's layers, and their colour through the passes, as the visibility's
+        DECL_BUFFER(PerFrame, Buffer(InstanceData), gInstances)
+        DECL_BUFFER(PerFrame, Buffer(MaterialData), gMaterials)
+        DECL_BUFFER(PerFrame, Buffer(float4), gRefraction)
+        DECL_BUFFER(PerFrame, Buffer(float2), gDfg)
+        DECL_RWTEXTURE(PerFrame, RWTex2DArray(half4), gTintRawOut) // trace: rgb what the glass lets through, a the nearest layer's distance (0: none)
+        DECL_TEXTURE(PerFrame, Tex2DArray(float4), gTintRaw)       // temporal: the trace's
+        DECL_TEXTURE(PerFrame, Tex2DArray(float4), gTintHistory)   // temporal: last frame's; filter: this frame's
+        DECL_RWTEXTURE(PerFrame, RWTex2DArray(half4), gTintHistoryOut) // temporal: rgb over the rays no opaque surface blocked, a the layer's distance
+        DECL_RWTEXTURE(PerFrame, RWTex2DArray(half4), gTintFinal)  // filter: rtShadowTint (the trace's texture: free by then)
     END_SRT_SET(PerFrame)
 END_SRT(ShadowSrt)

@@ -693,8 +693,9 @@ float4 PS_MAIN(VSOutput In)
         float3 L = gFrame.sunDir[d].xyz;
         if (dot(N, L) <= 0.0)
             continue;
-        float shadow = (d == 0u && (sunFlags & FLAG_RT_SUN) != 0u) ? LoadTex3D(gRtShadows, NO_SAMPLER, int3(s.pixel, 0), 0).r
-                     : (d == 0u && (sunFlags & FLAG_SHADOWS) != 0u) ? sunShadow(In.WorldPos, N, viewZ, s.rot, dither) : 1.0;
+        float3 shadow = (d == 0u && (sunFlags & FLAG_RT_SUN) != 0u) ? tracedShadow(s.pixel, 0)
+                      : (d == 0u && (sunFlags & FLAG_SHADOWS) != 0u) ? float3(1.0, 1.0, 1.0) * sunShadow(In.WorldPos, N, viewZ, s.rot, dither)
+                      : float3(1.0, 1.0, 1.0);
         if (d == 0u)
             shadow *= contact;
         color += brdfLight(s, L, gFrame.sunColor[d].rgb * shadow);

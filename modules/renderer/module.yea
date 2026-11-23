@@ -213,7 +213,8 @@ export void material_alpha(handle m, float cutoff)
 # See-through, blended over what is behind (glass, lenses, visors, water): opacity times the base colour's own alpha
 # (material_factors' base_color alpha, its map's and the vertex colour's) is how much of the surface is there; its
 # reflections stay whole (clear glass still reflects). Drawn sorted back to front after the opaque scene, lit as every
-# surface is, through fog. 0 opaque (the default). Blended surfaces cast no shadows and write no depth.
+# surface is, through fog. 0 opaque (the default). Blended surfaces write no depth; with
+# instance_shadow on, ray-traced shadows (renderer_rt) take their colour through them (shadow maps don't see them).
 export void material_blend(handle m, float opacity)
 # How a see-through material bends, blurs and tints what is seen through it: ior its index of refraction (glass 1.5,
 # water 1.33, 1 none), thickness (m) and shape: 0 thin (a pane or a sheet that thick: what is behind shifts a little), 1

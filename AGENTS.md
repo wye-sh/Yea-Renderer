@@ -140,10 +140,23 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   trace it; dropped 8 frames after their last use. While any are traced, the module logs their refit and rebuild GPU
   time every 10 s (`skinned ray structures`). One
   top-level structure per frame in flight, its instances rewritten with `setInstances` and rebuilt every frame
-  (mask 1 every drawable, 2 shadow casters). Instances are forced opaque except alpha-tested ones
+  (mask 1 every drawable, 2 shadow casters, 4 shadow casters that aren't glass: GI probe rays and their shadow rays).
+  Instances are forced opaque except alpha-tested ones
   (`RenderCaster.masked`, with the frame's material maps): those are non-opaque, and every ray query (reflections,
   their shadow rays, traced shadows, GI probe rays) loops over their candidates, cutting them out by base colour alpha at mip 0 as
-  the raster passes do (`Shaders/Cutout.h.fsl`; the material + 1 rides in gRtInstances' w). Lit hits (reflections and GI
+  the raster passes do (`Shaders/Cutout.h.fsl`; the material + 1 rides in gRtInstances' w, under flag bits 0x20000000
+  cut-out, 0x40000000 two-sided, 0x80000000 glass). Glass (frame v25, `seeThrough`, with material maps, `refraction`
+  and `dfg`) goes into the top-level structure after the drawables, non-opaque, never committed by any query
+  (`Shaders/Hit.h.fsl`). A layer counts where raster draws one: a front face, or any face of a two-sided material
+  except a solid refraction (shape 1), front faces only. It lets through T = (1 - coverage) x tint x (1 - FssEss -
+  Fms Ems) at its angle (coverage material_blend's opacity x base colour alpha; the split-sum terms from the core's
+  `dfg`, as its see-through pass). A reflection ray keeps the nearest layer in front of what it saw and shows its own
+  light (diffuse and glow by coverage, specular whole, no decals) over what is behind times T. Shadow rays (reflected
+  hits' and traced shadows') multiply T over the layers they pass. When a glass caster is traced, rt_prepare sets
+  `rtShadowTint` (RGBA16F, rtShadows' size and layers: the trace's raw tint with the nearest layer's distance in a,
+  then, reused, the filtered tint) and rt_run fills it: accumulated over frames like the visibility over the rays no
+  opaque surface blocked, filtered over the penumbra the layer's distance gives, by plane and normal. GI probe rays skip glass (as renderer_gi's
+  raster captures do). Lit hits (reflections and GI
   probe rays) read the material's maps as the forward pass does (base colour, ORM with its occlusion on the ambient,
   normal, emissive; `hitMaterial` in Trace.comp.fsl), each map's mip from the ray cone (Akenine-Moller 2021: a pixel at
   the surface, spreading by the pixel angle, twice the reflector's bend to its neighbours and the GGX alpha; a probe
@@ -461,7 +474,7 @@ surface's luminance is that over its area). Colours linear RGB.
   `material_maps(m, base_color, orm, normal, emissive)`, `material_factors` (glTF's), `material_alpha(m, cutoff)` (cut out
   below it; 0 opaque). Tables `TextureMap` (a row a shader slot), `TexturePath`, `MaterialMap`.
 - See-through: `material_blend(m, opacity)` (glass, lenses, visors, water; opacity times the base colour's alpha is how
-  much of the surface is there, its reflection stays whole; 0 opaque). Blended surfaces cast no shadows yet.
+  much of the surface is there, its reflection stays whole; 0 opaque). Blended surfaces tint ray-traced shadows (instance_shadow on); shadow maps don't see them yet.
   `material_refraction(m, ior, thickness, shape, tint)`: how it bends (thin pane 0, solid ball or block 1), blurs (by its
   roughness: frosted glass) and tints what is behind it. Knob `refraction` (Performance) turns the bending and blur off.
   renderer_models calls `material_blend(m, 1)` for glTF BLEND materials, their alpha in the factors.

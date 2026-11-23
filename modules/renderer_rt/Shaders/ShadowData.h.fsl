@@ -9,7 +9,8 @@ STRUCT(ShadowData)
     DATA(float4, screen, None);  // xy size, zw TAA jitter (px)
     DATA(float4, sunDir, None);  // towards the sun, w tan of its angular radius
     DATA(float4, params, None);  // x most frames of history, y filter scale (of the penumbra), z widest filter radius (px)
-    DATA(uint4, misc, None);     // x frame number (noise), y traced shadows, z 1: no history at all this frame
+    DATA(uint4, misc, None);     // x frame number (noise), y traced shadows, z 1: no history at all this frame,
+                                 // w glass: 1 its colour traced (rtShadowTint), 2 its history usable
     DATA(uint4, slots[9], None); // per shadow: x its slice in rtShadows, y its layer in last frame's history,
                                  // z its light in gLights (0xFFFFFFFF: the sun), w 1 when it has no history
 };

@@ -13,6 +13,12 @@
 #ifndef RT_CUTOUT_H
 #define RT_CUTOUT_H
 
+// gRtInstances' w (renderer_rt.cpp): the material + 1 in its low bits (0 where neither flag below needs it), and flags.
+#define RT_INST_MATERIAL  0x00FFFFFFu
+#define RT_INST_CUT       0x20000000u // alpha-tested: candidates cut away where the base colour's alpha is under its cutoff
+#define RT_INST_TWO_SIDED 0x40000000u
+#define RT_INST_GLASS     0x80000000u // see-through (Hit.h.fsl): never committed, its layers tint what passes
+
 float2 vertexUv(uint v) { return asfloat(uint2(gAttributes[v * 5u + 2u], gAttributes[v * 5u + 3u])); }
 
 float vertexAlpha(uint v) { return float(gAttributes[v * 5u + 4u] >> 24u) * (1.0 / 255.0); }
@@ -22,10 +28,10 @@ float vertexAlpha(uint v) { return float(gAttributes[v * 5u + 4u] >> 24u) * (1.0
 // cut it. The map is read at its full resolution: the cut-out's true shape, which the frames average.
 bool cutAway(uint index, uint prim, float2 bary)
 {
-    uint4 inst = gRtInstances[index]; // x instance row, y first index, z first vertex, w its material + 1 when cut out
-    if (inst.w == 0u)
+    uint4 inst = gRtInstances[index]; // x instance row, y first index, z first vertex, w its material + 1 and flags
+    if ((inst.w & RT_INST_CUT) == 0u)
         return false;
-    MaterialMapData mm = gMaterialMaps[inst.w - 1u];
+    MaterialMapData mm = gMaterialMaps[(inst.w & RT_INST_MATERIAL) - 1u];
     uint            v0 = gIndices[inst.y + prim * 3u] + inst.z;
     uint            v1 = gIndices[inst.y + prim * 3u + 1u] + inst.z;
     uint            v2 = gIndices[inst.y + prim * 3u + 2u] + inst.z;

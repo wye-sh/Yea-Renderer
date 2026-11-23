@@ -128,7 +128,7 @@ const uint32_t kFlagCulled = 1, kFlagHeatmap = 2, kFlagCascades = 4, kFlagShadow
                kFlagContactDebug = 128, kFlagUnlit = 256, kFlagSsr = 512, kFlagSsrDebug = 1024,
                kFlagReceiverPlane = 2048, kFlagRt = 4096, kFlagRtDebug = 8192, kFlagRtShadows = 16384,
                kFlagRtSun = 32768, kFlagArea = 65536, kFlagSky = 131072, kFlagFog = 262144,
-               kFlagGi = 524288, kFlagGiDebug = 1048576, kFlagDecals = 2097152, kFlagRefraction = 4194304;
+               kFlagGi = 524288, kFlagGiDebug = 1048576, kFlagDecals = 2097152, kFlagRefraction = 4194304, kFlagRtTint = 8388608;
 const uint32_t kMaxFrames = 4;
 const uint32_t kMaxUnculledLights = 256;
 const uint32_t kHistogramBins = 128;
@@ -257,7 +257,8 @@ struct InstanceInfo
     uint32_t mesh; // the version drawn
     uint32_t row;  // in the Instance table
     uint32_t flags; // 1 visible, 2 casts shadow, 4 double-sided, 8 alpha-tested, 16 see-through (drawn sorted, alone),
-                    // 32 skinned (gSkinDraw)
+                    // 32 skinned (gSkinDraw), 64 see-through and instance_shadow on (traced shadows tint through it; no
+                    // map sees it)
     float    sphere[4];
     uint64_t moved;
 };
@@ -276,6 +277,7 @@ GpuMaterial*         gMaterialCpu;
 GpuFrame             gFrameCpu;
 RenderCaster* gCasters;
 RenderCaster* gDrawables; // every instance, by mesh (reflection probes draw them all)
+RenderCaster* gSeeThrough; // every live see-through instance, by mesh (frame v25 seeThrough: ray tracing sees them)
 RenderLight*  gLocal;
 uint32_t*     gOutside; // rows of lights outside the view, for what reflections see
 // Visible see-through instances, sorted back to front by their bounding spheres' view depth; their stream entries
@@ -1809,6 +1811,7 @@ int load(int reloaded)
     texturesInit(gDummyColor->pTexture);
     gCasters = new RenderCaster[Instances.capacity()];
     gDrawables = new RenderCaster[Instances.capacity()];
+    gSeeThrough = new RenderCaster[Instances.capacity()];
     gBlendList = new BlendEntry[Instances.capacity()];
     gLocal = new RenderLight[Lights.capacity()];
     gOutside = new uint32_t[Lights.capacity()];
@@ -2146,7 +2149,8 @@ void draw(uint32_t pass, const YeaFrame* yf)
         // See-through (material_blend): drawn alone, sorted, after the opaque scene; no prepass, shadow, probe or ray
         // tracing sees it yet. F1's view modes draw it as any surface.
         bool blended = !viewMode && materialOpacity(in.material) > 0;
-        info.flags = (visible ? 1u : 0u) | (in.shadow && !blended ? 2u : 0u) | (twoSided ? 4u : 0u) | (masked ? 8u : 0u) | (blended ? 16u : 0u);
+        info.flags = (visible ? 1u : 0u) | (in.shadow && !blended ? 2u : 0u) | (twoSided ? 4u : 0u) | (masked ? 8u : 0u) | (blended ? 16u : 0u) |
+                     (in.shadow && blended ? 64u : 0u);
         if (masked && gTexturesChanged > info.moved)
             info.moved = gTexturesChanged;
         // The simplest version whose error stays under lod_error display pixels where the instance is nearest the
@@ -2250,11 +2254,31 @@ void draw(uint32_t pass, const YeaFrame* yf)
         start += drawCount[k];
     }
     uint32_t* stream = gStream;
+    uint32_t  seeThrough = 0;
     for (uint32_t i = 0; i < count; ++i)
     {
         const InstanceInfo& info = gInfo[i];
         if (info.flags & 16)
-            continue; // see-through: listed apart
+        {
+            // See-through: listed apart, for ray tracing (frame seeThrough).
+            const Mesh&   mesh = Meshes[info.mesh];
+            RenderCaster& c = gSeeThrough[seeThrough++];
+            c = RenderCaster{};
+            c.instance = i;
+            c.firstIndex = mesh.firstIndex;
+            c.indexCount = mesh.indexCount;
+            c.vertexOffset = (info.flags & 32) ? gSkinDraw[i].current : (int32_t)mesh.firstVertex; // posed, as it draws
+            memcpy(c.sphere, info.sphere, sizeof c.sphere);
+            c.moved = info.moved;
+            c.twoSided = (info.flags >> 2) & 1;
+            c.dynamic = (info.flags >> 5) & 1;
+            c.mesh = info.mesh;
+            c.vertexCount = mesh.vertexCount;
+            c.castShadow = (info.flags >> 6) & 1;
+            c.generation = gMeshGen[info.mesh];
+            c.masked = (info.flags >> 3) & 1;
+            continue;
+        }
         uint32_t            key = info.mesh * 4 + ((info.flags >> 2) & 3);
         const bool          skinned = (info.flags & 32) != 0;
         if ((info.flags & 1) && !skinned)
@@ -2553,6 +2577,15 @@ void draw(uint32_t pass, const YeaFrame* yf)
     float            L = settings.sky_luminance;
     F.drawables = gDrawables;
     F.drawableCount = count - blendAll;
+    F.seeThrough = gSeeThrough;
+    F.seeThroughCount = seeThrough;
+    qsort(gSeeThrough, seeThrough, sizeof(RenderCaster), [](const void* a, const void* b) {
+        uint32_t ma = ((const RenderCaster*)a)->mesh, mb = ((const RenderCaster*)b)->mesh;
+        return ma < mb ? -1 : ma > mb ? 1 : 0;
+    });
+    F.refraction = gRefractBuf[fi];
+    F.dfg = gDfg;
+    F.rtShadowTint = nullptr; // renderer_rt's rt_prepare sets it
     F.materials = gMaterialBuf[fi];
     F.skyZenith[0] = zen.x * L, F.skyZenith[1] = zen.y * L, F.skyZenith[2] = zen.z * L;
     F.skyHorizon[0] = hor.x * L, F.skyHorizon[1] = hor.y * L, F.skyHorizon[2] = hor.z * L;
@@ -2716,7 +2749,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
                     (shadows && F.receiverPlane ? kFlagReceiverPlane : 0) | (rt ? kFlagRt : 0) | (rt && F.rtDebug ? kFlagRtDebug : 0) |
                     (rtShadows ? kFlagRtShadows : 0) | (rtShadows && F.rtSunShadows ? kFlagRtSun : 0) | (anyShape ? kFlagArea : 0) | (sky ? kFlagSky : 0) | (fog ? kFlagFog : 0) |
                     (gi ? kFlagGi : 0) | (gi && F.giDebug ? kFlagGiDebug : 0) | (decals ? kFlagDecals : 0) |
-                    (refractVisible ? kFlagRefraction : 0);
+                    (refractVisible ? kFlagRefraction : 0) | (rtShadows && F.rtShadowTint ? kFlagRtTint : 0);
     gf->refraction[0] = (float)gChainMips;
     if (ssr)
     {
@@ -2890,7 +2923,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         Buffer*  masks = culled ? F.tileMasks : gDummyU32;
         Buffer*  bins = culled ? F.zbins : gDummyU32;
         Buffer*  views = shadows ? F.shadowViews : gDummyViews;
-        DescriptorData p[37] = {};
+        DescriptorData p[38] = {};
         Texture*       ssrDepth = ssr ? F.ssrDepth : gDummyDepth->pTexture;
         Texture*       previous = ssr ? F.previous->pTexture : gDummyColor->pTexture;
         Texture*       probeTex = probes ? F.probes->pTexture : gDummyArray->pTexture;
@@ -2982,18 +3015,21 @@ void draw(uint32_t pass, const YeaFrame* yf)
         p[33].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gDecalBins);
         p[33].ppBuffers = &decalBins;
         Texture* sceneColor = gChain ? gChain : gDummyColor->pTexture;
+        Texture* rtTint = rtShadows && F.rtShadowTint ? F.rtShadowTint : gDummyArray->pTexture;
         p[34].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gRefraction);
         p[34].ppBuffers = &gRefractBuf[fi];
         p[35].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gSceneColor);
         p[35].ppTextures = &sceneColor;
-        uint32_t bindings = 36;
+        p[36].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gRtShadowTint);
+        p[36].ppTextures = &rtTint;
+        uint32_t bindings = 37;
         if (gTexturesBound[fi] != F.textureVersion)
         {
-            p[36].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gTextures);
-            p[36].ppTextures = (Texture**)F.textures;
-            p[36].mCount = RENDER_MAX_TEXTURES;
+            p[37].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gTextures);
+            p[37].ppTextures = (Texture**)F.textures;
+            p[37].mCount = RENDER_MAX_TEXTURES;
             gTexturesBound[fi] = F.textureVersion;
-            bindings = 37;
+            bindings = 38;
         }
         updateDescriptorSet(gRenderer, fi, gSceneFrame, bindings, p);
 

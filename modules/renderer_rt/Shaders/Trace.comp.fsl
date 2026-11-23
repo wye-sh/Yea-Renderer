@@ -59,6 +59,7 @@ STRUCT(ShadowView)
 #include "Trace.srt.h"
 #include "Shadow.h.fsl"
 #include "Cutout.h.fsl"
+#include "Hit.h.fsl"
 #define GI_IRRADIANCE gGiIrradiance
 #define GI_DISTANCE   gGiDistance
 #define GI_PROBES     gGiProbes
@@ -71,6 +72,12 @@ STRUCT(ShadowView)
 #define FLAG_SCREEN 1u
 #define FLAG_DEBUG 4u
 #define FLAG_MAPS 8u // the frame has material maps (gMaterialMaps, gTextures bound): hits read them
+#define FLAG_GLASS 16u // see-through instances are in the top-level structure (Hit.h.fsl): rays look for their layers
+// Instance masks (renderer_rt.cpp): 1 seen in reflections, 2 casts shadows (glass too), 4 opaque and casts (GI probe
+// rays and their shadow rays: renderer_gi's raster captures skip glass, so traced probes do too).
+#define MASK_REFLECTED 1u
+#define MASK_CASTS 2u
+#define MASK_GI 4u
 // How a hit's local lights are shadowed (shadowMode.y). The sun always takes a ray.
 #define SHADOWS_SCENE 0u // as the scene: from the light's shadow map where it has one, else a ray
 #define SHADOWS_RAYS 1u  // a ray for every light (the scene's ray-traced mode, or the comparison knob)
@@ -170,19 +177,6 @@ float3 skyIrradiance(float3 N)
     return lerp(down, up, N.y * 0.5 + 0.5);
 }
 
-// An octahedral snorm16x2 word (x low, y high), as frame.h packs normals and tangents.
-float3 octWord(uint w)
-{
-    float2 f = max(float2(float(int(w << 16u) >> 16), float(int(w) >> 16)) / 32767.0, float2(-1.0, -1.0));
-    float3 n = float3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
-    float  t = saturate(-n.z);
-    n.x += n.x >= 0.0 ? -t : t;
-    n.y += n.y >= 0.0 ? -t : t;
-    return normalize(n);
-}
-
-// Vertex v's normal: its attributes' first word.
-float3 vertexNormal(uint v) { return octWord(gAttributes[v * 5u]); }
 
 // GGX with height-correlated Smith visibility and Schlick's Fresnel, as the core's forward pass.
 float3 brdfLight(float3 N, float3 V, float3 L, float3 diffuse, float3 f0, float a2, float3 E)
@@ -203,47 +197,55 @@ float3 brdfLight(float3 N, float3 V, float3 L, float3 diffuse, float3 f0, float 
     return (diffuse * (1.0 / PI) + D * Vis * F) * E * NoL;
 }
 
-// Whether anything is between P and a light along L, up to tMax (one any-hit ray).
-float lightVisible(float3 P, float3 L, float tMax)
+// What reaches P from a light along L, up to tMax (one any-hit ray): 0 where something opaque is in the way, else the
+// product of the glass layers it passes (white without). gi: a GI probe hit's ray, which sees no glass (MASK_GI).
+float3 lightVisible(float3 P, float3 L, float tMax, bool gi)
 {
     if (gRt.shadowMode.y == SHADOWS_OFF)
-        return 1.0;
+        return float3(1.0, 1.0, 1.0);
     RayDesc shadowRay;
     shadowRay.Origin = P;
     shadowRay.Direction = L;
     shadowRay.TMin = 0.0;
     shadowRay.TMax = tMax;
-    RayQueryAnyHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RT_RAY_FLAGS, shadowRay, 2u, occluded) // casters only
+    float3 through = float3(1.0, 1.0, 1.0);
+    RayQueryAnyHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RT_RAY_FLAGS, shadowRay, gi ? MASK_GI : MASK_CASTS, occluded) // casters only
     RayQueryBeginForEachCandidate(occluded)
     {
-        if (!cutAway(RayQueryCandidateInstanceID(occluded), RayQueryCandidatePrimitiveIndex(occluded), RayQueryCandidateBarycentrics(occluded)))
+        uint   ci = RayQueryCandidateInstanceID(occluded);
+        uint   cp = RayQueryCandidatePrimitiveIndex(occluded);
+        float2 cb = RayQueryCandidateBarycentrics(occluded);
+        if (isGlass(ci))
+            through *= cutAway(ci, cp, cb) ? float3(1.0, 1.0, 1.0) : glassThrough(ci, cp, cb, L);
+        else if (!cutAway(ci, cp, cb))
             RayQueryCommitCandidate(occluded);
         RayQueryProceed(occluded);
     }
     RayQueryEndForEachCandidate(occluded)
-    return RayQueryIsHit(occluded) ? 0.0 : 1.0;
+    return RayQueryIsHit(occluded) ? float3(0.0, 0.0, 0.0) : through;
 }
 
 // The hit lit where it is: emission, the sun (shadowed by a ray), local lights (those in view nearest first, then
 // the rest; shadowed by their maps or rays, shadowMode.y, at most maxRays rays) and the light around: the sky's, or
 // where renderer_gi's probes hold it, their bounced light (diffuse). rot turns the maps' filter. probe: a GI probe
 // ray's hit, which takes no specular from the surroundings (diffuse probes; the sky's would leak indoors).
-float3 shadeHit(float3 P, float3 N, float3 V, MaterialData m, float occlusion, float2 rot, uint maxRays, bool probe)
+// coverage: a glass layer's (its diffuse light and glow scale by it, as the core's see-through pass), else 1.
+float3 shadeHit(float3 P, float3 N, float3 V, MaterialData m, float occlusion, float2 rot, uint maxRays, bool probe, float coverage)
 {
     float  metallic = saturate(m.params.x);
     float3 albedo = m.albedoRough.rgb;
-    float3 diffuse = albedo * (1.0 - metallic);
+    float3 diffuse = albedo * (1.0 - metallic) * coverage;
     float3 f0 = lerp(float3(m.params.y, m.params.y, m.params.y), albedo, metallic);
     float  rough = clamp(m.albedoRough.a, 0.03, 1.0);
     float  a2 = rough * rough;
     a2 *= a2;
-    float3 color = m.emissive.rgb;
+    float3 color = m.emissive.rgb * coverage;
     float3 offset = P + N * 0.01;
     if (gRt.sunDir.w > 0.5)
     {
         float3 L = gRt.sunDir.xyz;
         if (dot(N, L) > 0.0)
-            color += brdfLight(N, V, L, diffuse, f0, a2, gRt.sunColor.rgb * lightVisible(offset, L, 1000.0));
+            color += brdfLight(N, V, L, diffuse, f0, a2, gRt.sunColor.rgb * lightVisible(offset, L, 1000.0, probe));
     }
     uint  lights = min(gRt.counts.x, MAX_HIT_LIGHTS);
     uint  rays = 0u;
@@ -280,7 +282,7 @@ float3 shadeHit(float3 P, float3 N, float3 V, MaterialData m, float occlusion, f
                 lit *= localShadow(l, P, N, d2 * invDist, NoL, rot);
             else if ((rayAll || l.params.w > 0.5) && rays < maxRays)
             {
-                lit *= lightVisible(offset, L, max(d2 * invDist - 0.05, 0.0));
+                lit *= lightVisible(offset, L, max(d2 * invDist - 0.05, 0.0), probe);
                 rays += 1u;
             }
         }
@@ -360,56 +362,21 @@ float3 applyHeightFog(float3 color, float3 O, float3 d, float t)
     return color * T + gRt.fogAlbedo.rgb * L * (1.0 - T);
 }
 
-// A hit's world normal (as stored, not yet turned towards the ray) and material: top-level instance index, its
-// triangle and barycentrics.
-float3 hitNormal(uint index, uint prim, float2 bary, out(uint) material)
-{
-    uint4        inst = gRtInstances[index]; // x instance row, y first index, z first vertex
-    InstanceData row = gInstances[inst.x];
-    uint         i0 = gIndices[inst.y + prim * 3u] + inst.z;
-    uint         i1 = gIndices[inst.y + prim * 3u + 1u] + inst.z;
-    uint         i2 = gIndices[inst.y + prim * 3u + 2u] + inst.z;
-    float3       n = vertexNormal(i0) * (1.0 - bary.x - bary.y) + vertexNormal(i1) * bary.x + vertexNormal(i2) * bary.y;
-    // Object to world through the cofactor matrix (right for non-uniform scale), as the forward pass.
-    float3 c0 = cross(row.row1.xyz, row.row2.xyz);
-    float3 c1 = cross(row.row2.xyz, row.row0.xyz);
-    float3 c2 = cross(row.row0.xyz, row.row1.xyz);
-    material = row.misc.x;
-    return normalize(float3(dot(c0, n), dot(c1, n), dot(c2, n)));
-}
-
 float3 vertexPosition(uint v) { return asfloat(uint3(gPositions[v * 3u], gPositions[v * 3u + 1u], gPositions[v * 3u + 2u])); }
 
-float4 vertexColor(uint v)
-{
-    uint c = gAttributes[v * 5u + 4u];
-    return float4(float(c & 0xFFu), float((c >> 8u) & 0xFFu), float((c >> 16u) & 0xFFu), float(c >> 24u)) * (1.0 / 255.0);
-}
-
-// Map `slot` (gTextures' index + 1) at uv, its mip from lod: log2 of the cone's footprint in uv units (the map's own
-// size added here, so one lod serves every map of the material).
-float4 sampleMapLod(uint slot, float2 uv, float lod)
-{
-    float4 c = float4(1.0, 1.0, 1.0, 1.0);
-    uint   texSlot = slot - 1u;
-    BeginNonUniformResourceIndex(texSlot, MAX_TEXTURES);
-        int2 size = GetDimensions(gTextures[texSlot], NO_SAMPLER);
-        c = SampleLvlTex2D(gTextures[texSlot], gSamplerTrilinearWrap, uv, max(lod + 0.5 * log2(float(size.x * size.y)), 0.0));
-    EndNonUniformResourceIndex();
-    return c;
-}
-
 // The material a hit shows (top-level instance index, triangle, barycentrics): its flat values, or with the core's
-// texture maps (renderer's Material.h.fsl materialLook and mappedNormal, as the forward pass draws it) where it has
-// them. The maps' mip comes from the ray cone (Akenine-Moller et al. 2021): `width` the cone's width at the hit (m),
-// R the ray's direction; the triangle's uv and world areas turn it into texels. N: the hit's normal (turned towards
-// the ray), replaced by the normal map's; occlusion: the occlusion map's (1: none).
-MaterialData hitMaterial(uint index, uint prim, float2 bary, float width, float3 R, inout(float3) N, out(float) occlusion)
+// texture maps (Hit.h.fsl hitLook) where it has them. The maps' mip comes from the ray cone (Akenine-Moller et al.
+// 2021): `width` the cone's width at the hit (m), R the ray's direction; the triangle's uv and world areas turn it into
+// texels. N: the hit's normal (turned towards the ray), replaced by the normal map's; occlusion: the occlusion map's (1:
+// none); alpha: the base colour's alpha with the maps (1 without: see-through coverage is then material_blend's alone).
+MaterialData hitMaterialAlpha(uint index, uint prim, float2 bary, float width, float3 R, inout(float3) N, out(float) occlusion,
+                              out(float) alpha)
 {
     uint4        inst = gRtInstances[index];
     InstanceData row = gInstances[inst.x];
     MaterialData m = gMaterials[row.misc.x];
     occlusion = 1.0;
+    alpha = 1.0;
     if ((gRt.counts.z & FLAG_MAPS) == 0u)
         return m;
     MaterialMapData mm = gMaterialMaps[row.misc.x];
@@ -418,10 +385,7 @@ MaterialData hitMaterial(uint index, uint prim, float2 bary, float width, float3
     uint   v0 = gIndices[inst.y + prim * 3u] + inst.z;
     uint   v1 = gIndices[inst.y + prim * 3u + 1u] + inst.z;
     uint   v2 = gIndices[inst.y + prim * 3u + 2u] + inst.z;
-    float3 b = float3(1.0 - bary.x - bary.y, bary.x, bary.y);
     float2 t0 = vertexUv(v0), t1 = vertexUv(v1), t2 = vertexUv(v2);
-    float2 uv = t0 * b.x + t1 * b.y + t2 * b.z;
-    float4 color = vertexColor(v0) * b.x + vertexColor(v1) * b.y + vertexColor(v2) * b.z;
     float3 a = row.row0.xyz, c = row.row1.xyz, d = row.row2.xyz;
     float3 e1 = vertexPosition(v1) - vertexPosition(v0), e2 = vertexPosition(v2) - vertexPosition(v0);
     e1 = float3(dot(a, e1), dot(c, e1), dot(d, e1));
@@ -430,47 +394,13 @@ MaterialData hitMaterial(uint index, uint prim, float2 bary, float width, float3
     float2 u1 = t1 - t0, u2 = t2 - t0;
     float uvArea = abs(u1.x * u2.y - u2.x * u1.y);
     float lod = 0.5 * log2(max(uvArea, 1e-20) / max(worldArea, 1e-20)) + log2(max(width, 1e-6) / max(abs(dot(N, R)), 0.05)) + gRt.params.w;
+    return hitLook(index, prim, bary, lod, R, N, occlusion, alpha);
+}
 
-    float4 albedoRough = float4(m.albedoRough.rgb, m.albedoRough.a);
-    if (mm.maps.x != 0u)
-        albedoRough.rgb = mm.baseFactor.rgb * sampleMapLod(mm.maps.x, uv, lod).rgb;
-    albedoRough.rgb *= color.rgb;
-    if (mm.maps.y != 0u)
-    {
-        float3 orm = sampleMapLod(mm.maps.y, uv, lod).rgb;
-        albedoRough.a = mm.factors.x * orm.g;
-        m.params.x = mm.factors.y * orm.b;
-        occlusion = 1.0 + mm.factors.w * (orm.r - 1.0);
-    }
-    m.albedoRough = albedoRough;
-    if (mm.maps.w != 0u)
-        m.emissive.rgb *= sampleMapLod(mm.maps.w, uv, lod).rgb;
-    if (mm.maps.z != 0u)
-    {
-        // MikkTSpace: each vertex's world normal and tangent at unit length (an instance's scale would otherwise
-        // weigh the map's x, y and z unevenly), interpolated as they come, the bitangent from them and the tangent's
-        // sign; the whole frame turned with the face the ray hit. As the core's Forward.vert and Material.h.fsl.
-        float3 c0 = cross(c, d), c1 = cross(d, a), c2 = cross(a, c);
-        float3 n0 = vertexNormal(v0), n1 = vertexNormal(v1), n2 = vertexNormal(v2);
-        float3 n = normalize(float3(dot(c0, n0), dot(c1, n0), dot(c2, n0))) * b.x +
-                   normalize(float3(dot(c0, n1), dot(c1, n1), dot(c2, n1))) * b.y +
-                   normalize(float3(dot(c0, n2), dot(c1, n2), dot(c2, n2))) * b.z;
-        uint   w0 = gAttributes[v0 * 5u + 1u];
-        float3 t0 = octWord(w0), t1 = octWord(gAttributes[v1 * 5u + 1u]), t2 = octWord(gAttributes[v2 * 5u + 1u]);
-        float3 t = normalize(float3(dot(a, t0), dot(c, t0), dot(d, t0))) * b.x +
-                   normalize(float3(dot(a, t1), dot(c, t1), dot(d, t1))) * b.y +
-                   normalize(float3(dot(a, t2), dot(c, t2), dot(d, t2))) * b.z;
-        float  facing = dot(n, R) > 0.0 ? -1.0 : 1.0;
-        float2 xy = sampleMapLod(mm.maps.z, uv, lod).xy * 2.0 - 1.0;
-        float  z = sqrt(saturate(1.0 - dot(xy, xy)));
-        xy *= mm.factors.z;
-        float3 B = cross(n, t) * (((w0 >> 16u) & 1u) != 0u ? -1.0 : 1.0);
-        float3 mapped = t * xy.x + B * xy.y + n * z;
-        float  l = dot(mapped, mapped);
-        if (l > 1e-12)
-            N = mapped * (rsqrt(l) * facing);
-    }
-    return m;
+MaterialData hitMaterial(uint index, uint prim, float2 bary, float width, float3 R, inout(float3) N, out(float) occlusion)
+{
+    float alpha;
+    return hitMaterialAlpha(index, prim, bary, width, R, N, occlusion, alpha);
 }
 
 STRUCT(Hit)
@@ -484,7 +414,30 @@ STRUCT(Hit)
     DATA(uint4, tri, None);     // the hit's top-level instance, triangle and barycentrics (as uints)
     DATA(float, cone, None);    // the ray cone's width there (m)
     DATA(float, invPdf, None);  // 1 / the probability the ray was cast with (GGX visible normals), for its reuse
+    DATA(float4, glass, None);  // the nearest glass layer in front of what the ray saw (FLAG_GLASS): xyz where, w its
+                                // distance (0: none)
+    DATA(uint4, glassTri, None); // its top-level instance, triangle and barycentrics (as uints)
+    DATA(float, glassCone, None); // the ray cone's width there (m)
 };
+
+// The ray cone's width t along pixel p's reflected ray (Akenine-Moller et al. 2021): a pixel wide at the surface (view
+// depth z, normal N), spreading by the pixel's angle, twice the surface's own bend across a pixel (the normal's change
+// to the neighbours on the same surface) and the lobe's width (alpha) for a rough reflection, so distant and curved
+// reflections pick blurrier mips instead of shimmering.
+float coneWidth(int2 p, float z, float3 N, float alpha, float t)
+{
+    int2  size = int2(gRt.screen.xy);
+    float pixelAngle = 2.0 / (gRt.up.w * gRt.screen.y);
+    float bend = 0.0;
+    for (uint k = 0u; k < 2u; ++k)
+    {
+        int2  q = clamp(p + int2(k == 0u ? 1 : 0, k == 1u ? 1 : 0), int2(0, 0), size - int2(1, 1));
+        float dq = LoadTex2D(gDepth, NO_SAMPLER, q, 0).r;
+        if (dq > 0.0 && abs(gRt.forward.w / dq - z) < 0.05 * z)
+            bend = max(bend, length(normalize(LoadTex2D(gSurface, NO_SAMPLER, q, 0).yzw) - N));
+    }
+    return z * pixelAngle + t * (pixelAngle + 2.0 * bend + alpha);
+}
 
 // Traces pixel p's reflected ray (surface and d: its surface and depth). What the screen shows, the sky and
 // untraced pixels come back finished; a hit to light where it is comes back with result.a < 0 (lightHit).
@@ -500,6 +453,9 @@ Hit traceRay(int2 p, float4 surface, float d, uint seq)
     o.tri = uint4(0u, 0u, 0u, 0u);
     o.cone = 0.0;
     o.invPdf = 0.0;
+    o.glass = float4(0.0, 0.0, 0.0, 0.0);
+    o.glassTri = uint4(0u, 0u, 0u, 0u);
+    o.glassCone = 0.0;
     int2   size = int2(gRt.screen.xy);
     float  rough = surface.x;
     if (d <= 0.0 || rough >= gRt.camPos.w)
@@ -537,16 +493,38 @@ Hit traceRay(int2 p, float4 surface, float d, uint seq)
     ray.Direction = R;
     ray.TMin = 0.0;
     ray.TMax = gRt.params.x;
-    RayQueryClosestHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RT_RAY_FLAGS, ray, 1u, hit)
+    // Glass is never committed: the nearest layer that counts (Hit.h.fsl) is kept, to show over what is behind it.
+    float  glassT = ray.TMax;
+    uint4  glassTri = uint4(0u, 0u, 0u, 0u);
+    RayQueryClosestHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RT_RAY_FLAGS, ray, MASK_REFLECTED, hit)
     RayQueryBeginForEachCandidate(hit)
     {
-        if (!cutAway(RayQueryCandidateInstanceID(hit), RayQueryCandidatePrimitiveIndex(hit), RayQueryCandidateBarycentrics(hit)))
+        uint   ci = RayQueryCandidateInstanceID(hit);
+        uint   cp = RayQueryCandidatePrimitiveIndex(hit);
+        float2 cb = RayQueryCandidateBarycentrics(hit);
+        if (isGlass(ci))
+        {
+            float ct = RayQueryCandidateRayT(hit);
+            uint  material;
+            if (ct < glassT && !cutAway(ci, cp, cb) && glassCounts(ci, (gRtInstances[ci].w & RT_INST_MATERIAL) - 1u, dot(hitNormal(ci, cp, cb, material), R) < 0.0))
+            {
+                glassT = ct;
+                glassTri = uint4(ci, cp, asuint(cb));
+            }
+        }
+        else if (!cutAway(ci, cp, cb))
             RayQueryCommitCandidate(hit);
         RayQueryProceed(hit);
     }
     RayQueryEndForEachCandidate(hit)
     o.ray = float4(R, 0.0); // kept for the half-resolution rays' reuse
     bool debug = (gRt.counts.z & FLAG_DEBUG) != 0u;
+    if (glassT < (RayQueryIsHit(hit) ? RayQueryRayT(hit) : ray.TMax))
+    {
+        o.glass = float4(ray.Origin + R * glassT, glassT);
+        o.glassTri = glassTri;
+        o.glassCone = coneWidth(p, z, N, alpha, glassT);
+    }
     if (!RayQueryIsHit(hit))
     {
         float3 sky = applyHeightFog(skyRadiance(R) * gRt.sunColor.w, ray.Origin, R, gRt.fogAlbedo.w);
@@ -599,19 +577,7 @@ Hit traceRay(int2 p, float4 surface, float d, uint seq)
     o.screen = float4(screenColor, 0.0);
     o.material = material;
     o.tri = uint4(index, prim, asuint(bary));
-    // The ray cone (Akenine-Moller et al. 2021): a pixel wide at the surface, spreading by the pixel's angle, twice the
-    // surface's own bend across a pixel (the normal's change to the neighbours on the same surface) and the lobe's
-    // width (alpha) for a rough reflection, so distant and curved reflections pick blurrier mips instead of shimmering.
-    float pixelAngle = 2.0 / (gRt.up.w * gRt.screen.y);
-    float bend = 0.0;
-    for (uint k = 0u; k < 2u; ++k)
-    {
-        int2  q = clamp(p + int2(k == 0u ? 1 : 0, k == 1u ? 1 : 0), int2(0, 0), size - int2(1, 1));
-        float dq = LoadTex2D(gDepth, NO_SAMPLER, q, 0).r;
-        if (dq > 0.0 && abs(gRt.forward.w / dq - z) < 0.05 * z)
-            bend = max(bend, length(normalize(LoadTex2D(gSurface, NO_SAMPLER, q, 0).yzw) - N));
-    }
-    o.cone = z * pixelAngle + t * (pixelAngle + 2.0 * bend + alpha);
+    o.cone = coneWidth(p, z, N, alpha, t);
     return o;
 }
 
@@ -626,7 +592,7 @@ float4 lightHit(Hit h, int2 p)
     float3       N = h.normal.xyz;
     float        occlusion;
     MaterialData m = hitMaterial(h.tri.x, h.tri.y, asfloat(h.tri.zw), h.cone, ray.xyz, N, occlusion);
-    float3       lit = shadeHit(pos.xyz, N, -ray.xyz, m, occlusion, float2(cos(phi), sin(phi)), MAX_SHADOW_RAYS, false);
+    float3       lit = shadeHit(pos.xyz, N, -ray.xyz, m, occlusion, float2(cos(phi), sin(phi)), MAX_SHADOW_RAYS, false, 1.0);
     // The fog between the reflecting surface and the hit (what the screen shows of it already holds the camera's).
     lit = applyHeightFog(lit, pos.xyz - ray.xyz * pos.w, ray.xyz, pos.w);
     float3 color = lerp(lit, screen, ray.w);
@@ -635,13 +601,38 @@ float4 lightHit(Hit h, int2 p)
     return float4(clampSample(color), max(pos.w, 1e-3));
 }
 
+// A sample (what the ray saw behind) with the glass layer in front of it (h.glass), as the core's see-through pass
+// draws one over the scene: what is behind times the layer's T, plus its own light (its diffuse and glow by its
+// coverage, its specular whole), fogged over its distance. No decals on glass, as in the raster. p turns the maps' filter.
+float4 overGlass(Hit h, float4 behind, int2 p)
+{
+    if (h.glass.w <= 0.0)
+        return behind;
+    float3       R = h.ray.xyz;
+    float2       bary = asfloat(h.glassTri.zw);
+    uint         material;
+    float3       N = hitNormal(h.glassTri.x, h.glassTri.y, bary, material);
+    if (dot(N, R) > 0.0)
+        N = -N; // the side the ray came from
+    float        occlusion, alpha;
+    MaterialData m = hitMaterialAlpha(h.glassTri.x, h.glassTri.y, bary, h.glassCone, R, N, occlusion, alpha);
+    float        coverage = saturate(gMaterialMaps[material].misc.z * alpha);
+    float3       T = glassTransmit(m, material, coverage, max(dot(N, -R), 1e-3));
+    float        phi = noise2(float2(p) + float(gRt.counts.y % 64u) * 5.588238) * 2.0 * PI;
+    float3       own = shadeHit(h.glass.xyz, N, -R, m, occlusion, float2(cos(phi), sin(phi)), MAX_SHADOW_RAYS, false, coverage);
+    own = applyHeightFog(own, h.glass.xyz - R * h.glass.w, R, h.glass.w);
+    float3 color = own + behind.rgb * T;
+    if ((gRt.counts.z & FLAG_DEBUG) != 0u)
+        color = float3(1.0, 0.0, 1.0);
+    return float4(clampSample(color), behind.a);
+}
+
 // What pixel p's reflected ray sees: rgb, a its distance (0: not traced, RT_MISS: the sky).
 float4 tracePixel(int2 p, float4 surface, float d)
 {
     Hit h = traceRay(p, surface, d, gRt.counts.y);
-    if (h.result.a >= 0.0)
-        return h.result;
-    return lightHit(h, p);
+    float4 behind = h.result.a >= 0.0 ? h.result : lightHit(h, p);
+    return overGlass(h, behind, p);
 }
 
 // Half resolution: each 2 x 2 block traces one pixel, a different one each frame (TAA gathers them).
@@ -687,6 +678,7 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
             // The maps' filter is turned by where the sample is written (the half-size texel at half resolution).
             if (h.result.a < 0.0)
                 h.result = lightHit(h, isHalf ? b : p);
+            h.result = overGlass(h, h.result, isHalf ? b : p);
             if (isHalf)
             {
                 Write2D(gOutHalf, b, h.result);
@@ -1211,7 +1203,7 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
 #if defined(GI_PASS)
 // renderer_gi's probe rays (giCounts.x probes, giCounts.y rays each; a thread a ray, probe-major): ray k of probe i from
 // the probe's place along this frame's turned spherical Fibonacci direction k, against everything that casts a shadow
-// (mask 2: lights' own emitters and markers don't, so the probes don't count a light twice). A hit is lit where it is
+// (MASK_GI, opaque casters: glass is skipped as renderer_gi's captures skip it; lights' own emitters and markers don't, so the probes don't count a light twice). A hit is lit where it is
 // as reflections' are (emission, the sun's ray, local lights through their maps, rays for at most GI_SHADOW_RAYS lights
 // without one, the probes' own bounced light from last frame), then fogged over its distance; a hit on a back face
 // writes no light and its distance negated (the probe is inside something); a miss the sky, fogged over the fog's range,
@@ -1235,7 +1227,7 @@ void CS_MAIN(SV_GroupID(uint3) gid, SV_GroupThreadID(uint3) tid)
     ray.Direction = giRayDirection(k, rays, gRt.giRot[0], gRt.giRot[1], gRt.giRot[2]);
     ray.TMin = 0.0;
     ray.TMax = RT_FAR;
-    RayQueryClosestHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RT_RAY_FLAGS, ray, 2u, hit)
+    RayQueryClosestHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RT_RAY_FLAGS, ray, MASK_GI, hit)
     RayQueryBeginForEachCandidate(hit)
     {
         if (!cutAway(RayQueryCandidateInstanceID(hit), RayQueryCandidatePrimitiveIndex(hit), RayQueryCandidateBarycentrics(hit)))
@@ -1261,7 +1253,7 @@ void CS_MAIN(SV_GroupID(uint3) gid, SV_GroupThreadID(uint3) tid)
             float        occlusion;
             MaterialData m = hitMaterial(RayQueryInstanceID(hit), RayQueryPrimitiveIndex(hit), RayQueryBarycentrics(hit),
                                          t * sqrt(4.0 * PI / float(max(rays, 1u))), ray.Direction, N, occlusion);
-            float3 lit = shadeHit(P, N, -ray.Direction, m, occlusion, float2(cos(phi), sin(phi)), GI_SHADOW_RAYS, true);
+            float3 lit = shadeHit(P, N, -ray.Direction, m, occlusion, float2(cos(phi), sin(phi)), GI_SHADOW_RAYS, true, 1.0);
             result = float4(clampSample(applyHeightFog(lit, ray.Origin, ray.Direction, t)), t);
         }
     }

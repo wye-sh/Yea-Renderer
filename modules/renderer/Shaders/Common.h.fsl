@@ -80,6 +80,7 @@ STRUCT(ProbeData)
 #define FLAG_GI       524288u // renderer_gi: diffuse ambient from its probes (gGiIrradiance, gGiDistance, gGiProbes)
 #define FLAG_GI_DEBUG 1048576u
 #define FLAG_DECALS   2097152u // decals: gDecals, binned (with FLAG_CULLED) in gDecalMasks and gDecalBins
+#define FLAG_RT_TINT  8388608u // renderer_rt: gRtShadowTint, the colour glass lets through to each traced shadow (frame rtShadowTint)
 #define FLAG_REFRACTION 4194304u // the see-through pass: gSceneColor holds the scene behind glass, for gRefraction's materials
 #define FLAG_AREA     65536u // gLightShapes is filled: some light has a shape or its own size (area lights take LTC terms)
 #define RT_MISS       60000.0

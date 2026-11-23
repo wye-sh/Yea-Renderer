@@ -47,5 +47,6 @@ BEGIN_SRT(SceneSrt)
         DECL_BUFFER(PerFrame, Buffer(float4), gRefraction)   // two a material (material_refraction): x ior, y thickness, z shape,
                                                              // w 1 given; then rgb tint
         DECL_TEXTURE(PerFrame, Tex2D(float4), gSceneColor)  // the scene colour chain glass refracts (FLAG_REFRACTION)
+        DECL_TEXTURE(PerFrame, Tex2DArray(float4), gRtShadowTint) // glass's colour in traced shadows (FLAG_RT_TINT)
     END_SRT_SET(PerFrame)
 END_SRT(SceneSrt)

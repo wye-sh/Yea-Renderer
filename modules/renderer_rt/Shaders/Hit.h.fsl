@@ -1,0 +1,197 @@
+// What a ray hit, shared by the reflections (Trace.comp.fsl) and the traced shadows (Shadows.comp.fsl): include after
+// Cutout.h.fsl and an SRT that declares gRtInstances, gInstances, gMaterials, gMaterialMaps, gTextures, gIndices,
+// gAttributes, gRefraction and gDfg (InstanceData, MaterialData and MaterialMapData as the core's).
+// gRtInstances' w (renderer_rt.cpp): RT_INST_MATERIAL the material + 1 (0: none needed), and its flags.
+#ifndef RT_HIT_H
+#define RT_HIT_H
+
+// A candidate's distance along its ray (FSL has the committed one only).
+#if defined(VULKAN)
+#define RayQueryCandidateRayT(hit) (rayQueryGetIntersectionTEXT(hit, false))
+#else
+#define RayQueryCandidateRayT(hit) (hit.CandidateTriangleRayT())
+#endif
+
+// An octahedral snorm16x2 word (x low, y high), as frame.h packs normals and tangents.
+float3 octWord(uint w)
+{
+    float2 f = max(float2(float(int(w << 16u) >> 16), float(int(w) >> 16)) / 32767.0, float2(-1.0, -1.0));
+    float3 n = float3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    float  t = saturate(-n.z);
+    n.x += n.x >= 0.0 ? -t : t;
+    n.y += n.y >= 0.0 ? -t : t;
+    return normalize(n);
+}
+
+// Vertex v's normal: its attributes' first word.
+float3 vertexNormal(uint v) { return octWord(gAttributes[v * 5u]); }
+
+float4 vertexColor(uint v)
+{
+    uint c = gAttributes[v * 5u + 4u];
+    return float4(float(c & 0xFFu), float((c >> 8u) & 0xFFu), float((c >> 16u) & 0xFFu), float(c >> 24u)) * (1.0 / 255.0);
+}
+
+// A hit's world normal (as stored, not yet turned towards the ray) and material: top-level instance index, its
+// triangle and barycentrics.
+float3 hitNormal(uint index, uint prim, float2 bary, out(uint) material)
+{
+    uint4        inst = gRtInstances[index]; // x instance row, y first index, z first vertex
+    InstanceData row = gInstances[inst.x];
+    uint         i0 = gIndices[inst.y + prim * 3u] + inst.z;
+    uint         i1 = gIndices[inst.y + prim * 3u + 1u] + inst.z;
+    uint         i2 = gIndices[inst.y + prim * 3u + 2u] + inst.z;
+    float3       n = vertexNormal(i0) * (1.0 - bary.x - bary.y) + vertexNormal(i1) * bary.x + vertexNormal(i2) * bary.y;
+    // Object to world through the cofactor matrix (right for non-uniform scale), as the forward pass.
+    float3 c0 = cross(row.row1.xyz, row.row2.xyz);
+    float3 c1 = cross(row.row2.xyz, row.row0.xyz);
+    float3 c2 = cross(row.row0.xyz, row.row1.xyz);
+    material = row.misc.x;
+    return normalize(float3(dot(c0, n), dot(c1, n), dot(c2, n)));
+}
+
+// Map `slot` (gTextures' index + 1) at uv, its mip from lod: log2 of the cone's footprint in uv units (the map's own
+// size added here, so one lod serves every map of the material). A lod far below 0 reads mip 0.
+float4 sampleMapLod(uint slot, float2 uv, float lod)
+{
+    float4 c = float4(1.0, 1.0, 1.0, 1.0);
+    uint   texSlot = slot - 1u;
+    BeginNonUniformResourceIndex(texSlot, MAX_TEXTURES);
+        int2 size = GetDimensions(gTextures[texSlot], NO_SAMPLER);
+        c = SampleLvlTex2D(gTextures[texSlot], gSamplerTrilinearWrap, uv, max(lod + 0.5 * log2(float(size.x * size.y)), 0.0));
+    EndNonUniformResourceIndex();
+    return c;
+}
+
+// A hit's look from its material's texture maps (which it was given: MaterialMapData misc.y), as the core's
+// Material.h.fsl materialLook and mappedNormal draw it: base colour, ORM, glow and the normal map at mip `lod` (as
+// sampleMapLod). N: the hit's normal turned towards the ray, replaced by the normal map's; alpha: the base colour's
+// alpha (its factor, map and vertex colour), as see-through surfaces take their coverage from it.
+MaterialData hitLook(uint index, uint prim, float2 bary, float lod, float3 R, inout(float3) N, out(float) occlusion, out(float) alpha)
+{
+    uint4           inst = gRtInstances[index];
+    InstanceData    row = gInstances[inst.x];
+    MaterialData    m = gMaterials[row.misc.x];
+    MaterialMapData mm = gMaterialMaps[row.misc.x];
+    occlusion = 1.0;
+    uint   v0 = gIndices[inst.y + prim * 3u] + inst.z;
+    uint   v1 = gIndices[inst.y + prim * 3u + 1u] + inst.z;
+    uint   v2 = gIndices[inst.y + prim * 3u + 2u] + inst.z;
+    float3 b = float3(1.0 - bary.x - bary.y, bary.x, bary.y);
+    float2 uv = vertexUv(v0) * b.x + vertexUv(v1) * b.y + vertexUv(v2) * b.z;
+    float4 color = vertexColor(v0) * b.x + vertexColor(v1) * b.y + vertexColor(v2) * b.z;
+    float3 a = row.row0.xyz, c = row.row1.xyz, d = row.row2.xyz;
+
+    float4 albedoRough = float4(m.albedoRough.rgb, m.albedoRough.a);
+    alpha = mm.baseFactor.a * color.a;
+    if (mm.maps.x != 0u)
+    {
+        float4 base = sampleMapLod(mm.maps.x, uv, lod);
+        albedoRough.rgb = mm.baseFactor.rgb * base.rgb;
+        alpha *= base.a;
+    }
+    albedoRough.rgb *= color.rgb;
+    if (mm.maps.y != 0u)
+    {
+        float3 orm = sampleMapLod(mm.maps.y, uv, lod).rgb;
+        albedoRough.a = mm.factors.x * orm.g;
+        m.params.x = mm.factors.y * orm.b;
+        occlusion = 1.0 + mm.factors.w * (orm.r - 1.0);
+    }
+    m.albedoRough = albedoRough;
+    if (mm.maps.w != 0u)
+        m.emissive.rgb *= sampleMapLod(mm.maps.w, uv, lod).rgb;
+    if (mm.maps.z != 0u)
+    {
+        // MikkTSpace: each vertex's world normal and tangent at unit length (an instance's scale would otherwise
+        // weigh the map's x, y and z unevenly), interpolated as they come, the bitangent from them and the tangent's
+        // sign; the whole frame turned with the face the ray hit. As the core's Forward.vert and Material.h.fsl.
+        float3 c0 = cross(c, d), c1 = cross(d, a), c2 = cross(a, c);
+        float3 n0 = vertexNormal(v0), n1 = vertexNormal(v1), n2 = vertexNormal(v2);
+        float3 n = normalize(float3(dot(c0, n0), dot(c1, n0), dot(c2, n0))) * b.x +
+                   normalize(float3(dot(c0, n1), dot(c1, n1), dot(c2, n1))) * b.y +
+                   normalize(float3(dot(c0, n2), dot(c1, n2), dot(c2, n2))) * b.z;
+        uint   w0 = gAttributes[v0 * 5u + 1u];
+        float3 t0 = octWord(w0), t1 = octWord(gAttributes[v1 * 5u + 1u]), t2 = octWord(gAttributes[v2 * 5u + 1u]);
+        float3 t = normalize(float3(dot(a, t0), dot(c, t0), dot(d, t0))) * b.x +
+                   normalize(float3(dot(a, t1), dot(c, t1), dot(d, t1))) * b.y +
+                   normalize(float3(dot(a, t2), dot(c, t2), dot(d, t2))) * b.z;
+        float  facing = dot(n, R) > 0.0 ? -1.0 : 1.0;
+        float2 xy = sampleMapLod(mm.maps.z, uv, lod).xy * 2.0 - 1.0;
+        float  z = sqrt(saturate(1.0 - dot(xy, xy)));
+        xy *= mm.factors.z;
+        float3 B = cross(n, t) * (((w0 >> 16u) & 1u) != 0u ? -1.0 : 1.0);
+        float3 mapped = t * xy.x + B * xy.y + n * z;
+        float  l = dot(mapped, mapped);
+        if (l > 1e-12)
+            N = mapped * (rsqrt(l) * facing);
+    }
+    return m;
+}
+
+// The core's split-sum table (renderer's Shaders/Brdf.h.fsl dfgLookup, identical; frame.h dfg).
+float2 dfgLookup(float NoV, float rough)
+{
+    float  x = saturate(NoV) * 31.0;
+    float  y = saturate(rough) * 31.0;
+    uint   x0 = uint(x);
+    uint   y0 = uint(y);
+    uint   x1 = min(x0 + 1u, 31u);
+    uint   y1 = min(y0 + 1u, 31u);
+    float  fx = x - float(x0);
+    float  fy = y - float(y0);
+    float2 a = lerp(gDfg[y0 * 32u + x0], gDfg[y0 * 32u + x1], fx);
+    float2 b = lerp(gDfg[y1 * 32u + x0], gDfg[y1 * 32u + x1], fx);
+    return lerp(a, b, fy);
+}
+
+// Glass (see-through instances, frame seeThrough): non-opaque in the top-level structure with RT_INST_GLASS, never
+// committed. Each layer a ray crosses lets through what the core's see-through pass lets through of what is behind it
+// (Forward.frag.fsl TRANSLUCENT): T = (1 - coverage) (1 - the specular's directional albedo) tint, coverage being
+// material_blend's opacity (material maps' misc.z) times the base colour's alpha. As the raster draws them, a layer
+// counts where the ray meets a front face, or any face of a two-sided material, except a solid refraction (it draws
+// only its near side).
+bool isGlass(uint index) { return (gRtInstances[index].w & RT_INST_GLASS) != 0u; }
+
+bool glassCounts(uint index, uint material, bool front)
+{
+    return front || ((gRtInstances[index].w & RT_INST_TWO_SIDED) != 0u && gRefraction[material * 2u].z < 0.5);
+}
+
+// A layer's T for its look m (after its maps), coverage, and the cosine NoV between its shading normal and the ray.
+float3 glassTransmit(MaterialData m, uint material, float coverage, float NoV)
+{
+    float  metallic = saturate(m.params.x);
+    float3 f0 = lerp(float3(m.params.y, m.params.y, m.params.y), m.albedoRough.rgb, metallic);
+    float2 dfg = dfgLookup(max(NoV, 1e-3), clamp(m.albedoRough.a, 0.03, 1.0));
+    float  Ess = dfg.x + dfg.y;
+    float3 FssEss = f0 * dfg.x + float3(dfg.y, dfg.y, dfg.y);
+    float  Ems = 1.0 - Ess;
+    float3 Favg = f0 + (float3(1.0, 1.0, 1.0) - f0) * (1.0 / 21.0);
+    float3 Fms = FssEss * Favg / (float3(1.0, 1.0, 1.0) - Ems * Favg);
+    return (1.0 - saturate(coverage)) * saturate(float3(1.0, 1.0, 1.0) - FssEss - Fms * Ems) * gRefraction[material * 2u + 1u].rgb;
+}
+
+// What a glass candidate (top-level instance index, triangle, barycentrics) lets through along R, its maps at mip 0
+// (as cut-outs: the frames average them); white where the layer doesn't count.
+float3 glassThrough(uint index, uint prim, float2 bary, float3 R)
+{
+    uint   material;
+    float3 N = hitNormal(index, prim, bary, material);
+    bool   front = dot(N, R) < 0.0;
+    if (!glassCounts(index, material, front))
+        return float3(1.0, 1.0, 1.0);
+    N = front ? N : -N;
+    MaterialData    m = gMaterials[material];
+    MaterialMapData mm = gMaterialMaps[material];
+    float           coverage = mm.misc.z;
+    if (mm.misc.y > 0.5)
+    {
+        float occlusion, alpha;
+        m = hitLook(index, prim, bary, -100.0, R, N, occlusion, alpha);
+        coverage *= alpha;
+    }
+    return glassTransmit(m, material, coverage, abs(dot(N, R)));
+}
+
+#endif

@@ -274,6 +274,15 @@ uint sunCascadeIndex(float viewZ)
 }
 
 // dither: 0..1 noise that changes each frame (TAA on), or negative.
+// A traced shadow (renderer_rt): slice's visibility at pixel, times the colour glass lets through to it (FLAG_RT_TINT).
+float3 tracedShadow(int2 pixel, int slice)
+{
+    float  v = LoadTex3D(gRtShadows, NO_SAMPLER, int3(pixel, slice), 0).r;
+    float3 tint = (gFrame.counts.z & FLAG_RT_TINT) != 0u ? LoadTex3D(gRtShadowTint, NO_SAMPLER, int3(pixel, slice), 0).rgb
+                                                          : float3(1.0, 1.0, 1.0);
+    return tint * v;
+}
+
 float sunShadow(float3 P, float3 N, float viewZ, float2 rot, float dither)
 {
     uint count = uint(gFrame.shadow.x);
@@ -675,7 +684,7 @@ float3 shadeLocalLight(uint i, Surface s, float3 sofar)
             if ((!tracedA && (gFrame.counts.z & FLAG_SHADOWS) == 0u) || shadowUnseen(lit, sofar))
                 return lit;
             if (tracedA)
-                return lit * LoadTex3D(gRtShadows, NO_SAMPLER, int3(s.pixel, int(l.params.w - 1.0)), 0).r;
+                return lit * tracedShadow(s.pixel, int(l.params.w - 1.0));
             return lit * localShadow(l, s.P, s.N, d2 * invDist, NoL, s.rot, size);
         }
     }
@@ -698,7 +707,7 @@ float3 shadeLocalLight(uint i, Surface s, float3 sofar)
     if ((!traced && (gFrame.counts.z & FLAG_SHADOWS) == 0u) || shadowUnseen(lit, sofar))
         return lit;
     if (traced)
-        return lit * LoadTex3D(gRtShadows, NO_SAMPLER, int3(s.pixel, int(l.params.w - 1.0)), 0).r;
+        return lit * tracedShadow(s.pixel, int(l.params.w - 1.0));
     return lit * localShadow(l, s.P, s.N, d2 * invDist, NoL, s.rot, size);
 }
 
