@@ -19,6 +19,8 @@ import renderer handle texture_add(u64 path, u64 offset, u64 bytes, u32 format, 
 import renderer void material_maps(handle m, handle base_color, handle orm, handle normal, handle emissive)
 import renderer void material_factors(handle m, float4 base_color, float roughness, float metallic, float normal_scale, float occlusion)
 import renderer void material_alpha(handle m, float cutoff)
+# Blended (renderer 4.8.0): opacity times the material's own alpha (its factors', its map's, its vertices'); 0 opaque.
+import renderer void material_blend(handle m, float opacity)
 import renderer handle instance_add(u32 mesh, handle material) = 4294967295
 import renderer void instance_place(handle i, float3 pos, float4 rotation, float3 scale)
 import renderer void instance_shadow(handle i, bool cast)

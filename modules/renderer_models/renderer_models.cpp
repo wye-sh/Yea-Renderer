@@ -369,6 +369,8 @@ void loadCooked(Entry& e)
                                 texture(mt.textures[3]));
         if (mt.alpha == RmodelMask)
             renderer::material_alpha(material, mt.alphaCutoff > 0 ? mt.alphaCutoff : 0.5f);
+        else if (mt.alpha == RmodelBlend) // blended: its factors' alpha (above) times its map's, as glTF says
+            renderer::material_blend(material, 1.0f);
         row->key = e.key;
         row->part = k;
         row->mesh = e.mesh[k] = chain[0];

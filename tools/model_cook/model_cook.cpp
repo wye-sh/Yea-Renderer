@@ -962,7 +962,7 @@ int main(int argc, char** argv)
         o.normalScale = src.normalScale;
         o.occlusionStrength = src.occlusionStrength;
         if (o.alpha == RmodelBlend)
-            warn("material %s is alpha blend: drawn opaque until the renderer has transparency", o.name);
+            note("material %s is alpha blend: blended (renderer 4.8.0 and later)", o.name);
         // The flat look (each map averaged) for a renderer without the textures.
         memcpy(o.flatColor, o.baseColor, 12);
         o.flatRoughness = o.roughness, o.flatMetallic = o.metallic;

@@ -351,8 +351,9 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   shape (box, sphere, cylinder, cone, torus, plane), or a cooked model, `models/<name>.rmodel` in the declaring module's
   `Assets/` (`rmodel.h`; written by `tools/model_cook`), read in this module's own update from the owner's `yea::assets()`
   path: each part (one per material) a LOD chain of the core's meshes (`mesh_packed`, linked with `mesh_lod`) and a material
-  from its factors, texture maps (`texture_add` with the file's path and offsets: the core streams them itself) and alpha mask
-  (cutoff 0.5 unless the file says); emissive is the file's factor times strength times `emissive_nits`. A file that is
+  from its factors, texture maps (`texture_add` with the file's path and offsets: the core streams them itself) and alpha mode
+  (a mask cuts out at the file's cutoff, 0.5 by default; a BLEND material is blended through `material_blend(m, 1)`, its
+  factors' alpha times its map's); emissive is the file's factor times strength times `emissive_nits`. A file that is
   missing, damaged or of another version fails that model only, logged and shown in the Viewer; state `Format` rebuilds
   every model when `rmodel.h`'s kRmodelVersion changes. Its tables: `Placement` (a row per
   placement, keyed by the model's owner and name), `PartInstance` (the core's instances, one per part), `ModelPart` (each
