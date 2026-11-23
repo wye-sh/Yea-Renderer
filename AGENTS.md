@@ -187,8 +187,28 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   (`Shaders/Hit.h.fsl`). A layer counts where raster draws one: a front face, or any face of a two-sided material
   except a solid refraction (shape 1), front faces only. It lets through T = (1 - coverage) x tint x (1 - FssEss -
   Fms Ems) at its angle (coverage material_blend's opacity x base colour alpha; the split-sum terms from the core's
-  `dfg`, as its see-through pass). A reflection ray keeps the nearest layer in front of what it saw and shows its own
-  light (diffuse and glow by coverage, specular whole, no decals) over what is behind times T. Shadow rays (reflected
+  `dfg`, as its see-through pass). A reflection ray shades each layer it meets, front to back (its own
+  light: diffuse and glow by coverage, specular whole, no decals; then T times what is behind; fog per segment), and
+  goes on from it: with frame v28 `refractOn` (the core's see-through pass refracts) through a material_refraction
+  layer it bends as Forward.frag's refractedScene (`refractThrough` in Trace.comp.fsl: thin shifted by its thickness,
+  on as it came; solid a ball that thick, in and out), then traces the real scene from where it leaves; rough glass
+  jitters it over a disc of angular diameter 2 alpha (1 - 1/ior), refractedScene's spread, which the history averages,
+  and widens the ray cone by it. Four layers are shaded and bent at most (GLASS_LAYERS); past them a second, glass-only
+  ray multiplies the T of every layer up to the hit, as raster multiplies every see-through surface (`followRay`,
+  shared by reflections and on-screen refraction). On-screen refraction (frame v28 `rtRefraction` and
+  `rtRefractLanding`, knob `traced_refraction`): while refractOn and glass is in the structure, rt_prepare sets both (made at
+  render size on first need, 36 bytes a pixel) and rt_run's refraction pass (REFRACT_PASS, before the reflections)
+  traces the screen rectangle of every see-through sphere, a thread a pixel: the camera ray through the pixel's
+  centre, this frame's jittered projection, to the nearest counting refracting layer in front of the prepass depth,
+  bent there by its mapped normal (refractThrough), then followRay. rgb is what comes back, fogged from the camera
+  along the path; a is the layer's view depth. Where the bent ray meets what the depth shows on screen (the sky's depth
+  0 for a miss) and a glass-only ray from the camera to it crosses as many other counting layers beyond the layer
+  (`glassBehind`), the landing says to read the core's chain there: xy a pixel offset from the fragment's centre, z
+  refractedScene's mip. That path never jitters, so the landing holds still. Elsewhere, through rough glass (this layer
+  or deeper), one ray a frame goes over the spreads, accumulated over history_frames where last frame's layer was, by
+  its view depth. The core takes them only where |a - zP| < max(0.005 zP, 2 fwidth(zP)); a refracting layer behind the
+  front one keeps the chain path. Hits there have no screen AO or contact shadows, as reflections' hits. A reflection's
+  distance is its whole path; the half-resolution reuse keeps the ray as cast. Shadow rays (reflected
   hits' and traced shadows') multiply T over the layers they pass. When a glass caster is traced, rt_prepare sets
   `rtShadowTint` (RGBA16F, rtShadows' size and layers: the trace's raw tint with the nearest layer's distance in a,
   then, reused, the filtered tint) and rt_run fills it: accumulated over frames like the visibility over the rays no
@@ -822,6 +842,19 @@ for the decals in its tile and z-bin (a box test, then up to three map reads or 
   logs the first frame with each pass and with VRS's rates bound. The forward pass binds renderer_vrs's rate image only
   when vrs_run's own guard holds: on frames it hadn't written it (no gloss target while its prepass pipelines warmed)
   the image was unwritten and, just made, in UNORDERED_ACCESS.
+- 6.8.0 crashed in draw on an RTX 2080: Direct3D 12's driver refused a renderer_rt compute pipeline (E_OUTOFMEMORY,
+  in Yea's local log only) and The Forge still returned the Pipeline, without its object, which SetPipelineState then
+  read. Ray queries are what the driver chokes on: each `RayQuery...` site, after inlining, is its own, so keep one
+  call site per traversal (shadeHit's one shadow ray for the sun and lights, followRay's one query for its glass rounds,
+  refraction's one followRay); `dxc -dumpbin` on the built `.comp_0.dxil` counts `AllocateRayQuery`. renderer_rt checks
+  every pipeline's native object at load (`pipelineMade`): a refused one is logged to the hub by name and only its
+  part goes off (rtReflection, giTraced, rtRefraction, rtShadows stay unset, so the core falls back).
+- 7.2.0: refusals come from the driver's first compile of a shader (nothing in its cache), any renderer_rt pipeline,
+  7 KB ones too, and 7.1.1's alike; the same desc compiles a moment later. Every renderer_rt pipeline is queued on
+  Yea's compile threads (`yea::pipelines()`) in `load()` (made in `load()`, ten cold compiles hung it past 2 s); each
+  part is off, its slot empty and never bound, till its pipeline is made (`update()` takes them). A refused one is
+  queued again 30, 60, ... frames later, 6 tries in all, each outcome logged ("made on try N" / "stays off"). To test it, salt the kernels so the cache misses
+  (a no-op `if (WaveGetLaneCount() == 1013u) return;`, a new number each run after each `INIT_MAIN;`, never committed).
 - Third-party material: every addition or removal updates both `licenses.json` and `LICENSES.txt` (its name,
   what uses it, source, verbatim licence text with its copyright line) in the same commit.
 - Code run per light per pixel (`brdfLight`, the shadow filters) stays free of sin, cos, pow and per-tap sqrt: the

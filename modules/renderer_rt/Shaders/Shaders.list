@@ -31,6 +31,11 @@
 #include "Trace.comp.fsl"
 #end
 
+#comp FT_RAYTRACING renderer_rt_refract.comp
+#define REFRACT_PASS
+#include "Trace.comp.fsl"
+#end
+
 #comp FT_RAYTRACING renderer_rt_probe.comp
 #define PROBE_PASS
 #include "Trace.comp.fsl"

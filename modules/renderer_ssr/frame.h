@@ -10,7 +10,7 @@ struct Buffer;
 struct RenderTarget;
 struct Texture;
 
-#define RENDER_FRAME_VERSION 27u
+#define RENDER_FRAME_VERSION 28u
 #define RENDER_RT_MAX_TRACED 8u
 #define RENDER_MAX_CASCADES  4u
 #define RENDER_MAX_TEXTURES  1024u // texture maps the shaders' array holds (the core's Texture table)
@@ -432,5 +432,27 @@ struct RenderFrame
     // light's bit set where its sphere reaches the tile's four side planes past the near plane, sky tiles too. ANDed with
     // the z-bin's range as tileMasks are. SHADER_RESOURCE after cull_run; set whenever tileMasks is.
     Buffer*       sideMasks;
+    // Set by the core before rt_prepare (frame v28): 1 while glass refracts (its refraction knob is on and the scene colour
+    // chain is made, not in F1's view modes), as the see-through pass does whether or not a refracting surface is in view.
+    // renderer_rt bends reflection rays through material_refraction's glass only then; else they pass straight, tinted.
+    // Either way a solid (refraction shape 1) is one layer, its near side: the see-through pass never draws its far side.
+    uint32_t      refractOn;
+    // Set by renderer_rt in rt_prepare while it traces on-screen refraction (refractOn, rays available), filled by rt_run
+    // before the forward pass; SHADER_RESOURCE by the see-through pass. nullptr: refract from the scene colour chain as
+    // before. Per pixel, for the nearest refracting layer along the view (material_refraction given, the glassCounts rule;
+    // non-refracting glass in front of it passes straight):
+    Texture* rtRefraction;     // RGBA16F, render size: rgb what the layer lets through from behind, as the chain would hold
+                               // it there (lit, fogged, deeper glass shaded; before this layer's own T), a its view depth
+                               // (0: no refracting layer here)
+    Texture* rtRefractLanding; // RGBA16F: where w is 1, the bent ray meets what the depth shows on screen and the straight
+                               // view to it crosses as many other glass layers: read the chain there (it holds steam and the
+                               // glass drawn behind), at xy pixels from the fragment's own centre (In.Position.xy + xy, this
+                               // frame's jittered pixels), at mip z (refractedScene's px rule; clamp it to the chain's
+                               // levels). w 0: take rtRefraction.rgb
+    // The core's area-light shading data for renderer_rt's hits (as Lighting.h.fsl reads them), every frame:
+    Buffer*  ltc;         // the area lights' LTC tables (gLtc: Assets/ltc.bin, 2 x 64 x 64 float4), SHADER_RESOURCE
+    Buffer*  lightLooks;  // per GPU light, its image + 1 (0 none), in lightBuffer's order (uint each; written by the core
+                          // later in its draw, before submission: read it on the GPU only)
+    Texture* lightImages; // the rect lights' images (2D array, prefiltered mips), SHADER_RESOURCE
 };
 #define RENDER_RT_MISS 60000.0f
