@@ -1249,7 +1249,8 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
 // (MASK_GI, opaque casters: glass is skipped as renderer_gi's captures skip it; lights' own emitters and markers don't, so the probes don't count a light twice). A hit is lit where it is
 // as reflections' are (emission, the sun's ray, local lights through their maps, rays for at most GI_SHADOW_RAYS lights
 // without one, the probes' own bounced light from last frame), then fogged over its distance; a hit on a back face
-// writes no light and its distance negated (the probe is inside something); a miss the sky, fogged over the fog's range,
+// writes no light and its distance negated (the probe is inside something), unless the surface is two-sided: then it is
+// lit from that side, as renderer_gi's raster captures draw it; a miss the sky, fogged over the fog's range,
 // and GI_MISS. Probes not traced this frame (giProbeTraced) leave their rays unwritten.
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(64, 1, 1)
@@ -1286,10 +1287,13 @@ void CS_MAIN(SV_GroupID(uint3) gid, SV_GroupThreadID(uint3) tid)
         float  t = RayQueryRayT(hit);
         uint   material;
         float3 N = hitNormal(RayQueryInstanceID(hit), RayQueryPrimitiveIndex(hit), RayQueryBarycentrics(hit), material);
-        if (dot(N, ray.Direction) > 0.0)
+        bool   back = dot(N, ray.Direction) > 0.0;
+        if (back && (gRtInstances[RayQueryInstanceID(hit)].w & RT_INST_TWO_SIDED) == 0u)
             result = float4(0.0, 0.0, 0.0, -t);
         else
         {
+            if (back)
+                N = -N;
             float3 P = ray.Origin + ray.Direction * t;
             float  phi = float(pcgHash(index ^ (gRt.counts.y * 2654435761u)) & 0xFFFFu) * (2.0 * PI / 65536.0);
             // A probe ray's cone: its share of the sphere, sqrt(4 pi / rays) radians wide.

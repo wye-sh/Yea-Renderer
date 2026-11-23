@@ -227,7 +227,8 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   `Trace.comp.fsl` GI_PASS traces a thread a ray into giRayOut (GiSample.h.fsl, copied unchanged from renderer_gi:
   origins, rotated spherical Fibonacci directions, which probes trace), against mask 2 (casters: lights' own emitters
   and markers don't, so the probes don't count a light twice); hits lit by `shadeHit` as reflections' are but with rays
-  for at most 2 mapless lights and no specular from the surroundings, back faces 0 and their distance negated, misses
+  for at most 2 mapless lights and no specular from the surroundings, back faces 0 and their distance negated (a
+  two-sided surface's lit from that side instead, as the raster captures draw it), misses
   the sky fogged over the fog's range and GI_MISS; then giTraced = 1. Every hit's diffuse surroundings (reflections'
   too) come from last frame's probes (giIrradiance, blended to the sky's by `inside`) once renderer_gi has blended any.
   Ray-traced shadows (`shadows`, off until measured on the user's GPU; `traced_lights`, 4): `rt_pick` takes the sun and up to `traced_lights` visible

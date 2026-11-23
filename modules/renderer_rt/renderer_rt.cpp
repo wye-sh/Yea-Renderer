@@ -1388,7 +1388,7 @@ void rt_run(uint64_t address)
         gInstCpu[n * 4 + 1] = c.firstIndex;
         gInstCpu[n * 4 + 2] = (uint32_t)c.vertexOffset;
         gInstCpu[n * 4 + 3] = (cut || isGlass ? F->instanceRows[c.instance].material + 1 : 0) | (cut ? kInstCut : 0) |
-                              (isGlass ? kInstGlass | (c.twoSided ? kInstTwoSided : 0) : 0);
+                              (isGlass ? kInstGlass : 0) | (c.twoSided ? kInstTwoSided : 0);
         n++;
     }
     dropDynamic(F->frameNumber);
