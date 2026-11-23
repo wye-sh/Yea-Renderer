@@ -1,7 +1,8 @@
 // The Renderer component's example view: a floor, a metal and a plastic sphere row sweeping
-// roughness, assorted shapes, a sun, many moving coloured point lights, sweeping spot lights, four area lights (a
-// softbox, a pendant disc, a fluorescent tube and a glowing sphere), two reflection probes, and a free-look camera (hold the mouse button to look, the move keys to fly).
-// Reset: the scene is rebuilt with the lights and camera where they start.
+// roughness, assorted shapes, a sun, light_count moving lights (coloured points and sweeping spot lamps), four area
+// lights (a softbox, a pendant disc, a fluorescent tube and a glowing sphere), two reflection probes, and a free-look
+// camera (hold the mouse button to look, the move keys to fly). Each light type can be switched off, which removes its
+// lights. Reset: the scene is rebuilt with the lights and camera where they start.
 #include "yea_renderer_example.h"
 
 #include <math.h>
@@ -11,7 +12,7 @@ namespace renderer_example
 {
 namespace
 {
-const uint32_t kMaxLights = 512, kMaxSpots = 16, kMaxSpin = 16, kAreas = 4;
+const uint32_t kMaxLights = 512, kMaxSpin = 16, kAreas = 4, kNone = 0xFFFFFFFFu;
 const float    kPi = 3.14159265f;
 
 struct State
@@ -20,27 +21,26 @@ struct State
     float      t;
     yea_float3 eye;
     float      yaw, pitch; // look direction: (cos yaw cos pitch, sin pitch, sin yaw cos pitch)
-    uint32_t   pictureUnused; // was the card-picture flag; kept so the state's layout stays the same
-    yea_handle sun;
-    uint32_t   lightCount;
+    yea_handle sun;        // kNone while the sun is off
+    // Moving lights by slot: each slot's type (0 none, 1 point, 2 spot), its light, its marker (a point's orb, a spot's
+    // lens) and the marker's material, and a spot's lamp body.
+    uint32_t   lightCount; // slots in use (some may be empty)
+    uint32_t   lightType[kMaxLights];
     yea_handle lights[kMaxLights];
     yea_handle markers[kMaxLights];
     yea_handle markerMaterials[kMaxLights];
-    uint32_t   spotCount;
-    yea_handle spots[kMaxSpots];
+    yea_handle housings[kMaxLights];
     uint32_t   spinCount;
     yea_handle spin[kMaxSpin];
     yea_float3 spinPos[kMaxSpin];
     yea_float3 spinScale[kMaxSpin];
     yea_float3 spinAxis[kMaxSpin];
-    uint32_t   sphereMesh;
-    yea_handle spotMarkers[kMaxSpots];
-    yea_handle spotMarkerMaterials[kMaxSpots];
-    uint32_t   instances, lightsAlive; // the renderer's live counts once this frame's scene was in place
-    uint32_t   cylinderMesh;           // the spot lamps' housings and lenses
+    uint32_t   orbMesh, cylinderMesh, boxMesh, sphereMesh;
     yea_handle housingMaterial;
-    yea_handle spotHousings[kMaxSpots];
-    yea_handle areas[kAreas];          // the area lights and their emitters' materials
+    uint32_t   instances, lightsAlive; // the renderer's live counts once this frame's scene was in place
+    // The area lights: each light and its emitter (kNone while its type is off), and the emitter's material.
+    yea_handle areas[kAreas];
+    yea_handle areaEmitters[kAreas];
     yea_handle areaMaterials[kAreas];
 };
 State* gState;
@@ -67,7 +67,7 @@ State* state()
     if (!gState)
     {
         int fresh = 0;
-        gState = (State*)yea::host()->state("renderer_example", 6, sizeof(State), &fresh);
+        gState = (State*)yea::host()->state("renderer_example", 7, sizeof(State), &fresh);
         if (fresh)
             startCamera(gState);
     }
@@ -180,7 +180,8 @@ void build(State* s)
     s->built = 0;
     renderer::clear();
     renderer_probes::probe_clear();
-    s->lightCount = s->spotCount = s->spinCount = 0;
+    s->lightCount = s->spinCount = 0;
+    s->sun = kNone;
     // Segments so the silhouettes stay round in the close-ups (a sphere filling the screen at 2560x1356 is under a
     // third of a pixel off a true circle at 128); farther away the renderer draws simpler versions of each shape, so
     // this costs only up close. The light orbs are small, so 32 keeps their triangles a useful size.
@@ -189,8 +190,10 @@ void build(State* s)
         return; // the renderer isn't loaded: try again next frame
     uint32_t box = renderer::mesh_box(), plane = renderer::mesh_plane();
     uint32_t cylinder = renderer::mesh_cylinder(96), cone = renderer::mesh_cone(96), torus = renderer::mesh_torus(0.15f, 128);
-    s->sphereMesh = renderer::mesh_sphere(32); // the light orbs
+    s->orbMesh = renderer::mesh_sphere(32); // the light orbs
     s->cylinderMesh = cylinder;
+    s->boxMesh = box;
+    s->sphereMesh = sphere;
     s->housingMaterial = renderer::material_add({ 0.06f, 0.06f, 0.065f }, 0.45f, 0.0f); // a dark painted lamp body
 
     yea_handle floor = renderer::material_add({ 0.42f, 0.42f, 0.42f }, 0.65f, 0);
@@ -234,25 +237,17 @@ void build(State* s)
 
     addProbes();
 
-    // Area lights, each with an emitter of its exact shape that casts no shadow (it would shadow its own light, as the
-    // orbs would), and dark fittings: the softbox's backing and stand, the pendant's canopy and cord, the tube's
-    // brackets. The fittings beside an emitter cast none either; the stand's pole and foot do.
+    // The area lights' dark fittings: the softbox's backing and stand, the pendant's canopy and cord, the tube's
+    // brackets. They stay when a type is switched off (a lamp turned off). Those beside an emitter cast no shadow (they
+    // would shadow its light); the stand's pole and foot do.
     for (uint32_t i = 0; i < kAreas; ++i)
     {
         const AreaLight& a = kAreaLights[i];
         yea_float3       z = normalized(a.dir), x = normalized(a.across), y = cross(z, x);
-        s->areas[i] = renderer::light_add(a.type);
-        renderer::light_place(s->areas[i], a.pos, z);
-        renderer::light_size(s->areas[i], a.width, a.height, x);
-        renderer::light_range(s->areas[i], a.range);
-        renderer::light_shadow(s->areas[i], true);
+        s->areas[i] = s->areaEmitters[i] = kNone;
         s->areaMaterials[i] = renderer::material_add({ 0, 0, 0 }, 1, 0);
-        yea_float3 behind = { a.pos.x - z.x * 0.006f, a.pos.y - z.y * 0.006f, a.pos.z - z.z * 0.006f };
-        yea_handle e;
-        if (a.type == 3) // a thin slab, its face on the light's plane
+        if (a.type == 3)
         {
-            e = renderer::instance_add(box, s->areaMaterials[i]);
-            renderer::instance_place(e, behind, basis(x, y, z), { a.width, a.height, 0.01f });
             yea_handle back = renderer::instance_add(box, s->housingMaterial);
             renderer::instance_place(back, { a.pos.x - z.x * 0.065f, a.pos.y - z.y * 0.065f, a.pos.z - z.z * 0.065f }, basis(x, y, z),
                                      { a.width + 0.12f, a.height + 0.12f, 0.1f });
@@ -261,28 +256,17 @@ void build(State* s)
             place(cylinder, s->housingMaterial, { foot.x, a.pos.y * 0.5f, foot.z }, { 0.05f, a.pos.y, 0.05f });
             place(cylinder, s->housingMaterial, { foot.x, 0.02f, foot.z }, { 0.5f, 0.04f, 0.5f });
         }
-        else if (a.type == 4) // a glowing diffuser 4 cm deep, its rim showing under a slim canopy hung from a cord
+        else if (a.type == 4)
         {
-            yea_float4 q = basis(x, z, cross(x, z));
-            e = renderer::instance_add(cylinder, s->areaMaterials[i]);
-            renderer::instance_place(e, { a.pos.x - z.x * 0.02f, a.pos.y - z.y * 0.02f, a.pos.z - z.z * 0.02f }, q, { a.width, 0.04f, a.height });
             yea_handle canopy = renderer::instance_add(cylinder, s->housingMaterial);
-            renderer::instance_place(canopy, { a.pos.x - z.x * 0.06f, a.pos.y - z.y * 0.06f, a.pos.z - z.z * 0.06f }, q,
+            renderer::instance_place(canopy, { a.pos.x - z.x * 0.06f, a.pos.y - z.y * 0.06f, a.pos.z - z.z * 0.06f }, basis(x, z, cross(x, z)),
                                      { a.width * 0.96f, 0.04f, a.height * 0.96f });
             renderer::instance_shadow(canopy, false);
             yea_handle cord = renderer::instance_add(cylinder, s->housingMaterial);
             renderer::instance_place(cord, { a.pos.x, a.pos.y + 2.09f, a.pos.z }, kNoRotation, { 0.015f, 4.0f, 0.015f });
             renderer::instance_shadow(cord, false);
         }
-        else if (a.type == 5)
-        {
-            e = renderer::instance_add(sphere, s->areaMaterials[i]);
-            renderer::instance_place(e, a.pos, kNoRotation, { 2 * a.width, 2 * a.width, 2 * a.width });
-        }
-        else // a tube on two brackets
-        {
-            e = renderer::instance_add(cylinder, s->areaMaterials[i]);
-            renderer::instance_place(e, a.pos, basis(x, z, cross(x, z)), { 2 * a.height, a.width, 2 * a.height });
+        else if (a.type == 6)
             for (int side = -1; side <= 1; side += 2)
             {
                 yea_float3 b = { a.pos.x + z.x * a.width * 0.4f * side, a.pos.y - 0.075f, a.pos.z + z.z * a.width * 0.4f * side };
@@ -290,57 +274,132 @@ void build(State* s)
                 renderer::instance_place(bracket, b, kNoRotation, { 0.04f, 0.15f, 0.04f });
                 renderer::instance_shadow(bracket, false);
             }
-        }
-        renderer::instance_shadow(e, false);
     }
 
-    s->sun = renderer::light_add(0);
-    renderer::light_shadow(s->sun, true);
     s->built = 1;
 }
 
+// A moving light slot's type for the types switched on: with both, every fifth slot a spot (the defaults' 20 lights:
+// 16 points and 4 spots); with one, every slot that type. A slot keeps its own path whatever its type, so switching a
+// type off removes its lights and the rest stay where they are.
+uint32_t slotType(uint32_t i)
+{
+    bool points = settings.points, spots = settings.spots;
+    if (points && spots)
+        return i % 5 == 4 ? 2 : 1;
+    return points ? 1 : (spots ? 2 : 0);
+}
+
+void removeSlot(State* s, uint32_t i)
+{
+    if (!s->lightType[i])
+        return;
+    renderer::light_remove(s->lights[i]);
+    renderer::instance_remove(s->markers[i]);
+    if (s->lightType[i] == 2)
+        renderer::instance_remove(s->housings[i]);
+    s->lightType[i] = 0;
+}
+
+void addSlot(State* s, uint32_t i, uint32_t type)
+{
+    s->lightType[i] = type;
+    s->lights[i] = renderer::light_add(type);
+    s->markerMaterials[i] = renderer::material_add({ 0, 0, 0 }, 1, 0);
+    // A point's orb; a spot's lamp: a short dark body behind the light, aimed along it, and a glowing lens disc at its
+    // front. None casts a shadow (it would shadow its own light).
+    s->markers[i] = renderer::instance_add(type == 2 ? s->cylinderMesh : s->orbMesh, s->markerMaterials[i]);
+    renderer::instance_shadow(s->markers[i], false);
+    if (type == 2)
+    {
+        renderer::light_cone(s->lights[i], 14, 24);
+        s->housings[i] = renderer::instance_add(s->cylinderMesh, s->housingMaterial);
+        renderer::instance_shadow(s->housings[i], false);
+    }
+}
+
+// The area light i's light and its emitter, of the light's exact shape (casting no shadow).
+void addArea(State* s, uint32_t i)
+{
+    const AreaLight& a = kAreaLights[i];
+    yea_float3       z = normalized(a.dir), x = normalized(a.across), y = cross(z, x);
+    s->areas[i] = renderer::light_add(a.type);
+    renderer::light_place(s->areas[i], a.pos, z);
+    renderer::light_size(s->areas[i], a.width, a.height, x);
+    renderer::light_range(s->areas[i], a.range);
+    renderer::light_shadow(s->areas[i], true);
+    yea_handle e;
+    if (a.type == 3) // a thin slab, its face on the light's plane
+    {
+        e = renderer::instance_add(s->boxMesh, s->areaMaterials[i]);
+        renderer::instance_place(e, { a.pos.x - z.x * 0.006f, a.pos.y - z.y * 0.006f, a.pos.z - z.z * 0.006f }, basis(x, y, z),
+                                 { a.width, a.height, 0.01f });
+    }
+    else if (a.type == 4) // a glowing diffuser 4 cm deep, its rim showing under the canopy
+    {
+        e = renderer::instance_add(s->cylinderMesh, s->areaMaterials[i]);
+        renderer::instance_place(e, { a.pos.x - z.x * 0.02f, a.pos.y - z.y * 0.02f, a.pos.z - z.z * 0.02f }, basis(x, z, cross(x, z)),
+                                 { a.width, 0.04f, a.height });
+    }
+    else if (a.type == 5)
+    {
+        e = renderer::instance_add(s->sphereMesh, s->areaMaterials[i]);
+        renderer::instance_place(e, a.pos, kNoRotation, { 2 * a.width, 2 * a.width, 2 * a.width });
+    }
+    else // a tube
+    {
+        e = renderer::instance_add(s->cylinderMesh, s->areaMaterials[i]);
+        renderer::instance_place(e, a.pos, basis(x, z, cross(x, z)), { 2 * a.height, a.width, 2 * a.height });
+    }
+    renderer::instance_shadow(e, false);
+    s->areaEmitters[i] = e;
+}
+
+bool areaOn(uint32_t type)
+{
+    return type == 3 ? settings.rects : type == 4 ? settings.discs : type == 5 ? settings.spheres : settings.tubes;
+}
+
+// The lights the knobs ask for: switched-off types removed (not just dark, so their cost goes too).
 void syncLights(State* s)
 {
+    if (settings.sun && s->sun == kNone)
+    {
+        s->sun = renderer::light_add(0);
+        renderer::light_shadow(s->sun, true);
+    }
+    else if (!settings.sun && s->sun != kNone)
+    {
+        renderer::light_remove(s->sun);
+        s->sun = kNone;
+    }
     uint32_t want = settings.light_count < 0 ? 0 : (uint32_t)settings.light_count;
     want = want > kMaxLights ? kMaxLights : want;
-    while (s->lightCount < want)
+    uint32_t slots = want > s->lightCount ? want : s->lightCount;
+    for (uint32_t i = 0; i < slots; ++i)
     {
-        uint32_t i = s->lightCount;
-        s->lights[i] = renderer::light_add(1);
-        s->markerMaterials[i] = renderer::material_add({ 0, 0, 0 }, 1, 0);
-        s->markers[i] = renderer::instance_add(s->sphereMesh, s->markerMaterials[i]);
-        renderer::instance_shadow(s->markers[i], false);
-        s->lightCount++;
+        uint32_t type = i < want ? slotType(i) : 0;
+        if (i < s->lightCount && s->lightType[i] == type)
+            continue;
+        if (i < s->lightCount)
+            removeSlot(s, i);
+        else
+            s->lightType[i] = 0;
+        if (type)
+            addSlot(s, i, type);
     }
-    while (s->lightCount > want)
+    s->lightCount = want;
+    for (uint32_t i = 0; i < kAreas; ++i)
     {
-        uint32_t i = --s->lightCount;
-        renderer::light_remove(s->lights[i]);
-        renderer::instance_remove(s->markers[i]);
-    }
-    uint32_t spots = settings.spot_count < 0 ? 0 : (uint32_t)settings.spot_count;
-    spots = spots > kMaxSpots ? kMaxSpots : spots;
-    while (s->spotCount < spots)
-    {
-        uint32_t   i = s->spotCount++;
-        yea_handle h = renderer::light_add(2);
-        renderer::light_cone(h, 14, 24);
-        renderer::light_shadow(h, true);
-        s->spots[i] = h;
-        // A lamp: a short dark body behind the light, aimed along it, and a glowing lens disc at its front. Neither casts
-        // a shadow (it would shadow its own light), as the point lights' orbs don't.
-        s->spotMarkerMaterials[i] = renderer::material_add({ 0, 0, 0 }, 1, 0);
-        s->spotMarkers[i] = renderer::instance_add(s->cylinderMesh, s->spotMarkerMaterials[i]);
-        renderer::instance_shadow(s->spotMarkers[i], false);
-        s->spotHousings[i] = renderer::instance_add(s->cylinderMesh, s->housingMaterial);
-        renderer::instance_shadow(s->spotHousings[i], false);
-    }
-    while (s->spotCount > spots)
-    {
-        uint32_t i = --s->spotCount;
-        renderer::light_remove(s->spots[i]);
-        renderer::instance_remove(s->spotMarkers[i]);
-        renderer::instance_remove(s->spotHousings[i]);
+        bool on = areaOn(kAreaLights[i].type);
+        if (on && s->areas[i] == kNone)
+            addArea(s, i);
+        else if (!on && s->areas[i] != kNone)
+        {
+            renderer::light_remove(s->areas[i]);
+            renderer::instance_remove(s->areaEmitters[i]);
+            s->areas[i] = s->areaEmitters[i] = kNone;
+        }
     }
 }
 
@@ -348,51 +407,63 @@ void animate(State* s)
 {
     float t = s->t;
     float el = settings.sun_elevation * kPi / 180, az = settings.sun_azimuth * kPi / 180;
-    renderer::light_place(s->sun, { 0, 0, 0 }, { -cosf(el) * cosf(az), -sinf(el), -cosf(el) * sinf(az) });
-    renderer::light_color(s->sun, settings.sun_color, settings.sun_intensity);
+    if (s->sun != kNone)
+    {
+        renderer::light_place(s->sun, { 0, 0, 0 }, { -cosf(el) * cosf(az), -sinf(el), -cosf(el) * sinf(az) });
+        renderer::light_color(s->sun, settings.sun_color, settings.sun_intensity);
+    }
 
-    uint32_t shadowed = settings.shadowed_points < 0 ? 0 : (uint32_t)settings.shadowed_points;
+    uint32_t shadowed = settings.shadowed_lights < 0 ? 0 : (uint32_t)settings.shadowed_lights;
     for (uint32_t i = 0; i < s->lightCount; ++i)
     {
-        float      fi = (float)i;
-        float      radius = 2.5f + 8.0f * frac(fi * 0.618034f);
-        float      speed = settings.light_speed * (0.4f + frac(fi * 0.371f)) * ((i & 1) ? 1.0f : -1.0f) * 3.0f / radius;
-        float      a = fi * 2.39996f + t * speed;
-        float      y = 0.8f + 2.0f * frac(fi * 0.7311f) + 0.25f * sinf(t * 0.9f + fi);
-        yea_float3 p = { cosf(a) * radius, y, sinf(a) * radius };
-        yea_float3 c = hue(frac(fi * 0.618034f + 0.05f));
-        renderer::light_place(s->lights[i], p, { 0, -1, 0 });
-        renderer::light_color(s->lights[i], c, settings.light_intensity);
-        renderer::light_range(s->lights[i], settings.light_range);
-        renderer::light_shadow(s->lights[i], i < shadowed);
-        renderer::material_emissive(s->markerMaterials[i], c, settings.light_intensity * 0.6f + 1.0f);
-        renderer::instance_place(s->markers[i], p, kNoRotation, { 0.12f, 0.12f, 0.12f });
-    }
-    for (uint32_t i = 0; i < s->spotCount; ++i)
-    {
-        float      a = (float)i / (float)(s->spotCount ? s->spotCount : 1) * 2 * kPi;
-        yea_float3 p = { cosf(a) * 7.0f, 6.5f, sinf(a) * 7.0f };
-        float      b = a + t * 0.5f * settings.light_speed / 0.4f;
-        yea_float3 target = { cosf(b) * 3.0f, 0, sinf(b) * 3.0f };
-        yea_float3 c = (i & 1) ? yea_float3{ 0.7f, 0.85f, 1.0f } : yea_float3{ 1.0f, 0.85f, 0.6f };
-        renderer::light_place(s->spots[i], p, { target.x - p.x, target.y - p.y, target.z - p.z });
-        renderer::light_color(s->spots[i], c, settings.spot_intensity);
-        renderer::material_emissive(s->spotMarkerMaterials[i], c, settings.spot_intensity * 0.6f + 1.0f);
-        // The lamp turned so its axis (the cylinder's y) points along the light: the body 0.3 m long behind the light,
-        // the lens 0.2 m across just in front of it.
-        yea_float3 d = { target.x - p.x, target.y - p.y, target.z - p.z };
-        float      dl = sqrtf(d.x * d.x + d.y * d.y + d.z * d.z);
-        d = { d.x / dl, d.y / dl, d.z / dl };
-        yea_float4 q = axisAngle({ d.z, 0, -d.x }, acosf(d.y < -1 ? -1 : (d.y > 1 ? 1 : d.y))); // +y onto d
-        renderer::instance_place(s->spotHousings[i], { p.x - d.x * 0.16f, p.y - d.y * 0.16f, p.z - d.z * 0.16f }, q, { 0.26f, 0.3f, 0.26f });
-        renderer::instance_place(s->spotMarkers[i], { p.x + d.x * 0.0f, p.y + d.y * 0.0f, p.z + d.z * 0.0f }, q, { 0.2f, 0.02f, 0.2f });
-        renderer::light_range(s->spots[i], 20); // reaches the far edge of the sweep (11.9 m) at 77% of the inverse square
+        float fi = (float)i;
+        if (s->lightType[i] == 1)
+        {
+            float      radius = 2.5f + 8.0f * frac(fi * 0.618034f);
+            float      speed = settings.light_speed * (0.4f + frac(fi * 0.371f)) * ((i & 1) ? 1.0f : -1.0f) * 3.0f / radius;
+            float      a = fi * 2.39996f + t * speed;
+            float      y = 0.8f + 2.0f * frac(fi * 0.7311f) + 0.25f * sinf(t * 0.9f + fi);
+            yea_float3 p = { cosf(a) * radius, y, sinf(a) * radius };
+            yea_float3 c = hue(frac(fi * 0.618034f + 0.05f));
+            renderer::light_place(s->lights[i], p, { 0, -1, 0 });
+            renderer::light_color(s->lights[i], c, settings.point_intensity);
+            renderer::light_range(s->lights[i], settings.point_range);
+            renderer::light_shadow(s->lights[i], i < shadowed);
+            renderer::material_emissive(s->markerMaterials[i], c, settings.point_intensity * 0.6f + 1.0f);
+            renderer::instance_place(s->markers[i], p, kNoRotation, { 0.12f, 0.12f, 0.12f });
+        }
+        else if (s->lightType[i] == 2)
+        {
+            // Around a ring 7 m out and 6.5 m up, at an angle from the slot (frac(i (1 + phi) / 5): spread evenly both for
+            // every slot and for every fifth), sweeping a circle 3 m out on the floor; warm and cool by turns.
+            float      a = frac(fi * 0.3236068f) * 2 * kPi;
+            yea_float3 p = { cosf(a) * 7.0f, 6.5f, sinf(a) * 7.0f };
+            float      b = a + t * 0.5f * settings.light_speed / 0.4f;
+            yea_float3 target = { cosf(b) * 3.0f, 0, sinf(b) * 3.0f };
+            yea_float3 c = ((i / 5) & 1) ? yea_float3{ 0.7f, 0.85f, 1.0f } : yea_float3{ 1.0f, 0.85f, 0.6f };
+            renderer::light_place(s->lights[i], p, { target.x - p.x, target.y - p.y, target.z - p.z });
+            renderer::light_color(s->lights[i], c, settings.spot_intensity);
+            renderer::light_range(s->lights[i], 20); // reaches the far edge of the sweep (11.9 m) at 77% of the inverse square
+            renderer::light_shadow(s->lights[i], i < shadowed);
+            renderer::material_emissive(s->markerMaterials[i], c, settings.spot_intensity * 0.6f + 1.0f);
+            // The lamp turned so its axis (the cylinder's y) points along the light: the body 0.3 m long behind the
+            // light, the lens 0.2 m across at it.
+            yea_float3 d = { target.x - p.x, target.y - p.y, target.z - p.z };
+            float      dl = sqrtf(d.x * d.x + d.y * d.y + d.z * d.z);
+            d = { d.x / dl, d.y / dl, d.z / dl };
+            yea_float4 q = axisAngle({ d.z, 0, -d.x }, acosf(d.y < -1 ? -1 : (d.y > 1 ? 1 : d.y))); // +y onto d
+            renderer::instance_place(s->housings[i], { p.x - d.x * 0.16f, p.y - d.y * 0.16f, p.z - d.z * 0.16f }, q, { 0.26f, 0.3f, 0.26f });
+            renderer::instance_place(s->markers[i], p, q, { 0.2f, 0.02f, 0.2f });
+        }
     }
     for (uint32_t i = 0; i < kAreas; ++i)
     {
-        // Each emitter's luminance (the pendant's its own): each light's candela is it times the emitter's area.
+        // Each emitter's luminance (the pendant three times the others': it lights the boxes from 1.4 m up, where the
+        // others light the yard), and its light's candela that times the emitter's area.
         const AreaLight& a = kAreaLights[i];
-        float            lum = a.type == 4 ? settings.pendant_luminance : settings.area_luminance;
+        if (s->areas[i] == kNone)
+            continue;
+        float lum = settings.area_luminance * (a.type == 4 ? 3.0f : 1.0f);
         renderer::light_color(s->areas[i], a.color, lum * areaOf(a));
         renderer::material_emissive(s->areaMaterials[i], a.color, lum);
     }

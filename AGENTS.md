@@ -320,10 +320,16 @@ for screen reflections (a quarter of it at half resolution).
 
 ## Example view (`example/renderer_example`)
 
+The view has two features: Base Settings (the component's 11 modules: what a game using the Renderer gets) and
+Example Scene (`renderer_example` alone, its scene knobs). `renderer_example` is the example module, with no `use`
+line, so the hub's one-use-per-view rule doesn't count it.
 Floor, gold and red sphere rows sweeping roughness, pillars and assorted shapes, spinning tori, a sun,
-`light_count` moving coloured point lights (markers glow in their colour; the first `shadowed_points` cast
-shadows; all of them by default), `spot_count` sweeping shadowed spots (each a lamp: a dark body aimed along the beam,
-its lens glowing in the light's colour; neither casts shadows), four area lights at `area_luminance` (cd/m²; the pendant at its own `pendant_luminance`): a
+`light_count` moving lights by slot (each slot keeps its own path whatever its type): with points and spots both on,
+every fifth slot a spot, else every slot the type left on (20 by default: 16 points, 4 spots). Points glow in their
+colour (`point_intensity`, `point_range`); spots are lamps (a dark body aimed along the beam, its lens glowing; neither
+casts shadows; `spot_intensity`, range 20). The first `shadowed_lights` slots cast shadows (all by default). Light
+Types: `sun`, `points`, `spots`, `rects`, `discs`, `spheres`, `tubes`, each off removing that type's lights and
+emitters (their fittings stay). Four area lights at `area_luminance` (cd/m²; the pendant at three times it): a
 softbox on a stand by the sphere rows, a pendant disc over the white boxes, a fluorescent tube on the stone ledge,
 the glowing sphere on the steel drum, two reflection probes (the sphere rows, the whole yard), a free-look camera: holding its `look` action (left mouse button) after a press on the game
 asks the host for the mouse each frame (`yea::captureMouse(true)`: hidden, kept in the window) and turns by

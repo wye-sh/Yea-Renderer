@@ -34,16 +34,25 @@ export bool picture(bool on)
 action look MouseLeft
 
 category Lights
-setting int light_count 16 0 512
-setting float light_intensity 6000 0 inf
-setting float light_range 9 1 inf
+# The moving lights: coloured points and sweeping spot lamps, spread over the types switched on (with both, every
+# fifth a spot); the first shadowed_lights of them cast shadows.
+setting int light_count 20 0 512
 setting float light_speed 0.4 0 inf
-setting int shadowed_points 512 0 512
-setting int spot_count 4 0 16
+setting int shadowed_lights 512 0 512
+setting float point_intensity 6000 0 inf
+setting float point_range 9 1 inf
 setting float spot_intensity 40000 0 inf
-# The area lights' surface brightness (cd/m2): the softbox, the tube and the glowing sphere; the pendant disc's own.
+# The area lights' surface brightness (cd/m2); the pendant disc's is three times it.
 setting float area_luminance 6000 0 inf
-setting float pendant_luminance 18000 0 inf
+category Light Types
+# Off removes that type's lights (their cost too); the moving lights' count goes to the types left on.
+setting bool sun true
+setting bool points true
+setting bool spots true
+setting bool rects true
+setting bool discs true
+setting bool spheres true
+setting bool tubes true
 category Sun
 setting float sun_intensity 400 0 inf
 setting color sun_color 1 0.82 0.65
