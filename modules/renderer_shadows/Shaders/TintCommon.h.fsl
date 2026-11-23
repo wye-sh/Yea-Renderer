@@ -1,5 +1,0 @@
-#ifndef TINT_COMMON_H
-#define TINT_COMMON_H
-#include "ShadowTypes.h.fsl"
-#include "Tint.srt.h"
-#endif

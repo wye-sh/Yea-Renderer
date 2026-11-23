@@ -8,73 +8,9 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
 ## Modules
 
 - `renderer`: the core. Scene tables and exports, camera, depth prepass, forward shading, sky, exposure,
-  tonemap, composite. Code: `renderer.cpp` (frame), `scene.cpp` (exports), `textures.cpp` (texture maps), `Shaders/`
-  (`Material.h.fsl`: the maps, shared by every pass that shades materials or clips cut-outs).
+  tonemap, composite. Code: `renderer.cpp` (frame), `scene.cpp` (exports), `Shaders/`.
 - `renderer_culling`: Z-bins (CPU, lights sorted by view depth) and per-tile light bitmasks (compute,
-  tile depth range from the prepass). Switch off: every pixel loops all visible lights (capped at 256). The core's
-  decals (frame v23 `decalSpheres`, in paint order) are binned the same way into `decalMasks` (8 words a tile) and
-  `decalBins`; without culling the forward pass tries every decal in view.
-- See-through surfaces (the core, frame v23): `material_blend(m, opacity)` (Table `MaterialBlend`; GpuMaterialMap
-  misc.z). Blended instances leave the opaque lists (gMeshCount, drawables, casters: no prepass, shadows, probes, GI or
-  ray tracing sees them yet) and are sorted back to front by their spheres' view depth on the CPU (`gBlendList`, stream
-  entries after the opaque ones). Each draws alone, two blends per side (`gBlendPipe`: multiply what is behind by
-  T = (1 - coverage)(1 - the specular's directional albedo) per channel, then add its own light; the Forge has no
-  dual-source blending), a double-sided one's far side first. Lit as every surface (Forward.frag TRANSLUCENT: no AO,
-  contact, traced shadows or traced reflections, which are the opaque scene's pixels; maps kept via keepShadowMaps;
-  lights from the z-bin alone), fog and aerial perspective kept exact (f(c) - T f(0)). With one sample a pixel they draw
-  in the see-through pass after the forward pass (timed "see-through"; BLEND_PASS: no depth target, the depth test
-  against gSceneDepth in the shader) into hdr, `reactive` and `transparency` (R8, max-blended coverage; frame
-  `reactive` is now the core's, particles and glass, `transparency` glass alone, for DLSS `transparency` and FSR's
-  transparency-and-composition mask); with MSAA inside the forward pass, without particles or masks. The particles
-  draw in the same pass: renderer_particles splits its sorted list at the surfaces' depths (frame `blendDepths`, the
-  nearest RENDER_MAX_BLEND_RUNS), and the core calls `particles_draw(frame, run)` just before each surface, so steam
-  behind a pane is seen through it. F1's view modes draw blended surfaces as opaque ones. Their pipelines (`gBlendPipe`) are warmed with the rest and never made on a frame that
-  draws: until they are, blended surfaces wait.
-- Refraction (the core, 4.9.0; no frame change): `material_refraction(m, ior, thickness, shape, tint)` (Table
-  `MaterialRefraction`; the Scene SRT's `gRefraction`, two float4 a material: ior, thickness, shape, given; tint). Tint
-  multiplies T everywhere. Knob `refraction`, FLAG_REFRACTION while a refracting surface is in view: the scene colour chain `gChain` (RGBA16F, render size, up to 7
-  levels to ~8 px; `gSceneColor`), Chain.comp.fsl: level 0 a copy of hdr, then Jimenez 2014's 13-tap downsample, the
-  first Karis-weighted (no fireflies). Copied over the whole screen before the first refracting surface, then again over
-  the dirty rectangle (blended surfaces' screen rectangles since the last copy, the whole screen for a particle run)
-  before one whose rectangle, widened by its size each way, meets it: at most kChainCopies (6) a frame, so glass sees
-  glass and steam behind it. A refracting surface's multiply writes 0 and its add puts T times the chain at the bent
-  ray's landing (Forward.frag `refractedScene`: thin a slab, solid a ball refracted in and out, landing found in two
-  steps on gSceneDepth, a landing in front of the glass taking the straight view; mip from roughness x distance behind),
-  fog kept exact. A solid one draws its near side only; a thin double-sided one its far side, a recopy, its near side.
-  `transparency` is 1 over refracting glass. With MSAA (4.12.1), as UE does, each copy's level 0 is resolved from the
-  multisampled hdr (Chain.comp.fsl CHAIN_MS, renderer_chain_ms_N: the samples' mean) with the depth beside it
-  (`gChainDepth`, R32F, the nearest sample, bound as gSceneDepth), between the see-through draws inside the forward pass
-  (drawSeeThrough, shared with the one-sample pass). Not in probe captures or ray-traced hits yet.
-- Decals (the core, frame v23): `decal_add` and friends (Table `Decal`, 4096). Up to RENDER_MAX_DECALS (256) in view
-  a frame, sorted by priority then add order (`gDecalList`; past 256 the lowest go), as GpuDecal rows (a world-to-box
-  matrix, axes, look, maps' slots, a noise seed). Applied in the forward pass before any lighting (DOOM 2016's
-  clustered decals): the tile mask ANDed with the z-bin's range, in paint order, blending albedo and glow, roughness,
-  metallic and the normal by coverage times weights. Coverage: the base colour map's alpha, else a procedural ellipse or
-  rectangle with an `edge` fade and value-noise `noise` (ragged rim, patches), times the angle fade and the box's depth
-  fade. Not on see-through surfaces. Knob `decals` (Performance).
-  Captures and ray hits (frame v25): every live decal (up to RENDER_MAX_WORLD_DECALS, 1024, in paint order) as
-  `worldDecals`, with a world grid over them (`decalCells`, `decalItems`, `decalGrid`: up to 32 cubed cells, coarser past
-  65536 entries), rebuilt only when a decal, the loaded maps or the knob change (`decalsChanged`). `Shaders/Decal.h.fsl`
-  is the one painting code (decalPaint; decalsAt through the grid): renderer_probes and renderer_gi keep identical copies
-  and paint their captures with it (probes recapture when `decalsChanged` moves; GI's raster captures catch up as they go
-  round), and renderer_rt paints its hits (not glass hits).
-- `renderer_shadows`, glass (4.15.0, frame v26, knobs `glass_shadows`, `glass_resolution` in Glass): every shadow view
-  that see-through casters (`seeThrough`, castShadow) lie over gets a deep shadow map of them in the tint maps
-  (`tintDepth` R32F, `tintColor` RGB10A2; one square a layer over just the glass's footprint, at the view's texel size or
-  coarser by powers of two when it would take more than half the maps' side, a cap that halves while a view finds no
-  room and doubles back once they sit under an eighth full for 2 s; `shadowTints` says where). Layer k is the
-  k-th glass surface out from the light (depth peeling into a scratch square, `Tint.frag.fsl`, each copied into its square
-  by `TintCopy`): its depth and T = (1 - coverage) (1 - FssEss - Fms Ems) tint at the ray's cosine after the normal map,
-  the see-through pass's and renderer_rt's rule (same dfgLookup, glassCounts' faces, cut-outs; glass behind the opaque map
-  is left out). The last layer also multiplies in every surface past it (`TintRest.frag.fsl`, colour alone: no per-target
-  blending) and counts them in alpha; two occlusion queries a counted view (32 a frame, read a few frames later) give a
-  view whose last layer holds two or more surfaces one layer more (up to RENDER_MAX_TINT_LAYERS, 8), and take one back,
-  never under 2, when it holds none: a view stays exact however many panes stack. The log line counts the views at each
-  layer count. Tints are redrawn with their view, or when the glass over it, its look or the textures change; the maps
-  go 10 s after glass stops casting. Lighting.h.fsl `glassTint` multiplies a view's layers nearer than the point (moved
-  two texels and the normal bias towards the light, so a pane never tints its own lit side), averaged over four taps
-  across the filter's disk, into `sunShadow` and `localShadow`, which return RGB. FSL: a file has one PS_MAIN signature
-  however Shaders.list defines it, so output variants are separate files.
+  tile depth range from the prepass). Switch off: every pixel loops all visible lights (capped at 256).
 - `renderer_shadows`: sun cascades (stabilised, PCF or PCSS; each redrawn only when its view or a caster over it
   changed) and a cached atlas for spot and point lights
   (6 tiles per point light), redrawn only when the light or a nearby caster moves. Each face's tile is a square of
@@ -154,45 +90,9 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
 - `renderer_rt`: ray-traced reflections, through Yea's ray-query service (`yea::raytracing()`, nullptr on GPUs
   without inline ray queries: the module then does nothing and `renderer_ssr` runs as before; with it, SSR is
   off). Owns the acceleration structures: one bottom-level structure per mesh (built on the frame's command list
-  from the positions stream when the mesh is new, its geometry moved or its caster's `generation` changed, as the
-  buffers are rewritten in place; replaced ones freed once no frame in flight uses them; hits read the normal from
-  the attributes stream, octahedral). Skinned casters (`RenderCaster.dynamic`) get their own, keyed by instance: with
-  the ray-tracing service's `updateBottom` (v2), one per frame in flight (ALLOW_UPDATE, fast build), refitted each
-  frame to this frame's posed copy and built afresh every `kRebuildFrames` (60, staggered by instance; on the Bend rig
-  a refitted tree reaches its worst within 15 frames, 4% dearer to trace on average, 26% at worst, so the interval
-  only caps drift that keeps growing, such as root motion); on older hosts, or once a refit is refused, one per posed
-  copy (keyed by `vertexOffset` too), built afresh each frame. Never refitted or built over while a frame in flight may
-  trace it; dropped 8 frames after their last use. While any are traced, the module logs their refit and rebuild GPU
-  time every 10 s (`skinned ray structures`). One
+  when the mesh is new or its geometry moved; replaced ones freed once no frame in flight uses them) and one
   top-level structure per frame in flight, its instances rewritten with `setInstances` and rebuilt every frame
-  (mask 1 every drawable, 2 shadow casters, 4 shadow casters that aren't glass: what GI probe rays hit, 8 every glass
-  instance: what they pass through).
-  Instances are forced opaque except alpha-tested ones
-  (`RenderCaster.masked`, with the frame's material maps): those are non-opaque, and every ray query (reflections,
-  their shadow rays, traced shadows, GI probe rays) loops over their candidates, cutting them out by base colour alpha at mip 0 as
-  the raster passes do (`Shaders/Cutout.h.fsl`; the material + 1 rides in gRtInstances' w, under flag bits 0x20000000
-  cut-out, 0x40000000 two-sided, 0x80000000 glass). Glass (frame v25, `seeThrough`, with material maps, `refraction`
-  and `dfg`) goes into the top-level structure after the drawables, non-opaque, never committed by any query
-  (`Shaders/Hit.h.fsl`). A layer counts where raster draws one: a front face, or any face of a two-sided material
-  except a solid refraction (shape 1), front faces only. It lets through T = (1 - coverage) x tint x (1 - FssEss -
-  Fms Ems) at its angle (coverage material_blend's opacity x base colour alpha; the split-sum terms from the core's
-  `dfg`, as its see-through pass). A reflection ray keeps the nearest layer in front of what it saw and shows its own
-  light (diffuse and glow by coverage, specular whole, no decals) over what is behind times T. Shadow rays (reflected
-  hits' and traced shadows') multiply T over the layers they pass. When a glass caster is traced, rt_prepare sets
-  `rtShadowTint` (RGBA16F, rtShadows' size and layers: the trace's raw tint with the nearest layer's distance in a,
-  then, reused, the filtered tint) and rt_run fills it: accumulated over frames like the visibility over the rays no
-  opaque surface blocked, filtered over the penumbra the layer's distance gives, by plane and normal. GI probe rays pass through glass (mask 8, a second ray up to their hit or the sky), their light multiplied by each
-  layer's T, as renderer_gi's raster captures draw see-through surfaces (a multiplicative layer, no light of its own);
-  their hits' shadow rays are tinted as reflections' are. Lit hits (reflections and GI
-  probe rays) read the material's maps as the forward pass does (base colour, ORM with its occlusion on the ambient,
-  normal, emissive; `hitMaterial` in Trace.comp.fsl), each map's mip from the ray cone (Akenine-Moller 2021: a pixel at
-  the surface, spreading by the pixel angle, twice the reflector's bend to its neighbours and the GGX alpha; a probe
-  ray by sqrt(4 pi / rays)) over the triangle's uv-to-world area, plus mipBias; positions are bound for that. Normal maps
-  use each vertex's world normal and tangent at unit length, as the core's Material.h.fsl mappedNormal does (the core's
-  vertex normal keeps the instance's scale for specular antialiasing; Tangent.w carries that length with the sign). Then hits take the frame's world decals (frame v25
-  `worldDecals` through its grid, `decalsAt` in `Shaders/Decal.h.fsl`, an identical copy of the core's: change them
-  together), as the forward pass and the captures paint them: never on glass, the footprint the ray cone's width across
-  the ray, stretched along it by the angle (`hitDecals`). The core's vertex and index buffers get the device-address and
+  (mask 1 every drawable, 2 shadow casters). The core's vertex and index buffers get the device-address and
   build-input flags and a uint view when the service exists. While it runs, the prepass writes `surface`
   (RGBA16F: x reflection roughness, yzw the normal; renderer_vrs reads x as its gloss). After the prepass, one
   full-size compute dispatch traces each pixel below `max_roughness` along one GGX visible-normal sample (R2
@@ -241,123 +141,6 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   `max_roughness` (`gTiles`, flag sets double-buffered so no thread reads a flag another rewrites); the resolve skips
   the rest and writes their zeros only when the history there isn't zero already. Every GPU object is freed
   in `unload()` (device-loss recovery unloads modules); nothing GPU-side is in tables.
-  renderer_gi's probe rays (frame.h giProbeCount > 0, with reflections and traced shadows on or off; needs what
-  renderer_rt needs, TAA included, else giTraced stays 0 and renderer_gi keeps its probes): after the top-level build,
-  `Trace.comp.fsl` GI_PASS traces a thread a ray into giRayOut (GiSample.h.fsl, copied unchanged from renderer_gi:
-  origins, rotated spherical Fibonacci directions, which probes trace), against mask 2 (casters: lights' own emitters
-  and markers don't, so the probes don't count a light twice); hits lit by `shadeHit` as reflections' are but with rays
-  for at most 2 mapless lights and no specular from the surroundings, back faces 0 and their distance negated (a
-  two-sided surface's lit from that side instead, as the raster captures draw it), misses
-  the sky fogged over the fog's range and GI_MISS; then giTraced = 1. Every hit's diffuse surroundings (reflections'
-  too) come from last frame's probes (giIrradiance, blended to the sky's by `inside`) once renderer_gi has blended any.
-  Ray-traced shadows (`shadows`, off until measured on the user's GPU; `traced_lights`, 4): `rt_pick` takes the sun and up to `traced_lights` visible
-  casting lights, area lights first (their PCSS costs most, and rays give their real shape), needing TAA and no debug
-  view. After the top-level build, `Shaders/Shadows.comp.fsl`'s three full-size passes, each over every traced shadow
-  (dispatch z, layers of 2D arrays matched to last frame's by light id): a trace (one any-hit ray a pixel, mask 2, to a
-  sample on the real shape: the sun's disc, a point or spot light's sphere of its own size or rtLightRadius, a rect's
-  or disc's surface, a sphere, a tube along its axis and across its radius; PCG hash per pixel plus R2 over frames;
-  from the pixel's unjittered position, as reflections, else grazing floors shadowed themselves), a temporal pass
-  (reprojected by motion, view-depth test, clamped to the 5x5 rays' mean ± 1.5σ, restarting at 4 when clamped; up to 32
-  frames, but 2 a pixel of penumbra width with at least 8, so sharp edges don't trail), and a filter (5x5 taps spread
-  over half the penumbra predicted from the averaged blocker distance, at most 8 px, plane and normal weighted) into
-  `rtShadows`. Checked on the tiny scene against a reference accumulated from one unclamped, unfiltered ray a frame for
-  hundreds of frames: mean error 0.2-0.4% (sun, point), 0.8-0.9% for a rect, disc, sphere or tube light; moving, against
-  32 rays a frame, about a third of the trailing that 32 frames everywhere left.
-- `renderer_sky`: the physical sky (Hillaire 2020, UE's sky atmosphere), on by default (physical_sky; off: the core's
-  Sky gradient knobs). Earth's Rayleigh, Mie (haze) and ozone (Hillaire's table 1, each scaled by a knob) over a 6360 km
-  planet to 6460 km; the scene's ground is y = 0, metres. `sky_prepare` (core, right after the sun is set, before
-  shadows_prepare) works out on the CPU, with the transmittance pass's own integral, what of the sun reaches the camera
-  (frame.h sunTransmittance; the core scales sunColor by it, so the sun light's intensity is its illuminance above the
-  atmosphere) and hands out its images; false without a sun. `sky_run` (first of the recording, timed \"sky\"): the
-  transmittance (256 x 64) and multiple-scattering (32 x 32, Hillaire's psi_ms) LUTs only when the atmosphere changes;
-  each frame the sky-view LUT (192 x 108, no sun disk; the core still draws the disk from the transmitted sunColor), the
-  aerial-perspective froxels (32^3 over the screen, depth^2 slices to 32 km), the sky's reflection image (octahedral
-  128, 6 mips: mip m the GGX lobe of roughness m / 5 sampled from the sky-view LUT) and its ambient (9 cosine-convolved
-  SH over pi from 2048 directions of mip 0). The core reads them under FLAG_SKY: the sky pass and skyRadiance from the
-  sky-view LUT, skyIrradiance from the SH, environment()'s sky from the reflection image, aerial perspective on every
-  lit pixel (aerial_perspective scales the distance). Probes' captures take their ambient from the SH; renderer_rt's
-  misses the reflection image and its hits' ambient the SH.
-- `renderer_fog`: volumetric fog in froxels (Wronski 2014; Hillaire 2015, Frostbite), off by default (`fog`; off or with
-  nothing in the air it costs nothing). Exponential height fog (density at and below base_height, thinning by
-  height_falloff) plus up to 16 local volumes (`Volume` table: boxes or ellipsoids, each with its own density, albedo and
-  soft edge; exports below). `fog_prepare` (core, after vrs_prepare: the lights, their z-bins, shadow views and sky are
-  set) sizes the froxels from the render size (quality: High 8 px columns x 128 slices, Medium 8 x 64, Low 16 x 64; slices
-  finer near the camera, edge(s) = 2 m x (2^(s log2(range / 2 + 1) / slices) - 1), out to `range`). `fog_run` (after
-  probes_render, before the depth prepass; timed "fog"): LIGHT (`Fog.comp.fsl`, 4x4x4 groups) per froxel at a point
-  jittered inside it each frame (R2 across, golden ratio along) the medium and the light it scatters to the camera: the
-  sun as it arrives through one filtered compare in its cascade (none while renderer_rt traces the sun: no cascades
-  then), the sky's mean radiance (the SH's first band, else the gradient's exact average) times the core's ambient, and
-  the local lights in the group's own list (each 4x4x4 group first culls every visible light's sphere against its froxels'
-  view-space box into a shared bitmask, read in light order: the same sum as over all lights; windowed inverse square, spot cone, rects and discs one-sided, area
-  lights no nearer than their size) with one compare in their shadow map; a Henyey-Greenstein phase (anisotropy). It
-  blends 0.9 of last frame's froxel at the same world point (reprojected with last frame's camera; off with temporal,
-  or after a resize, a skipped frame or a quality change). INTEGRATE (8x8, one thread a column) runs Frostbite's
-  energy-conserving step front to back into `fogVolume`: light scattered in and transmittance to each slice's far side.
-  The core applies it (FLAG_FOG, `applyFog` in Lighting.h.fsl) after aerial perspective on every lit pixel and on the
-  sky (its last slice) at render size, before TAA or the upscaler, so it works with each. Not under F1's view modes.
-  Rays the froxels don't hold (probe captures, the reflected sky in the forward pass, renderer_rt's hits and misses)
-  take the height fog analytically along the ray (frame v19 `fogMedium`, `fogAlbedo`; `applyHeightFog`, the same in
-  Lighting.h.fsl, Capture.frag.fsl and Trace.comp.fsl): exact optical depth of the exponential height profile, the sun
-  unshadowed with the phase and the sky's mean light scattered in; local volumes only in the froxels. `fog_on` (core,
-  before rt_pick) sets frame `fogShadowMaps`: renderer_shadows then keeps the sun's cascades and traced lights' tiles
-  even while renderer_rt traces them, so sunbeams and lamp shafts stay shadowed (surfaces still read the traced
-  shadows). fog_prepare runs just before probes_prepare. Every GPU object is freed in `unload()`.
-- `renderer_particles`: GPU particles (on by default, `particles`; nothing runs while no emitter exists and no particle
-  can be alive). Up to 64 emitters (`Emitter` table, exports below), a pool of `max_particles` (rounded up to a power
-  of two). `particles_prepare` (core, after fog_prepare) counts this frame's emission per emitter on the CPU and bounds
-  the particles alive from a ring of what was made and its longest life; `particles_run` (after fog_run, timed
-  \"particles\"; `Sim.comp.fsl`): EMIT (each new particle takes a free slot; it also empties the draw list), SIMULATE
-  (age, death into the free list, gravity, drag, divergence-free turbulence; one in view is lit once where it is: the
-  sun through one cascade compare, the sky's mean light, the local lights in the core's z-bin at its depth with one
-  map compare each (z-bins, not screen tiles: the tiles end at the opaque depth), a 4x Henyey-Greenstein phase per
-  emitter, and listed with its view depth), then while any alpha-blended emitter made particles a bitonic sort of the
-  list back to front (1024 a group in shared memory, larger strides a pass each; always sorted while blended surfaces
-  are in view), then SPLIT: one binary search per blended surface's depth cuts the list into runs (`gRunArgs`, indirect
-  draws; `gRunStart`, each run's first entry, an instance-rate stream). In the core's see-through pass
-  (`particles_draw_begin`, `particles_draw(frame, run)` per run between the surfaces, `particles_draw_end`), each run
-  draws indirectly: camera-facing round sprites, premultiplied into `hdr` (additive ones write alpha 0), soft against
-  the prepass depth (`soft_distance`) and the camera (`near_fade`), behind the froxel fog at their depth, before
-  exposure, TAA and the upscaler; their coverage adds into the core's `reactive` (TAA takes up to 0.6 more of the
-  current frame there; renderer_upscale's FSR reactive and DLSS bias masks read it). Only at one sample (no MSAA). The draw pipeline is queued on Yea's compile threads by the first particles_prepare (never made on a
-  drawing frame; particles simulate undrawn until it is ready; made in load() on a host without the service).
-  The core sets frame `keepShadowMaps` (v19's fogShadowMaps) while fog or particles run. Every GPU object is freed in
-  `unload()`.
-- `renderer_gi`: dynamic diffuse global illumination (on by default, `gi`): DDGI (Majercik et al. 2019, JCGT; 2021's
-  relocation and classification; as NVIDIA's RTXGI). A grid of up to 16 x 8 x 16 probes over the box `gi_volume` sets
-  (state Volume), else one fitted round the shadow casters (snapped to whole metres, kept while the scene stays within
-  it; casters over 3x the median radius and 2 m count only a metre about their centre for height, so a floor's sphere
-  doesn't stretch it), spaced evenly from the longest side. Each probe holds an 8x8 irradiance tile (6x6 inside, rgb
-  irradiance / pi, as skyIrradiance) and a 16x16 distance tile (mean and mean squared, for Chebyshev visibility), both
-  octahedral with a one-texel border, in two RGBA16F atlases (frame v22: giIrradiance, giDistance, giProbeData; xyz
-  relocation, w state 0 off, 1 on, 2 on but not lit yet, which nothing reads). `Shaders/GiSample.h.fsl` holds the grid,
-  ray directions and sampling; copied identically into renderer, renderer_rt, renderer_fog and renderer_particles, and it
-  reads only what its includer passes (the grid as four float4, the textures through GI_* macros). `gi_prepare` (core,
-  before rt_prepare) fits the grid, picks this frame's random rotation of the spherical-Fibonacci rays (64/128/256 a
-  probe by `quality`) and sets giProbeCount (0 on a new grid's first frame, which INIT clears). renderer_rt traces them
-  in `rt_run` (its paragraph above): radiance with direct light, emission and last frame's probes at each hit, so bounces
-  add up without end. `gi_run` (core, after rt_run, before the forward pass; timed "gi", `Blend.comp.fsl`): a group per
-  probe blends the rays into its tiles (hysteresis, less where the light changed a lot; none for a probe not lit yet),
-  copies the borders, then CLASSIFY moves each probe out of walls and off near surfaces (at most 45% of a cell) and
-  switches off those buried (over a quarter of rays hit backfaces) or with no surface within their cell (traced only
-  every 8th frame, to wake). Without rays this frame (no ray tracing, TAA off, renderer_rt off), the raster fallback
-  captures `quality`'s 4/8/16 probes a frame in turn instead: six 16x16 faces each into one RGBA16F strip
-  (`Capture.*.fsl`, both sides drawn, back faces of one-sided surfaces as negative distance; base colour and emissive
-  maps, cut-outs cut), lit as renderer_rt lights its hits (the sun through renderer_gi's own sun map; up to 64 lights
-  through their maps; last frame's probes for the bounce; height fog), read back as the same rays (RASTER_RAYS), blended
-  with at most 0.6 of history. The sun map (4.7.2, 2048² D32, `fitSun`): orthographic along the sun over the box round
-  the probe volume and every shadow caster (spheres over 200 m left out), so outside its rectangle no caster lies
-  between a point and the sun (lit, exactly) and past its far side the depth clamps to 1 (shadowed by whatever is
-  drawn there); every caster, both sides, cut-outs cut. Split in two (4.16.1): the still casters' map is drawn again
-  only on a raster frame where the sun turned, a still caster moved, appeared or went, the probe box or the textures
-  changed; moving casters (`dynamic`, or `moved` twice within 60 frames, so appearing or one jump is a single still
-  redraw) go every raster frame into a second map of the same view (`gGiSunDyn`, shadow.w), and the capture compares
-  each of its 2 x 2 texels against the nearer of the two depths: the same light as one map of every caster. The view
-  takes the moving casters' spheres with 1.25 r + 1 m to spare and refits only when one leaves it. The core
-  reads the probes for diffuse ambient in the forward pass (FLAG_GI, frame grid in FrameData gi[4]: `irradiance` lerps
-  from the sky's to `giIrradiance` by `inside`, which falls to 0 a cell outside the grid or where no probe round the
-  point holds light; show_gi shows it alone); fog's froxels and particles take `giAmbient` (mean over up and down,
-  no visibility) the same way. The probes include the ambient strength (renderer_rt's misses carry it). Not under F1's
-  view modes. Every GPU object is freed in `unload()`.
 - `renderer_post`: post-processing on the resolved (TAA or upscaled) scene-linear HDR image at display size, before
   the core's tonemapper, so it works the same with every upscaler (NVIDIA's DLSS guide and UE5 place it there).
   `post_prepare` (after the core's composite constants, before its descriptors) returns the image the tonemap pass and
@@ -409,97 +192,33 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   Its 16-bit and wave64 shaders run only where `yea::device()` says the device has them on. Its working memory is
   allocated in this module's own `update()`, never in `upscale_prepare`. Jitter: Halton 2,3 over 8 x ratio² phases;
   the render size is the vendors' ratio per quality mode (DLSS's own `renderSize` for DLSS); the core's exposure is copied into a 1x1 texture (one tiny
-  dispatch); the upscalers' own sharpening is off. Particles' and glass's coverage (frame.h `reactive`, when set) is FSR's
-  reactive mask and DLSS's `biasColour`; glass's alone (`transparency`) is FSR's transparency-and-composition mask and
-  DLSS's `transparency` (dlss.h version 2, Yea 146; an older host ignores both). After one records, The Forge's bound state is forgotten so its next binds
+  dispatch); the upscalers' own sharpening is off. After one records, The Forge's bound state is forgotten so its next binds
   are made in full. Lines said from `upscale_prepare` wait for this module's `update()`, so they are filed under
   renderer_upscale: which upscaler is picked and runs, its sizes, and why FSR can't run.
   Nothing of Microsoft's ships.
 - `renderer_models`: models, and the Model Viewer panel. A game's module declares each model with `MODEL(name, "source")`
   through `ModelLink.h` (`import renderer_models u64 api(u32 version) = 0`), registering in its own update (`mdl::update()`,
   which passes its own `yea::assets()`), and places it whole (`mdl::place`, `move`, `remove`, `placed`). Sources: a built-in
-  shape (box, sphere, cylinder, cone, torus, plane), or a cooked model, `models/<name>.rmodel` in the declaring module's
-  `Assets/` (`rmodel.h`; written by `tools/model_cook`), read in this module's own update from the owner's `yea::assets()`
-  path: each part (one per material) a LOD chain of the core's meshes (`mesh_packed`, linked with `mesh_lod`) and a material
-  from its factors, texture maps (`texture_add` with the file's path and offsets: the core streams them itself) and alpha mode
-  (a mask cuts out at the file's cutoff, 0.5 by default; a BLEND material is blended through `material_blend(m, 1)`, its
-  factors' alpha times its map's); emissive is the file's factor times strength times `emissive_nits`. A file that is
-  missing, damaged or of another version fails that model only, logged and shown in the Viewer; state `Format` rebuilds
-  every model when `rmodel.h`'s kRmodelVersion changes (the loader reads kRmodelOldest up). Skinned models (rmodel v3,
-  `Info.kind` 2) play their first clip, looping, once placed: `mdl::play(h, "Run", speed, loop, fade)` switches clip
-  (crossfaded, 0.2 s by default; nullptr or "" the rest pose; a name asked for while loading is taken once loaded),
-  `mdl::clipTime(h)`, `mdl::joint(h, "hand_r", m)` a joint's world 3x4 this frame (attach things to it); clips and joints
-  are named as in the source. `ModelLink.h`'s `hasAnim(a)` says the module has them (Api's size). Morph targets
-  (rmodel v4, `hasMorph(a)`): a clip's weight tracks play and crossfade with its pose; `mdl::morph(h, "Smile", w)` holds a
-  target over the clip (table `MorphOverride`, emptied with its placement and by Reset), `mdl::unmorph(h[, name])` hands
-  it back. Root motion (`hasRootMotion(a)`): `mdl::rootMotion(h, true)` (taken while loading) plays its clips in place,
-  the motion node's travel across the up and its turn about it held at each clip's first frame (the node: the nearest
-  common ancestor of the bones the clips move, found at load; its parent taken as at rest), and gathers what they left out
-  in table `PlacementMotion` (loops, clip ends, speed and crossfades as the pose blends); `mdl::takeRootMotion(h, m)`
-  hands it over in the world (m[0..2] metres, m[3] radians about +Y) for the game to move the placement by. Until taken,
-  the placement draws (and `joint` reads) moved on by it, so pose and place agree on every frame (switched on mid-clip,
-  what the clip did since its first frame starts pending, so the model stays put). Retargeting (`retarget.h`,
-  `hasRetarget(a)`): `mdl::play(h, otherModel, "Run")` plays another skinned model's clip on this one, as UE's IK
-  Retargeter: chains (pelvis, spine, head, clavicles, arms, legs, toes) found from bone names (Mixamo, UE, Blender's
-  DEF-, Bip01, prefixes such as `mixamorig:`), other bones by name; FK turns each bone as its source turned from rest
-  (model space, so bone axes may differ; chains of unequal length interpolate); the pelvis moves scaled by the two
-  pelvis heights; two-bone IK on legs and arms reaches the scaled source end (legs offset by their rest feet, so
-  planted feet stay planted on the ground), the knee bending where FK bent it, else to the front; root motion and
-  morph weights (by target name) come along. A map per pair of skeletons is made in `animate()` (this module's update,
-  32 cached, logged once) and remade when either reloads or its Up Axis changes. Table `PlacementRetarget`: whose clip
-  plays and whose it fades from. A leg goal out of reach first lowers the pelvis by the least that brings both legs'
-  goals within reach (as UE's IK Rig), so feet stay planted with no stretch; out of reach sideways, the nearest point. Clips are sampled with
-  `anim.h` (shared with the cooker: smallest-three rotations, quantised tracks, `sampleClip`, `blendPoses`, `palette`)
-  in `YEA_PHASE_LATE` into scratch made in load(), and each part instance gets the palette through `instance_pose`.
-  Its tables: `Placement` (a row per
-  placement, keyed by the model's owner and name), `PlacementAnim` (beside it: clip, time, speed, loop and the clip
-  it fades from), `PlacementMotion` (beside it: root motion on, and what it gathered), `PlacementRetarget` (beside it), `PartInstance` (the core's instances, one per part), `ModelPart` (each
+  shape (box, sphere, cylinder, cone, torus, plane) until the cooked loader lands. Its tables: `Placement` (a row per
+  placement, keyed by the model's owner and name), `PartInstance` (the core's instances, one per part), `ModelPart` (each
   model's meshes and materials in the core, found again after a reload), state `Scene` (the core's scene_epoch they belong
   to: when it changes, every part and instance is made again). It builds and syncs in `YEA_PHASE_LATE`, after the game's
   modules moved things. Each MODEL line gets the knobs of its each block (scale, up_axis, lod_quality, cast_shadows,
   double_sided), shown only in the Model Viewer. The Model Viewer (`panels/Viewer.cpp`): a dropdown of the view's models
   (kind, triangles, a lit dot while placed), a canvas preview (drag orbits, the wheel zooms, a double-click goes back to
-  the front; the turntable and Front View icons), the LOD shown (Auto as `lod_error` picks at that size, or each LOD), for
-  a skinned model its clips (a dropdown with Rest Pose, play and pause, From the Start, Speed, Crossfade: the preview's
-  own clip state in `gPreview.anim`, played in update and posed through `RenderPreview.palette`; a folding Morph
-  Targets list, a slider each, dragging one holds it until Follow the Clip; v3's `weights`; Clips From, another skinned model whose clips it plays retargeted; In Place, on by default, for
-  a model with a motion node), the
+  the front; the turntable and Front View icons), the LOD shown (Auto as `lod_error` picks at that size, or each LOD), the
   model's knobs; Add Models (the header's +) and drops go to the agents. The preview: this module makes its targets in
   its own `update()` at twice the canvas size (RGBA16F and D32 at 4 samples, a 1024² D32 shadow map, an RGBA8 sRGB out),
   and in `draw(YEA_PASS_RENDER)`, only on frames the panel showed it, calls the core's `preview_draw` (a `RenderPreview*`,
-  `preview.h`, copied identically into renderer and renderer_models: change both and raise `RENDER_PREVIEW_VERSION`;
-  v2 adds a palette: `skinPreview` poses the skinned parts with its own jobs, palette and set into a region at the end
-  of the pool's dynamic area, reserved from the next core draw while the preview asks; bind pose until then),
+  `preview.h`, copied identically into renderer and renderer_models: change both and raise `RENDER_PREVIEW_VERSION`),
   which draws the model alone with the core's meshes, materials, BRDF (`Shaders/Brdf.h.fsl`, shared with the forward
   pass) and tonemapper under a studio rig (a key light with a 16-tap filtered shadow map, a neutral grey sky for
   ambient and reflections, a floor showing only shadow and contact darkening), resolves its 4 samples tonemapped into
   the out target, and leaves everything in SHADER_RESOURCE; the panel shows it with `yea::canvasImage`. The core's
   preview pipelines and buffers are made in its own `load()` (`preview_core.h`); a failure turns only the preview off.
 - The core calls the others through optional imports with a `RenderFrame*` (as `u64`): `frame.h`, copied
-  identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes`, `renderer_ssr`, `renderer_vrs`, `renderer_rt`, `renderer_upscale`, `renderer_post`, `renderer_sky`, `renderer_fog`, `renderer_particles` and `renderer_gi` (`mathx.h` into the
-  first three). Change all copies together and raise `RENDER_FRAME_VERSION`. Geometry (frame v16): two vertex streams, `positions`
-  (float3, `RENDER_POSITION_STRIDE`) and `attributes` (`RENDER_ATTRIBUTE_STRIDE`: octahedral normal and tangent snorm16x2,
-  uv0, rgba8 colour; frame.h says how to decode), and u32 `indices`. They are GPU-only, made with half again as much room
-  and appended to with the queue idle when meshes are added (remade only when full or the scene starts over), always in
-  vertex/index plus shader-resource state (never barriered), with RT build-input flags and 4-byte `Buffer(uint)` views
-  while ray queries are on. `RenderCaster.generation` changes whenever that mesh's data was written. Shadow maps bind
-  positions only (masked casters also attributes, for uv0); the scene, probes and preview bind positions and attributes.
-  Skinning (frame v24): a skinned mesh is a pool mesh in its bind pose plus `SkinVertex` rows (`mesh_skin`); each
-  frame `skin.cpp` gives every posed instance a region after the meshes (two copies of its finest version's vertex
-  count: this frame's at frameNumber & 1, last frame's the other) and one compute dispatch (`Skin.comp.fsl`, the
-  "skin" timing, first in the frame) writes them, pool buffers barriered to unordered access and back. Its
-  `RenderCaster` has `dynamic` set and `vertexOffset` at this frame's copy: every module draws or traces a dynamic
-  caster at its own vertexOffset, one at a time (renderer_shadows, renderer_gi's sun map, renderer_rt's per-instance
-  refitted structures), never shared or cached by mesh. MOTION variants bind a fourth stream, `PrevPosition` (binding 3,
-  last frame's copy; the static pool for still meshes), so moving limbs leave true motion vectors; the see-through
-  pipelines keep the three-stream layout. Instance flag 32 is skinned (16 see-through). Morph targets ride the same
-  pass: tables `MeshMorph`, `MorphVertex` (a u32 a vertex: first delta and count) and `MorphDelta` (16 bytes: position
-  offset, target and snorm8 normal offset), sent to the GPU only when they change; each job's third uint4 names them and
-  the weights (after the palettes in the same buffer); deltas are added before the bones, the tangent re-orthogonalised.
-  Texture maps (frame v21): `materialMaps` (a material's maps, Common.h.fsl MaterialMapData) and `textures`
-  (RENDER_MAX_TEXTURES, a stand-in where empty or loading, all SHADER_RESOURCE), rebound only when `textureVersion`
-  changes; FrameData.textures.x is the mip bias. Probes clip cut-outs and read base colour and emissive maps; masked
-  shadow casters redraw and probes recapture when textureVersion changes. Ray-traced shadows (frame v15): renderer_rt's `rt_pick`, called just
+  identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes`, `renderer_ssr`, `renderer_vrs`, `renderer_rt`, `renderer_upscale` and `renderer_post` (`mathx.h` into the
+  first three). Change all copies together and raise `RENDER_FRAME_VERSION`. Ray-traced shadows (frame v15): renderer_rt's `rt_pick`, called just
   before `shadows_prepare`, marks the lights (`RenderLight.traced`) and the sun (`rtSunShadows`) it traces; renderer_shadows
   then draws no cascades for a traced sun and no tiles for traced lights, the core writes LightData params.w = 2 + n for
   them, and the forward pass reads `rtShadows` (slice 0 the sun, 1 + n light n) instead of their maps. While renderer_rt
@@ -510,11 +229,9 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
 
 Units: metres; sun intensity in lux, point, spot and area lights in candela (an area light's seen face-on; its
 surface's luminance is that over its area). Colours linear RGB.
-- Meshes: `mesh_box/sphere/plane/cylinder/cone/torus` (unit size, centred, with UVs and tangents), or `mesh_begin`,
-  `mesh_vertex(pos, normal)` (returns a local index; no UVs), `mesh_triangle`, `mesh_end` → mesh id, or
-  `mesh_packed(positions, attributes, vertex_count, indices, index_count)` (pointers as u64, frame.h's packed layout; a
-  cooked mesh in one call) and `mesh_lod(mesh, error, simpler)` to chain versions. New meshes are appended to the GPU
-  buffers on the next frame (a short stall: build them up front). A triangle faces where cross(b - a, c - a)
+- Meshes: `mesh_box/sphere/plane/cylinder/cone/torus` (unit size, centred), or `mesh_begin`,
+  `mesh_vertex(pos, normal)` (returns a local index), `mesh_triangle`, `mesh_end` → mesh id. Meshes are
+  uploaded when they change (a stall: build them up front). A triangle faces where cross(b - a, c - a)
   points (counter-clockwise around its outward normal); back faces are culled.
 - Mesh versions (LOD): the curved built-in shapes make a chain of simpler versions after the mesh they return
   (`MeshLod` table: each row's `next` and its surface `error` in object units; ~1/sqrt(2) the segments each, so the
@@ -524,31 +241,10 @@ surface's luminance is that over its area). Colours linear RGB.
   than the screen's (a finer caster would shadow the screen's surface). A version change counts as a move for the
   cached shadow maps. Custom meshes have one version. Request finer segments for close-ups freely: far away it costs
   nothing.
-- Morphs (renderer_models calls these): `mesh_morph(mesh, refs, deltas, count)` after `mesh_skin` (a morphed mesh is
-  always skinned), `instance_morph(i, weights, count)` each frame with `instance_pose` (without it: no morph).
-- Skins (renderer_models calls these): `mesh_skin(mesh, skin, lo, hi)` (per vertex u16x4 bones and unorm16x4 weights
-  summing to 65535; lo and hi the bounds its clips reach, so culling never loses a limb), `instance_pose(i, palette,
-  bones)` each frame it is posed (3 rows of 4 floats a bone, model space; an instance not posed this frame draws its
-  bind pose).
 - Materials: `material_add(albedo, roughness, metallic)`, `material_set`, `material_emissive(m, color, nits)`,
   `material_reflections(m, on)`: off, the material shows no reflected image (probes or sky), only the sky's
   soft light, however shiny or metallic it is. `material_double_sided(m, on)` (off by default): drawn from
   both sides, for open or thin surfaces (a lone plane, leaves, cloth).
-- Texture maps (from cooked files; renderer_models calls these): `texture_add(path, offset, bytes, format, w, h, mips)`
-  (BC7 sRGB/linear or BC5, read from the file over the next frames, up to 24 MB a frame), `texture_state`, `texture_remove`;
-  `material_maps(m, base_color, orm, normal, emissive)`, `material_factors` (glTF's), `material_alpha(m, cutoff)` (cut out
-  below it; 0 opaque). Tables `TextureMap` (a row a shader slot), `TexturePath`, `MaterialMap`.
-- See-through: `material_blend(m, opacity)` (glass, lenses, visors, water; opacity times the base colour's alpha is how
-  much of the surface is there, its reflection stays whole; 0 opaque). With instance_shadow on (the default), a blended
-  surface tints the light that passes it, in ray-traced shadows and (4.15.0) in the shadow maps alike.
-  `material_refraction(m, ior, thickness, shape, tint)`: how it bends (thin pane 0, solid ball or block 1), blurs (by its
-  roughness: frosted glass) and tints what is behind it. Knob `refraction` (Performance) turns the bending and blur off.
-  renderer_models calls `material_blend(m, 1)` for glTF BLEND materials, their alpha in the factors.
-- Decals: `decal_add(pos, quat, half)` (a box; it paints along its -z, its z out of the surface), `decal_place`,
-  `decal_look(d, albedo+opacity, roughness, metallic, emissive, nits, weights)` (weights: colour and glow, roughness,
-  metallic, normal; 0 leaves that part), `decal_shape(d, 0 ellipse | 1 rectangle, edge, noise, angle°)`,
-  `decal_maps(d, base_color, normal, orm, normal_scale)` (texture_add's handles), `decal_priority`, `decal_remove`,
-  `decal_clear`. `clear()` removes them too.
 - Instances: `instance_add(mesh, material)`, `instance_place(i, pos, quat, scale)`, `instance_material`,
   `instance_shadow(i, cast)`, `instance_remove`. Only call `instance_place` when it moved: a move redraws
   local shadows near it.
@@ -593,12 +289,10 @@ AgX (our own constants, in Tonemap.h.fsl), Hable_Filmic, Reinhard, None, ACES_Fi
 compiles only while the shader's TONEMAPPER_ACES_FITTED is 1, which a build baking another tonemapper sets to 0),
 Tony_McMapface (its table, Assets/tony_mc_mapface.dds, is read only while it is picked; Khronos PBR Neutral stands in
 when missing); the shader's mode is its index, so new options go at the end; both licences are tied to their options), msaa (1/2/4/8), specular_aa, sky/horizon/ground colours, sky_luminance, ambient,
-sun_disk (degrees), near_plane, gpu_timings (logs each pass's GPU time every 10 s: avg/max ms), lod_error (display pixels; 0: always the finest),
-texture_detail (Full, Half, Quarter: top mips left out; more when GPU memory is short). `renderer_culling`: enabled, max_lights, tile_size (8/16/32), z_bins,
+sun_disk (degrees), near_plane, gpu_timings (logs each pass's GPU time every 10 s: avg/max ms), lod_error (display pixels; 0: always the finest). `renderer_culling`: enabled, max_lights, tile_size (8/16/32), z_bins,
 heatmap. `renderer_shadows`: enabled (the sun's), cascades, shadow_distance, cascade_split, sun_resolution, softness,
 filter_taps, pcss, sun_size, normal_bias, slope_bias, receiver_plane, light_shadows, shadowed_lights, local_atlas_resolution,
-updates_per_frame, max_tile_resolution, contact_hardening, light_size (m), show_cascades, show_atlas (the light shadow atlas, top right),
-glass_shadows, glass_resolution (the tint maps' side). `renderer_taa`: enabled, history_weight, clamp_width, sharpen, jitter,
+updates_per_frame, max_tile_resolution, contact_hardening, light_size (m), show_cascades, show_atlas (the light shadow atlas, top right). `renderer_taa`: enabled, history_weight, clamp_width, sharpen, jitter,
 jitter_phases. `renderer_upscale`: upscaler (TAA, FSR, DLSS), quality_mode (Native, Quality 67%, Balanced 59%,
 Performance 50%, Ultra_Performance 33%; for an upscaler only), dlss_model (Auto: Transformer where the GPU runs FP8, CNN
 elsewhere, CNN until Yea reports FP8; Transformer: NVIDIA's default per mode, K/M/L; CNN: preset E, two to five times cheaper on RTX 20 and 30, falling back to the default in a mode where it's refused and the default then runs, said once per mode; Transformer is
@@ -609,81 +303,26 @@ intensity, max_distance, show_contact. `renderer_probes`: enabled, resolution (6
 show_hits (tints where reflections were found). `renderer_vrs`: enabled, aggressiveness, motion (0), keep_curved, glossy_below, allow_4x4,
 show_rates (green half rate, blue 2x2, magenta coarser). `renderer_rt`: enabled, max_roughness, half_resolution, full_below, screen_colors,
 reflected_shadows (Scene, Rays, Off), history_frames, brightest, max_distance, show_hits (green: hit seen on screen, blue: lit at the hit, grey: sky),
-probe_rays (temporary: 0 off; traces 1 sun ray plus k-1 local-light rays per pixel and discards them; retire it with a major
-version), shadows (ray-traced shadows), traced_lights (0-8, besides the sun).
-`renderer_fog`: fog, density, height_falloff, base_height, albedo, anisotropy, quality (Low, Medium, High), range,
-temporal. Its exports: `fog_volume_add(shape, center, half_size)` (0 box, 1 ellipsoid; density 0.1, white, softness
-0.25), `fog_volume_place`, `fog_volume_medium(v, density, albedo, softness)`, `fog_volume_remove`, `fog_volume_clear`.
-`renderer_particles`: particles, max_particles, soft_distance, near_fade. Its exports: `particle_emitter_add(pos)`
-(defaults: 20 a second, 0.5 m/s up over 20°, 2 to 3 s, white, 5 to 15 cm, half opaque, lit, blended),
-`particle_emitter_place(e, pos, dir)`, `_shape(e, shape, extent)` (0 point, 1 box, 2 sphere), `_rate(e, per_second,
-burst)`, `_motion(e, speed, spread_deg, speed_jitter, gravity, drag, turbulence)`, `_life(e, min_s, max_s)`,
-`_look(e, color_start, color_end, size_start, size_end, opacity)`, `_light(e, emissive, anisotropy, additive)`,
-`_remove`, `_clear` (particles live out their lives).
-`renderer_gi`: gi, quality (Low, Medium, High: 64/128/256 rays a probe, or 4/8/16 probes captured a frame without ray
-tracing), hysteresis, show_gi (the diffuse light alone, on white). Its export: `gi_volume(center, size)` (size 0 0 0:
-fitted round the scene again).
-`renderer_models`: emissive_nits (a model's emissive 1 at strength 1, cd/m²); per MODEL line, in the Model Viewer only: scale, up_axis (Auto, Y, Z: Z up in the file turned to Y up),
+probe_rays (temporary: 0 off; traces 1 sun ray plus k-1 local-light rays per pixel and discards them, to measure ray-traced
+shadows' cost on the user's GPU; remove once measured).
+`renderer_models` (per MODEL line, in the Model Viewer only): scale, up_axis (Auto, Y, Z: Z up in the file turned to Y up),
 lod_quality, cast_shadows, double_sided.
-Players of a released game tune (`player` lines): upscaler, quality_mode, dlss_model, exposure_ev (brightness), lod_error, texture_detail,
+Players of a released game tune (`player` lines): upscaler, quality_mode, dlss_model, exposure_ev (brightness), lod_error,
 TAA's sharpen, shadows' sun_resolution, shadow_distance, pcss and light_shadows, and enabled for AO, contact shadows, SSR,
-ray-traced reflections, ray-traced shadows and VRS, with half_resolution for AO, SSR and ray-traced reflections, probes' resolution,
-fog with its quality, particles, and global illumination (gi) with its quality.
+ray-traced reflections and VRS, with half_resolution for AO, SSR and ray-traced reflections, and probes' resolution.
 Debug views and show_ knobs never. renderer_rt's `enabled` needs `raytracing` and renderer_vrs' `shadingrate` (hidden and
 false without them); each still returns from `load()` before touching its service when that is nullptr, as `load()` runs
 either way.
 
-## Tools (never shipped)
-
-Run by agents in their orb; never compiled into a module, kept out of `licenses.json` (they ship nothing). Each vendored
-library keeps its licence file beside its source, since the component's repository redistributes it.
-- `tools/ltc_fit.cpp`: fits the area-light LTC tables (`modules/renderer/Assets/ltc.bin`). Our own code.
-- `tools/dfg_bake.cpp`: bakes the split-sum table (`modules/renderer/Assets/dfg.bin`, 128 x 128 at x sqrt(N.V), y roughness;
-  visible-normal sampling) that `dfgLookup` reads; every copy of `dfgLookup` (core, renderer_rt, renderer_shadows) stays
-  identical to Brdf.h.fsl's. Our own code.
-- `tools/model_cook/` (`build.sh` → `build/tools/model_cook in.glb out.rmodel`): glTF/GLB (Draco too), FBX and OBJ to
-  `.rmodel` with a report. Our
-  own code plus `vendor/cgltf` (MIT, Johannes Kuhlmann; v1.15), `vendor/meshoptimizer` (MIT, Arseny Kapoulkine; v1.3),
-  `vendor/stb` (stb_image v2.34, MIT or public domain, Sean Barrett) and `vendor/bc7e` (Basis Universal's bc7e scalar
-  port, Apache-2.0, Binomial LLC; its NOTICE beside it), `vendor/ufbx` (ufbx v0.23.1, MIT or public domain, Samuli
-  Raivio: FBX and OBJ) and Google's Draco 1.5.9 (Apache-2.0: KHR_draco_mesh_compression), which `build.sh` fetches,
-  checks against its SHA-256 and builds under `build/tools/` (not kept in the repository). FBX and OBJ go into glTF's
-  space through ufbx (metres, +Y up), UVs flipped, tangents always generated, vertex colours left out; their materials
-  map to metallic-roughness (roughness, metallic and occlusion maps merged into the ORM), and an opacity map that is the
-  base colour's image cuts out. Each ORM channel comes from its own map; one without is white (glTF's lone
-  metallic-roughness image leaves red unused). A BLEND material's colour map keeps its painted alpha. Texture maps (rmodel v2) go in with full mips: BC7 for colour and
-  ORM, BC5 for normals.
-  Skins and clips (rmodel v3, `cook_anim.h`): up to 4 bones a vertex; meshes under animated nodes without a skin are
-  bound whole to their node; every node's pose resampled at the file's key rate, else the lowest of 30 to 240 a second
-  whose decoded skin stays within 1 mm of the source (or 2.5e-4 of the model's size); LODs keep influence borders.
-  glTF through cgltf, FBX through ufbx's evaluator; empty takes skipped. Morph targets (rmodel v4, glTF): position and
-  normal deltas (tangent deltas left out), merged by target name over the model's meshes, defaults from mesh.weights,
-  one quantised weight track a target per clip, measured at the skin (weight error times the target's reach); bounds
-  grow by what the morphs reach; how far a vertex morphs weighs in the simplifier. A model with targets cooks skinned.
-  It normalises units (node scales applied; warns past 500 m or under 1 cm) and axes (+Y up kept, Z negated into the
-  renderer's left-handed space, triangle order flipped), generates flat normals and MikkTSpace-compatible tangents where
-  missing, merges primitives by material into parts (64 at most), and builds each part's LOD chain with meshoptimizer's
-  attribute-aware simplifier (normals and UVs weighted; seams and hard edges only collapse along themselves; vertices on
-  a material border locked), half the triangles a level with its error in metres. A model sent in the chat or dropped
-  on the Model Viewer: cook it, put the `.rmodel` in the using module's `Assets/models/` (with its licence entry, or an
-  `own.txt` line when made in this project), add its `MODEL` line, publish, and pass the report on.
-
 ## Reset
 
 All scene data is in `renderer`'s tables and state: Reset empties the scene; the feature's link module
-builds it again (decals included). renderer_fog's volumes and renderer_particles' emitters are in their tables: Reset removes them too (and starts the
-particle pool empty). renderer_gi's volume (state) goes back to fitted, and its probes start again from dark: they fill
-within a second or two traced, a few seconds rasterized. renderer_models' placements go with it: a game places its models again whenever `mdl::placed(h)` is
-false, and their clips start again from the first (PlacementAnim goes with them). GPU objects and shadow caches are
-rebuilt on load.
+builds it again. renderer_models' placements go with it: a game places its models again whenever `mdl::placed(h)` is
+false. GPU objects and shadow caches are rebuilt on load.
 
 ## Cost
 
-Per frame, with animated models: one skin dispatch (a thread a posed vertex), 32 bytes a vertex twice per posed
-instance in the pool, palettes uploaded (48 bytes a bone), each posed instance drawn on its own (not instanced), its
-shadow casters redrawn every frame it moves, and with ray tracing its own structure refitted (renderer_rt).
-Per frame: one depth prepass and one forward pass (draws grouped by mesh, sidedness and cut-out, instanced; cut-outs
-clip in a prepass of their own and the forward pass draws them depth-equal; back
+Per frame: one depth prepass and one forward pass (draws grouped by mesh and sidedness, instanced; back
 faces culled except for double-sided materials; a leaner forward shader unless PCSS or a debug view is on), one culling
 dispatch per 16 px tile, a GTAO dispatch and `denoise` blur dispatches (at half size with half_resolution; the forward pass upsamples), one contact shadow dispatch (all full size; 64-pixel stretches of rays from the sun's point on screen, two bilinear depth reads per pixel), one
 rate dispatch per 16 px tile and a small dilation dispatch with variable-rate shading (the forward pass then shades smooth tiles at 2x2), one
@@ -693,39 +332,12 @@ resolution plus 6 small passes per mip, sun cascades whose view or casters chang
 exposure dispatches, with ray-traced reflections (instead of the SSR depth copy and march) one top-level
 rebuild, a trace dispatch (a closest-hit ray per glossy pixel, a quarter of them with half_resolution except
 mirror-like ones; where the hit isn't on screen a shadow map lookup per lit light with a map, a ray for the sun and for mapless casters), with half_resolution a
-full-size reconstruction (nine rays reused per glossy pixel) a full-size resolve (temporal accumulation; tiles with no glossy pixel cost a read or two) and a full-size filter (up to 25 taps per glossy pixel, a write elsewhere), with ray-traced shadows (the top-level rebuild
-too, if reflections are off) three full-size dispatches per traced shadow (one any-hit ray a pixel, a 25-read temporal
-pass, a filter of up to 25 taps in penumbrae only), and screen-size arrays of 1 + traced_lights layers (at least 2): the
-rays and then the output in one R16F (one ray is all or nothing, so its blocker distance alone holds it), and two
-histories of RG16F visibility and blocker distance plus R16F samples: 14 bytes a pixel a layer, plus 8 for two R32F
-depths, about 270 MB at 2560x1356 with the default 4 (4.5.2; 410 MB before, bit for bit the same image), remade when
-traced_lights or the size changes and freed while off), one full-screen TAA resolve (when on; with an upscaler, its dispatch at the display size and a one-thread
-exposure copy instead, every scene pass then at the render size), one full-screen composite. With fog on, two
-dispatches: one thread per froxel (240 x 135 x 128 at 1080p on High: 4.1 M, each a cascade compare and its z-bin's lights
-with a compare each) and one per column, plus 3 RGBA16F froxel volumes (about 33 MB at 1080p on High, 17 MB on Medium),
-and one bilinear volume read per pixel in the forward and sky passes. With particles alive: emit and simulate
-dispatches over the pool (one thread a slot), the sort (log² passes, only while blended particles live), and one
-draw of 6 vertices a listed particle (their overdraw is the main cost); 72 bytes a pool slot (2.4 MB at 32768) and an
-R8 render-size mask. With global illumination: probe rays (16 x 8 x 16 = 2048 probes at most, 128 rays each on Medium,
-262 k rays traced in renderer_rt's pass, shaded with shadow maps and a sun ray; the probes switched off trace every 8th
-frame), two blend dispatches (a group per probe, each texel over every ray), a classify dispatch, 2 atlases (128 x 64
-and 256 x 128 tiles: about 0.5 MB) and 4 MB of rays; in the forward pass 8 probes a pixel (two bilinear reads each).
-Without ray tracing instead: 6 x 16² faces for each of 4/8/16 probes a frame (the casters drawn into each face they
-reach, culled on the CPU), one ray-gathering dispatch, and the sun maps (2 x 16 MB): the still casters' redrawn only
-when something it holds changes, the moving casters alone into the other each raster frame they are there. The Model Viewer's preview costs
+full-size reconstruction (nine rays reused per glossy pixel) a full-size resolve (temporal accumulation; tiles with no glossy pixel cost a read or two) and a full-size filter (up to 25 taps per glossy pixel, a write elsewhere), one full-screen TAA resolve (when on; with an upscaler, its dispatch at the display size and a one-thread
+exposure copy instead, every scene pass then at the render size), one full-screen composite. The Model Viewer's preview costs
 nothing unless its panel is open and showing a model: then, per frame, one 1024² shadow map pass and one 4-sample pass of
-that model at twice the canvas size, and a resolve (about 6 MB of targets at a 520 × 320 canvas). Texture maps: their mips
-in GPU memory (BC7/BC5, 1 byte a texel; a 2048² map about 5.6 MB with mips), read from file while loading (24 MB a
-frame at most), one sample per map per pixel. No per-frame allocation. GPU memory at the defaults:
+that model at twice the canvas size, and a resolve (about 6 MB of targets at a 520 × 320 canvas). No per-frame allocation. GPU memory at the defaults:
 HDR + depth at 4x MSAA, sun atlas 4096² D32 (64 MB), local atlas 4096² (64 MB), a screen-size R32F depth copy
 for screen reflections (a quarter of it at half resolution).
-
-See-through surfaces: per visible blended instance two draws a side (multiply, add) with the forward shader's lighting,
-sorted on the CPU (one qsort); particles add one tiny split dispatch and an indirect draw a run. Refraction, while
-refracting glass is in view: a copy of the scene and its blurred levels (about 1.4 copies' worth of pixels), plus a
-partial copy where glass is behind glass or steam, and a few depth reads a glass pixel. Decals: their
-spheres binned with the lights (one more mask loop in the culling dispatch); in the forward pass each pixel pays only
-for the decals in its tile and z-bin (a box test, then up to three map reads or a few noise taps).
 
 ## Pitfalls
 
@@ -780,27 +392,10 @@ for the decals in its tile and z-bin (a box test, then up to three map reads or 
   renderer_rt's 1x1 `addResource` D32 stand-in, bound while renderer_shadows was reloading, most likely crashed
   Direct3D 12 in 2.2.1.
 - A probe sees the objects inside its box too, so a shiny object reflects itself where it is near the probe.
-- Scene pipelines come in fours per pass (opaque or cut-out, one- or two-sided). Never all in `load()`: that took past
-  Yea's 2 s hang limit on the orb's software GPU (about 400 ms a forward pipeline). The frame that (re)makes them makes
-  the opaque prepass, lean forward and sky ones. With Yea's background compiles (`yea::pipelines()`, SDK 158) it first
-  queues on Yea's threads what that frame draws with, then the cut-out set, then every other variant (the full shader
-  and F1's view modes; not those in a release), and waits only for the first; later frames take the rest as they finish,
-  and a variant still compiling when a frame needs it is waited for, never queued or made twice (Direct3D 12 forbids
-  loading one pipeline from a library on two threads). Remaking or `unload()` cancels what is queued; the cache is
-  removed after the shaders, as removeShader waits for compiles reading them. A cancelled compile already running goes
-  on, so each cancelled desc (slot, samples, motion) is tainted for the session: asked for again (settings back within
-  seconds, as TAA or an upscaler loading after the core does), it compiles without the cache. Two threads loading one
-  pipeline from the library crashed Direct3D 12 on every start before 4.16.2. After any cancel the cache is saved only
-  at unload, after the shaders; each remake that cancelled or tainted logs how many. On an older host, warming makes the
-  rest 2 ms a frame, one at least. Either way no variant compiles on a frame that draws: until warmed, cut-outs wait (both passes, so depth and colour agree) and
-  the full shader gives way to the lean one. A pipeline cache in Yea's data folder (`renderer_pipelines_d3d12.bin` or
-  `_vulkan.bin`; a Direct3D 12 library from another driver starts empty) is saved when warming ends (unless a compile was cancelled) and in `unload()`.
-  It logs "scene pipelines warmed in X ms over N frames (at most Y ms a frame); cut-outs held back K frames", and any
-  pipeline still made on a drawing frame.
 
 ## Example view (`example/renderer_example`)
 
-The view has two features: Base Settings (the component's modules: what a game using the Renderer gets) and
+The view has two features: Base Settings (the component's 11 modules: what a game using the Renderer gets) and
 Example Scene (`renderer_example` alone, its scene knobs). `renderer_example` is the example module, with no `use`
 line, so the hub's one-use-per-view rule doesn't count it.
 Floor, gold and red sphere rows sweeping roughness, pillars and assorted shapes, spinning tori, a sun,
@@ -809,24 +404,14 @@ every fifth slot a spot, else every slot the type left on (20 by default: 16 poi
 colour (`point_intensity`, `point_range`); spots are lamps (a dark body aimed along the beam, its lens glowing; neither
 casts shadows; `spot_intensity`, range 20). The first `shadowed_lights` slots cast shadows (all by default). Light
 Types: `sun`, `points`, `spots`, `rects`, `discs`, `spheres`, `tubes`, each off removing that type's lights and
-emitters (their fittings stay). Particles (`state Particles`, each emitter's handle + 1): `dust` (motes over the
-middle of the floor, 500 a second, 6 to 10 s, scattering forwards so they glint towards the sun and lamps) and `steam`
-(off the steel drum's top, rising and spreading), each off removing its emitter; Glass and Decals: `glass` (a clear pane
-between the start view and the steam, a teal one behind it, a frosted one beside them, a solid glass ball by the path, all
-refracting) and `decals` (a scorch by the white
-boxes, worn yellow lines along the path with a puddle over them, green patina on the copper block, a glowing cyan strip on
-the stone ledge), switching either building the scene again; `build()` clears them with the scene. Four area lights at `area_luminance` (cd/m²; the pendant at three times it): a
+emitters (their fittings stay). Four area lights at `area_luminance` (cd/m²; the pendant at three times it): a
 softbox on a stand by the sphere rows, a pendant disc over the white boxes, a fluorescent tube on the stone ledge,
 the glowing sphere on the steel drum, a 4 × 3 stained-glass panel on a stand opposite the softbox (a rect with a
-light_image, its panes glowing slabs in their colours, at twice `area_luminance`; under Rects), two reflection probes (the sphere rows, the whole yard), four sample models (Khronos' glTF samples, CC0; cooked
-in `Assets/models/`, their sources fetched and checked at a pinned commit by `example/model_sources/fetch_and_cook.sh`,
-never kept in the repository): a street lamp by the white boxes, the flight helmet on the stone ledge, the water bottle
-in front, the boom box on the copper block, placed whole through renderer_models (`state Models`; their sizes are
-`default <model>_scale` lines), a free-look camera: holding its `look` action (left mouse button) after a press on the game
+light_image, its panes glowing slabs in their colours, at twice `area_luminance`; under Rects), two reflection probes (the sphere rows, the whole yard), a free-look camera: holding its `look` action (left mouse button) after a press on the game
 asks the host for the mouse each frame (`yea::captureMouse(true)`: hidden, kept in the window) and turns by
 `yea_mouse_dx`/`yea_mouse_dy` (`look_sensitivity`); the move keys fly (WASD, Q/E down/up, `move_speed`).
 The host lets go when the button is up (it is no longer asked), F1 opens, focus is lost, or on a view switch
-or Reset. Reset: lights, camera, dust and steam
-back to the start (the particle pool starts empty). `benchmark_view` holds the camera at its start view (field of view 55), or at the gold or
+or Reset. Reset: lights and camera
+back to the start. `benchmark_view` holds the camera at its start view (field of view 55), or at the gold or
 mirror sphere's close-up (`benchmark_camera`, field of view 40), without moving the user's own, and holds the lights and shapes still, so GPU Timings compare between versions; the project's
 `modules/test_renderer_bench` (a test on the user's machine) drives it. Exports `picture` (a fixed angle).

@@ -5,10 +5,8 @@
 STRUCT(VSInput)
 {
     DATA(float3, Position, POSITION);
-    DATA(float2, Normal, NORMAL); // octahedral
+    DATA(float3, Normal, NORMAL);
     DATA(uint, Entry, TEXCOORD1);
-    DATA(float2, Uv, TEXCOORD0);
-    DATA(float4, Color, COLOR);
 };
 
 STRUCT(VSOutput)
@@ -18,8 +16,6 @@ STRUCT(VSOutput)
     DATA(float3, Normal, TEXCOORD1);
     DATA(FLAT(uint), Material, TEXCOORD2);
     DATA(FLAT(uint), View, TEXCOORD3);
-    DATA(float2, Uv, TEXCOORD4);
-    DATA(float4, Color, TEXCOORD5);
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -36,11 +32,9 @@ VSOutput VS_MAIN(VSInput In)
     float3 a = inst.row0.xyz;
     float3 b = inst.row1.xyz;
     float3 c = inst.row2.xyz;
-    float3 n = octDecode(In.Normal);
+    float3 n = In.Normal;
     Out.Normal = float3(dot(cross(b, c), n), dot(cross(c, a), n), dot(cross(a, b), n));
     Out.Material = inst.misc.x;
     Out.View = In.Entry >> 20;
-    Out.Uv = In.Uv;
-    Out.Color = In.Color;
     RETURN(Out);
 }

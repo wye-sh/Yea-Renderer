@@ -1,9 +1,8 @@
 // The depth prepass's second output while renderer_vrs runs: per pixel, the roughness its reflections
 // have (1 for materials with reflections off; the clear, 1, for the sky). The rate pass keeps tiles with
-// glossy pixels at full rate, at any distance. MASKED: alpha-tested materials, cut out as the forward pass draws them.
+// glossy pixels at full rate, at any distance.
 #include "Common.h.fsl"
 #include "Scene.srt.h"
-#include "Material.h.fsl"
 
 STRUCT(VSOutput)
 {
@@ -13,26 +12,13 @@ STRUCT(VSOutput)
     DATA(FLAT(uint), Material, TEXCOORD2);
     DATA(float4, CurrClip, TEXCOORD3);
     DATA(float4, PrevClip, TEXCOORD4);
-    DATA(float2, Uv, TEXCOORD5);
-    DATA(float4, Tangent, TEXCOORD6);
-    DATA(float4, Color, TEXCOORD7);
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
 float4 PS_MAIN(VSOutput In)
 {
     INIT_MAIN;
-    MaterialData    m = gMaterials[In.Material];
-    MaterialMapData mm = gMaterialMaps[In.Material];
-    float           uvScale = exp2(gFrame.textures.x);
-    float2          uvDx = ddx(In.Uv) * uvScale;
-    float2          uvDy = ddy(In.Uv) * uvScale;
-#ifdef MASKED
-    clip(materialAlpha(mm, In.Uv, uvDx, uvDy, mm.misc.y > 0.5 ? In.Color.a : 1.0) - mm.misc.x);
-#endif
-    float rough = m.albedoRough.a;
-    if (mm.maps.y != 0u)
-        rough = mm.factors.x * sampleMap(mm.maps.y, In.Uv, uvDx, uvDy).g;
-    float g = m.params.z > 0.5 ? rough : 1.0;
+    MaterialData m = gMaterials[In.Material];
+    float g = m.params.z > 0.5 ? m.albedoRough.a : 1.0;
     RETURN(float4(g, g, g, g));
 }

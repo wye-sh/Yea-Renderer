@@ -4,7 +4,6 @@
 #include "scene.h"
 
 #include <math.h>
-#include <string.h>
 
 namespace renderer
 {
@@ -54,71 +53,17 @@ template<class T> T* allocRow(const yea::Table<T>& t, uint32_t* rowOut)
 
 template<class T> yea_handle handleOf(const yea::Table<T>& t, uint32_t row) { return row | ((t[row].gen & 0xFFFu) << 20); }
 
-// A unit vector as octahedral snorm16x2 (frame.h's RENDER_ATTRIBUTE_STRIDE): of the nearby roundings, the one that
-// decodes closest to it. parity -1 or 1 keeps only codes whose y is odd or even (a tangent's bitangent sign), 0 any.
-uint32_t octPack(float x, float y, float z, int parity)
+uint32_t vertex(float px, float py, float pz, float nx, float ny, float nz)
 {
-    float l = fabsf(x) + fabsf(y) + fabsf(z);
-    if (!(l > 0))
-        x = 0, y = 0, z = 1, l = 1;
-    float u = x / l, v = y / l;
-    if (z < 0)
-    {
-        float ou = u;
-        u = (1 - fabsf(v)) * (ou >= 0 ? 1.0f : -1.0f);
-        v = (1 - fabsf(ou)) * (v >= 0 ? 1.0f : -1.0f);
-    }
-    float    len = sqrtf(x * x + y * y + z * z);
-    float    best = -2;
-    int32_t  bu = 0, bv = 0;
-    int32_t  fu = (int32_t)floorf(u * 32767.0f), fv = (int32_t)floorf(v * 32767.0f);
-    for (int32_t i = 0; i < 2; ++i)
-        for (int32_t j = -1; j < 3; ++j)
-        {
-            int32_t cu = fu + i, cv = fv + j;
-            cu = cu < -32767 ? -32767 : (cu > 32767 ? 32767 : cu);
-            cv = cv < -32767 ? -32767 : (cv > 32767 ? 32767 : cv);
-            if ((parity < 0 && !(cv & 1)) || (parity > 0 && (cv & 1)) || (parity == 0 && (j < 0 || j > 1)))
-                continue;
-            float dx = (float)cu / 32767.0f, dy = (float)cv / 32767.0f, dz = 1 - fabsf(dx) - fabsf(dy);
-            float t = dz < 0 ? -dz : 0;
-            dx += dx >= 0 ? -t : t;
-            dy += dy >= 0 ? -t : t;
-            float d = (dx * x + dy * y + dz * z) / (sqrtf(dx * dx + dy * dy + dz * dz) * len);
-            if (d > best)
-                best = d, bu = cu, bv = cv;
-        }
-    return (uint32_t)(uint16_t)(int16_t)bu | ((uint32_t)(uint16_t)(int16_t)bv << 16);
-}
-
-// A vertex with its normal n, uv, tangent t (along +u) and bitangent b (along +v); t is made perpendicular to n.
-uint32_t vertexFull(const float p[3], const float n[3], float u, float v, const float t[3], const float b[3])
-{
-    Vertex* row = Vertexes.add();
-    if (!row)
+    Vertex* v = Vertexes.add();
+    if (!v)
     {
         build()->failed = 1;
         return 0;
     }
-    float d = n[0] * t[0] + n[1] * t[1] + n[2] * t[2];
-    float tx = t[0] - n[0] * d, ty = t[1] - n[1] * d, tz = t[2] - n[2] * d;
-    float cx = n[1] * tz - n[2] * ty, cy = n[2] * tx - n[0] * tz, cz = n[0] * ty - n[1] * tx; // cross(n, t)
-    int   sign = cx * b[0] + cy * b[1] + cz * b[2] < 0 ? -1 : 1;
-    row->pos = { p[0], p[1], p[2] };
-    row->normal = octPack(n[0], n[1], n[2], 0);
-    row->tangent = octPack(tx, ty, tz, sign);
-    row->uv = { u, v };
-    row->color = 0xFFFFFFFFu;
+    v->pos = { px, py, pz };
+    v->normal = { nx, ny, nz };
     return Vertexes.size() - 1 - build()->firstVertex;
-}
-
-// A vertex without uv (custom meshes): any tangent perpendicular to n.
-uint32_t vertex(float px, float py, float pz, float nx, float ny, float nz)
-{
-    const float p[3] = { px, py, pz }, n[3] = { nx, ny, nz };
-    const float t[3] = { fabsf(nx) < 0.9f ? 1.0f : 0.0f, fabsf(nx) < 0.9f ? 0.0f : 1.0f, 0 };
-    const float b[3] = { ny * t[2] - nz * t[1], nz * t[0] - nx * t[2], nx * t[1] - ny * t[0] };
-    return vertexFull(p, n, 0, 0, t, b);
 }
 
 void tri(uint32_t a, uint32_t b, uint32_t c)
@@ -257,8 +202,7 @@ uint32_t mesh_box()
             float px = f[0] * 0.5f + f[3] * su + f[6] * sv;
             float py = f[1] * 0.5f + f[4] * su + f[7] * sv;
             float pz = f[2] * 0.5f + f[5] * su + f[8] * sv;
-            const float p[3] = { px, py, pz }, tb[6] = { f[3], f[4], f[5], -f[6], -f[7], -f[8] };
-            uint32_t    i = vertexFull(p, f, su + 0.5f, 0.5f - sv, tb, tb + 3); // the face's u right, v down
+            uint32_t i = vertex(px, py, pz, f[0], f[1], f[2]);
             if (c == 0)
                 base = i;
         }
@@ -280,10 +224,8 @@ uint32_t sphere(uint32_t seg)
         for (uint32_t s = 0; s <= seg; ++s)
         {
             float p = 6.28318531f * (float)s / (float)seg;
-            float       nx = sinf(t) * cosf(p), ny = cosf(t), nz = sinf(t) * sinf(p);
-            const float q[3] = { nx * 0.5f, ny * 0.5f, nz * 0.5f }, n[3] = { nx, ny, nz };
-            const float tg[3] = { -sinf(p), 0, cosf(p) }, bt[3] = { cosf(t) * cosf(p), -sinf(t), cosf(t) * sinf(p) };
-            vertexFull(q, n, (float)s / (float)seg, (float)r / (float)rings, tg, bt); // u around, v from the top down
+            float nx = sinf(t) * cosf(p), ny = cosf(t), nz = sinf(t) * sinf(p);
+            vertex(nx * 0.5f, ny * 0.5f, nz * 0.5f, nx, ny, nz);
         }
     }
     for (uint32_t r = 0; r < rings; ++r)
@@ -306,11 +248,10 @@ uint32_t mesh_plane()
 {
     if (!begin())
         return kNoMesh;
-    const float n[3] = { 0, 1, 0 }, t[3] = { 1, 0, 0 }, b[3] = { 0, 0, -1 };
-    const float c[4][3] = { { -0.5f, 0, -0.5f }, { 0.5f, 0, -0.5f }, { 0.5f, 0, 0.5f }, { -0.5f, 0, 0.5f } };
-    uint32_t    a = vertexFull(c[0], n, 0, 1, t, b); // u along x, v down along -z
-    for (int k = 1; k < 4; ++k)
-        vertexFull(c[k], n, c[k][0] + 0.5f, 0.5f - c[k][2], t, b);
+    uint32_t a = vertex(-0.5f, 0, -0.5f, 0, 1, 0);
+    vertex(0.5f, 0, -0.5f, 0, 1, 0);
+    vertex(0.5f, 0, 0.5f, 0, 1, 0);
+    vertex(-0.5f, 0, 0.5f, 0, 1, 0);
     quad(a, a + 3, a + 2, a + 1);
     return finish();
 }
@@ -332,11 +273,8 @@ uint32_t revolve(uint32_t segments, const float (*profile)[4], uint32_t count, b
         for (uint32_t s = 0; s <= seg; ++s)
         {
             float p = 6.28318531f * ((float)s + half) / (float)seg;
-            float       c = cosf(p), sn = sinf(p);
-            const float q[3] = { profile[k][0] * c, profile[k][1], profile[k][0] * sn };
-            const float n[3] = { profile[k][2] * c, profile[k][3], profile[k][2] * sn };
-            const float tg[3] = { -sn, 0, c }, bt[3] = { 0, -1, 0 };
-            vertexFull(q, n, ((float)s + half) / (float)seg, 0.5f - profile[k][1], tg, bt); // u around, v down
+            float c = cosf(p), sn = sinf(p);
+            vertex(profile[k][0] * c, profile[k][1], profile[k][0] * sn, profile[k][2] * c, profile[k][3], profile[k][2] * sn);
         }
     }
     for (uint32_t k = 0; k + 1 < count; ++k)
@@ -357,14 +295,11 @@ uint32_t revolve(uint32_t segments, const float (*profile)[4], uint32_t count, b
             continue;
         const float* ring = profile[top ? count - 1 : 0];
         float        ny = top ? 1.0f : -1.0f;
-        const float  n[3] = { 0, ny, 0 }, tg[3] = { 1, 0, 0 }, bt[3] = { 0, 0, -1 };
-        const float  q0[3] = { 0, ring[1], 0 };
-        uint32_t     centre = vertexFull(q0, n, 0.5f, 0.5f, tg, bt); // seen from above: u along x, v down along -z
+        uint32_t     centre = vertex(0, ring[1], 0, 0, ny, 0);
         for (uint32_t s = 0; s <= seg; ++s)
         {
-            float       p = 6.28318531f * (float)s / (float)seg;
-            const float q[3] = { ring[0] * cosf(p), ring[1], ring[0] * sinf(p) };
-            vertexFull(q, n, q[0] + 0.5f, 0.5f - q[2], tg, bt);
+            float p = 6.28318531f * (float)s / (float)seg;
+            vertex(ring[0] * cosf(p), ring[1], ring[0] * sinf(p), 0, ny, 0);
         }
         for (uint32_t s = 0; s < seg; ++s)
             if (top)
@@ -412,10 +347,8 @@ uint32_t torus(float minor, uint32_t seg)
         for (uint32_t j = 0; j <= sides; ++j)
         {
             float v = 6.28318531f * (float)j / (float)sides;
-            float       nx = cosf(v) * cosf(u), ny = sinf(v), nz = cosf(v) * sinf(u);
-            const float q[3] = { major * cosf(u) + minor * nx, minor * ny, major * sinf(u) + minor * nz }, n[3] = { nx, ny, nz };
-            const float tg[3] = { -sinf(u), 0, cosf(u) }, bt[3] = { -sinf(v) * cosf(u), cosf(v), -sinf(v) * sinf(u) };
-            vertexFull(q, n, (float)i / (float)seg, (float)j / (float)sides, tg, bt); // u around the ring, v around the tube
+            float nx = cosf(v) * cosf(u), ny = sinf(v), nz = cosf(v) * sinf(u);
+            vertex(major * cosf(u) + minor * nx, minor * ny, major * sinf(u) + minor * nz, nx, ny, nz);
         }
     }
     for (uint32_t i = 0; i < seg; ++i)
@@ -464,41 +397,6 @@ void mesh_triangle(uint32_t a, uint32_t b, uint32_t c)
 
 uint32_t mesh_end() { return finish(); }
 
-uint32_t mesh_packed(uint64_t positions, uint64_t attributes, uint32_t vertex_count, uint64_t indices, uint32_t index_count)
-{
-    const float*    p = (const float*)(uintptr_t)positions;
-    const uint32_t* a = (const uint32_t*)(uintptr_t)attributes;
-    const uint32_t* ix = (const uint32_t*)(uintptr_t)indices;
-    if (!p || !a || !ix || !vertex_count || !index_count || index_count % 3 ||
-        Vertexes.size() + (uint64_t)vertex_count > Vertexes.capacity() || Indexes.size() + (uint64_t)index_count > Indexes.capacity())
-        return kNoMesh;
-    for (uint32_t i = 0; i < index_count; ++i)
-        if (ix[i] >= vertex_count)
-            return kNoMesh;
-    if (!begin())
-        return kNoMesh;
-    for (uint32_t i = 0; i < vertex_count; ++i)
-    {
-        Vertex* v = Vertexes.add();
-        v->pos = { p[i * 3], p[i * 3 + 1], p[i * 3 + 2] };
-        v->normal = a[i * 5];
-        v->tangent = a[i * 5 + 1];
-        memcpy(&v->uv, a + i * 5 + 2, 8);
-        v->color = a[i * 5 + 4];
-    }
-    for (uint32_t i = 0; i < index_count; ++i)
-        Indexes.add()->v = ix[i];
-    return finish();
-}
-
-void mesh_lod(uint32_t mesh, float error, uint32_t simpler)
-{
-    if (mesh >= MeshLods.size() || (simpler != kNoMesh && (simpler >= Meshes.size() || simpler == mesh)))
-        return;
-    MeshLods[mesh].error = error > 0 ? error : 0;
-    MeshLods[mesh].next = simpler;
-}
-
 // --- Materials --------------------------------------------------------------------------------
 
 yea_handle material_add(yea_float3 albedo, float roughness, float metallic)
@@ -509,7 +407,6 @@ yea_handle material_add(yea_float3 albedo, float roughness, float metallic)
         return 0xFFFFFFFFu;
     m->reflectance = 0.5f;
     m->reflections = 1;
-    materialMapsReset(row);
     yea_handle h = handleOf(Materials, row);
     material_set(h, albedo, roughness, metallic);
     return h;
@@ -776,112 +673,9 @@ void clear()
     Lights.clear();
     LightTexels.clear();
     LightLooks.clear();
-    TextureMaps.clear();
-    TexturePaths.clear();
-    MaterialMaps.clear();
-    MaterialBlends.clear();
-    MaterialRefractions.clear();
-    Decals.clear();
-    MeshSkins.clear();
-    SkinVertexes.clear();
-    MeshMorphs.clear();
-    MorphVertexes.clear();
-    MorphDeltas.clear();
     build()->active = 0;
     sceneState()->removed = yea::host()->frame();
     newEpoch();
-}
-
-// --- Decals -----------------------------------------------------------------------------------
-
-yea_handle decal_add(yea_float3 pos, yea_float4 rotation, yea_float3 half)
-{
-    uint32_t row;
-    Decal*   d = allocRow(Decals, &row);
-    if (!d)
-        return 0xFFFFFFFFu;
-    d->albedo = { 0.1f, 0.1f, 0.1f, 1.0f };
-    d->roughness = 0.8f;
-    d->weights = { 1, 1, 1, 1 };
-    d->edge = 0.3f;
-    d->angle = 80.0f;
-    d->baseColor = d->normal = d->orm = 0xFFFFFFFFu;
-    d->normalScale = 1.0f;
-    uint32_t order = 0; // after every decal alive, so equal priorities paint in the order they were added
-    for (const Decal& o : Decals)
-        order = o.alive && o.order > order ? o.order : order;
-    d->order = order + 1;
-    decal_place(handleOf(Decals, row), pos, rotation, half);
-    return handleOf(Decals, row);
-}
-
-void decal_place(yea_handle h, yea_float3 pos, yea_float4 rotation, yea_float3 half)
-{
-    uint32_t row = rowOf(Decals, h);
-    if (row == 0xFFFFFFFFu)
-        return;
-    float l = sqrtf(rotation.x * rotation.x + rotation.y * rotation.y + rotation.z * rotation.z + rotation.w * rotation.w);
-    Decals[row].pos = pos;
-    Decals[row].rot = l > 1e-8f ? yea_float4{ rotation.x / l, rotation.y / l, rotation.z / l, rotation.w / l } : yea_float4{ 0, 0, 0, 1 };
-    Decals[row].half = { fabsf(half.x) > 1e-4f ? fabsf(half.x) : 1e-4f, fabsf(half.y) > 1e-4f ? fabsf(half.y) : 1e-4f,
-                         fabsf(half.z) > 1e-4f ? fabsf(half.z) : 1e-4f };
-}
-
-void decal_look(yea_handle h, yea_float4 albedo, float roughness, float metallic, yea_float3 emissive, float luminance, yea_float4 weights)
-{
-    uint32_t row = rowOf(Decals, h);
-    if (row == 0xFFFFFFFFu)
-        return;
-    Decal& d = Decals[row];
-    d.albedo = albedo;
-    d.roughness = roughness;
-    d.metallic = metallic;
-    d.emissive = { emissive.x * luminance, emissive.y * luminance, emissive.z * luminance };
-    d.weights = weights;
-}
-
-void decal_shape(yea_handle h, uint32_t shape, float edge, float noise, float angle_deg)
-{
-    uint32_t row = rowOf(Decals, h);
-    if (row == 0xFFFFFFFFu)
-        return;
-    Decal& d = Decals[row];
-    d.shape = shape > 1 ? 1 : shape;
-    d.edge = edge < 0 ? 0 : edge > 1 ? 1 : edge;
-    d.noise = noise < 0 ? 0 : noise > 1 ? 1 : noise;
-    d.angle = angle_deg < 1 ? 1 : angle_deg > 180 ? 180 : angle_deg;
-}
-
-void decal_maps(yea_handle h, yea_handle base_color, yea_handle normal, yea_handle orm, float normal_scale)
-{
-    uint32_t row = rowOf(Decals, h);
-    if (row == 0xFFFFFFFFu)
-        return;
-    Decal& d = Decals[row];
-    d.baseColor = base_color;
-    d.normal = normal;
-    d.orm = orm;
-    d.normalScale = normal_scale;
-}
-
-void decal_priority(yea_handle h, int32_t priority)
-{
-    uint32_t row = rowOf(Decals, h);
-    if (row != 0xFFFFFFFFu)
-        Decals[row].priority = priority;
-}
-
-void decal_remove(yea_handle h)
-{
-    uint32_t row = rowOf(Decals, h);
-    if (row != 0xFFFFFFFFu)
-        Decals[row].alive = 0;
-}
-
-void decal_clear()
-{
-    for (Decal& d : Decals)
-        d.alive = 0;
 }
 
 // --- Camera -----------------------------------------------------------------------------------

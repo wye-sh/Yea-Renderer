@@ -1,25 +1,36 @@
-// Shadow casters: an instance-rate stream of (instance | view << 20), never SV_InstanceID. MASKED: alpha-tested casters,
-// with uv0 for ShadowMasked.frag.
-#include "ShadowCommon.h.fsl"
+// Shadow casters: an instance-rate stream of (instance | view << 20), never SV_InstanceID.
+STRUCT(InstanceData)
+{
+    DATA(float4, row0, None);
+    DATA(float4, row1, None);
+    DATA(float4, row2, None);
+    DATA(uint4, misc, None);
+};
+
+STRUCT(ShadowView)
+{
+    DATA(float4, row0, None);
+    DATA(float4, row1, None);
+    DATA(float4, row2, None);
+    DATA(float4, row3, None);
+    DATA(float4, rect, None);
+    DATA(float4, info, None);
+    DATA(float4, inv0, None);
+    DATA(float4, inv1, None);
+    DATA(float4, inv2, None);
+};
+
+#include "Shadow.srt.h"
 
 STRUCT(VSInput)
 {
     DATA(float3, Position, POSITION);
     DATA(uint, Entry, TEXCOORD1);
-#ifdef MASKED
-    DATA(float2, Uv, TEXCOORD0);
-    DATA(float4, Color, COLOR); // the vertex colour (its alpha is read)
-#endif
 };
 
 STRUCT(VSOutput)
 {
     DATA(float4, Position, SV_Position);
-#ifdef MASKED
-    DATA(float2, Uv, TEXCOORD0);
-    DATA(FLAT(uint), Material, TEXCOORD1);
-    DATA(float, Alpha, TEXCOORD2);
-#endif
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -32,10 +43,5 @@ VSOutput VS_MAIN(VSInput In)
     float4 p = float4(In.Position, 1.0);
     float4 w = float4(dot(inst.row0, p), dot(inst.row1, p), dot(inst.row2, p), 1.0);
     Out.Position = float4(dot(v.row0, w), dot(v.row1, w), dot(v.row2, w), dot(v.row3, w));
-#ifdef MASKED
-    Out.Uv = In.Uv;
-    Out.Material = inst.misc.x;
-    Out.Alpha = In.Color.a;
-#endif
     RETURN(Out);
 }

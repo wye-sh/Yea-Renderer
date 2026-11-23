@@ -1,12 +1,10 @@
 // The depth prepass's second output while renderer_rt runs: per pixel, x the roughness its reflections
 // have (with specular antialiasing, as the forward pass widens it; 1 for materials with reflections off,
 // and the clear, 1, for the sky), yzw the shading normal turned towards the viewer. The ray-traced
-// reflections start from it (with the material's maps, as the forward pass shades it; MASKED: cut out as it is);
-// renderer_vrs reads x as it reads the gloss output. Its second output is the motion vectors, as the forward pass
-// writes them, so they are final when renderer_rt runs (its shadow denoiser reprojects by them).
+// reflections start from it; renderer_vrs reads x as it reads the gloss output. Its second output is the motion
+// vectors, as the forward pass writes them, so they are final when renderer_rt runs (its shadow denoiser reprojects by them).
 #include "Common.h.fsl"
 #include "Scene.srt.h"
-#include "Material.h.fsl"
 
 STRUCT(VSOutput)
 {
@@ -16,9 +14,6 @@ STRUCT(VSOutput)
     DATA(FLAT(uint), Material, TEXCOORD2);
     DATA(float4, CurrClip, TEXCOORD3);
     DATA(float4, PrevClip, TEXCOORD4);
-    DATA(float2, Uv, TEXCOORD5);
-    DATA(float4, Tangent, TEXCOORD6);
-    DATA(float4, Color, TEXCOORD7);
 };
 
 STRUCT(PSOutput)
@@ -31,30 +26,16 @@ ROOT_SIGNATURE(DefaultRootSignature)
 PSOutput PS_MAIN(VSOutput In)
 {
     INIT_MAIN;
-    MaterialData    m = gMaterials[In.Material];
-    MaterialMapData mm = gMaterialMaps[In.Material];
-    float           uvScale = exp2(gFrame.textures.x);
-    float2          uvDx = ddx(In.Uv) * uvScale;
-    float2          uvDy = ddy(In.Uv) * uvScale;
-#ifdef MASKED
-    clip(materialAlpha(mm, In.Uv, uvDx, uvDy, mm.misc.y > 0.5 ? In.Color.a : 1.0) - mm.misc.x);
-#endif
-    if (mm.maps.y != 0u)
-        m.albedoRough.a = mm.factors.x * sampleMap(mm.maps.y, In.Uv, uvDx, uvDy).g;
+    MaterialData m = gMaterials[In.Material];
     float3 N = normalize(In.Normal);
     float3 V = normalize(gFrame.camPos.xyz - In.WorldPos);
-    float  facing = dot(N, V) < 0.0 ? -1.0 : 1.0;
-    N *= facing;
-    if (mm.maps.z != 0u)
-        N = mappedNormal(mm, In.Normal, In.Tangent, In.Uv, uvDx, uvDy) * facing;
+    if (dot(N, V) < 0.0)
+        N = -N;
     float rough = clamp(m.albedoRough.a, 0.03, 1.0);
     float a2 = rough * rough;
     a2 *= a2;
-    // The unit normal's change across the pixel: In.Normal's length is the instance's scale squared (Forward.vert),
-    // which would widen a scaled-up object's highlights and sharpen a scaled-down one's past what their curvature asks.
-    float3 unitN = normalize(In.Normal);
-    float3 dndx = ddx(unitN);
-    float3 dndy = ddy(unitN);
+    float3 dndx = ddx(In.Normal);
+    float3 dndy = ddy(In.Normal);
     float  variance = 0.25 * gFrame.misc.y * (dot(dndx, dndx) + dot(dndy, dndy));
     a2 = saturate(a2 + min(2.0 * variance, 0.18));
     float r = m.params.z > 0.5 ? sqrt(sqrt(a2)) : 1.0;

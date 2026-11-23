@@ -15,8 +15,7 @@ STRUCT(RtData)
     DATA(float4, skyGround, None);
     DATA(uint4, counts, None);       // x lights, y frame number (noise; never wraps short), z flags, w instances
     DATA(float4, params, None);      // x max distance (m), y edge fade (fraction of the screen), z roughness below
-                                     // which pixels are traced at full resolution (above 1 with half_resolution off),
-                                     // w the texture maps' mip bias (frame.h mipBias)
+                                     // which pixels are traced at full resolution (above 1 with half_resolution off)
     DATA(float4, temporal, None);    // x frames of history for rough reflections, y 1 when last frame's history is
                                      // usable, z the brightest a sample may be (exposed luminance),
                                      // w 1 when the half-resolution trace ran
@@ -31,14 +30,5 @@ STRUCT(RtData)
     DATA(float4, denoise, None);     // the filter: x footprint scale, y largest radius (px), z roughness at or below
                                      // which pixels are copied (full_below: mirror-like)
     DATA(float4, taps[32], None);    // xy: the filters' Vogel disk, unturned (as the core's)
-    DATA(float4, sky, None);         // x 1: renderer_sky's physical sky (gSkyEnv, gSkySh), y gSkyEnv's mips
     DATA(uint4, probe, None);        // TEMPORARY (probe_rays): x shadow rays per pixel to measure, 0 none
-    DATA(float4, fogMedium, None);   // renderer_fog's height fog (frame.h fogMedium; x 0: none)
-    DATA(float4, fogAlbedo, None);   // rgb albedo, w the fog's range (m)
-    DATA(float4, giGrid[4], None);   // renderer_gi's probes (frame.h giGrid; GiSample.h.fsl)
-    DATA(float4, giRot[3], None);    // this frame's rotation of their rays (frame.h giRotation, rows)
-    DATA(uint4, giCounts, None);     // x probes (0: none), y rays a probe, z the GI pass's groups across,
-                                     // w 1 when last frame's probes can be sampled (the bounce at hits)
-    DATA(uint4, decals, None);       // x decals hits paint (frame worldDecalCount; 0: none)
-    DATA(float4, decalGrid[2], None); // frame.h decalGrid
 };

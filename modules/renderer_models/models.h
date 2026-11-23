@@ -3,7 +3,6 @@
 
 #include "ModelLink.h"
 #include "preview.h"
-#include "rmodel.h"
 
 #include <stdint.h>
 
@@ -11,7 +10,6 @@ namespace renderer_models
 {
 constexpr uint32_t kMaxModels = 512;
 constexpr uint32_t kMaxParts = RENDER_PREVIEW_PARTS;
-constexpr uint32_t kNoClip = 0xFFFFFFFFu; // no clip: the rest pose
 
 struct Entry
 {
@@ -24,22 +22,7 @@ struct Entry
     float    knobs[mdl::kKnobs];
     uint32_t parts;
     uint32_t mesh[kMaxParts], material[kMaxParts];
-    uint32_t twoSided[kMaxParts]; // its material is double-sided in the file (the Double Sided knob adds to it)
     float    lo[3], hi[3]; // its bounds as cooked (object units)
-    // A skinned model's skeleton and clips (rmodel.h): the file's bytes from its RmodelSkeleton to its textures, read
-    // with the model (malloc, this module's own update), offsets in it from the file's start minus `animBase`.
-    uint8_t*              anim;
-    uint64_t              animBase;
-    const RmodelSkeleton* skel;
-    const RmodelNode*     nodes;
-    const RmodelBone*     bones;
-    const RmodelClip*     clips;
-    const RmodelMorphTarget* targets; // its morph targets (skel->targetCount of them; v4), in `anim`
-    // Root motion: the node that carries the clips' travel (every bone's nearest common ancestor; kNoClip none) and its
-    // parent's model-space transform at rest (3x3 rows `motionLin`, its inverse, and its translation).
-    uint32_t motionNode;
-    float    motionLin[9], motionInv[9], motionT[3];
-    uint32_t animStamp; // counts its skeleton's reads (a retarget map made from it is made again after one)
 };
 // Every model the view's modules declared, in the order declared (made in load()).
 extern Entry*   gEntries;
@@ -58,21 +41,6 @@ struct Preview
     uint32_t lodShown, triangles; // what the last draw drew
     const void* outTexture;  // what the panel shows: the target's Texture* (nullptr until made)
     uint32_t    outW, outH;
-    // A skinned model's clip in the preview (its own, not a placement's): the panel picks, update() plays it.
-    PlacementAnim anim;
-    uint32_t      animModel;    // whose clip `anim` is (0: none yet)
-    uint32_t      pickClip;     // picked in the panel: 1 the rest pose, clip c at c + 2; 0 none
-    uint32_t      playing;
-    float         speed, fade;  // speed 1 as authored; seconds faded from the clip before
-    // Its morph targets: a weight the panel holds (morphHeld) over what the clip says.
-    float         morph[kRmodelMaxTargets];
-    uint8_t       morphHeld[kRmodelMaxTargets];
-    float         morphNow[kRmodelMaxTargets]; // the weights its last draw showed
-    int           morphOpen;                   // its Morph Targets row unfolded
-    int           inPlace;                     // its clips shown in place (their root motion left out)
-    // Whose clips it plays: clipsFrom the model the panel picked (its id; 0 its own); srcClip and srcFrom the models
-    // (keys; 0 its own) of `anim`'s clip and of the one it fades from, retargeted onto it.
-    uint32_t      clipsFrom, srcClip, srcFrom;
 };
 extern Preview gPreview;
 

@@ -36,8 +36,6 @@ float4 PS_MAIN(VSOutput In)
         float edge = smoothstep(cosDisk - (1.0 - cosDisk) * 0.3, cosDisk, c);
         color += gFrame.sunColor[0].rgb * (edge / (2.0 * PI * (1.0 - cosDisk)));
     }
-    if ((gFrame.counts.z & FLAG_FOG) != 0u)
-        color = applyFog(color, 1e9, In.UV); // all the fog there is
 #ifdef MOTION
     // At infinity only the camera's turning moves the sky.
     float4 dir = float4(d, 0.0);

@@ -5,16 +5,16 @@
 
 float2 dfgLookup(float NoV, float rough)
 {
-    float  x = sqrt(saturate(NoV)) * 127.0;
-    float  y = saturate(rough) * 127.0;
+    float  x = saturate(NoV) * 31.0;
+    float  y = saturate(rough) * 31.0;
     uint   x0 = uint(x);
     uint   y0 = uint(y);
-    uint   x1 = min(x0 + 1u, 127u);
-    uint   y1 = min(y0 + 1u, 127u);
+    uint   x1 = min(x0 + 1u, 31u);
+    uint   y1 = min(y0 + 1u, 31u);
     float  fx = x - float(x0);
     float  fy = y - float(y0);
-    float2 a = lerp(gDfg[y0 * 128u + x0], gDfg[y0 * 128u + x1], fx);
-    float2 b = lerp(gDfg[y1 * 128u + x0], gDfg[y1 * 128u + x1], fx);
+    float2 a = lerp(gDfg[y0 * 32u + x0], gDfg[y0 * 32u + x1], fx);
+    float2 b = lerp(gDfg[y1 * 32u + x0], gDfg[y1 * 32u + x1], fx);
     return lerp(a, b, fy);
 }
 

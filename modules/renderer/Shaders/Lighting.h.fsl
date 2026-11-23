@@ -6,64 +6,9 @@
 
 #include "Brdf.h.fsl"
 
-// --- Sky ---------------------------------------------------------------------------------------
-// The physical sky (renderer_sky, FLAG_SKY: Hillaire 2020), else the procedural gradient: zenith, horizon and ground
-// colours (luminance).
-
-// Where a direction falls in renderer_sky's sky-view LUT (its Atmosphere.h.fsl skyViewUv): azimuth from the sun's,
-// zenith angle finer towards the horizon, the ground below it.
-float2 skyViewUv(float3 d)
-{
-    float r = gFrame.atmosphere.z, Rb = gFrame.atmosphere.x;
-    float beta = acos(clamp(sqrt(max(r * r - Rb * Rb, 0.0)) / r, -1.0, 1.0));
-    float zh = PI - beta;
-    float zenith = acos(clamp(d.y, -1.0, 1.0));
-    float v = zenith < zh ? (1.0 - sqrt(max(1.0 - zenith / zh, 0.0))) * 0.5 : sqrt(saturate((zenith - zh) / beta)) * 0.5 + 0.5;
-    float2 a = d.xz, b = gFrame.sunDir[0].xz;
-    float  la = dot(a, a), lb = dot(b, b);
-    float  cosAz = la > 1e-12 && lb > 1e-12 ? dot(a, b) * rsqrt(la * lb) : 1.0;
-    return float2(sqrt(saturate(0.5 - 0.5 * cosAz)), v);
-}
-
-float2 skyOct(float3 d)
-{
-    float2 p = d.xz / (abs(d.x) + abs(d.y) + abs(d.z));
-    if (d.y < 0.0)
-        p = (float2(1.0, 1.0) - abs(p.yx)) * float2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
-    return p * 0.5 + 0.5;
-}
-
-// The sky's reflection along R at a roughness (its GGX-prefiltered mips).
-float3 skyReflection(float3 R, float rough)
-{
-    return SampleLvlTex2D(gSkyEnv, gSamplerTrilinearClamp, skyOct(R), rough * (gFrame.atmosphere2.y - 1.0)).rgb;
-}
-
-// Distant surfaces fade into the air's own light (aerial perspective): the light scattered in and the transmittance
-// from the camera to P, from renderer_sky's froxels over the screen (uv), slices at depth^2 out to atmosphere2.x km.
-float3 aerialPerspective(float3 color, float3 P, float2 uv)
-{
-    float d = length(P - gFrame.camPos.xyz) * 0.001 * gFrame.atmosphere.w;
-    float w = sqrt(d / gFrame.atmosphere2.x) * 32.0 - 1.0; // slice k ends at depth ((k + 1) / 32)^2
-    float4 a = SampleLvlTex3D(gSkyAerial, gSamplerBilinearClamp, float3(uv, (max(w, 0.0) + 0.5) / 32.0), 0.0);
-    float  f = saturate(w + 1.0); // nearer than the first slice: towards none
-    return color * lerp(1.0, a.a, f) + a.rgb * f;
-}
-
-// Volumetric fog (renderer_fog, FLAG_FOG) between the camera and view depth viewZ at screen uv: renderer_fog's froxels
-// hold the light scattered in and the transmittance to each slice's far side, slices finer near the camera.
-float3 applyFog(float3 color, float viewZ, float2 uv)
-{
-    float  p = log2(max(viewZ, 0.0) * gFrame.fog.x + 1.0) * gFrame.fog.y;
-    float4 f = SampleLvlTex3D(gFogVolume, gSamplerBilinearClamp, float3(uv * gFrame.fog2.xy, (max(p - 1.0, 0.0) + 0.5) * gFrame.fog.z), 0.0);
-    float  k = saturate(p); // within the first slice: towards none
-    return color * lerp(1.0, f.a, k) + f.rgb * k;
-}
-
+// Procedural sky: zenith, horizon and ground colours (luminance).
 float3 skyRadiance(float3 d)
 {
-    if ((gFrame.counts.z & FLAG_SKY) != 0u)
-        return SampleLvlTex2D(gSkyView, gSamplerBilinearClamp, skyViewUv(d), 0.0).rgb;
     if (d.y >= 0.0)
         return lerp(gFrame.skyHorizon.rgb, gFrame.skyZenith.rgb, sqrt(saturate(d.y)));
     return lerp(gFrame.skyHorizon.rgb, gFrame.skyGround.rgb, saturate(-d.y * 3.0));
@@ -72,51 +17,9 @@ float3 skyRadiance(float3 d)
 // Cosine-weighted average of the sky seen around N (irradiance / PI).
 float3 skyIrradiance(float3 N)
 {
-    if ((gFrame.counts.z & FLAG_SKY) != 0u)
-    {
-        // renderer_sky's 9 cosine-convolved spherical harmonics (its Lut.comp.fsl's basis and order).
-        float3 c = gSkySh[0].rgb * 0.282095 + (gSkySh[1].rgb * N.y + gSkySh[2].rgb * N.z + gSkySh[3].rgb * N.x) * 0.488603 +
-                   (gSkySh[4].rgb * (N.x * N.y) + gSkySh[5].rgb * (N.y * N.z) + gSkySh[7].rgb * (N.x * N.z)) * 1.092548 +
-                   gSkySh[6].rgb * (0.315392 * (3.0 * N.z * N.z - 1.0)) + gSkySh[8].rgb * (0.546274 * (N.x * N.x - N.y * N.y));
-        return max(c, float3(0.0, 0.0, 0.0));
-    }
     float3 up = lerp(gFrame.skyHorizon.rgb, gFrame.skyZenith.rgb, 0.6);
     float3 down = lerp(gFrame.skyHorizon.rgb, gFrame.skyGround.rgb, 0.85);
     return lerp(down, up, N.y * 0.5 + 0.5);
-}
-
-// Height fog along a ray the froxels don't hold (renderer_fog's fogMedium, x 0: none): over length t from O along unit
-// d, the color behind fades by the transmittance and the light scattered in is added. The optical depth is exact: the
-// density is rho at and below the base and rho e^(-k h) at h above it, whose integral over height is rho h below and
-// rho (1 - e^(-k h)) / k above, so the ray's is the difference at its ends over d.y. With the light along the ray taken
-// as constant (the sun unshadowed with its phase, the sky's mean radiance), single scattering adds albedo L (1 - T).
-float fogHeightIntegral(float h, float rho, float k)
-{
-    if (h <= 0.0 || k < 1e-5)
-        return rho * h;
-    return rho * (1.0 - exp(-k * h)) / k;
-}
-
-float3 applyHeightFog(float3 color, float3 O, float3 d, float t)
-{
-    float4 m = gFrame.fogMedium;
-    float  h0 = O.y - m.z;
-    float  depth;
-    if (abs(d.y) < 1e-4)
-        depth = m.x * exp(-m.y * max(h0, 0.0)) * t;
-    else
-        depth = (fogHeightIntegral(h0 + d.y * t, m.x, m.y) - fogHeightIntegral(h0, m.x, m.y)) / d.y;
-    float  T = exp(-max(depth, 0.0));
-    float3 sky = (gFrame.counts.z & FLAG_SKY) != 0u ? max(gSkySh[0].rgb, float3(0.0, 0.0, 0.0)) * 0.282095
-                                                     : (gFrame.skyHorizon.rgb * 0.5 + gFrame.skyZenith.rgb * (2.0 / 3.0) + gFrame.skyGround.rgb * (5.0 / 6.0)) * 0.5;
-    float3 L = sky * gFrame.skyGround.w;
-    if (gFrame.counts.y > 0u)
-    {
-        float g = m.w, c = dot(d, gFrame.sunDir[0].xyz);
-        float q = max(1.0 + g * g - 2.0 * g * c, 1e-4);
-        L += gFrame.sunColor[0].rgb * ((1.0 - g * g) / (4.0 * PI * q * sqrt(q)));
-    }
-    return color * T + gFrame.fogAlbedo.rgb * L * (1.0 - T);
 }
 
 // --- Shadows ---------------------------------------------------------------------------------
@@ -224,51 +127,7 @@ float localPcfWide(float3 c, float2 g, float radius, float4 bounds, uint taps, f
     return sum * inv;
 }
 
-// What glass lets through to a point at map uv c.xy of shadow view `view`: renderer_shadows' tint layers nearer the light
-// than tz, multiplied (a deep shadow map: each layer the next glass surface out from the light, its depth and what it lets
-// through). tz is the point's depth moved towards the light by a few texels (tintDepth), so glass never tints its own lit
-// side. Averaged over four taps across the filter's disk, so a tinted shadow's edge is as soft as its visibility's; the
-// caller multiplies the two.
-float3 glassTint(uint view, float2 c, float tz, float radius, float2 rot)
-{
-    if ((gFrame.counts.z & FLAG_GLASS_SHADOW) == 0u)
-        return float3(1.0, 1.0, 1.0);
-    ShadowTint t = gShadowTints[view];
-    uint       n = t.count.x;
-    if (n == 0u)
-        return float3(1.0, 1.0, 1.0);
-    float3 sum = float3(0.0, 0.0, 0.0);
-    float2 dir = rot;
-    for (uint i = 0u; i < 4u; ++i, dir = vogelTurn(dir))
-    {
-        float2 q = (c + dir * (sqrt((float(i) + 0.5) * 0.25) * radius) - t.area.xy) * t.area.z;
-        float3 through = float3(1.0, 1.0, 1.0);
-        if (min(q.x, q.y) >= 0.0 && max(q.x, q.y) < t.area.w)
-        {
-            int2 texel = int2(q);
-            for (uint k = 0u; k < n; ++k)
-            {
-                uint  o = k < 4u ? t.layers0[k] : t.layers1[k - 4u];
-                int2  at = texel + int2(int(o & 0xFFFFu), int(o >> 16));
-                float z = LoadTex2D(gTintDepth, NO_SAMPLER, at, 0).r;
-                if (z >= tz) // the layers go out from the light: the rest lie behind the point too
-                    break;
-                through *= LoadTex2D(gTintColor, NO_SAMPLER, at, 0).rgb;
-            }
-        }
-        sum += through;
-    }
-    return sum * 0.25;
-}
-
-// The depth glassTint compares with: P moved towards the light (L) by two texels and the normal bias, at least 5 mm.
-float tintDepth(ShadowView v, float3 P, float3 L, float texelWorld)
-{
-    return viewToAtlas(v, P + L * max((2.0 + gFrame.shadow.w) * texelWorld, 0.005)).z;
-}
-
-// The sun's shadow from one cascade: visibility times what glass lets through.
-float3 sunCascade(uint cascade, float3 P, float3 N, float2 rot)
+float sunCascade(uint cascade, float3 P, float3 N, float2 rot)
 {
     ShadowView v = gShadowViews[cascade];
     float  texel = gFrame.shadow2.x;
@@ -276,7 +135,7 @@ float3 sunCascade(uint cascade, float3 P, float3 N, float2 rot)
     float3 c = viewToAtlas(v, Pb);
     float4 bounds = float4(v.rect.xy + texel, v.rect.xy + v.rect.zw - texel);
     if (c.z >= 1.0)
-        return float3(1.0, 1.0, 1.0);
+        return 1.0;
     float2 g = receiverSlope(v, Pb, N, dot(N, gFrame.sunDir[0].xyz));
     float radius = gFrame.shadow.y * texel;
     uint  taps = gFrame.counts.w;
@@ -300,13 +159,12 @@ float3 sunCascade(uint cascade, float3 P, float3 N, float2 rot)
             }
         }
         if (count == 0.0)
-            return glassTint(cascade, c.xy, tintDepth(v, P, gFrame.sunDir[0].xyz, v.info.x), radius, rot);
+            return 1.0;
         float gap = (c.z - blockers / count) * v.info.y;
         radius = clamp(gap * tanSize / v.info.x, 1.0, 32.0) * texel + radius * 0.25;
     }
 #endif
-    float lit = sunPcf(c, g, radius, bounds, taps, rot);
-    return lit > 0.0 ? lit * glassTint(cascade, c.xy, tintDepth(v, P, gFrame.sunDir[0].xyz, v.info.x), radius, rot) : float3(0.0, 0.0, 0.0);
+    return sunPcf(c, g, radius, bounds, taps, rot);
 }
 
 uint sunCascadeIndex(float viewZ)
@@ -319,21 +177,12 @@ uint sunCascadeIndex(float viewZ)
 }
 
 // dither: 0..1 noise that changes each frame (TAA on), or negative.
-// A traced shadow (renderer_rt): slice's visibility at pixel, times the colour glass lets through to it (FLAG_RT_TINT).
-float3 tracedShadow(int2 pixel, int slice)
-{
-    float  v = LoadTex3D(gRtShadows, NO_SAMPLER, int3(pixel, slice), 0).r;
-    float3 tint = (gFrame.counts.z & FLAG_RT_TINT) != 0u ? LoadTex3D(gRtShadowTint, NO_SAMPLER, int3(pixel, slice), 0).rgb
-                                                          : float3(1.0, 1.0, 1.0);
-    return tint * v;
-}
-
-float3 sunShadow(float3 P, float3 N, float viewZ, float2 rot, float dither)
+float sunShadow(float3 P, float3 N, float viewZ, float2 rot, float dither)
 {
     uint count = uint(gFrame.shadow.x);
     uint c = sunCascadeIndex(viewZ);
     if (c >= count)
-        return float3(1.0, 1.0, 1.0);
+        return 1.0;
     // Into the next cascade over the last tenth of this one. With TAA, one cascade per pixel, the next
     // one picked for a share of the pixels that grows across the band: TAA averages them, and each pixel
     // pays for one lookup. Without it, both blended.
@@ -343,24 +192,24 @@ float3 sunShadow(float3 P, float3 N, float viewZ, float2 rot, float dither)
     if (dither >= 0.0)
     {
         if (dither < w)
-            return c + 1u < count ? sunCascade(c + 1u, P, N, rot) : float3(1.0, 1.0, 1.0);
+            return c + 1u < count ? sunCascade(c + 1u, P, N, rot) : 1.0;
         return sunCascade(c, P, N, rot);
     }
-    float3 s = sunCascade(c, P, N, rot);
+    float s = sunCascade(c, P, N, rot);
     if (w > 0.0)
     {
-        float3 next = c + 1u < count ? sunCascade(c + 1u, P, N, rot) : float3(1.0, 1.0, 1.0);
+        float next = c + 1u < count ? sunCascade(c + 1u, P, N, rot) : 1.0;
         s = lerp(s, next, w);
     }
     return s;
 }
 
 // dist: the light's distance; NoL: N.L towards it (both from the caller, which has them).
-// size: the light's radius for contact-hardening (0: none). Visibility times what glass lets through.
-float3 localShadow(LightData l, float3 P, float3 N, float dist, float NoL, float2 rot, float size)
+// size: the light's radius for contact-hardening (0: none).
+float localShadow(LightData l, float3 P, float3 N, float dist, float NoL, float2 rot, float size)
 {
     if (l.params.y < 0.0)
-        return float3(1.0, 1.0, 1.0);
+        return 1.0;
     uint view = uint(l.params.y);
     if (l.color.w < 1.5)
     {
@@ -416,7 +265,7 @@ float3 localShadow(LightData l, float3 P, float3 N, float dist, float NoL, float
             count += dot(inFront, float4(1.0, 1.0, 1.0, 1.0));
         }
         if (count == 0.0)
-            return glassTint(view, c.xy, tintDepth(v, P, normalize(l.pos.xyz - P), v.info.x * dist), radius, rot);
+            return 1.0;
         dir = rot;
         for (uint i = 0u; i < 4u; ++i, dir = vogelTurn(dir))
         {
@@ -432,8 +281,9 @@ float3 localShadow(LightData l, float3 P, float3 N, float dist, float NoL, float
         radius = clamp(pen, 1.0, widest) * texel + radius * 0.25;
     }
     float wide = radius / texel;
-    float lit = wide > 8.0 ? localPcfWide(c, g, radius, bounds, gFrame.counts.w, rot, wide) : localPcf(c, g, radius, bounds, gFrame.counts.w, rot);
-    return lit > 0.0 ? lit * glassTint(view, c.xy, tintDepth(v, P, normalize(l.pos.xyz - P), v.info.x * dist), radius, rot) : float3(0.0, 0.0, 0.0);
+    if (wide > 8.0)
+        return localPcfWide(c, g, radius, bounds, gFrame.counts.w, rot, wide);
+    return localPcf(c, g, radius, bounds, gFrame.counts.w, rot);
 }
 
 // --- Area lights: linearly transformed cosines --------------------------------------------------
@@ -720,15 +570,11 @@ float3 shadeLocalLight(uint i, Surface s, float3 sofar)
             if (max(lit.r, max(lit.g, lit.b)) <= 0.0)
                 return lit;
             NoL = max(NoL, 0.1); // part of the light may be in view when its centre isn't
-#ifdef TRANSLUCENT
-            bool tracedA = false; // traced shadows are the opaque scene's pixels: its map (kept while see-through surfaces show)
-#else
             bool tracedA = l.params.w > 1.5;
-#endif
             if ((!tracedA && (gFrame.counts.z & FLAG_SHADOWS) == 0u) || shadowUnseen(lit, sofar))
                 return lit;
             if (tracedA)
-                return lit * tracedShadow(s.pixel, int(l.params.w - 1.0));
+                return lit * LoadTex3D(gRtShadows, NO_SAMPLER, int3(s.pixel, int(l.params.w - 1.0)), 0).r;
             return lit * localShadow(l, s.P, s.N, d2 * invDist, NoL, s.rot, size);
         }
     }
@@ -743,15 +589,11 @@ float3 shadeLocalLight(uint i, Surface s, float3 sofar)
     lit = brdfLight(s, L, l.color.rgb * atten);
     // Where the light adds under one 8-bit step on screen (shadowUnseen), its shadow can't be seen: the lookup is skipped.
     // A traced light (params.w 2 + n, only while renderer_rt traces) reads its slice instead of a map.
-#ifdef TRANSLUCENT
-    bool traced = false;
-#else
     bool traced = l.params.w > 1.5;
-#endif
     if ((!traced && (gFrame.counts.z & FLAG_SHADOWS) == 0u) || shadowUnseen(lit, sofar))
         return lit;
     if (traced)
-        return lit * tracedShadow(s.pixel, int(l.params.w - 1.0));
+        return lit * LoadTex3D(gRtShadows, NO_SAMPLER, int3(s.pixel, int(l.params.w - 1.0)), 0).r;
     return lit * localShadow(l, s.P, s.N, d2 * invDist, NoL, s.rot, size);
 }
 

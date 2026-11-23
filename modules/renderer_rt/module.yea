@@ -3,8 +3,6 @@ module renderer_rt
 # Called by renderer (the core) each frame with the address of its RenderFrame (frame.h).
 export bool rt_prepare(u64 frame)
 export void rt_run(u64 frame)
-# Called before shadows_prepare: picks the shadows it traces (rtShadows), which renderer_shadows then skips.
-export bool rt_pick(u64 frame)
 
 category Ray-Traced Reflections
 # Reflections found by tracing rays through the scene, also of what is off screen or hidden. Only on GPUs
@@ -37,14 +35,3 @@ setting bool show_hits false
 # Temporary, to measure ray-traced shadows' cost: shadow rays traced from every pixel on screen and thrown away
 # (1 the sun's, each more one local light's). The picture doesn't change.
 setting int probe_rays 0 0 9
-
-category Ray-Traced Shadows
-# Shadows found by tracing rays towards each light's real shape (the sun's disc, a lamp's sphere, an area
-# light's panel, disc or tube): sharp where they touch, softer further away. Only on GPUs with ray tracing,
-# with Anti-aliasing (TAA) on; elsewhere, and for lights not traced, shadow maps. Off by default until measured on
-# the user's GPU (test_renderer_rays).
-setting bool shadows false
-needs shadows raytracing
-player shadows
-# How many lights besides the sun get traced shadows (area lights first); the rest keep shadow maps.
-setting int traced_lights 4 0 8

@@ -381,14 +381,6 @@ bool fsrRun(const RenderFrame* F, RenderTarget* out, bool reset, float dtMs)
     d.motionVectors = fsrResource(F->motion->pTexture->mDx.pResource, FFX_API_SURFACE_FORMAT_R16G16_FLOAT, F->width, F->height,
                                   FFX_API_RESOURCE_USAGE_READ_ONLY, srv);
     d.exposure = fsrResource(gExposureTex->mDx.pResource, FFX_API_SURFACE_FORMAT_R32_FLOAT, 1, 1, FFX_API_RESOURCE_USAGE_READ_ONLY, srv);
-    // Particles' coverage (frame.h reactive): FSR leans on this frame's colour there, so they don't smear. Without it, none.
-    if (F->reactive)
-        d.reactive = fsrResource(F->reactive->mDx.pResource, FFX_API_SURFACE_FORMAT_R8_UNORM, F->width, F->height,
-                                 FFX_API_RESOURCE_USAGE_READ_ONLY, srv);
-    // Glass's coverage (frame.h transparency): FSR keeps what is seen through it from being locked as detail.
-    if (F->transparency)
-        d.transparencyAndComposition = fsrResource(F->transparency->mDx.pResource, FFX_API_SURFACE_FORMAT_R8_UNORM, F->width,
-                                                   F->height, FFX_API_RESOURCE_USAGE_READ_ONLY, srv);
     d.output = fsrResource(out->pTexture->mDx.pResource, FFX_API_SURFACE_FORMAT_R16G16B16A16_FLOAT, F->displayWidth,
                            F->displayHeight, FFX_API_RESOURCE_USAGE_UAV, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
     d.jitterOffset = { F->jitter[0], F->jitter[1] };
@@ -575,12 +567,6 @@ bool fsrRun(const RenderFrame* F, RenderTarget* out, bool reset, float dtMs)
                                   FFX_RESOURCE_USAGE_READ_ONLY, srv, L"renderer_motion");
     d.exposure = fsrResource(gExposureTex->mVk.pImage, FFX_SURFACE_FORMAT_R32_FLOAT, 1, 1, FFX_RESOURCE_USAGE_READ_ONLY, srv,
                              L"renderer_upscale_exposure");
-    if (F->reactive) // particles' coverage, as on Direct3D 12
-        d.reactive = fsrResource(F->reactive->mVk.pImage, FFX_SURFACE_FORMAT_R8_UNORM, F->width, F->height,
-                                 FFX_RESOURCE_USAGE_READ_ONLY, srv, L"renderer_reactive");
-    if (F->transparency) // glass's coverage, as on Direct3D 12
-        d.transparencyAndComposition = fsrResource(F->transparency->mVk.pImage, FFX_SURFACE_FORMAT_R8_UNORM, F->width, F->height,
-                                                   FFX_RESOURCE_USAGE_READ_ONLY, srv, L"renderer_transparency");
     d.output = fsrResource(out->pTexture->mVk.pImage, FFX_SURFACE_FORMAT_R16G16B16A16_FLOAT, F->displayWidth, F->displayHeight,
                            FFX_RESOURCE_USAGE_UAV, FFX_RESOURCE_STATE_UNORDERED_ACCESS, L"renderer_upscale_out");
     d.reconstructedPrevNearestDepth = gFfxInterface.fpGetResource(&gFfxInterface, gFfxShared[0]);
@@ -695,8 +681,6 @@ bool dlssRun(const RenderFrame* F, RenderTarget* out, bool reset, uint32_t q)
     in.depth = F->depth->pTexture;
     in.motion = F->motion->pTexture;
     in.exposure = gExposureTex;
-    in.biasColour = F->reactive; // particles' and glass's coverage: trust this frame there (dlss.h version 2; nullptr: none)
-    in.transparency = F->transparency; // glass's coverage (dlss.h version 2; nullptr: none)
     in.output = out->pTexture;
     in.renderWidth = F->width;
     in.renderHeight = F->height;

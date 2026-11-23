@@ -10,7 +10,6 @@
 #include <Common_3/Graphics/Interfaces/IGraphics.h>
 #include <Common_3/Resources/ResourceLoader/Interfaces/IResourceLoader.h>
 #include <Common_3/Graphics/FSL/defaults.h>
-#define MAX_TEXTURES RENDER_MAX_TEXTURES
 #include "Shaders/Capture.srt.h"
 #include "Shaders/Filter.srt.h"
 
@@ -29,9 +28,6 @@ struct CaptureData
     float    skyHorizon[4];
     float    skyGround[4];
     uint32_t counts[4];
-    float    fogMedium[4];
-    float    fogAlbedo[4];
-    float    decalGrid[2][4]; // frame.h's (counts[2] decals)
 };
 struct CaptureView
 {
@@ -65,16 +61,11 @@ Pipeline *     gCapturePipe[2], *gDownPipe, *gFilterPipe;
 DescriptorSet *gCaptureSet, *gPassSet;
 Buffer *       gCaptureCb[kMaxFrames], *gViewBuf[kMaxFrames], *gStreamBuf[kMaxFrames], *gProbeBuf[kMaxFrames];
 Buffer*        gPassCb[kPassSets];
-Buffer*        gNoSkySh; // stands in for renderer_sky's SH (9 float4)
-Buffer *       gNoDecals, *gNoCells, *gNoItems; // stand in for the frame's decals while there are none
 RenderTarget * gChain[kMaxLevels], *gCaptureDepth, *gProbeRt;
 uint32_t       gOcta, gLevels; // probe image size and its mips (also the capture levels)
 bool           gReady;
 
 uint64_t gCapturedAt[kMaxProbes]; // frame each probe slot was captured in (0: never)
-uint32_t gTexSeen;                 // the core's textureVersion last frame
-uint64_t gTexChanged;              // the frame it last changed: every probe captures again (maps came in)
-uint32_t gTexBound[kMaxFrames];    // the textureVersion each frame's set holds (0: none yet)
 uint32_t gCapturedGen[kMaxProbes];
 uint32_t gNext;                   // round robin
 uint32_t gTodo[kMaxPerFrame], gTodoCount;
@@ -265,37 +256,24 @@ Pipeline* fullscreenPipeline(Shader* s, const char* name)
 Pipeline* capturePipeline(CullMode cull)
 {
     VertexLayout l = {};
-    l.mBindingCount = 3; // the frame's positions and attributes, then the instance-rate stream
-    l.mBindings[0].mStride = RENDER_POSITION_STRIDE;
-    l.mBindings[1].mStride = RENDER_ATTRIBUTE_STRIDE;
-    l.mBindings[2].mStride = 4;
-    l.mBindings[2].mRate = VERTEX_BINDING_RATE_INSTANCE;
-    l.mAttribCount = 5;
+    l.mBindingCount = 2;
+    l.mBindings[0].mStride = 24; // RenderFrame::vertexStride: float3 position, float3 normal
+    l.mBindings[1].mStride = 4;
+    l.mBindings[1].mRate = VERTEX_BINDING_RATE_INSTANCE;
+    l.mAttribCount = 3;
     l.mAttribs[0] = {};
     l.mAttribs[0].mSemantic = SEMANTIC_POSITION;
     l.mAttribs[0].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
     l.mAttribs[1] = {};
     l.mAttribs[1].mSemantic = SEMANTIC_NORMAL;
-    l.mAttribs[1].mFormat = TinyImageFormat_R16G16_SNORM; // octahedral
-    l.mAttribs[1].mBinding = 1;
+    l.mAttribs[1].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
     l.mAttribs[1].mLocation = 1;
+    l.mAttribs[1].mOffset = 12;
     l.mAttribs[2] = {};
     l.mAttribs[2].mSemantic = SEMANTIC_TEXCOORD1;
     l.mAttribs[2].mFormat = TinyImageFormat_R32_UINT;
-    l.mAttribs[2].mBinding = 2;
+    l.mAttribs[2].mBinding = 1;
     l.mAttribs[2].mLocation = 2;
-    l.mAttribs[3] = {};
-    l.mAttribs[3].mSemantic = SEMANTIC_TEXCOORD0; // uv0 and the colour, for the material's maps
-    l.mAttribs[3].mFormat = TinyImageFormat_R32G32_SFLOAT;
-    l.mAttribs[3].mBinding = 1;
-    l.mAttribs[3].mLocation = 3;
-    l.mAttribs[3].mOffset = 8;
-    l.mAttribs[4] = {};
-    l.mAttribs[4].mSemantic = SEMANTIC_COLOR;
-    l.mAttribs[4].mFormat = TinyImageFormat_R8G8B8A8_UNORM;
-    l.mAttribs[4].mBinding = 1;
-    l.mAttribs[4].mLocation = 4;
-    l.mAttribs[4].mOffset = 16;
 
     RasterizerStateDesc raster = {};
     raster.mCullMode = cull;
@@ -440,12 +418,7 @@ int load(int reloaded)
     gStreamCpu = new uint32_t[kMaxEntries];
     gRuns = new Run[kMaxRuns];
     memset(gCapturedAt, 0, sizeof gCapturedAt);
-    gNoSkySh = makeBuffer(9 * 16, 16, DESCRIPTOR_TYPE_BUFFER, sr, "renderer_probe_no_sky_sh");
-    gNoDecals = makeBuffer(176, 176, DESCRIPTOR_TYPE_BUFFER, sr, "renderer_probe_no_decals");
-    gNoCells = makeBuffer(8, 8, DESCRIPTOR_TYPE_BUFFER, sr, "renderer_probe_no_decal_cells");
-    gNoItems = makeBuffer(4, 4, DESCRIPTOR_TYPE_BUFFER, sr, "renderer_probe_no_decal_items");
-    gReady = gCapturePipe[0] && gCapturePipe[1] && gDownPipe && gFilterPipe && gCaptureSet && gPassSet && gNoSkySh && gNoDecals &&
-             gNoCells && gNoItems;
+    gReady = gCapturePipe[0] && gCapturePipe[1] && gDownPipe && gFilterPipe && gCaptureSet && gPassSet;
     return gReady ? 0 : 1;
 }
 
@@ -465,10 +438,6 @@ void unload()
     for (Buffer* b : gPassCb)
         if (b)
             removeResource(b);
-    Buffer** dummies[4] = { &gNoSkySh, &gNoDecals, &gNoCells, &gNoItems };
-    for (Buffer** b : dummies)
-        if (*b)
-            removeResource(*b), *b = nullptr;
     DescriptorSet* sets[2] = { gCaptureSet, gPassSet };
     for (DescriptorSet* s : sets)
         if (s)
@@ -490,7 +459,7 @@ bool probes_prepare(uint64_t address)
 {
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
     gTodoCount = 0;
-    if (!gReady || !settings.enabled || !F || F->version != RENDER_FRAME_VERSION || !F->materials || !F->positions || !F->attributes)
+    if (!gReady || !settings.enabled || !F || F->version != RENDER_FRAME_VERSION || !F->materials || !F->vertices)
         return false;
     uint32_t octa = snapResolution(settings.resolution);
     if (octa != gOcta)
@@ -506,8 +475,6 @@ bool probes_prepare(uint64_t address)
     // Wireframe or Overdraw, which would change the capture's pipelines: the probes keep what they had.
     uint32_t rows = Probes.size() < kMaxProbes ? Probes.size() : kMaxProbes;
     uint32_t todoRows = yea::viewMode() ? 0 : rows;
-    if (F->textureVersion != gTexSeen)
-        gTexSeen = F->textureVersion, gTexChanged = F->frameNumber;
     uint32_t extra = settings.updates_per_frame < 0 ? 0 : (uint32_t)settings.updates_per_frame;
     uint32_t budget = extra > kMaxPerFrame ? kMaxPerFrame : (extra ? extra : 1);
     for (uint32_t i = 0; i < todoRows; ++i)
@@ -518,8 +485,7 @@ bool probes_prepare(uint64_t address)
             gCapturedAt[i] = 0;
             continue;
         }
-        bool dirty = !gCapturedAt[i] || gCapturedGen[i] != p.gen || p.changed >= gCapturedAt[i] || gTexChanged >= gCapturedAt[i] ||
-                     F->decalsChanged >= gCapturedAt[i]; // decals added, moved, repainted or removed
+        bool dirty = !gCapturedAt[i] || gCapturedGen[i] != p.gen || p.changed >= gCapturedAt[i];
         if (dirty && gTodoCount < budget)
             gTodo[gTodoCount++] = i;
     }
@@ -599,11 +565,6 @@ bool probes_prepare(uint64_t address)
         memcpy(cd.skyHorizon, F->skyHorizon, sizeof F->skyHorizon);
         memcpy(cd.skyGround, F->skyGround, sizeof F->skyGround);
         cd.skyGround[3] = F->ambient;
-        cd.counts[1] = F->skySh ? 1u : 0u;
-        cd.counts[2] = F->worldDecals && F->decalCells && F->decalItems ? F->worldDecalCount : 0;
-        memcpy(cd.decalGrid, F->decalGrid, sizeof cd.decalGrid);
-        memcpy(cd.fogMedium, F->fogMedium, sizeof F->fogMedium);
-        memcpy(cd.fogAlbedo, F->fogAlbedo, sizeof F->fogAlbedo);
         cd.counts[0] = F->lightBuffer ? (F->lightCount < kMaxCaptureLights ? F->lightCount : kMaxCaptureLights) : 0;
         memcpy(gCaptureCb[F->frameIndex]->pCpuMappedAddress, &cd, sizeof cd);
         memcpy(gViewBuf[F->frameIndex]->pCpuMappedAddress, gViewsCpu, sizeof(CaptureView) * gTodoCount * 6);
@@ -649,24 +610,12 @@ bool probes_prepare(uint64_t address)
 void probes_render(uint64_t address)
 {
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
-    if (!gReady || !F || !gTodoCount || F->probes != gProbeRt || !F->instances || !F->indices || !F->materialMaps || !F->textures)
+    if (!gReady || !F || !gTodoCount || F->probes != gProbeRt || !F->instances || !F->indices)
         return;
     Cmd*     cmd = F->cmd;
     uint32_t fi = F->frameIndex;
     Buffer*  lights = F->lightBuffer ? F->lightBuffer : gProbeBuf[fi]; // unread when there are none
-    Buffer*        skySh = F->skySh ? F->skySh : gNoSkySh; // unread without renderer_sky
-    DescriptorData d[11] = {};
-    const bool     decals = F->worldDecalCount && F->worldDecals && F->decalCells && F->decalItems;
-    Buffer*        decalBufs[3] = { decals ? F->worldDecals : gNoDecals, decals ? F->decalCells : gNoCells,
-                                    decals ? F->decalItems : gNoItems };
-    d[7].mIndex = SRT_RES_IDX(CaptureSrt, PerFrame, gDecals);
-    d[7].ppBuffers = &decalBufs[0];
-    d[8].mIndex = SRT_RES_IDX(CaptureSrt, PerFrame, gDecalCells);
-    d[8].ppBuffers = &decalBufs[1];
-    d[9].mIndex = SRT_RES_IDX(CaptureSrt, PerFrame, gDecalItems);
-    d[9].ppBuffers = &decalBufs[2];
-    d[5].mIndex = SRT_RES_IDX(CaptureSrt, PerFrame, gSkySh);
-    d[5].ppBuffers = &skySh;
+    DescriptorData d[5] = {};
     d[0].mIndex = SRT_RES_IDX(CaptureSrt, PerFrame, gCapture);
     d[0].ppBuffers = &gCaptureCb[fi];
     d[1].mIndex = SRT_RES_IDX(CaptureSrt, PerFrame, gInstances);
@@ -677,18 +626,7 @@ void probes_render(uint64_t address)
     d[3].ppBuffers = &F->materials;
     d[4].mIndex = SRT_RES_IDX(CaptureSrt, PerFrame, gLights);
     d[4].ppBuffers = &lights;
-    d[6].mIndex = SRT_RES_IDX(CaptureSrt, PerFrame, gMaterialMaps);
-    d[6].ppBuffers = (Buffer**)&F->materialMaps;
-    uint32_t bindings = 10;
-    if (gTexBound[fi] != F->textureVersion) // 1024 descriptors: only when the core's slots changed
-    {
-        d[10].mIndex = SRT_RES_IDX(CaptureSrt, PerFrame, gTextures);
-        d[10].ppTextures = (Texture**)F->textures;
-        d[10].mCount = RENDER_MAX_TEXTURES;
-        gTexBound[fi] = F->textureVersion;
-        bindings = 11;
-    }
-    updateDescriptorSet(gRenderer, fi, gCaptureSet, bindings, d);
+    updateDescriptorSet(gRenderer, fi, gCaptureSet, 5, d);
 
     cmdBeginDebugMarker(cmd, 0.5f, 0.9f, 0.9f, "Renderer reflection probes");
     for (uint32_t t = 0; t < gTodoCount; ++t)
@@ -710,10 +648,10 @@ void probes_render(uint64_t address)
                     cmdBindDescriptorSet(cmd, fi, gCaptureSet);
                     cmdBindIndexBuffer(cmd, F->indices, INDEX_TYPE_UINT32, 0);
                 }
-                Buffer*    bufs[3] = { F->positions, F->attributes, gStreamBuf[fi] };
-                uint32_t   strides[3] = { RENDER_POSITION_STRIDE, RENDER_ATTRIBUTE_STRIDE, 4 };
-                uint64_t   offsets[3] = { 0, 0, (uint64_t)run.streamStart * 4 };
-                cmdBindVertexBuffer(cmd, 3, bufs, strides, offsets);
+                Buffer*    bufs[2] = { F->vertices, gStreamBuf[fi] };
+                uint32_t   strides[2] = { F->vertexStride, 4 };
+                uint64_t   offsets[2] = { 0, (uint64_t)run.streamStart * 4 };
+                cmdBindVertexBuffer(cmd, 2, bufs, strides, offsets);
                 cmdDrawIndexedInstanced(cmd, run.indexCount, run.firstIndex, run.count, (uint32_t)run.vertexOffset, 0);
             }
             cmdBindRenderTargets(cmd, nullptr);

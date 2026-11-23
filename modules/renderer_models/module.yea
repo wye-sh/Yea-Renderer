@@ -10,29 +10,13 @@ import renderer u32 mesh_plane() = 4294967295
 import renderer u32 mesh_cylinder(u32 segments) = 4294967295
 import renderer u32 mesh_cone(u32 segments) = 4294967295
 import renderer u32 mesh_torus(float thickness, u32 segments) = 4294967295
-import renderer u32 mesh_packed(u64 positions, u64 attributes, u32 vertex_count, u64 indices, u32 index_count) = 4294967295
-import renderer void mesh_lod(u32 mesh, float error, u32 simpler)
 import renderer handle material_add(float3 albedo, float roughness, float metallic) = 4294967295
 import renderer void material_double_sided(handle m, bool on)
-import renderer void material_emissive(handle m, float3 color, float luminance)
-import renderer handle texture_add(u64 path, u64 offset, u64 bytes, u32 format, u32 width, u32 height, u32 mips) = 4294967295
-import renderer void material_maps(handle m, handle base_color, handle orm, handle normal, handle emissive)
-import renderer void material_factors(handle m, float4 base_color, float roughness, float metallic, float normal_scale, float occlusion)
-import renderer void material_alpha(handle m, float cutoff)
-# Blended (renderer 4.8.0): opacity times the material's own alpha (its factors', its map's, its vertices'); 0 opaque.
-import renderer void material_blend(handle m, float opacity)
 import renderer handle instance_add(u32 mesh, handle material) = 4294967295
 import renderer void instance_place(handle i, float3 pos, float4 rotation, float3 scale)
 import renderer void instance_shadow(handle i, bool cast)
 import renderer void instance_lod_quality(handle i, float quality)
 import renderer void instance_remove(handle i)
-# Skinning (renderer frame v24): a mesh's bones and weights (rmodel.h RmodelSkinVertex[its vertex count]) and the
-# bounds its animation reaches; and an instance's palette this frame (3x4 rows a bone, model space).
-import renderer void mesh_skin(u32 mesh, u64 skin, float3 lo, float3 hi)
-import renderer void instance_pose(handle i, u64 palette, u32 bones)
-# Morph targets (renderer 4.13.0): a skinned mesh's deltas, and an instance's weights this frame.
-import renderer void mesh_morph(u32 mesh, u64 refs, u64 deltas, u32 delta_count)
-import renderer void instance_morph(handle i, u64 weights, u32 count)
 import renderer u32 scene_epoch() = 0
 import renderer bool preview_draw(u64 preview) = false
 import table renderer Mesh
@@ -50,42 +34,6 @@ table Placement none 4096
   u32 gen
   u32 alive
 end
-# What a placement of a skinned model plays (rows as Placement's): its clip (4294967295: none, the rest pose), time
-# (seconds), speed and loop, and the clip it fades from over `fade` seconds (`faded` of them gone). `want`: a clip asked
-# for by name (its hash) before the model had loaded, taken once it has (0 none).
-table PlacementAnim none 4096
-  u32 clip
-  u32 want
-  float time
-  float speed
-  u32 loop
-  u32 from
-  float fromTime
-  float fromSpeed
-  u32 fromLoop
-  float fade
-  float faded
-end
-# A placement's morph targets set by the game (mdl::morph): the placement's handle, the target, its weight, held over
-# whatever its clip says until cleared.
-table MorphOverride none 4096
-  u32 placement
-  u32 target
-  float weight
-end
-# Root motion (mdl::rootMotion; rows as Placement's): on, its clips play in place and the motion they leave out gathers
-# here, in its own frame (metres before its scale; radians about its up), until the game takes it.
-table PlacementMotion none 4096
-  u32 on
-  float3 acc
-  float yaw
-end
-# Whose clips a placement plays (rows as Placement's): the model (its key; 0 its own) of its clip and of the one it
-# fades from, retargeted onto its skeleton.
-table PlacementRetarget none 4096
-  u32 clip
-  u32 from
-end
 # The renderer's instances a placement draws with, one per part of its model.
 table PartInstance none 65536
   u32 placement
@@ -98,24 +46,13 @@ table ModelPart none 4096
   u32 part
   u32 mesh
   u32 material
-  u32 twoSided
   float3 lo
   float3 hi
-  float3 emissive
 end
 # The renderer's scene the rows above were made in (its scene_epoch).
 state Scene
   u32 epoch
 end
-# The cooked file version this module's models were made from (rmodel.h's kRmodelVersion): a newer one rebuilds them.
-state Format
-  u32 version
-end
-
-category Models
-# How bright a model's glowing parts are: the luminance (cd/m2) of an emissive colour of 1 at strength 1 in its file
-# (glTF gives emission no unit).
-setting float emissive_nits 1000 0 inf
 
 # Every model's knobs (ModelLink.h's mdl::Knobs, in that order): a module that imports this one gets them for each of its
 # MODEL lines (chair_scale), tuned only in the Model Viewer.

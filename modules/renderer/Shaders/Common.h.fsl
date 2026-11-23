@@ -37,16 +37,6 @@ STRUCT(FrameData)
     DATA(float4, ssr, None);                 // x max roughness, y thickness (m), z max distance (m), w edge fade
     DATA(float4, ssr2, None);                // x intensity, y depth copy scale, z steps, w noise offset this frame
     DATA(float4, rt, None);                  // x max roughness of ray-traced reflections (renderer_rt)
-    DATA(float4, atmosphere, None);          // physical sky (FLAG_SKY): km, x ground radius, y top, z the camera from the centre; w aerial strength
-    DATA(float4, atmosphere2, None);         // x aerial perspective volume depth (km), y gSkyEnv's mips
-    DATA(float4, fog, None);                 // volumetric fog (FLAG_FOG): frame.h fogParams
-    DATA(float4, fog2, None);                // xy frame.h fogUv
-    DATA(float4, fogMedium, None);           // frame.h's: height fog for reflected rays (x 0: none)
-    DATA(float4, fogAlbedo, None);
-    DATA(float4, textures, None);            // x texture mip bias (log2 of render over display width; 0 at native)
-    DATA(float4, gi[4], None);               // dynamic diffuse GI (FLAG_GI): frame.h giGrid
-    DATA(uint4, decals, None);               // x decals in gDecals (FLAG_DECALS)
-    DATA(float4, refraction, None);          // x gSceneColor's levels (FLAG_REFRACTION)
     DATA(float4, taps[32], None);            // xy: the shadow filters' Vogel disk of counts.w taps, unturned
 };
 
@@ -75,14 +65,6 @@ STRUCT(ProbeData)
 #define FLAG_RT_DEBUG 8192u
 #define FLAG_RT_SHADOWS 16384u // renderer_rt traces shadows into gRtShadows: lights with params.w >= 2, and the sun with FLAG_RT_SUN
 #define FLAG_RT_SUN   32768u
-#define FLAG_SKY      131072u // renderer_sky: the sky, its reflections and ambient from gSkyView, gSkyEnv and gSkySh; gSkyAerial
-#define FLAG_FOG      262144u // renderer_fog: gFogVolume
-#define FLAG_GI       524288u // renderer_gi: diffuse ambient from its probes (gGiIrradiance, gGiDistance, gGiProbes)
-#define FLAG_GI_DEBUG 1048576u
-#define FLAG_DECALS   2097152u // decals: gDecals, binned (with FLAG_CULLED) in gDecalMasks and gDecalBins
-#define FLAG_RT_TINT  8388608u // renderer_rt: gRtShadowTint, the colour glass lets through to each traced shadow (frame rtShadowTint)
-#define FLAG_REFRACTION 4194304u // the see-through pass: gSceneColor holds the scene behind glass, for gRefraction's materials
-#define FLAG_GLASS_SHADOW 16777216u // renderer_shadows: glass tints the shadow maps (gShadowTints, gTintDepth, gTintColor)
 #define FLAG_AREA     65536u // gLightShapes is filled: some light has a shape or its own size (area lights take LTC terms)
 #define RT_MISS       60000.0
 
@@ -109,22 +91,6 @@ STRUCT(MaterialData)
     DATA(float4, emissive, None);     // rgb luminance
 };
 
-// A material's texture maps (gMaterialMaps, at its material's index): maps x base colour, y ORM (occlusion, roughness,
-// metallic), z normal (BC5 x, y), w emissive, each its slot in gTextures + 1, 0 when it has none or it hasn't loaded yet
-// (the material then takes MaterialData's look for that part). The emissive map multiplies MaterialData's emissive.
-STRUCT(MaterialMapData)
-{
-    DATA(uint4, maps, None);
-    DATA(float4, baseFactor, None);   // rgb times the base colour map, a times its alpha
-    DATA(float4, factors, None);      // x roughness, y metallic (times ORM's g, b), z normal scale, w occlusion strength
-    DATA(float4, misc, None);         // x alpha cutoff (0: opaque), y 1 when the maps were given (vertex colours count),
-                                      // z blended opacity (material_blend; 0: opaque)
-};
-#define MAX_TEXTURES 1024
-
-#include "Decal.h.fsl"
-#define DECAL_WORDS 8u // RENDER_MAX_DECALS / 32: gDecalMasks' words a tile
-
 STRUCT(LightData)
 {
     DATA(float4, pos, None);          // xyz, w range
@@ -143,15 +109,6 @@ STRUCT(LightShape)
     DATA(float4, ey, None);
 };
 
-// Glass over a shadow view (frame.h RenderGpuShadowTint, at the view's index): its square of the tint maps.
-STRUCT(ShadowTint)
-{
-    DATA(float4, area, None);   // xy map uv where the square starts, z its texels per map uv, w its side in texels
-    DATA(uint4, layers0, None); // layers 0-3: each one's copy of the square at texel (x & 0xFFFF, x >> 16)
-    DATA(uint4, layers1, None); // layers 4-7
-    DATA(uint4, count, None);   // x layers (0: no glass)
-};
-
 STRUCT(ShadowView)
 {
     DATA(float4, row0, None);
@@ -164,15 +121,5 @@ STRUCT(ShadowView)
     DATA(float4, inv1, None);
     DATA(float4, inv2, None);
 };
-
-// A vertex's octahedral normal or tangent (frame.h's RENDER_ATTRIBUTE_STRIDE), as a unit vector.
-float3 octDecode(float2 f)
-{
-    float3 n = float3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
-    float  t = saturate(-n.z);
-    n.x += n.x >= 0.0 ? -t : t;
-    n.y += n.y >= 0.0 ? -t : t;
-    return normalize(n);
-}
 
 #endif
