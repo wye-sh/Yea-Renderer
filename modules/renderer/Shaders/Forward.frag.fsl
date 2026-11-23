@@ -691,6 +691,7 @@ float4 PS_MAIN(VSOutput In)
     }
 
 #ifdef TRANSLUCENT
+    float viewZWidth = fwidth(viewZ); // outside any branch (renderer_rt's refraction depth test below)
     // Fog and aerial perspective are x A + B from the camera to here; what is behind already has B in front of it, which
     // the multiply took T of: add its (1 - T) back, so the air in front stays whole, f(color) - T f(0).
     float3 inscatter = float3(0.0, 0.0, 0.0);
@@ -705,7 +706,31 @@ float4 PS_MAIN(VSOutput In)
         inscatter = applyFog(inscatter, viewZ, In.Position.xy * gFrame.screen.zw);
     }
     if (refracts)
-        inscatter -= refractedScene(In.WorldPos, N, V, refr, a2, In.Position.xy); // the chain has its own air in front
+    {
+        // On RT cards renderer_rt traced what this pixel's nearest refracting layer lets through (FLAG_RT_REFRACT): this
+        // fragment is that layer where its depth matches (the same jittered pixel centre; a deeper refracting layer fails
+        // it and keeps the chain, and the front one's multiply clears it as before). w 1: the bent ray lands on what the
+        // screen shows, read from the chain there (it holds steam and glass behind); w 0: the traced colour. Else the
+        // chain as before.
+        float3 behind = float3(0.0, 0.0, 0.0);
+        bool   traced = false;
+        if ((gFrame.counts.z & FLAG_RT_REFRACT) != 0u)
+        {
+            int2   px = int2(In.Position.xy);
+            float4 r = LoadTex2D(gRtRefraction, NO_SAMPLER, px, 0);
+            if (r.a > 0.0 && abs(r.a - viewZ) < max(0.005 * viewZ, 2.0 * viewZWidth))
+            {
+                float4 l = LoadTex2D(gRtRefractLanding, NO_SAMPLER, px, 0);
+                behind = l.w > 0.5 ? SampleLvlTex2D(gSceneColor, gSamplerTrilinearClamp, (In.Position.xy + l.xy) * gFrame.screen.zw,
+                                                    clamp(l.z, 0.0, gFrame.refraction.x - 1.0)).rgb
+                                   : r.rgb;
+                traced = true;
+            }
+        }
+        if (!traced)
+            behind = refractedScene(In.WorldPos, N, V, refr, a2, In.Position.xy);
+        inscatter -= behind; // the chain has its own air in front
+    }
     color = max(color - transmit * inscatter, float3(0.0, 0.0, 0.0));
 #else
     if ((gFrame.counts.z & FLAG_SKY) != 0u && gFrame.atmosphere.w > 0.0)

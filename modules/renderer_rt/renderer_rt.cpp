@@ -48,6 +48,9 @@ struct RtData
     uint32_t giCounts[4];                // probes, rays a probe, groups across, 1: last frame's probes to sample
     uint32_t decals[4];                  // decals hits paint (frame worldDecalCount)
     float    decalGrid[2][4];            // frame.h decalGrid
+    uint32_t refract[4];                 // the refraction pass's rectangle: first pixel, past the last
+    float    refractTemporal[4];         // 1 when last frame's refraction is its history, frames of history, where
+                                         // gRtInstances' last-frame rows start (rt_run)
 };
 
 // Shaders/ShadowData.h.fsl
@@ -70,7 +73,7 @@ const uint32_t kMaxFrames = 4;
 const uint32_t kMaxMeshes = 1024;
 const uint32_t kMaxRetired = 256;
 const uint32_t kMaxInstances = 65536; // the core's Instance table
-const uint32_t kFlagScreen = 1, kFlagDebug = 4, kFlagMaps = 8, kFlagGlass = 16;
+const uint32_t kFlagScreen = 1, kFlagDebug = 4, kFlagMaps = 8, kFlagGlass = 16, kFlagRefract = 32;
 // gRtInstances' w (Shaders/Cutout.h.fsl): the material + 1 in its low bits, and flags.
 const uint32_t kInstCut = 0x20000000u, kInstTwoSided = 0x40000000u, kInstGlass = 0x80000000u;
 // Instance masks (Shaders/Trace.comp.fsl): 1 seen in reflections, 2 casts shadows (glass too), 4 opaque and casts (GI),
@@ -84,7 +87,7 @@ Queue*               gQueue;
 uint32_t             gFrames;
 const YeaRaytracing* gService;
 Raytracing*          gRay;
-enum { kTrace, kReconstruct, kResolve, kProbe, kFilter, kGi, kShaders };
+enum { kTrace, kReconstruct, kResolve, kProbe, kFilter, kGi, kRefract, kShaders };
 Shader*              gShader[kShaders];
 Pipeline*            gPipe[kShaders];
 DescriptorSet*       gSet; // four per frame in flight: the trace, the reconstruction, the resolve and the filter
@@ -97,6 +100,17 @@ Texture*             gHalfRay;  // its rays' directions, for their reuse
 Texture*             gAccum[2]; // accumulated reflections: this frame's is written, last frame's read
 Texture*             gAccumZ[2]; // RG16F: the view depth each accumulated pixel was for, and the samples it holds
 uint32_t             gAccumIndex;   // the one written last
+// On-screen refraction (frame rtRefraction, rtRefractLanding; Trace.comp.fsl REFRACT_PASS), made once glass refracts
+// on screen, at render size. Alternating, each the other's history: rgb and the layer's view depth, the samples it holds.
+Texture*             gRefract[2];
+Texture*             gRefractN[2];  // R16F
+Texture*             gRefractLand;
+Texture*             gNoRefract[2]; // 2 x 2 stand-ins the other sets bind, written (UNORDERED_ACCESS): RGBA16F, R16F
+DescriptorSet*       gRefractSet;   // one per frame in flight
+uint32_t             gRefractIndex; // the one written this frame (rt_prepare)
+uint64_t             gRefractFrame; // the frame it was written last (0: none)
+bool                 gRefractNow;   // rt_prepare: refraction is traced this frame, over gRefractRect
+uint32_t             gRefractRect[4];
 uint64_t             gAccumFrame;   // the frame it was written (0: no history)
 // Per 8 x 8 tile (UNORDERED_ACCESS once used), six sets of flags, so no pass reads a flag it writes: whether
 // any pixel reflects (this frame's, which the trace sets, and next frame's, which the resolve clears), and
@@ -130,8 +144,8 @@ enum { kShadowTrace, kShadowTemporal, kShadowFilter, kShadowShaders };
 Shader*        gShShader[kShadowShaders];
 Pipeline*      gShPipe[kShadowShaders];
 DescriptorSet* gShSet; // three per frame in flight, a pass each
-// The textureVersion each set's texture maps hold (cut-outs; 0: none yet): gSet's, gShSet's, then gGiSet's.
-uint32_t       gTexBound[kMaxFrames * 8];
+// The textureVersion each set's texture maps hold (cut-outs; 0: none yet): gSet's, gShSet's, gGiSet's, then gRefractSet's.
+uint32_t       gTexBound[kMaxFrames * 9];
 Buffer*        gShCb[kMaxFrames];
 Buffer*        gNoShapes; // bound while the core has no shape buffer (every light kind 0)
 // All SHADER_RESOURCE between frames.
@@ -201,6 +215,15 @@ uint32_t                           gInstCapacity[kMaxFrames];
 AccelerationStructureInstanceDesc* gDescs;
 uint32_t                           gDescCapacity;
 uint32_t*                          gInstCpu;
+// Each see-through instance's rows as last traced (by core instance row), so the refraction pass finds where a point on
+// moving glass was last frame: gInstBuf's last-frame rows (3 uint4 a top-level instance, after its instances).
+struct GlassRows
+{
+    float    row[3][4];
+    uint64_t frame; // when they were taken (0: never)
+    uint32_t mesh;
+};
+GlassRows* gGlassRows;
 
 float    gPrevViewProj[4][4];
 uint64_t gPrevFrame;
@@ -217,6 +240,14 @@ void freeTexture()
     if (gTiles)
         removeResource(gTiles);
     gTiles = nullptr;
+    Texture** refract[5] = { &gRefract[0], &gRefract[1], &gRefractN[0], &gRefractN[1], &gRefractLand };
+    for (Texture** t : refract)
+    {
+        if (*t)
+            removeResource(*t);
+        *t = nullptr;
+    }
+    gRefractFrame = 0;
     gWidth = gHeight = 0;
     gAccumFrame = 0;
 }
@@ -351,6 +382,30 @@ void createTexture(uint32_t w, uint32_t h)
     gFreshFrames = 2;
     gWidth = w;
     gHeight = h;
+}
+
+// The refraction pass's textures, at the reflections' size (36 bytes a pixel): false when they couldn't be made.
+bool createRefractTextures()
+{
+    if (gRefractLand)
+        return true;
+    for (uint32_t i = 0; i < 2; ++i)
+    {
+        gRefract[i] = makeTexture(gWidth, gHeight, "renderer_rt_refraction");
+        gRefractN[i] = makeTexture(gWidth, gHeight, "renderer_rt_refraction_samples", TinyImageFormat_R16_SFLOAT);
+    }
+    gRefractLand = makeTexture(gWidth, gHeight, "renderer_rt_refraction_landing");
+    gRefractFrame = 0;
+    if (gRefract[0] && gRefract[1] && gRefractN[0] && gRefractN[1] && gRefractLand)
+        return true;
+    Texture** all[5] = { &gRefract[0], &gRefract[1], &gRefractN[0], &gRefractN[1], &gRefractLand };
+    for (Texture** t : all)
+    {
+        if (*t)
+            removeResource(*t);
+        *t = nullptr;
+    }
+    return false;
 }
 
 Buffer* makeMapped(uint64_t size, uint32_t stride, DescriptorType type, const char* name)
@@ -692,9 +747,10 @@ int load(int reloaded)
     }
     gDescs = new AccelerationStructureInstanceDesc[kMaxInstances];
     gInstCpu = new uint32_t[kMaxInstances * 4];
+    gGlassRows = new GlassRows[kMaxInstances]();
     gDescCapacity = kMaxInstances;
     const char* names[kShaders] = { "renderer_rt_trace.comp", "renderer_rt_reconstruct.comp", "renderer_rt_resolve.comp", "renderer_rt_probe.comp",
-                                    "renderer_rt_filter.comp", "renderer_rt_gi.comp" };
+                                    "renderer_rt_filter.comp", "renderer_rt_gi.comp", "renderer_rt_refract.comp" };
     for (uint32_t k = 0; k < kShaders; ++k)
     {
         ShaderLoadDesc sd = {};
@@ -801,6 +857,7 @@ int load(int reloaded)
     addDescriptorSet(gRenderer, &setDesc, &gSet);
     DescriptorSetDesc giDesc = SRT_SET_DESC(RtSrt, PerFrame, gFrames, 0);
     addDescriptorSet(gRenderer, &giDesc, &gGiSet);
+    addDescriptorSet(gRenderer, &giDesc, &gRefractSet);
     for (uint32_t i = 0; i < gFrames; ++i)
         gCb[i] = makeMapped(sizeof(RtData) < 256 ? 256 : (sizeof(RtData) + 255) / 256 * 256, 0, DESCRIPTOR_TYPE_UNIFORM_BUFFER, "renderer_rt_cb");
     DescriptorSetDesc shadowSet = SRT_SET_DESC(ShadowSrt, PerFrame, gFrames * 3, 0);
@@ -819,10 +876,29 @@ int load(int reloaded)
     gNoDecals = makeMapped(176, 176, DESCRIPTOR_TYPE_BUFFER, "renderer_rt_no_decals");
     gNoCells = makeMapped(8, 8, DESCRIPTOR_TYPE_BUFFER, "renderer_rt_no_decal_cells");
     gNoItems = makeMapped(4, 4, DESCRIPTOR_TYPE_BUFFER, "renderer_rt_no_decal_items");
+    {
+        TextureDesc t = {};
+        t.mWidth = t.mHeight = 2;
+        t.mDepth = t.mArraySize = t.mMipLevels = 1;
+        t.mSampleCount = SAMPLE_COUNT_1;
+        t.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
+        t.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+        const TinyImageFormat formats[2] = { TinyImageFormat_R16G16B16A16_SFLOAT, TinyImageFormat_R16_SFLOAT };
+        for (uint32_t i = 0; i < 2; ++i)
+        {
+            t.mFormat = formats[i];
+            t.pName = "renderer_rt_no_refraction_out";
+            TextureLoadDesc tl = {};
+            tl.pDesc = &t;
+            tl.ppTexture = &gNoRefract[i];
+            addResource(&tl, nullptr);
+        }
+        waitForAllResourceLoads();
+    }
     gNoShapes = makeMapped(sizeof(RenderGpuLightShape) * 4, sizeof(RenderGpuLightShape), DESCRIPTOR_TYPE_BUFFER, "renderer_rt_no_shapes");
     if (gNoShapes)
         memset(gNoShapes->pCpuMappedAddress, 0, sizeof(RenderGpuLightShape) * 4);
-    gReady = gSet != nullptr && gGiSet != nullptr && gShSet != nullptr && gNoShapes != nullptr && gNoTint[0] && gNoTint[1] && gNoRefraction &&
+    gReady = gSet != nullptr && gGiSet != nullptr && gRefractSet != nullptr && gNoRefract[0] && gNoRefract[1] && gShSet != nullptr && gNoShapes != nullptr && gNoTint[0] && gNoTint[1] && gNoRefraction &&
              gNoDfg && gNoDecals && gNoCells && gNoItems;
     yea::log(gReady ? "renderer_rt: ray-traced reflections on" : "renderer_rt: the trace pipeline failed");
     return gReady ? 0 : 1;
@@ -900,6 +976,15 @@ void unload()
     if (gGiSet)
         removeDescriptorSet(gRenderer, gGiSet);
     gGiSet = nullptr;
+    if (gRefractSet)
+        removeDescriptorSet(gRenderer, gRefractSet);
+    gRefractSet = nullptr;
+    for (Texture*& t : gNoRefract)
+    {
+        if (t)
+            removeResource(t);
+        t = nullptr;
+    }
     if (gNoGiRays)
         removeResource(gNoGiRays);
     gNoGiRays = nullptr;
@@ -1035,11 +1120,14 @@ bool rt_prepare(uint64_t address)
         return false;
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
     bool shadows = gPickCount && F && gPickFrame == F->frameNumber;
-    gTintNow = gGlassNow = false;
+    gTintNow = gGlassNow = gRefractNow = false;
     if (F && F->version == RENDER_FRAME_VERSION)
+    {
         F->rtShadowTint = nullptr;
+        F->rtRefraction = F->rtRefractLanding = nullptr;
+    }
     bool gi = F && F->version == RENDER_FRAME_VERSION && F->giProbeCount && F->giRaysPerProbe && F->giProbeData && F->giRayOut;
-    if (!gReady || (!settings.enabled && !shadows && !gi) || !F || F->version != RENDER_FRAME_VERSION || !F->width || !F->height || !F->taaOn)
+    if (!gReady || (!settings.enabled && !settings.traced_refraction && !shadows && !gi) || !F || F->version != RENDER_FRAME_VERSION || !F->width || !F->height || !F->taaOn)
         return false;
     if (yea::viewMode() || !F->surface || !F->previous || !F->drawableCount || !F->positions || !F->attributes || !F->indices || !F->instances ||
         !F->materials || !F->lightBuffer || !F->exposure || !F->motion || F->frameIndex >= kMaxFrames)
@@ -1097,7 +1185,8 @@ bool rt_prepare(uint64_t address)
     const bool glass = glassInRays(F);
     gGlassNow = glass;
     d.counts[2] = (settings.screen_colors ? kFlagScreen : 0) | (settings.show_hits ? kFlagDebug : 0) |
-                  (F->materialMaps && F->textures ? kFlagMaps : 0) | (glass ? kFlagGlass : 0);
+                  (F->materialMaps && F->textures ? kFlagMaps : 0) | (glass ? kFlagGlass : 0) |
+                  (glass && F->refractOn ? kFlagRefract : 0);
     // Traced shadows tinted by glass: set now, beside rtShadows (the core binds it before rt_run fills it).
     if (glass && shadows && F->rtShadows && F->rtShadows == gRtShadows)
     {
@@ -1162,6 +1251,58 @@ bool rt_prepare(uint64_t address)
     // Decals, painted at hits (reflections' and GI probe rays') as on screen. None on glass, as raster paints none there.
     d.decals[0] = F->worldDecalCount && F->worldDecals && F->decalCells && F->decalItems ? F->worldDecalCount : 0;
     memcpy(d.decalGrid, F->decalGrid, sizeof d.decalGrid);
+    // On-screen refraction: over the screen rectangle of every see-through instance's sphere (all of it when one is about
+    // the camera), the camera's rays to the glass that bends; rt_run traces them before the see-through pass reads them.
+    if (settings.traced_refraction && glass && F->refractOn)
+    {
+        int32_t rect[4] = { (int32_t)F->width, (int32_t)F->height, 0, 0 };
+        for (uint32_t i = 0; i < F->seeThroughCount; ++i)
+        {
+            const float* s = F->seeThrough[i].sphere;
+            float        rel[3] = { s[0] - F->camPos[0], s[1] - F->camPos[1], s[2] - F->camPos[2] };
+            float        vx = 0, vy = 0, vz = 0;
+            for (int k = 0; k < 3; ++k)
+            {
+                vx += v[0][k] * rel[k];
+                vy += v[1][k] * rel[k];
+                vz += v[2][k] * rel[k];
+            }
+            float r = s[3];
+            if (vz + r <= F->nearZ)
+                continue; // all behind the camera
+            int32_t box[4] = { 0, 0, (int32_t)F->width, (int32_t)F->height };
+            if (vz - r > F->nearZ * 1.01f)
+            {
+                // The sphere's extent over x / z and y / z, each end divided by the nearest or farthest depth it can have.
+                float x0 = (vx - r) / (vx - r <= 0 ? vz - r : vz + r) * F->p00, x1 = (vx + r) / (vx + r >= 0 ? vz - r : vz + r) * F->p00;
+                float y0 = (vy - r) / (vy - r <= 0 ? vz - r : vz + r) * F->p11, y1 = (vy + r) / (vy + r >= 0 ? vz - r : vz + r) * F->p11;
+                box[0] = (int32_t)floorf((x0 * 0.5f + 0.5f) * F->width + F->jitter[0]) - 2;
+                box[2] = (int32_t)ceilf((x1 * 0.5f + 0.5f) * F->width + F->jitter[0]) + 2;
+                box[1] = (int32_t)floorf((0.5f - y1 * 0.5f) * F->height + F->jitter[1]) - 2;
+                box[3] = (int32_t)ceilf((0.5f - y0 * 0.5f) * F->height + F->jitter[1]) + 2;
+            }
+            for (int k = 0; k < 2; ++k)
+            {
+                rect[k] = box[k] < rect[k] ? box[k] : rect[k];
+                rect[k + 2] = box[k + 2] > rect[k + 2] ? box[k + 2] : rect[k + 2];
+            }
+        }
+        rect[0] = rect[0] < 0 ? 0 : rect[0];
+        rect[1] = rect[1] < 0 ? 0 : rect[1];
+        rect[2] = rect[2] > (int32_t)F->width ? (int32_t)F->width : rect[2];
+        rect[3] = rect[3] > (int32_t)F->height ? (int32_t)F->height : rect[3];
+        if (rect[2] > rect[0] && rect[3] > rect[1] && createRefractTextures())
+        {
+            gRefractNow = true;
+            gRefractIndex ^= 1;
+            for (int k = 0; k < 4; ++k)
+                gRefractRect[k] = d.refract[k] = (uint32_t)rect[k];
+            d.refractTemporal[0] = havePrev && gRefractFrame + 1 == F->frameNumber ? 1.0f : 0.0f;
+            d.refractTemporal[1] = settings.history_frames < 1 ? 1.0f : (float)settings.history_frames;
+            F->rtRefraction = gRefract[gRefractIndex];
+            F->rtRefractLanding = gRefractLand;
+        }
+    }
     memcpy(gCb[F->frameIndex]->pCpuMappedAddress, &d, sizeof d);
 
     F->rtReflection = settings.enabled ? gTex : nullptr; // the filter writes it after the resolve; none: shadows only
@@ -1366,6 +1507,44 @@ void traceShadows(RenderFrame* F, Cmd* cmd, uint32_t fi)
     gShIdCount = gPickCount;
 }
 
+// Where a point on see-through instance c was last frame: the rows taking this frame's world position to last frame's
+// (last frame's rows times the inverse of this frame's), into out (3 x 4); all zero where it has no last frame (it
+// appeared, changed mesh, or wasn't traced then). Then keeps this frame's for the next.
+void glassMotion(const RenderFrame* F, const RenderCaster& c, float out[12])
+{
+    GlassRows&  g = gGlassRows[c.instance];
+    const float(*a)[4] = F->instanceRows[c.instance].row;
+    memset(out, 0, 12 * sizeof(float));
+    if (g.frame && g.frame + 1 == F->frameNumber && g.mesh == c.mesh)
+    {
+        if (!memcmp(g.row, a, sizeof g.row))
+            out[0] = out[5] = out[10] = 1.0f; // still
+        else
+        {
+            // Inverse of [A | t]: [A^-1 | -A^-1 t], A^-1 from its cofactors.
+            float inv[3][3] = { { a[1][1] * a[2][2] - a[1][2] * a[2][1], a[0][2] * a[2][1] - a[0][1] * a[2][2], a[0][1] * a[1][2] - a[0][2] * a[1][1] },
+                                { a[1][2] * a[2][0] - a[1][0] * a[2][2], a[0][0] * a[2][2] - a[0][2] * a[2][0], a[0][2] * a[1][0] - a[0][0] * a[1][2] },
+                                { a[1][0] * a[2][1] - a[1][1] * a[2][0], a[0][1] * a[2][0] - a[0][0] * a[2][1], a[0][0] * a[1][1] - a[0][1] * a[1][0] } };
+            float det = a[0][0] * inv[0][0] + a[0][1] * inv[1][0] + a[0][2] * inv[2][0];
+            if (fabsf(det) > 1e-12f)
+            {
+                float m[3][4];
+                for (int r = 0; r < 3; ++r)
+                    for (int k = 0; k < 3; ++k)
+                        m[r][k] = inv[r][k] / det;
+                for (int r = 0; r < 3; ++r)
+                    m[r][3] = -(m[r][0] * a[0][3] + m[r][1] * a[1][3] + m[r][2] * a[2][3]);
+                for (int r = 0; r < 3; ++r)
+                    for (int k = 0; k < 4; ++k)
+                        out[r * 4 + k] = g.row[r][0] * m[0][k] + g.row[r][1] * m[1][k] + g.row[r][2] * m[2][k] + (k == 3 ? g.row[r][3] : 0.0f);
+            }
+        }
+    }
+    memcpy(g.row, a, sizeof g.row);
+    g.frame = F->frameNumber;
+    g.mesh = c.mesh;
+}
+
 void rt_run(uint64_t address)
 {
     if (!coreMatches())
@@ -1392,7 +1571,7 @@ void rt_run(uint64_t address)
         if (gInstBuf[fi])
             removeResource(gInstBuf[fi]);
         gInstCapacity[fi] = grow(all);
-        gInstBuf[fi] = makeMapped((uint64_t)gInstCapacity[fi] * 16, 16, DESCRIPTOR_TYPE_BUFFER, "renderer_rt_instances");
+        gInstBuf[fi] = makeMapped((uint64_t)gInstCapacity[fi] * 16 * 4, 16, DESCRIPTOR_TYPE_BUFFER, "renderer_rt_instances");
     }
 
     // Instances: each live instance with its mesh's bottom-level structure (built here when new). Only alpha-tested
@@ -1422,6 +1601,8 @@ void rt_run(uint64_t address)
         gInstCpu[n * 4 + 2] = (uint32_t)c.vertexOffset;
         gInstCpu[n * 4 + 3] = (cut || isGlass ? F->instanceRows[c.instance].material + 1 : 0) | (cut ? kInstCut : 0) |
                               (isGlass ? kInstGlass : 0) | (c.twoSided ? kInstTwoSided : 0);
+        if (isGlass && gInstBuf[fi] && n < gInstCapacity[fi])
+            glassMotion(F, c, (float*)gInstBuf[fi]->pCpuMappedAddress + ((size_t)gInstCapacity[fi] + (size_t)n * 3) * 4);
         n++;
     }
     dropDynamic(F->frameNumber);
@@ -1431,6 +1612,7 @@ void rt_run(uint64_t address)
         return;
     }
     memcpy(gInstBuf[fi]->pCpuMappedAddress, gInstCpu, (size_t)n * 16);
+    ((RtData*)gCb[fi]->pCpuMappedAddress)->refractTemporal[2] = (float)gInstCapacity[fi];
 
     // This frame slot's top-level structure: made (with room to spare) when too small, then its instances
     // rewritten and rebuilt.
@@ -1478,7 +1660,7 @@ void rt_run(uint64_t address)
     bool           maps = F->localAtlas && F->localAtlas->pTexture && F->shadowViews;
     Texture*       atlas = maps ? F->localAtlas->pTexture : gDummyAtlas->pTexture;
     Buffer*        views = maps ? F->shadowViews : gDummyViews;
-    DescriptorData p[38] = {};
+    DescriptorData p[43] = {};
     const bool     decals = F->worldDecalCount && F->worldDecals && F->decalCells && F->decalItems;
     Buffer*        decalBufs[3] = { decals ? F->worldDecals : gNoDecals, decals ? F->decalCells : gNoCells,
                                     decals ? F->decalItems : gNoItems };
@@ -1488,6 +1670,17 @@ void rt_run(uint64_t address)
     p[36].ppBuffers = &decalBufs[1];
     p[37].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gDecalItems);
     p[37].ppBuffers = &decalBufs[2];
+    // The refraction pass's own; the others bind stand-ins.
+    p[38].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gRefractHistory);
+    p[38].ppTextures = &gNoSky;
+    p[39].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gRefractHistoryN);
+    p[39].ppTextures = &gNoSky;
+    p[40].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gOutRefract);
+    p[40].ppTextures = &gNoRefract[0];
+    p[41].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gOutRefractLand);
+    p[41].ppTextures = &gNoRefract[0];
+    p[42].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gOutRefractN);
+    p[42].ppTextures = &gNoRefract[1];
     Buffer*        positions = F->positions;
     p[32].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gPositions);
     p[32].ppBuffers = &positions;
@@ -1573,7 +1766,7 @@ void rt_run(uint64_t address)
     if (gi)
     {
         // renderer_gi's probe rays (a thread each; renderer_gi reads them in gi_run, after this).
-        updateDescriptorSet(gRenderer, fi, gGiSet, 38, p);
+        updateDescriptorSet(gRenderer, fi, gGiSet, 43, p);
         bindCutouts(F, gGiSet, fi, kMaxFrames * 7 + fi, SRT_RES_IDX(RtSrt, PerFrame, gMaterialMaps), SRT_RES_IDX(RtSrt, PerFrame, gTextures));
         uint32_t       groups = (F->giProbeCount * F->giRaysPerProbe + 63) / 64, across = giAcross(F->giProbeCount * F->giRaysPerProbe);
         BufferBarrier  rb = { F->giRayOut, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS };
@@ -1586,24 +1779,50 @@ void rt_run(uint64_t address)
         cmdResourceBarrier(cmd, 1, &rb, 0, nullptr, 0, nullptr);
         F->giTraced = 1;
     }
+    if (gRefractNow && F->rtRefraction == gRefract[gRefractIndex])
+    {
+        // On-screen refraction (rt_prepare's rectangle), into rtRefraction and rtRefractLanding; last frame's is its history.
+        const uint32_t r = gRefractIndex;
+        DescriptorData q[43];
+        memcpy(q, p, sizeof q);
+        q[38].ppTextures = &gRefract[r ^ 1];
+        q[39].ppTextures = &gRefractN[r ^ 1];
+        q[40].ppTextures = &gRefract[r];
+        q[41].ppTextures = &gRefractLand;
+        q[42].ppTextures = &gRefractN[r];
+        updateDescriptorSet(gRenderer, fi, gRefractSet, 43, q);
+        bindCutouts(F, gRefractSet, fi, kMaxFrames * 8 + fi, SRT_RES_IDX(RtSrt, PerFrame, gMaterialMaps), SRT_RES_IDX(RtSrt, PerFrame, gTextures));
+        TextureBarrier rb[3] = { { gRefract[r], RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS },
+                                 { gRefractLand, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS },
+                                 { gRefractN[r], RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS } };
+        cmdResourceBarrier(cmd, 0, nullptr, 3, rb, 0, nullptr);
+        cmdBindPipeline(cmd, gPipe[kRefract]);
+        cmdBindDescriptorSet(cmd, 0, gPersistent);
+        cmdBindDescriptorSet(cmd, fi, gRefractSet);
+        cmdDispatch(cmd, (gRefractRect[2] - gRefractRect[0] + 7) / 8, (gRefractRect[3] - gRefractRect[1] + 7) / 8, 1);
+        for (TextureBarrier& b : rb)
+            b = { b.pTexture, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE };
+        cmdResourceBarrier(cmd, 0, nullptr, 3, rb, 0, nullptr);
+        gRefractFrame = F->frameNumber;
+    }
     if (!F->rtReflection)
     {
         cmdEndDebugMarker(cmd);
         return;
     }
-    updateDescriptorSet(gRenderer, fi * 4, gSet, 38, p);
+    updateDescriptorSet(gRenderer, fi * 4, gSet, 43, p);
     p[12].ppTextures = &gHalf;
     p[24].ppTextures = &gHalfRay;
-    updateDescriptorSet(gRenderer, fi * 4 + 1, gSet, 38, p);
+    updateDescriptorSet(gRenderer, fi * 4 + 1, gSet, 43, p);
     p[13].ppTextures = &gTex;
-    updateDescriptorSet(gRenderer, fi * 4 + 2, gSet, 38, p);
+    updateDescriptorSet(gRenderer, fi * 4 + 2, gSet, 43, p);
     // The filter reads this frame's accumulation and writes the trace texture, free by then, as rtReflection.
     p[13].ppTextures = &gAccum[w ^ 1];
     p[15].ppTextures = &gAccum[w];
     p[16].ppTextures = &gAccumZ[w];
     p[20].ppTextures = &gTex;
     p[21].ppTextures = &gAccumZ[w ^ 1];
-    updateDescriptorSet(gRenderer, fi * 4 + 3, gSet, 38, p);
+    updateDescriptorSet(gRenderer, fi * 4 + 3, gSet, 43, p);
     // Cut-outs, for the passes that trace: the trace (and the probe pass, on its set) and the reconstruction.
     for (uint32_t k = 0; k < 2; ++k)
         bindCutouts(F, gSet, fi * 4 + k, fi * 4 + k, SRT_RES_IDX(RtSrt, PerFrame, gMaterialMaps), SRT_RES_IDX(RtSrt, PerFrame, gTextures));

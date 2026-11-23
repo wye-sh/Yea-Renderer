@@ -184,8 +184,28 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   (`Shaders/Hit.h.fsl`). A layer counts where raster draws one: a front face, or any face of a two-sided material
   except a solid refraction (shape 1), front faces only. It lets through T = (1 - coverage) x tint x (1 - FssEss -
   Fms Ems) at its angle (coverage material_blend's opacity x base colour alpha; the split-sum terms from the core's
-  `dfg`, as its see-through pass). A reflection ray keeps the nearest layer in front of what it saw and shows its own
-  light (diffuse and glow by coverage, specular whole, no decals) over what is behind times T. Shadow rays (reflected
+  `dfg`, as its see-through pass). A reflection ray shades each layer it meets, front to back (its own
+  light: diffuse and glow by coverage, specular whole, no decals; then T times what is behind; fog per segment), and
+  goes on from it: with frame v28 `refractOn` (the core's see-through pass refracts) through a material_refraction
+  layer it bends as Forward.frag's refractedScene (`refractThrough` in Trace.comp.fsl: thin shifted by its thickness,
+  on as it came; solid a ball that thick, in and out), then traces the real scene from where it leaves; rough glass
+  jitters it over a disc of angular diameter 2 alpha (1 - 1/ior), refractedScene's spread, which the history averages,
+  and widens the ray cone by it. Four layers are shaded and bent at most (GLASS_LAYERS); past them a second, glass-only
+  ray multiplies the T of every layer up to the hit, as raster multiplies every see-through surface (`followRay`,
+  shared by reflections and on-screen refraction). On-screen refraction (frame v28 `rtRefraction` and
+  `rtRefractLanding`, knob `traced_refraction`): while refractOn and glass is in the structure, rt_prepare sets both (made at
+  render size on first need, 36 bytes a pixel) and rt_run's refraction pass (REFRACT_PASS, before the reflections)
+  traces the screen rectangle of every see-through sphere, a thread a pixel: the camera ray through the pixel's
+  centre, this frame's jittered projection, to the nearest counting refracting layer in front of the prepass depth,
+  bent there by its mapped normal (refractThrough), then followRay. rgb is what comes back, fogged from the camera
+  along the path; a is the layer's view depth. Where the bent ray meets what the depth shows on screen (the sky's depth
+  0 for a miss) and a glass-only ray from the camera to it crosses as many other counting layers beyond the layer
+  (`glassBehind`), the landing says to read the core's chain there: xy a pixel offset from the fragment's centre, z
+  refractedScene's mip. That path never jitters, so the landing holds still. Elsewhere, through rough glass (this layer
+  or deeper), one ray a frame goes over the spreads, accumulated over history_frames where last frame's layer was, by
+  its view depth. The core takes them only where |a - zP| < max(0.005 zP, 2 fwidth(zP)); a refracting layer behind the
+  front one keeps the chain path. Hits there have no screen AO or contact shadows, as reflections' hits. A reflection's
+  distance is its whole path; the half-resolution reuse keeps the ray as cast. Shadow rays (reflected
   hits' and traced shadows') multiply T over the layers they pass. When a glass caster is traced, rt_prepare sets
   `rtShadowTint` (RGBA16F, rtShadows' size and layers: the trace's raw tint with the nearest layer's distance in a,
   then, reused, the filtered tint) and rt_run fills it: accumulated over frames like the visibility over the rays no

@@ -12,6 +12,11 @@ category Ray-Traced Reflections
 setting bool enabled true
 needs enabled raytracing
 player enabled
+# Glass that bends what is behind it (material_refraction) shows the scene through it found by rays, also what is off
+# screen or hidden behind something; elsewhere, and with this off, it bends the picture on screen.
+setting bool traced_refraction true
+needs traced_refraction raytracing
+player traced_refraction
 # Surfaces rougher than this keep the probes' blurred reflections; traced ones fade out towards it.
 setting float max_roughness 0.5 0 1
 # Rays for one pixel in four, filled in by matching depth and normal: about a quarter of the cost.
