@@ -695,10 +695,9 @@ bool dlssRun(const RenderFrame* F, RenderTarget* out, bool reset, uint32_t q)
     in.depth = F->depth->pTexture;
     in.motion = F->motion->pTexture;
     in.exposure = gExposureTex;
-    // No masks (dlss.h version 2's biasColour, transparency) until Yea's DLSS service takes them safely: with them set,
-    // Yea crashed in The Forge on the main thread on an RTX 2080 (6.1.0's bisect). FSR keeps its reactive and
-    // transparency-and-composition masks.
-    in.biasColour = nullptr;
+    in.biasColour = F->reactive; // particles' and glass's coverage: trust this frame there (dlss.h version 2; nullptr: none)
+    // No transparency mask: Streamline 2.14 takes its resource state wrong and leaves it in COMMON after NGX, so the next
+    // barrier starts from the wrong state (Yea 152 ignores it; a device loss on an RTX 2080 in 6.1.0). FSR keeps its own.
     in.transparency = nullptr;
     in.output = out->pTexture;
     in.renderWidth = F->width;
