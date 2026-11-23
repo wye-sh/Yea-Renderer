@@ -138,7 +138,13 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   the core's tonemapper, so it works the same with every upscaler (NVIDIA's DLSS guide and UE5 place it there).
   `post_prepare` (after the core's composite constants, before its descriptors) returns the image the tonemap pass and
   composite read, or 0 when every effect is neutral (nothing runs); `post_run` records right after the resolve. Not
-  under F1's view modes or the AO, contact or culling debug views; without TAA only at one sample. Bloom: a 13-tap
+  under F1's view modes or the AO, contact or culling debug views; without TAA only at one sample. Motion blur first
+  (McGuire 2012 with Jimenez 2014's fast path, `Blur.comp.fsl`): the core's motion vectors (render size) scaled by
+  half the shutter (motion_blur_amount) to a radius in display pixels, capped at the tile size (a 24th of the height);
+  per tile the longest velocity and shortest length, then over 3 x 3 tiles, then a gather of 8 to 32 bilinear samples
+  along it, depth- and spread-weighted, or a plain average where the tile's motion is uniform; still pixels copy.
+  Only while TAA or an upscaler gives motion vectors; its targets exist only while it is on. Bloom and the rest read
+  the blurred image. Bloom: a 13-tap
   downsample chain from half size (6 levels, Karis's average on the first) and 3 x 3 tent upsamples summed back up
   (Jimenez 2014), mixed energy-conserving (lerp by bloom_intensity, no threshold). Vignette: cos^4 off axis from the
   projection. Grading: a 32^3 LUT (flattened 1024 x 32, RGBA16F) indexed by ACEScct of exposed values (gExposure[1]),

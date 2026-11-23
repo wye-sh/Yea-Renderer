@@ -26,3 +26,17 @@
 #comp renderer_post_combine.comp
 #include "Combine.comp.fsl"
 #end
+
+#comp renderer_post_blur_tile.comp
+#define TILE
+#include "Blur.comp.fsl"
+#end
+
+#comp renderer_post_blur_neighbor.comp
+#define NEIGHBOR
+#include "Blur.comp.fsl"
+#end
+
+#comp renderer_post_blur_gather.comp
+#include "Blur.comp.fsl"
+#end

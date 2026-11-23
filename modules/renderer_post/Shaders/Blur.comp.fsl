@@ -1,0 +1,150 @@
+// Motion blur (McGuire, Hennessy, Bukowski and Osman, "A Reconstruction Filter for Plausible Motion Blur", 2012, with
+// Jimenez's refinements from "Next Generation Post Processing in Call of Duty: Advanced Warfare", 2014): the scene's
+// motion vectors (gMotion, uv now - uv last, at the render size) scaled to a blur radius in display pixels, gathered
+// at display size after the anti-aliasing or upscaling resolve, so it works the same with every upscaler.
+// TILE: one 8 x 8 group per tile of `blur.z` display pixels: the tile's longest velocity (xy) and its shortest
+// length (z). NEIGHBOR: each tile's longest velocity among it and its 8 neighbours, and their shortest length, so a
+// pixel sees anything that can blur over it. GATHER: samples along that velocity, each weighted by depth order and by
+// whether its own or the centre's blur reaches the other; where a tile's motion is uniform (its shortest near its
+// longest), a plain average along it (Jimenez's fast path).
+#include "Common.h.fsl"
+
+#if defined(TILE)
+GroupShared(float4, gsMax[64]);
+#endif
+
+// A velocity no longer than the largest radius the tiles can carry.
+float2 clampRadius(float2 v)
+{
+    float l = length(v);
+    return l > gPost.blur.z ? v * (gPost.blur.z / l) : v;
+}
+
+// The blur radius at a render-size texel (display pixels).
+float2 radiusAt(int2 r) { return clampRadius(LoadTex2D(gMotion, NO_SAMPLER, r, 0).xy * gPost.blur.xy); }
+
+// View depth from reversed-Z with an infinite far plane (the sky: very far).
+float viewDepth(int2 r) { return gPost.blur.w / max(LoadTex2D(gDepth, NO_SAMPLER, r, 0).r, 1e-7); }
+
+float cone(float dist, float len) { return saturate(1.0 - dist / len); }
+float cylinder(float dist, float len) { return 1.0 - smoothstep(0.95 * len, 1.05 * len, dist); }
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) id, SV_GroupID(uint3) gid, SV_GroupThreadID(uint3) tid, SV_GroupIndex(uint) gi)
+{
+    INIT_MAIN;
+#if defined(TILE)
+    // The tile's render texels: those whose centres fall inside its display pixels.
+    float2 scale = gPost.blurSize.zw / gPost.blurSize.xy;
+    int2   r0 = int2(floor(float2(gid.xy) * gPost.blur.z * scale));
+    int2   r1 = min(int2(ceil(float2(gid.xy + uint2(1u, 1u)) * gPost.blur.z * scale)), int2(gPost.blurSize.zw));
+    float4 best = float4(0.0, 0.0, 0.0, 1e30); // xy the longest velocity, z its squared length, w the shortest squared
+    for (int y = r0.y + int(tid.y); y < r1.y; y += 8)
+    {
+        for (int x = r0.x + int(tid.x); x < r1.x; x += 8)
+        {
+            float2 v = radiusAt(int2(x, y));
+            float  l = dot(v, v);
+            best = l > best.z ? float4(v, l, best.w) : best;
+            best.w = min(best.w, l);
+        }
+    }
+    gsMax[gi] = best;
+    GroupMemoryBarrier();
+    for (uint s = 32u; s > 0u; s >>= 1u)
+    {
+        if (gi < s)
+        {
+            float4 o = gsMax[gi + s];
+            float4 m = gsMax[gi];
+            m = o.z > m.z ? float4(o.xyz, m.w) : m;
+            m.w = min(m.w, o.w);
+            gsMax[gi] = m;
+        }
+        GroupMemoryBarrier();
+    }
+    if (gi == 0u && gid.x < gPost.size.x && gid.y < gPost.size.y)
+    {
+        float4 m = gsMax[0];
+        Write2D(gOut, int2(gid.xy), float4(m.xy, m.w < 1e29 ? sqrt(m.w) : 0.0, 0.0));
+    }
+#elif defined(NEIGHBOR)
+    int2 p = int2(id.xy);
+    if (p.x >= int(gPost.size.x) || p.y >= int(gPost.size.y))
+        RETURN();
+    float3 best = float3(0.0, 0.0, 0.0);
+    float  bestLen = -1.0, shortest = 1e30;
+    for (int dy = -1; dy <= 1; ++dy)
+    {
+        for (int dx = -1; dx <= 1; ++dx)
+        {
+            int2 q = clamp(p + int2(dx, dy), int2(0, 0), int2(gPost.size.xy) - 1);
+            float3 t = LoadTex2D(gSrc, NO_SAMPLER, q, 0).xyz;
+            float  l = dot(t.xy, t.xy);
+            if (l > bestLen)
+            {
+                bestLen = l;
+                best = t;
+            }
+            shortest = min(shortest, t.z);
+        }
+    }
+    Write2D(gOut, p, float4(best.xy, shortest, 0.0));
+#else
+    int2 p = int2(id.xy);
+    if (p.x >= int(gPost.size.x) || p.y >= int(gPost.size.y))
+        RETURN();
+    float3 centre = LoadTex2D(gSrc, NO_SAMPLER, p, 0).rgb;
+    float3 n = LoadTex2D(gSrc2, NO_SAMPLER, p / int(gPost.blur.z), 0).xyz;
+    float  lenN = length(n.xy);
+    if (lenN < 0.5)
+    {
+        Write2D(gOut, p, float4(centre, 1.0));
+        RETURN();
+    }
+    float2 scale = gPost.blurSize.zw / gPost.blurSize.xy;
+    int2   maxR = int2(gPost.blurSize.zw) - 1;
+    int2   maxP = int2(gPost.size.xy) - 1;
+    // Samples about a pixel and a quarter apart across the streak, at least 8, at most 32, jittered per pixel and read
+    // bilinearly, so a streak is smooth after TAA (which runs before it and can't average its noise).
+    uint  count = clamp(uint(ceil(lenN * 0.75)) * 2u, 8u, 32u);
+    float j = frac(52.9829189 * frac(dot(float2(p), float2(0.06711056, 0.00583715)))) - 0.5;
+    float3 sum;
+    if (n.z > 0.8 * lenN)
+    {
+        // Uniform motion: every pixel around blurs as far the same way, so each sample counts the same.
+        sum = centre;
+        for (uint i = 0u; i < count; ++i)
+        {
+            float t = lerp(-1.0, 1.0, (float(i) + j + 1.0) / float(count + 1u));
+            sum += SampleLvlTex2D(gSrc, gSamplerBilinearClamp, (float2(p) + 0.5 + n.xy * t) / gPost.blurSize.xy, 0.0).rgb;
+        }
+        Write2D(gOut, p, float4(sum / float(count + 1u), 1.0));
+        RETURN();
+    }
+    int2  rc = min(int2((float2(p) + 0.5) * scale), maxR);
+    float lenC = max(length(radiusAt(rc)), 0.5);
+    float zC = viewDepth(rc);
+    float weight = 1.0 / lenC;
+    sum = centre * weight;
+    for (uint i = 0u; i < count; ++i)
+    {
+        float  t = lerp(-1.0, 1.0, (float(i) + j + 1.0) / float(count + 1u));
+        float2 off = n.xy * t;
+        float  dist = length(off);
+        float2 at = clamp(float2(p) + 0.5 + off, float2(0.5, 0.5), float2(maxP) + 0.5);
+        int2   r = min(int2(at * scale), maxR);
+        float  lenS = max(length(radiusAt(r)), 0.5);
+        float  zS = viewDepth(r);
+        float  soft = max(0.05 * min(zC, zS), 0.01);
+        float  front = saturate(1.0 - (zS - zC) / soft); // the sample is in front of the centre
+        float  back = saturate(1.0 - (zC - zS) / soft);  // the centre is in front of the sample
+        float  a = front * cone(dist, lenS) + back * cone(dist, lenC) + cylinder(dist, lenS) * cylinder(dist, lenC) * 2.0;
+        weight += a;
+        sum += SampleLvlTex2D(gSrc, gSamplerBilinearClamp, at / gPost.blurSize.xy, 0.0).rgb * a;
+    }
+    Write2D(gOut, p, float4(sum / weight, 1.0));
+#endif
+    RETURN();
+}

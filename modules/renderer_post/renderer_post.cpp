@@ -1,5 +1,5 @@
 // Post-processing for the renderer core, on the anti-aliased (or upscaled) scene-linear HDR image at display size,
-// before the core's tonemapper: bloom (a 13-tap downsample chain and tent upsamples, Jimenez 2014), a vignette, and
+// before the core's tonemapper: motion blur (McGuire 2012 with Jimenez 2014's refinements, Shaders/Blur.comp.fsl), bloom (a 13-tap downsample chain and tent upsamples, Jimenez 2014), a vignette, and
 // colour grading through a 32^3 LUT in ACEScct (white balance, contrast, lift / gamma / gain, saturation). With every
 // effect neutral, post_prepare returns 0 and nothing runs.
 #include "yea_renderer_post.h"
@@ -23,6 +23,8 @@ struct PostData
     uint32_t size[4];
     float    bloom[4];
     float    look[4];
+    float    blur[4];     // motion blur: xy motion (uv) to blur radius (display pixels), z the tile size (the largest radius), w near
+    float    blurSize[4]; // xy display size, zw render size (motion and depth)
     float    wb[3][4];
     float    lift[4];
     float    gamma[4];
@@ -30,9 +32,10 @@ struct PostData
 };
 
 const uint32_t kMaxFrames = 4, kSlots = 24, kLevels = 6;
-enum Pass { kDownFirst, kDown, kUp, kLut, kCombine, kPasses };
+enum Pass { kDownFirst, kDown, kUp, kLut, kCombine, kBlurTile, kBlurNeighbor, kBlurGather, kPasses };
 const char* const kShaderNames[kPasses] = { "renderer_post_down_first.comp", "renderer_post_down.comp", "renderer_post_up.comp",
-                                            "renderer_post_lut.comp", "renderer_post_combine.comp" };
+                                            "renderer_post_lut.comp",        "renderer_post_combine.comp", "renderer_post_blur_tile.comp",
+                                            "renderer_post_blur_neighbor.comp", "renderer_post_blur_gather.comp" };
 
 Renderer*      gRenderer;
 Queue*         gQueue;
@@ -46,13 +49,16 @@ Texture*       gLut;   // 1024 x 32: the grading LUT
 Texture*       gOut;   // display size: what the tonemapper reads
 Texture*       gDown[kLevels];
 Texture*       gUp[kLevels - 1];
+Texture*       gBlur;               // display size: the motion-blurred scene, made only while motion blur is on
+Texture*       gTiles, *gNeighbors; // per tile: the longest velocity and the shortest length; and over its neighbours
+uint32_t       gTile, gTilesX, gTilesY;
 uint32_t       gWidth, gHeight, gLevels;
 bool           gReady;
 
 // This frame's choices, from post_prepare to post_run.
 struct Plan
 {
-    bool     on, bloom, grade, bake;
+    bool     on, bloom, grade, bake, blur;
     Texture* in;
     PostData data;
 } gPlan;
@@ -87,8 +93,17 @@ void freeTexture(Texture*& t)
     t = nullptr;
 }
 
+void freeBlur()
+{
+    freeTexture(gBlur);
+    freeTexture(gTiles);
+    freeTexture(gNeighbors);
+    gTile = gTilesX = gTilesY = 0;
+}
+
 void freeSized()
 {
+    freeBlur();
     freeTexture(gOut);
     for (uint32_t i = 0; i < kLevels; ++i)
         freeTexture(gDown[i]);
@@ -116,6 +131,19 @@ bool makeSized(uint32_t w, uint32_t h)
     for (uint32_t i = 0; i < gLevels; ++i)
         ok = ok && gDown[i] && (i == 0 || gUp[i - 1]);
     return ok;
+}
+
+// Motion blur's targets for tiles of `tile` pixels, at the current size.
+bool makeBlur(uint32_t tile)
+{
+    gTilesX = (gWidth + tile - 1) / tile;
+    gTilesY = (gHeight + tile - 1) / tile;
+    gBlur = makeTexture(gWidth, gHeight, "renderer_post_blur");
+    gTiles = makeTexture(gTilesX, gTilesY, "renderer_post_blur_tiles");
+    gNeighbors = makeTexture(gTilesX, gTilesY, "renderer_post_blur_neighbors");
+    waitForAllResourceLoads();
+    gTile = tile;
+    return gBlur && gTiles && gNeighbors;
 }
 
 void barrier(Cmd* cmd, Texture* t, ResourceState from, ResourceState to)
@@ -234,7 +262,7 @@ void dispatch(RenderFrame* F, Pass pass, const PostData& d, Texture* src, Textur
     uint32_t index = F->frameIndex * kSlots + gSlot++;
     memcpy(gCb[index]->pCpuMappedAddress, &d, sizeof d);
     Texture*       lut = gLut;
-    Texture*       motion = gDummy;
+    Texture*       motion = F->motion ? F->motion->pTexture : gDummy;
     Buffer*        exposure = F->exposure;
     DescriptorData p[8] = {};
     p[0].mIndex = SRT_RES_IDX(PostSrt, PerFrame, gPost);
@@ -357,7 +385,10 @@ uint64_t post_prepare(uint64_t address)
     float intensity = settings.bloom ? clampf(settings.bloom_intensity, 0, 1) : 0.0f;
     float vignette = settings.vignette ? clampf(settings.vignette_intensity, 0, 1) : 0.0f;
     bool  grade = settings.grading && gradeData(d);
-    if (intensity <= 0 && vignette <= 0 && !grade)
+    // Motion blur needs the motion vectors the core renders with TAA or an upscaler, at one sample.
+    float shutter = settings.motion_blur ? clampf(settings.motion_blur_amount, 0, 1) : 0.0f;
+    bool  blur = shutter > 0 && F->taaOn && F->motion && F->sampleCount == 1;
+    if (intensity <= 0 && vignette <= 0 && !grade && !blur)
         return 0;
     if (w != gWidth || h != gHeight)
     {
@@ -369,8 +400,35 @@ uint64_t post_prepare(uint64_t address)
             return 0;
         }
     }
+    // Tiles of about a 24th of the height: the largest blur radius (a streak of up to 8% of the height, as UE's default
+    // limit of a few percent of the width).
+    uint32_t tile = (h + 12) / 24;
+    tile = tile < 8 ? 8 : (tile > 96 ? 96 : tile);
+    if (!blur && gBlur)
+    {
+        waitQueueIdle(gQueue); // frames in flight may still read them
+        freeBlur();
+    }
+    if (blur && gTile != tile)
+    {
+        waitQueueIdle(gQueue);
+        freeBlur();
+        if (!makeBlur(tile))
+        {
+            freeBlur();
+            blur = false;
+        }
+    }
     d.size[0] = w;
     d.size[1] = h;
+    d.blur[0] = 0.5f * shutter * (float)w;
+    d.blur[1] = 0.5f * shutter * (float)h;
+    d.blur[2] = (float)tile;
+    d.blur[3] = F->nearZ;
+    d.blurSize[0] = (float)w;
+    d.blurSize[1] = (float)h;
+    d.blurSize[2] = (float)F->width;
+    d.blurSize[3] = (float)F->height;
     d.bloom[0] = intensity;
     d.bloom[1] = clampf(settings.bloom_radius, 0.25f, 4);
     d.bloom[2] = 1.0f / (float)gLevels;
@@ -381,6 +439,7 @@ uint64_t post_prepare(uint64_t address)
     gPlan.bake = grade && (!gLutValid || memcmp(gLutData.wb, d.wb, sizeof(PostData) - offsetof(PostData, wb)) != 0);
     gPlan.on = true;
     gPlan.bloom = intensity > 0;
+    gPlan.blur = blur;
     gPlan.grade = grade;
     gPlan.in = in;
     return (uint64_t)(uintptr_t)gOut;
@@ -396,6 +455,20 @@ void post_run(uint64_t address)
     Cmd* cmd = F->cmd;
     cmdBeginDebugMarker(cmd, 1.0f, 0.8f, 0.4f, "Renderer post");
     const PostData& base = gPlan.data;
+    Texture*        scene = gPlan.in;
+    if (gPlan.blur)
+    {
+        // Each tile's motion, then over its neighbours, then the gather at full size; bloom and the rest read it.
+        PostData d = base;
+        d.size[0] = gTilesX;
+        d.size[1] = gTilesY;
+        d.size[2] = (uint32_t)base.blurSize[2];
+        d.size[3] = (uint32_t)base.blurSize[3];
+        dispatch(F, kBlurTile, d, nullptr, nullptr, gTiles, gTilesX * 8, gTilesY * 8);
+        dispatch(F, kBlurNeighbor, d, gTiles, nullptr, gNeighbors, gTilesX, gTilesY);
+        dispatch(F, kBlurGather, base, scene, gNeighbors, gBlur, gWidth, gHeight);
+        scene = gBlur;
+    }
     if (gPlan.bake)
     {
         dispatch(F, kLut, base, nullptr, nullptr, gLut, 1024, 32);
@@ -413,7 +486,7 @@ void post_run(uint64_t address)
             d.size[1] = levelSize(gHeight, i);
             d.size[2] = sw;
             d.size[3] = sh;
-            dispatch(F, i ? kDown : kDownFirst, d, i ? gDown[i - 1] : gPlan.in, nullptr, gDown[i], d.size[0], d.size[1]);
+            dispatch(F, i ? kDown : kDownFirst, d, i ? gDown[i - 1] : scene, nullptr, gDown[i], d.size[0], d.size[1]);
         }
         for (uint32_t i = gLevels - 1; i-- > 0;)
         {
@@ -425,7 +498,7 @@ void post_run(uint64_t address)
             dispatch(F, kUp, d, below, gDown[i], gUp[i], d.size[0], d.size[1]);
         }
     }
-    dispatch(F, kCombine, base, gPlan.in, gPlan.bloom ? gUp[0] : nullptr, gOut, gWidth, gHeight);
+    dispatch(F, kCombine, base, scene, gPlan.bloom ? gUp[0] : nullptr, gOut, gWidth, gHeight);
     cmdEndDebugMarker(cmd);
 }
 } // namespace renderer_post

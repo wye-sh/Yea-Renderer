@@ -6,6 +6,15 @@ module renderer_post
 export u64 post_prepare(u64 frame)
 export void post_run(u64 frame)
 
+category Motion Blur
+# Moving things and a turning camera smear along their motion, as on film. Needs TAA or an upscaler (their motion
+# vectors); off with neither.
+setting bool motion_blur true
+player motion_blur
+# How much of each frame the shutter is open: 0.5 as a film camera's 180 degree shutter; 1 the whole frame.
+setting float motion_blur_amount 0.5 0 1
+player motion_blur_amount
+
 category Bloom
 # Bright light spreads into its surroundings, as through a real lens: a share of every pixel's light, so only the
 # brightest things show it (no threshold).
