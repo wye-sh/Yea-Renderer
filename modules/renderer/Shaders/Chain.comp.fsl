@@ -8,6 +8,32 @@ STRUCT(ChainData)
     DATA(uint4, rect, None);  // xy the first texel written, zw one past the last
     DATA(uint4, mode, None);  // x 1: level 0 (a copy of gHdrIn), yz the level read's size, w 1: Karis-weighted
 };
+#ifdef CHAIN_MS
+#include "ChainMs.srt.h"
+
+// Level 0 with MSAA (as UE resolves its scene colour and depth before translucency reads them): the samples' mean colour
+// (the light the pixel shows) and their nearest depth (an edge pixel counts as its nearer surface, so a refracted ray
+// landing there takes the straight view rather than colour from in front of the glass).
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) id)
+{
+    INIT_MAIN;
+    uint2 p = gChain.rect.xy + id.xy;
+    if (p.x >= gChain.rect.z || p.y >= gChain.rect.w)
+        RETURN();
+    float3 c = float3(0.0, 0.0, 0.0);
+    float  z = 0.0;
+    for (int s = 0; s < SAMPLE_COUNT; ++s)
+    {
+        c += LoadTex2DMS(gHdrMs, NO_SAMPLER, int2(p), s).rgb;
+        z = max(z, LoadTex2DMS(gDepthMs, NO_SAMPLER, int2(p), s).r);
+    }
+    Write2D(gDst, int2(p), float4(c * (1.0 / float(SAMPLE_COUNT)), 1.0));
+    Write2D(gDepthOut, int2(p), z);
+    RETURN();
+}
+#else
 #include "Chain.srt.h"
 
 float3 texel(int2 p, int2 last) { return LoadRWTex2D(gPrev, clamp(p, int2(0, 0), last)).rgb; }
@@ -62,3 +88,4 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
     Write2D(gDst, int2(p), float4(sum, 1.0));
     RETURN();
 }
+#endif

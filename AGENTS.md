@@ -32,8 +32,7 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   draws: until they are, blended surfaces wait.
 - Refraction (the core, 4.9.0; no frame change): `material_refraction(m, ior, thickness, shape, tint)` (Table
   `MaterialRefraction`; the Scene SRT's `gRefraction`, two float4 a material: ior, thickness, shape, given; tint). Tint
-  multiplies T everywhere (MSAA too). In the see-through pass only (one sample a pixel; knob `refraction`,
-  FLAG_REFRACTION while a refracting surface is in view): the scene colour chain `gChain` (RGBA16F, render size, up to 7
+  multiplies T everywhere. Knob `refraction`, FLAG_REFRACTION while a refracting surface is in view: the scene colour chain `gChain` (RGBA16F, render size, up to 7
   levels to ~8 px; `gSceneColor`), Chain.comp.fsl: level 0 a copy of hdr, then Jimenez 2014's 13-tap downsample, the
   first Karis-weighted (no fireflies). Copied over the whole screen before the first refracting surface, then again over
   the dirty rectangle (blended surfaces' screen rectangles since the last copy, the whole screen for a particle run)
@@ -42,7 +41,10 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   ray's landing (Forward.frag `refractedScene`: thin a slab, solid a ball refracted in and out, landing found in two
   steps on gSceneDepth, a landing in front of the glass taking the straight view; mip from roughness x distance behind),
   fog kept exact. A solid one draws its near side only; a thin double-sided one its far side, a recopy, its near side.
-  `transparency` is 1 over refracting glass. Not in MSAA, probe captures or ray-traced hits yet.
+  `transparency` is 1 over refracting glass. With MSAA (4.12.1), as UE does, each copy's level 0 is resolved from the
+  multisampled hdr (Chain.comp.fsl CHAIN_MS, renderer_chain_ms_N: the samples' mean) with the depth beside it
+  (`gChainDepth`, R32F, the nearest sample, bound as gSceneDepth), between the see-through draws inside the forward pass
+  (drawSeeThrough, shared with the one-sample pass). Not in probe captures or ray-traced hits yet.
 - Decals (the core, frame v23): `decal_add` and friends (Table `Decal`, 4096). Up to RENDER_MAX_DECALS (256) in view
   a frame, sorted by priority then add order (`gDecalList`; past 256 the lowest go), as GpuDecal rows (a world-to-box
   matrix, axes, look, maps' slots, a noise seed). Applied in the forward pass before any lighting (DOOM 2016's

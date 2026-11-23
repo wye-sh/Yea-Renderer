@@ -210,8 +210,8 @@ float behind(float2 s, float rayZ)
     return rayZ - gFrame.camPos.w / max(d, 1e-7); // reversed-Z, infinite far: sky is never in front
 }
 
-#ifdef BLEND_PASS
-// The scene's view depth at pixel q (reversed-Z, infinite far).
+#ifdef TRANSLUCENT
+// The scene's view depth at pixel q (reversed-Z, infinite far): the see-through pass's depth, or with MSAA its resolve.
 float sceneZ(float2 q)
 {
     int2 p = int2(clamp(q, float2(0.0, 0.0), gFrame.screen.xy - 1.0));
@@ -515,12 +515,10 @@ float4 PS_MAIN(VSOutput In)
     // Coloured glass (material_refraction's tint) passes only its colour of it.
     float3 transmit = (1.0 - saturate(coverage)) * saturate(float3(1.0, 1.0, 1.0) - FssEss - Fms * Ems) *
                       gRefraction[In.Material * 2u + 1u].rgb;
-#ifdef BLEND_PASS
     // Glass that refracts replaces what is behind it with the scene it bends and blurs: the multiply clears it, the add
     // puts the transmitted part of the scene colour chain there.
     float4 refr = gRefraction[In.Material * 2u];
     bool   refracts = (gFrame.counts.z & FLAG_REFRACTION) != 0u && refr.w > 0.5;
-#endif
 #ifdef TRANSMIT
 #ifdef BLEND_PASS
     PSOutput Transmit;
@@ -529,7 +527,7 @@ float4 PS_MAIN(VSOutput In)
     Transmit.Transparency = 0.0;
     RETURN(Transmit);
 #else
-    RETURN(float4(transmit, 1.0));
+    RETURN(float4(refracts ? float3(0.0, 0.0, 0.0) : transmit, 1.0));
 #endif
 #endif
     s.diffuse *= saturate(coverage);
@@ -764,10 +762,8 @@ float4 PS_MAIN(VSOutput In)
         color = applyFog(color, viewZ, In.Position.xy * gFrame.screen.zw);
         inscatter = applyFog(inscatter, viewZ, In.Position.xy * gFrame.screen.zw);
     }
-#ifdef BLEND_PASS
     if (refracts)
         inscatter -= refractedScene(In.WorldPos, N, V, refr, a2, In.Position.xy); // the chain has its own air in front
-#endif
     color = max(color - transmit * inscatter, float3(0.0, 0.0, 0.0));
 #else
     if ((gFrame.counts.z & FLAG_SKY) != 0u && gFrame.atmosphere.w > 0.0)
