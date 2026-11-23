@@ -262,7 +262,8 @@ void addDecals()
     renderer::decal_look(d, { 0.02f, 0.018f, 0.016f, 0.95f }, 0.95f, 0, { 0, 0, 0 }, 0, { 1, 1, 1, 0 });
     renderer::decal_shape(d, 0, 0.5f, 0.8f, 80);
     // Worn yellow lines along the path, and a puddle over them in front: dark, mirror-smooth, flat.
-    for (float x : { -1.1f, 2.1f })
+    const float lines[2] = { -1.1f, 2.1f };
+    for (float x : lines)
     {
         d = renderer::decal_add({ x, 0, 4.5f }, up, { 0.07f, 3.5f, 0.3f });
         renderer::decal_look(d, { 0.85f, 0.62f, 0.05f, 1 }, 0.55f, 0, { 0, 0, 0 }, 0, { 1, 1, 1, 0 });
