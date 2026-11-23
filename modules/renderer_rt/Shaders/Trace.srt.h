@@ -4,6 +4,7 @@
 BEGIN_SRT(RtSrt)
     BEGIN_SRT_SET(Persistent) // as the core's: a sampler in a set of its own, written once
         DECL_SAMPLER(Persistent, SamplerComparisonState, gShadowCmp)
+        DECL_SAMPLER(Persistent, SamplerState, gSkySampler) // trilinear, clamped: the physical sky's image
     END_SRT_SET(Persistent)
     BEGIN_SRT_SET(PerFrame)
         DECL_RAYTRACING(PerFrame, RaytracingAccelerationStructure, gScene) // first: Vulkan binds it at 0
@@ -34,5 +35,7 @@ BEGIN_SRT(RtSrt)
         DECL_TEXTURE(PerFrame, Depth2D(float), gLocalAtlas)     // and its local lights' atlas
         DECL_TEXTURE(PerFrame, Tex2D(float4), gHalfRayIn)        // reconstruct: the half-resolution rays' directions, w 1 / their pdf
         DECL_RWTEXTURE(PerFrame, RWTex2D(half4), gOutHalfRay)    // trace: the same
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gSkyEnv)           // renderer_sky (sky.x 1): its reflection image
+        DECL_BUFFER(PerFrame, Buffer(float4), gSkySh)            // and its ambient (9 SH)
     END_SRT_SET(PerFrame)
 END_SRT(RtSrt)

@@ -38,6 +38,7 @@ struct RtData
     uint32_t shadowMode[4];
     float    denoise[4];
     float    taps[32][4];
+    float    sky[4]; // x 1: renderer_sky's physical sky, y its image's mips
     uint32_t probe[4]; // TEMPORARY (probe_rays)
 };
 
@@ -89,7 +90,9 @@ uint32_t             gWidth, gHeight;
 bool                 gReady;
 // For the shadow maps' lookups at hits: a comparison sampler as the core's, and stand-ins bound while
 // renderer_shadows draws no maps (then no light has one, and none is read).
-Sampler*             gShadowCmp;
+Sampler*             gShadowCmp, *gSkySampler;
+Texture*             gNoSky;   // 2 x 2 stand-in for renderer_sky's image
+Buffer*              gNoSkySh; // and its SH
 RenderTarget*        gDummyAtlas;  // as the core's gDummyDepth: a depth render target, 2 x 2
 DescriptorSet*       gPersistent;  // the sampler's set
 Buffer*              gDummyViews;
@@ -341,6 +344,25 @@ int load(int reloaded)
     sd.mAddressU = sd.mAddressV = sd.mAddressW = ADDRESS_MODE_CLAMP_TO_EDGE;
     sd.mCompareFunc = CMP_LEQUAL;
     addSampler(gRenderer, &sd, &gShadowCmp);
+    sd.mMipMapMode = MIPMAP_MODE_LINEAR;
+    sd.mCompareFunc = CMP_NEVER;
+    addSampler(gRenderer, &sd, &gSkySampler);
+    {
+        TextureDesc t = {};
+        t.mWidth = t.mHeight = 2; // one texel high gets a 1D view on Vulkan
+        t.mDepth = t.mArraySize = t.mMipLevels = 1;
+        t.mSampleCount = SAMPLE_COUNT_1;
+        t.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
+        t.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+        t.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+        t.pName = "renderer_rt_no_sky";
+        TextureLoadDesc tl = {};
+        tl.pDesc = &t;
+        tl.ppTexture = &gNoSky;
+        addResource(&tl, nullptr);
+        waitForAllResourceLoads();
+    }
+    gNoSkySh = makeMapped(9 * 16, 16, DESCRIPTOR_TYPE_BUFFER, "renderer_rt_no_sky_sh");
     {
         // Made as the core makes its stand-in depth: on Direct3D 12 a depth format reads as a texture only through
         // a render target (typeless, with a depth view), and one texel high gets a 1D view on Vulkan.
@@ -357,16 +379,18 @@ int load(int reloaded)
     gDummyViews = makeMapped(sizeof(RenderGpuShadowView) * 4, sizeof(RenderGpuShadowView), DESCRIPTOR_TYPE_BUFFER, "renderer_rt_no_views");
     DescriptorSetDesc persistent = SRT_SET_DESC(RtSrt, Persistent, 1, 0);
     addDescriptorSet(gRenderer, &persistent, &gPersistent);
-    if (!gShadowCmp || !gDummyAtlas || !gDummyAtlas->pTexture || !gDummyViews || !gPersistent)
+    if (!gShadowCmp || !gSkySampler || !gNoSky || !gNoSkySh || !gDummyAtlas || !gDummyAtlas->pTexture || !gDummyViews || !gPersistent)
     {
         unload();
         return 1;
     }
     {
-        DescriptorData s = {};
-        s.mIndex = SRT_RES_IDX(RtSrt, Persistent, gShadowCmp);
-        s.ppSamplers = &gShadowCmp;
-        updateDescriptorSet(gRenderer, 0, gPersistent, 1, &s);
+        DescriptorData s[2] = {};
+        s[0].mIndex = SRT_RES_IDX(RtSrt, Persistent, gShadowCmp);
+        s[0].ppSamplers = &gShadowCmp;
+        s[1].mIndex = SRT_RES_IDX(RtSrt, Persistent, gSkySampler);
+        s[1].ppSamplers = &gSkySampler;
+        updateDescriptorSet(gRenderer, 0, gPersistent, 2, s);
     }
     DescriptorSetDesc setDesc = SRT_SET_DESC(RtSrt, PerFrame, gFrames * 4, 0);
     addDescriptorSet(gRenderer, &setDesc, &gSet);
@@ -402,6 +426,15 @@ void unload()
         removeDescriptorSet(gRenderer, gSet);
     if (gShadowCmp)
         removeSampler(gRenderer, gShadowCmp);
+    if (gSkySampler)
+        removeSampler(gRenderer, gSkySampler);
+    if (gNoSky)
+        removeResource(gNoSky);
+    if (gNoSkySh)
+        removeResource(gNoSkySh);
+    gSkySampler = nullptr;
+    gNoSky = nullptr;
+    gNoSkySh = nullptr;
     if (gDummyAtlas)
         removeRenderTarget(gRenderer, gDummyAtlas);
     if (gPersistent)
@@ -478,6 +511,8 @@ bool rt_prepare(uint64_t address)
     }
     d.sunDir[3] = F->sunOn ? 1.0f : 0.0f;
     d.sunColor[3] = F->ambient;
+    d.sky[0] = F->skyEnv && F->skySh ? 1.0f : 0.0f;
+    d.sky[1] = (float)F->skyEnvMips;
     d.counts[0] = F->allLightCount;
     d.counts[1] = (uint32_t)F->frameNumber;
     d.counts[2] = (settings.screen_colors ? kFlagScreen : 0) | (settings.show_hits ? kFlagDebug : 0);
@@ -626,7 +661,13 @@ void rt_run(uint64_t address)
     bool           maps = F->localAtlas && F->localAtlas->pTexture && F->shadowViews;
     Texture*       atlas = maps ? F->localAtlas->pTexture : gDummyAtlas->pTexture;
     Buffer*        views = maps ? F->shadowViews : gDummyViews;
-    DescriptorData p[26] = {};
+    DescriptorData p[28] = {};
+    Texture*       skyEnv = F->skyEnv && F->skySh ? F->skyEnv : gNoSky;
+    Buffer*        skySh = F->skyEnv && F->skySh ? F->skySh : gNoSkySh;
+    p[26].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gSkyEnv);
+    p[26].ppTextures = &skyEnv;
+    p[27].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gSkySh);
+    p[27].ppBuffers = &skySh;
     p[22].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gShadowViews);
     p[22].ppBuffers = &views;
     p[23].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gLocalAtlas);
@@ -681,19 +722,19 @@ void rt_run(uint64_t address)
     p[12].ppTextures = &gAccum[w ^ 1];
     p[13].ppTextures = &gAccum[w ^ 1];
     p[24].ppTextures = &gAccum[w ^ 1];
-    updateDescriptorSet(gRenderer, fi * 4, gSet, 26, p);
+    updateDescriptorSet(gRenderer, fi * 4, gSet, 28, p);
     p[12].ppTextures = &gHalf;
     p[24].ppTextures = &gHalfRay;
-    updateDescriptorSet(gRenderer, fi * 4 + 1, gSet, 26, p);
+    updateDescriptorSet(gRenderer, fi * 4 + 1, gSet, 28, p);
     p[13].ppTextures = &gTex;
-    updateDescriptorSet(gRenderer, fi * 4 + 2, gSet, 26, p);
+    updateDescriptorSet(gRenderer, fi * 4 + 2, gSet, 28, p);
     // The filter reads this frame's accumulation and writes the trace texture, free by then, as rtReflection.
     p[13].ppTextures = &gAccum[w ^ 1];
     p[15].ppTextures = &gAccum[w];
     p[16].ppTextures = &gAccumZ[w];
     p[20].ppTextures = &gTex;
     p[21].ppTextures = &gAccumZ[w ^ 1];
-    updateDescriptorSet(gRenderer, fi * 4 + 3, gSet, 26, p);
+    updateDescriptorSet(gRenderer, fi * 4 + 3, gSet, 28, p);
 
     // Every target the passes write goes to UNORDERED_ACCESS at once; the tile flags stay there.
     BufferBarrier tb = { gTiles, gTilesState, RESOURCE_STATE_UNORDERED_ACCESS };

@@ -56,7 +56,7 @@ float3 environment(float3 P, float3 R, float rough, bool reflections)
     float ambient = gFrame.skyGround.w;
     if (!reflections)
         return skyIrradiance(R) * ambient;
-    float3 sky = lerp(skyRadiance(R), skyIrradiance(R), rough) * ambient;
+    float3 sky = ((gFrame.counts.z & FLAG_SKY) != 0u ? skyReflection(R, rough) : lerp(skyRadiance(R), skyIrradiance(R), rough)) * ambient;
     float3 color = float3(0.0, 0.0, 0.0);
     float  remaining = 1.0;
     float  lod = rough * float(max(gFrame.probeInfo.y, 1u) - 1u);
@@ -438,6 +438,8 @@ float4 PS_MAIN(VSOutput In)
         lightCount = gFrame.counts.x;
     }
 
+    if ((gFrame.counts.z & FLAG_SKY) != 0u && gFrame.atmosphere.w > 0.0)
+        color = aerialPerspective(color, In.WorldPos, In.Position.xy * gFrame.screen.zw);
 
 #ifdef FULL
     if ((gFrame.counts.z & FLAG_CASCADES) != 0u)

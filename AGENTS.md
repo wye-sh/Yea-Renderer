@@ -143,6 +143,20 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   `max_roughness` (`gTiles`, flag sets double-buffered so no thread reads a flag another rewrites); the resolve skips
   the rest and writes their zeros only when the history there isn't zero already. Every GPU object is freed
   in `unload()` (device-loss recovery unloads modules); nothing GPU-side is in tables.
+- `renderer_sky`: the physical sky (Hillaire 2020, UE's sky atmosphere), on by default (physical_sky; off: the core's
+  Sky gradient knobs). Earth's Rayleigh, Mie (haze) and ozone (Hillaire's table 1, each scaled by a knob) over a 6360 km
+  planet to 6460 km; the scene's ground is y = 0, metres. `sky_prepare` (core, right after the sun is set, before
+  shadows_prepare) works out on the CPU, with the transmittance pass's own integral, what of the sun reaches the camera
+  (frame.h sunTransmittance; the core scales sunColor by it, so the sun light's intensity is its illuminance above the
+  atmosphere) and hands out its images; false without a sun. `sky_run` (first of the recording, timed \"sky\"): the
+  transmittance (256 x 64) and multiple-scattering (32 x 32, Hillaire's psi_ms) LUTs only when the atmosphere changes;
+  each frame the sky-view LUT (192 x 108, no sun disk; the core still draws the disk from the transmitted sunColor), the
+  aerial-perspective froxels (32^3 over the screen, depth^2 slices to 32 km), the sky's reflection image (octahedral
+  128, 6 mips: mip m the GGX lobe of roughness m / 5 sampled from the sky-view LUT) and its ambient (9 cosine-convolved
+  SH over pi from 2048 directions of mip 0). The core reads them under FLAG_SKY: the sky pass and skyRadiance from the
+  sky-view LUT, skyIrradiance from the SH, environment()'s sky from the reflection image, aerial perspective on every
+  lit pixel (aerial_perspective scales the distance). Probes' captures take their ambient from the SH; renderer_rt's
+  misses the reflection image and its hits' ambient the SH.
 - `renderer_post`: post-processing on the resolved (TAA or upscaled) scene-linear HDR image at display size, before
   the core's tonemapper, so it works the same with every upscaler (NVIDIA's DLSS guide and UE5 place it there).
   `post_prepare` (after the core's composite constants, before its descriptors) returns the image the tonemap pass and
@@ -223,7 +237,7 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   the out target, and leaves everything in SHADER_RESOURCE; the panel shows it with `yea::canvasImage`. The core's
   preview pipelines and buffers are made in its own `load()` (`preview_core.h`); a failure turns only the preview off.
 - The core calls the others through optional imports with a `RenderFrame*` (as `u64`): `frame.h`, copied
-  identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes`, `renderer_ssr`, `renderer_vrs`, `renderer_rt`, `renderer_upscale` and `renderer_post` (`mathx.h` into the
+  identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes`, `renderer_ssr`, `renderer_vrs`, `renderer_rt`, `renderer_upscale`, `renderer_post` and `renderer_sky` (`mathx.h` into the
   first three). Change all copies together and raise `RENDER_FRAME_VERSION`. Geometry (frame v16): two vertex streams, `positions`
   (float3, `RENDER_POSITION_STRIDE`) and `attributes` (`RENDER_ATTRIBUTE_STRIDE`: octahedral normal and tangent snorm16x2,
   uv0, rgba8 colour; frame.h says how to decode), and u32 `indices`. They are GPU-only, made with half again as much room

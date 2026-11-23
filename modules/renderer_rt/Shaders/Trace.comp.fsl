@@ -117,8 +117,19 @@ float3 clampSample(float3 c)
     return l > gRt.temporal.z ? c * (gRt.temporal.z / l) : c;
 }
 
+// renderer_sky's reflection image (octahedral, y up) at a roughness: its GGX-prefiltered mips.
+float3 skyImage(float3 d, float rough)
+{
+    float2 p = d.xz / (abs(d.x) + abs(d.y) + abs(d.z));
+    if (d.y < 0.0)
+        p = (float2(1.0, 1.0) - abs(p.yx)) * float2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
+    return SampleLvlTex2D(gSkyEnv, gSkySampler, p * 0.5 + 0.5, rough * (gRt.sky.y - 1.0)).rgb;
+}
+
 float3 skyRadiance(float3 d)
 {
+    if (gRt.sky.x > 0.5)
+        return skyImage(d, 0.0);
     if (d.y >= 0.0)
         return lerp(gRt.skyHorizon.rgb, gRt.skyZenith.rgb, sqrt(saturate(d.y)));
     return lerp(gRt.skyHorizon.rgb, gRt.skyGround.rgb, saturate(-d.y * 3.0));
@@ -126,6 +137,14 @@ float3 skyRadiance(float3 d)
 
 float3 skyIrradiance(float3 N)
 {
+    if (gRt.sky.x > 0.5)
+    {
+        // renderer_sky's cosine-convolved SH (its basis and order, as the core's skyIrradiance).
+        float3 c = gSkySh[0].rgb * 0.282095 + (gSkySh[1].rgb * N.y + gSkySh[2].rgb * N.z + gSkySh[3].rgb * N.x) * 0.488603 +
+                   (gSkySh[4].rgb * (N.x * N.y) + gSkySh[5].rgb * (N.y * N.z) + gSkySh[7].rgb * (N.x * N.z)) * 1.092548 +
+                   gSkySh[6].rgb * (0.315392 * (3.0 * N.z * N.z - 1.0)) + gSkySh[8].rgb * (0.546274 * (N.x * N.x - N.y * N.y));
+        return max(c, float3(0.0, 0.0, 0.0));
+    }
     float3 up = lerp(gRt.skyHorizon.rgb, gRt.skyZenith.rgb, 0.6);
     float3 down = lerp(gRt.skyHorizon.rgb, gRt.skyGround.rgb, 0.85);
     return lerp(down, up, N.y * 0.5 + 0.5);
@@ -238,7 +257,8 @@ float3 shadeHit(float3 P, float3 N, float3 V, MaterialData m, float2 rot)
     }
     float  ambient = gRt.sunColor.w;
     float3 R = reflect(-V, N);
-    color += (diffuse * skyIrradiance(N) + f0 * lerp(skyRadiance(R), skyIrradiance(R), rough)) * ambient;
+    float3 skySeen = gRt.sky.x > 0.5 ? skyImage(R, rough) : lerp(skyRadiance(R), skyIrradiance(R), rough);
+    color += (diffuse * skyIrradiance(N) + f0 * skySeen) * ambient;
     return color;
 }
 

@@ -10,7 +10,7 @@ struct Buffer;
 struct RenderTarget;
 struct Texture;
 
-#define RENDER_FRAME_VERSION 16u
+#define RENDER_FRAME_VERSION 17u
 #define RENDER_RT_MAX_TRACED 8u
 #define RENDER_MAX_CASCADES  4u
 #define RENDER_VIEW_SHIFT    20u // shadow instance stream entry: instance | view << 20
@@ -282,5 +282,22 @@ struct RenderFrame
                                           // (such as shadow resolution) use
     uint32_t upscaleOn;
     float    mipBias;                     // texture LOD bias for the render scale (0 at native): log2(width / displayWidth)
+
+    // Physical sky (renderer_sky, frame v17). sky_prepare runs once the camera, sunOn, sunDir and sunColor (the sun's
+    // light above the atmosphere) are set, before shadows_prepare: it sets sunTransmittance (the share of it that reaches
+    // the camera; the core then scales sunColor by it, so every module sees the sun as it arrives) and the sky's images,
+    // all nullptr without it (the core's gradient sky). sky_run records first of all, before shadows_render, so they are
+    // ready (SHADER_RESOURCE) for probes_render, rt_run and the forward pass.
+    float    sunTransmittance[3];
+    Texture* skyView;      // the sky's radiance around the camera (renderer_sky's skyViewUv), lux-scaled, no sun disk
+    Texture* skyEnv;       // the sky as an octahedral map (y up, as the probes'), skyEnvMips mips, mip m the GGX lobe of
+                           // roughness m / (skyEnvMips - 1); the sky's reflections
+    uint32_t skyEnvMips;
+    Buffer*  skySh;        // 9 float4 (rgb): the sky's ambient, cosine-convolved spherical harmonics over pi (bands 0..2,
+                           // order y, z, x as renderer_sky's Lut.comp.fsl), radiance-like as skyIrradiance was
+    Texture* skyAerial;    // 32 x 32 x 32 RGBA16F froxels over the screen: rgb light scattered in, a transmittance, from the
+                           // camera to slice depth skyAerialDepth (km) x ((slice + 1) / 32)^2
+    float    skyAerialDepth;
+    float    skyRadii[4];  // km: x ground, y top of the atmosphere, z the camera from the planet's centre; w aerial strength
 };
 #define RENDER_RT_MISS 60000.0f

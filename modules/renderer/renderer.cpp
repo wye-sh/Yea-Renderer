@@ -59,6 +59,8 @@ struct GpuFrame
     float    ssr[4];  // x max roughness, y thickness, z max distance, w edge fade
     float    ssr2[4]; // x intensity, y depth copy scale, z steps
     float    rt[4];   // x max roughness of ray-traced reflections
+    float    atmosphere[4];  // renderer_sky: km, ground radius, top, the camera from the centre; aerial strength
+    float    atmosphere2[4]; // aerial volume depth (km), the sky image's mips
     float    taps[32][4]; // xy: the shadow filters' Vogel disk, unturned
 };
 struct GpuMaterial
@@ -78,12 +80,13 @@ struct ExposureData
     float    range[4];
     float    adapt[4];
     uint32_t size[4];
+    float    dark[4];
 };
 
 const uint32_t kFlagCulled = 1, kFlagHeatmap = 2, kFlagCascades = 4, kFlagShadows = 8, kFlagAo = 16, kFlagAoDebug = 32, kFlagContact = 64,
                kFlagContactDebug = 128, kFlagUnlit = 256, kFlagSsr = 512, kFlagSsrDebug = 1024,
                kFlagReceiverPlane = 2048, kFlagRt = 4096, kFlagRtDebug = 8192, kFlagRtShadows = 16384,
-               kFlagRtSun = 32768, kFlagArea = 65536;
+               kFlagRtSun = 32768, kFlagArea = 65536, kFlagSky = 131072;
 const uint32_t kMaxFrames = 4;
 const uint32_t kMaxUnculledLights = 256;
 const uint32_t kHistogramBins = 128;
@@ -128,6 +131,8 @@ uint32_t*      gLookCpu;     // per GPU light: its image + 1, 0 none (gLightLook
 RenderGpuLightShape* gShapeCpu;
 v3                   gCamRight = { 1, 0, 0 }; // the view's right last frame, for a camera looking exactly straight down or up
 Buffer *       gDfg, *gExposure, *gHistogram, *gDummyU32, *gDummyViews, *gDummyProbes;
+Buffer*        gDummySh;     // stands in for renderer_sky's ambient (9 float4)
+Texture*       gDummyVolume; // and its aerial perspective (2 x 2 x 2)
 Buffer *       gPosBuf, *gAttrBuf, *gIndexBuf; // the vertex streams and indices (uploadMeshes)
 uint32_t       gVertexCap, gIndexCap;          // what they hold
 uint32_t       gMeshGen[1024];                 // each mesh row's data generation (RenderCaster::generation)
@@ -762,8 +767,8 @@ void barrierBuf(Cmd* cmd, Buffer* buf, ResourceState from, ResourceState to)
 // (that frame's fence has passed by then, so nothing waits), averaged and logged every 10 s.
 namespace
 {
-enum Timing : uint32_t { kTimeShadows, kTimeProbes, kTimePrepass, kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeVrs, kTimeRt, kTimeForward, kTimeExposure, kTimeTaa, kTimeUpscale, kTimePost, kTimeTonemap, kTimeComposite, kTimeTotal, kTimings };
-const char* const kTimingNames[kTimings] = { "shadows", "probes", "prepass", "culling", "ao", "contact", "ssr", "vrs", "rt", "forward+sky", "exposure", "taa", "upscale", "post", "tonemap", "composite", "total" };
+enum Timing : uint32_t { kTimeSky, kTimeShadows, kTimeProbes, kTimePrepass, kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeVrs, kTimeRt, kTimeForward, kTimeExposure, kTimeTaa, kTimeUpscale, kTimePost, kTimeTonemap, kTimeComposite, kTimeTotal, kTimings };
+const char* const kTimingNames[kTimings] = { "sky", "shadows", "probes", "prepass", "culling", "ao", "contact", "ssr", "vrs", "rt", "forward+sky", "exposure", "taa", "upscale", "post", "tonemap", "composite", "total" };
 QueryPool*        gTimePool[kMaxFrames];
 uint32_t          gTimeUsed[kMaxFrames]; // bits: what that frame recorded
 double            gTimeTicks;            // per second
@@ -1019,6 +1024,7 @@ int load(int reloaded)
     gDummyViews = makeBuffer(sizeof(RenderGpuShadowView) * 4, sizeof(RenderGpuShadowView), DESCRIPTOR_TYPE_BUFFER, cpu, sr,
                              "renderer_dummy_views");
     gDummyProbes = makeBuffer(sizeof(RenderGpuProbe) * 4, sizeof(RenderGpuProbe), DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_dummy_probes");
+    gDummySh = makeBuffer(9 * 16, 16, DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_dummy_sky_sh");
 
     float* dfg = new float[32 * 32 * 2];
     buildDfg(dfg);
@@ -1077,6 +1083,11 @@ int load(int reloaded)
         tl.pDesc = &t;
         tl.ppTexture = &gDummyRates;
         addResource(&tl, nullptr);
+        t.mDepth = 2;
+        t.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
+        t.pName = "renderer_dummy_volume";
+        tl.ppTexture = &gDummyVolume;
+        addResource(&tl, nullptr);
         waitForAllResourceLoads();
     }
     // stands in for the probe array: two slices, so an array view
@@ -1088,7 +1099,7 @@ int load(int reloaded)
     // module cleanly instead of crashing on it later.
     lightImagesInit();
     gLightImages = lightImagesMake();
-    bool made = gDfg && gLtc && gLightImages && gExposure && gHistogram && gDummyU32 && gDummyViews && gDummyProbes && gDummyDepth && gDummyColor &&
+    bool made = gDfg && gLtc && gLightImages && gExposure && gHistogram && gDummyU32 && gDummyViews && gDummyProbes && gDummySh && gDummyVolume && gDummyDepth && gDummyColor &&
                 gDummyRates && gDummyArray && gScenePersistent && gSceneFrame && gCompositeSet && gExposureSet && gTonemapSet && gShadowSampler;
     for (uint32_t i = 0; i < gFrames; ++i)
         made = made && gFrameCb[i] && gCompositeCb[i] && gExposureCb[i] && gInstanceBuf[i] && gMaterialBuf[i] && gLightBuf[i] && gShapeBuf[i] && gLookBuf[i] && gLookBuf[i]->pCpuMappedAddress &&
@@ -1190,6 +1201,10 @@ void unload()
     freeBuffer(gDummyU32);
     freeBuffer(gDummyViews);
     freeBuffer(gDummyProbes);
+    freeBuffer(gDummySh);
+    if (gDummyVolume)
+        removeResource(gDummyVolume);
+    gDummyVolume = nullptr;
     freeBuffer(gDfg);
     freeBuffer(gLtc);
     if (gLightImages)
@@ -1618,6 +1633,16 @@ void draw(uint32_t pass, const YeaFrame* yf)
     F.sunDir[0] = gf->sunDir[0][0];
     F.sunDir[1] = gf->sunDir[0][1];
     F.sunDir[2] = gf->sunDir[0][2];
+    // The sun's light above the atmosphere; with the physical sky (renderer_sky), what of it reaches the camera, so
+    // every module (shadows' tints, probes, ray tracing, the forward pass) sees the sun as it arrives.
+    memcpy(F.sunColor, gf->sunColor[0], sizeof F.sunColor);
+    const bool sky = renderer_sky::sky_prepare((uint64_t)(uintptr_t)&F) && F.skyView && F.skyEnv && F.skySh && F.skyAerial;
+    if (sky)
+        for (int k = 0; k < 3; ++k)
+        {
+            F.sunColor[k] *= F.sunTransmittance[k];
+            gf->sunColor[0][k] = F.sunColor[k];
+        }
     F.positions = gPosBuf;
     F.attributes = gAttrBuf;
     F.indices = gIndexBuf;
@@ -1667,7 +1692,6 @@ void draw(uint32_t pass, const YeaFrame* yf)
     F.drawables = gDrawables;
     F.drawableCount = count;
     F.materials = gMaterialBuf[fi];
-    memcpy(F.sunColor, gf->sunColor[0], sizeof F.sunColor);
     F.skyZenith[0] = zen.x * L, F.skyZenith[1] = zen.y * L, F.skyZenith[2] = zen.z * L;
     F.skyHorizon[0] = hor.x * L, F.skyHorizon[1] = hor.y * L, F.skyHorizon[2] = hor.z * L;
     F.skyGround[0] = gnd.x * L, F.skyGround[1] = gnd.y * L, F.skyGround[2] = gnd.z * L;
@@ -1814,7 +1838,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
                     (contact && F.contactDebug ? kFlagContactDebug : 0) |
                     ((viewMode & YEA_VIEW_WIREFRAME) ? kFlagUnlit : 0) | (ssr ? kFlagSsr : 0) | (ssr && F.ssrDebug ? kFlagSsrDebug : 0) |
                     (shadows && F.receiverPlane ? kFlagReceiverPlane : 0) | (rt ? kFlagRt : 0) | (rt && F.rtDebug ? kFlagRtDebug : 0) |
-                    (rtShadows ? kFlagRtShadows : 0) | (rtShadows && F.rtSunShadows ? kFlagRtSun : 0) | (anyShape ? kFlagArea : 0);
+                    (rtShadows ? kFlagRtShadows : 0) | (rtShadows && F.rtSunShadows ? kFlagRtSun : 0) | (anyShape ? kFlagArea : 0) | (sky ? kFlagSky : 0);
     if (ssr)
     {
         gf->ssr[0] = F.ssrMaxRoughness;
@@ -1827,6 +1851,12 @@ void draw(uint32_t pass, const YeaFrame* yf)
         gf->ssr2[3] = (float)((F.frameNumber % 64u) * 0.6180339887); // rotates the march's noise; TAA averages it
     }
     gf->rt[0] = rt ? F.rtMaxRoughness : 0.0f;
+    if (sky)
+    {
+        memcpy(gf->atmosphere, F.skyRadii, sizeof F.skyRadii);
+        gf->atmosphere2[0] = F.skyAerialDepth;
+        gf->atmosphere2[1] = (float)F.skyEnvMips;
+    }
     if (probes)
     {
         gf->probeInfo[0] = F.probeCount;
@@ -1960,6 +1990,8 @@ void draw(uint32_t pass, const YeaFrame* yf)
     ed->adapt[3] = settings.auto_exposure ? 0.0f : 1.0f;
     ed->size[0] = w;
     ed->size[1] = h;
+    ed->dark[0] = 3.0f; // about a scene lit as the sun sets leaves it, in this renderer's units (the sun ~500 lux)
+    ed->dark[1] = mx::clampf(settings.dark_adaptation, 0, 1);
 
     // Descriptors for this frame.
     {
@@ -1968,7 +2000,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         Buffer*  masks = culled ? F.tileMasks : gDummyU32;
         Buffer*  bins = culled ? F.zbins : gDummyU32;
         Buffer*  views = shadows ? F.shadowViews : gDummyViews;
-        DescriptorData p[21] = {};
+        DescriptorData p[25] = {};
         Texture*       ssrDepth = ssr ? F.ssrDepth : gDummyDepth->pTexture;
         Texture*       previous = ssr ? F.previous->pTexture : gDummyColor->pTexture;
         Texture*       probeTex = probes ? F.probes->pTexture : gDummyArray->pTexture;
@@ -2019,7 +2051,19 @@ void draw(uint32_t pass, const YeaFrame* yf)
         p[19].ppBuffers = &gShapeBuf[fi];
         p[20].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gLightLooks);
         p[20].ppBuffers = &gLookBuf[fi];
-        updateDescriptorSet(gRenderer, fi, gSceneFrame, 21, p);
+        Texture* skyView = sky ? F.skyView : gDummyColor->pTexture;
+        Texture* skyEnv = sky ? F.skyEnv : gDummyColor->pTexture;
+        Buffer*  skySh = sky ? F.skySh : gDummySh;
+        Texture* skyAerial = sky ? F.skyAerial : gDummyVolume;
+        p[21].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gSkyView);
+        p[21].ppTextures = &skyView;
+        p[22].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gSkyEnv);
+        p[22].ppTextures = &skyEnv;
+        p[23].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gSkySh);
+        p[23].ppBuffers = &skySh;
+        p[24].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gSkyAerial);
+        p[24].ppTextures = &skyAerial;
+        updateDescriptorSet(gRenderer, fi, gSceneFrame, 25, p);
 
         DescriptorData c[7] = {};
         c[0].mIndex = SRT_RES_IDX(CompositeSrt, PerFrame, gComposite);
@@ -2085,6 +2129,13 @@ void draw(uint32_t pass, const YeaFrame* yf)
         gExposureState = RESOURCE_STATE_SHADER_RESOURCE;
     }
 
+    if (sky)
+    {
+        if (timed)
+            timeBegin(cmd, fi, kTimeSky);
+        renderer_sky::sky_run((uint64_t)(uintptr_t)&F);
+        timeEnd(cmd, fi, kTimeSky);
+    }
     if (shadows)
     {
         if (timed)

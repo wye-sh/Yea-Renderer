@@ -6,9 +6,54 @@
 
 #include "Brdf.h.fsl"
 
-// Procedural sky: zenith, horizon and ground colours (luminance).
+// --- Sky ---------------------------------------------------------------------------------------
+// The physical sky (renderer_sky, FLAG_SKY: Hillaire 2020), else the procedural gradient: zenith, horizon and ground
+// colours (luminance).
+
+// Where a direction falls in renderer_sky's sky-view LUT (its Atmosphere.h.fsl skyViewUv): azimuth from the sun's,
+// zenith angle finer towards the horizon, the ground below it.
+float2 skyViewUv(float3 d)
+{
+    float r = gFrame.atmosphere.z, Rb = gFrame.atmosphere.x;
+    float beta = acos(clamp(sqrt(max(r * r - Rb * Rb, 0.0)) / r, -1.0, 1.0));
+    float zh = PI - beta;
+    float zenith = acos(clamp(d.y, -1.0, 1.0));
+    float v = zenith < zh ? (1.0 - sqrt(max(1.0 - zenith / zh, 0.0))) * 0.5 : sqrt(saturate((zenith - zh) / beta)) * 0.5 + 0.5;
+    float2 a = d.xz, b = gFrame.sunDir[0].xz;
+    float  la = dot(a, a), lb = dot(b, b);
+    float  cosAz = la > 1e-12 && lb > 1e-12 ? dot(a, b) * rsqrt(la * lb) : 1.0;
+    return float2(sqrt(saturate(0.5 - 0.5 * cosAz)), v);
+}
+
+float2 skyOct(float3 d)
+{
+    float2 p = d.xz / (abs(d.x) + abs(d.y) + abs(d.z));
+    if (d.y < 0.0)
+        p = (float2(1.0, 1.0) - abs(p.yx)) * float2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
+    return p * 0.5 + 0.5;
+}
+
+// The sky's reflection along R at a roughness (its GGX-prefiltered mips).
+float3 skyReflection(float3 R, float rough)
+{
+    return SampleLvlTex2D(gSkyEnv, gSamplerTrilinearClamp, skyOct(R), rough * (gFrame.atmosphere2.y - 1.0)).rgb;
+}
+
+// Distant surfaces fade into the air's own light (aerial perspective): the light scattered in and the transmittance
+// from the camera to P, from renderer_sky's froxels over the screen (uv), slices at depth^2 out to atmosphere2.x km.
+float3 aerialPerspective(float3 color, float3 P, float2 uv)
+{
+    float d = length(P - gFrame.camPos.xyz) * 0.001 * gFrame.atmosphere.w;
+    float w = sqrt(d / gFrame.atmosphere2.x) * 32.0 - 1.0; // slice k ends at depth ((k + 1) / 32)^2
+    float4 a = SampleLvlTex3D(gSkyAerial, gSamplerBilinearClamp, float3(uv, (max(w, 0.0) + 0.5) / 32.0), 0.0);
+    float  f = saturate(w + 1.0); // nearer than the first slice: towards none
+    return color * lerp(1.0, a.a, f) + a.rgb * f;
+}
+
 float3 skyRadiance(float3 d)
 {
+    if ((gFrame.counts.z & FLAG_SKY) != 0u)
+        return SampleLvlTex2D(gSkyView, gSamplerBilinearClamp, skyViewUv(d), 0.0).rgb;
     if (d.y >= 0.0)
         return lerp(gFrame.skyHorizon.rgb, gFrame.skyZenith.rgb, sqrt(saturate(d.y)));
     return lerp(gFrame.skyHorizon.rgb, gFrame.skyGround.rgb, saturate(-d.y * 3.0));
@@ -17,6 +62,14 @@ float3 skyRadiance(float3 d)
 // Cosine-weighted average of the sky seen around N (irradiance / PI).
 float3 skyIrradiance(float3 N)
 {
+    if ((gFrame.counts.z & FLAG_SKY) != 0u)
+    {
+        // renderer_sky's 9 cosine-convolved spherical harmonics (its Lut.comp.fsl's basis and order).
+        float3 c = gSkySh[0].rgb * 0.282095 + (gSkySh[1].rgb * N.y + gSkySh[2].rgb * N.z + gSkySh[3].rgb * N.x) * 0.488603 +
+                   (gSkySh[4].rgb * (N.x * N.y) + gSkySh[5].rgb * (N.y * N.z) + gSkySh[7].rgb * (N.x * N.z)) * 1.092548 +
+                   gSkySh[6].rgb * (0.315392 * (3.0 * N.z * N.z - 1.0)) + gSkySh[8].rgb * (0.546274 * (N.x * N.x - N.y * N.y));
+        return max(c, float3(0.0, 0.0, 0.0));
+    }
     float3 up = lerp(gFrame.skyHorizon.rgb, gFrame.skyZenith.rgb, 0.6);
     float3 down = lerp(gFrame.skyHorizon.rgb, gFrame.skyGround.rgb, 0.85);
     return lerp(down, up, N.y * 0.5 + 0.5);

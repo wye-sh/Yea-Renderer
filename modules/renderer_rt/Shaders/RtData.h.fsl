@@ -30,5 +30,6 @@ STRUCT(RtData)
     DATA(float4, denoise, None);     // the filter: x footprint scale, y largest radius (px), z roughness at or below
                                      // which pixels are copied (full_below: mirror-like)
     DATA(float4, taps[32], None);    // xy: the filters' Vogel disk, unturned (as the core's)
+    DATA(float4, sky, None);         // x 1: renderer_sky's physical sky (gSkyEnv, gSkySh), y gSkyEnv's mips
     DATA(uint4, probe, None);        // TEMPORARY (probe_rays): x shadow rays per pixel to measure, 0 none
 };

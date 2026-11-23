@@ -72,9 +72,10 @@ setting bool discs true
 setting bool spheres true
 setting bool tubes true
 category Sun
-setting float sun_intensity 400 0 inf
-setting color sun_color 1 0.82 0.65
-setting float sun_elevation 22 2 90
+# The sun's light above the atmosphere (lux in this scene's units); the physical sky dims and reddens it on the way down.
+setting float sun_intensity 500 0 inf
+setting color sun_color 1 0.97 0.94
+setting float sun_elevation 22 -10 90
 setting float sun_azimuth 35 0 360
 category Camera
 setting float fov 55 20 100

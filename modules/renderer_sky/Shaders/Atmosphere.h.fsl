@@ -1,0 +1,111 @@
+// The atmosphere (Hillaire, "A Scalable and Production Ready Sky and Atmosphere Rendering Technique", EGSR 2020):
+// a planet of radius `bottom` km under a shell to `top`, with Rayleigh and Mie scattering falling off exponentially
+// with altitude and an ozone layer (absorption only) peaking at 25 km. Distances in km; the scene's metres are 0.001 km
+// above the ground at y = 0. renderer_sky.cpp's transmittance() is the same model on the CPU (the sun's colour).
+// Include after SkyData.h.fsl and the pass's SRT (gSky).
+
+#define SKY_PI 3.14159265358979
+
+struct Medium
+{
+    float3 scattering; // Rayleigh + Mie
+    float3 extinction;
+    float3 rayleigh;
+    float  mie;
+};
+
+Medium mediumAt(float altitude)
+{
+    Medium m;
+    float  r = exp(-altitude / gSky.rayleigh.w);
+    float  mi = exp(-altitude / gSky.mie.w);
+    float  oz = max(0.0, 1.0 - abs(altitude - 25.0) / 15.0);
+    m.rayleigh = gSky.rayleigh.rgb * r;
+    m.mie = gSky.mie.x * mi;
+    m.scattering = m.rayleigh + float3(m.mie, m.mie, m.mie);
+    m.extinction = m.rayleigh + float3(m.mie + gSky.mie.y * mi, m.mie + gSky.mie.y * mi, m.mie + gSky.mie.y * mi) + gSky.ozone.rgb * oz;
+    return m;
+}
+
+// Distance along a ray from height r (from the planet's centre) at cosine mu with the vertical to a sphere of radius R;
+// negative when it misses.
+float raySphere(float r, float mu, float R)
+{
+    float d = r * r * (mu * mu - 1.0) + R * R;
+    return d < 0.0 ? -1.0 : -r * mu + sqrt(d);
+}
+
+// Whether the ray hits the ground before leaving the atmosphere.
+bool hitsGround(float r, float mu) { return mu < 0.0 && r * r * (mu * mu - 1.0) + gSky.radii.x * gSky.radii.x >= 0.0; }
+
+// The transmittance LUT's parametrisation (Bruneton 2017, section 2.3), shared with its compute pass.
+float2 transmittanceUv(float r, float mu)
+{
+    float Rb = gSky.radii.x, Rt = gSky.radii.y;
+    float H = sqrt(Rt * Rt - Rb * Rb);
+    float rho = sqrt(max(r * r - Rb * Rb, 0.0));
+    float d = max(-r * mu + sqrt(max(r * r * (mu * mu - 1.0) + Rt * Rt, 0.0)), 0.0);
+    float dMin = Rt - r, dMax = rho + H;
+    return float2((d - dMin) / max(dMax - dMin, 1e-6), rho / H);
+}
+
+void transmittanceRMu(float2 uv, out float r, out float mu)
+{
+    float Rb = gSky.radii.x, Rt = gSky.radii.y;
+    float H = sqrt(Rt * Rt - Rb * Rb);
+    float rho = H * uv.y;
+    r = sqrt(rho * rho + Rb * Rb);
+    float dMin = Rt - r, dMax = rho + H;
+    float d = dMin + uv.x * (dMax - dMin);
+    mu = d == 0.0 ? 1.0 : clamp((H * H - rho * rho - d * d) / (2.0 * r * d), -1.0, 1.0);
+}
+
+float rayleighPhase(float c) { return 3.0 / (16.0 * SKY_PI) * (1.0 + c * c); }
+
+// Cornette-Shanks, as Hillaire's.
+float miePhase(float c)
+{
+    float g = gSky.mie.z, g2 = g * g;
+    return 3.0 / (8.0 * SKY_PI) * (1.0 - g2) * (1.0 + c * c) / ((2.0 + g2) * pow(max(1.0 + g2 - 2.0 * g * c, 1e-4), 1.5));
+}
+
+// Octahedral mapping of a direction (y up) to 0..1, as the probes' (the sky's reflection image uses it too).
+float2 octEncode(float3 d)
+{
+    float2 p = d.xz / (abs(d.x) + abs(d.y) + abs(d.z));
+    if (d.y < 0.0)
+        p = (float2(1.0, 1.0) - abs(p.yx)) * float2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
+    return p * 0.5 + 0.5;
+}
+
+float3 octDecode(float2 uv)
+{
+    float2 p = uv * 2.0 - 1.0;
+    float3 d = float3(p.x, 1.0 - abs(p.x) - abs(p.y), p.y);
+    if (d.y < 0.0)
+    {
+        float2 q = (float2(1.0, 1.0) - abs(d.zx)) * float2(d.x >= 0.0 ? 1.0 : -1.0, d.z >= 0.0 ? 1.0 : -1.0);
+        d.x = q.x;
+        d.z = q.y;
+    }
+    return normalize(d);
+}
+
+// Where a world direction d (y up) falls in the sky-view LUT, for a camera at height r and the sun along s: the
+// inverse of Lut.comp.fsl's skyViewDir.
+float2 skyViewUv(float3 d, float r, float3 s)
+{
+    float Rb = gSky.radii.x;
+    float beta = acos(clamp(sqrt(max(r * r - Rb * Rb, 0.0)) / r, -1.0, 1.0));
+    float zh = SKY_PI - beta;
+    float zenith = acos(clamp(d.y, -1.0, 1.0));
+    float v;
+    if (zenith < zh)
+        v = (1.0 - sqrt(max(1.0 - zenith / zh, 0.0))) * 0.5;
+    else
+        v = sqrt(saturate((zenith - zh) / beta)) * 0.5 + 0.5;
+    float2 a = d.xz, b = s.xz;
+    float  la = dot(a, a), lb = dot(b, b);
+    float  cosAz = la > 1e-12 && lb > 1e-12 ? dot(a, b) * rsqrt(la * lb) : 1.0;
+    return float2(sqrt(saturate(0.5 - 0.5 * cosAz)), v);
+}

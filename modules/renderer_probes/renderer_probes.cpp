@@ -61,6 +61,7 @@ Pipeline *     gCapturePipe[2], *gDownPipe, *gFilterPipe;
 DescriptorSet *gCaptureSet, *gPassSet;
 Buffer *       gCaptureCb[kMaxFrames], *gViewBuf[kMaxFrames], *gStreamBuf[kMaxFrames], *gProbeBuf[kMaxFrames];
 Buffer*        gPassCb[kPassSets];
+Buffer*        gNoSkySh; // stands in for renderer_sky's SH (9 float4)
 RenderTarget * gChain[kMaxLevels], *gCaptureDepth, *gProbeRt;
 uint32_t       gOcta, gLevels; // probe image size and its mips (also the capture levels)
 bool           gReady;
@@ -419,7 +420,8 @@ int load(int reloaded)
     gStreamCpu = new uint32_t[kMaxEntries];
     gRuns = new Run[kMaxRuns];
     memset(gCapturedAt, 0, sizeof gCapturedAt);
-    gReady = gCapturePipe[0] && gCapturePipe[1] && gDownPipe && gFilterPipe && gCaptureSet && gPassSet;
+    gNoSkySh = makeBuffer(9 * 16, 16, DESCRIPTOR_TYPE_BUFFER, sr, "renderer_probe_no_sky_sh");
+    gReady = gCapturePipe[0] && gCapturePipe[1] && gDownPipe && gFilterPipe && gCaptureSet && gPassSet && gNoSkySh;
     return gReady ? 0 : 1;
 }
 
@@ -439,6 +441,9 @@ void unload()
     for (Buffer* b : gPassCb)
         if (b)
             removeResource(b);
+    if (gNoSkySh)
+        removeResource(gNoSkySh);
+    gNoSkySh = nullptr;
     DescriptorSet* sets[2] = { gCaptureSet, gPassSet };
     for (DescriptorSet* s : sets)
         if (s)
@@ -566,6 +571,7 @@ bool probes_prepare(uint64_t address)
         memcpy(cd.skyHorizon, F->skyHorizon, sizeof F->skyHorizon);
         memcpy(cd.skyGround, F->skyGround, sizeof F->skyGround);
         cd.skyGround[3] = F->ambient;
+        cd.counts[1] = F->skySh ? 1u : 0u;
         cd.counts[0] = F->lightBuffer ? (F->lightCount < kMaxCaptureLights ? F->lightCount : kMaxCaptureLights) : 0;
         memcpy(gCaptureCb[F->frameIndex]->pCpuMappedAddress, &cd, sizeof cd);
         memcpy(gViewBuf[F->frameIndex]->pCpuMappedAddress, gViewsCpu, sizeof(CaptureView) * gTodoCount * 6);
@@ -616,7 +622,10 @@ void probes_render(uint64_t address)
     Cmd*     cmd = F->cmd;
     uint32_t fi = F->frameIndex;
     Buffer*  lights = F->lightBuffer ? F->lightBuffer : gProbeBuf[fi]; // unread when there are none
-    DescriptorData d[5] = {};
+    Buffer*        skySh = F->skySh ? F->skySh : gNoSkySh; // unread without renderer_sky
+    DescriptorData d[6] = {};
+    d[5].mIndex = SRT_RES_IDX(CaptureSrt, PerFrame, gSkySh);
+    d[5].ppBuffers = &skySh;
     d[0].mIndex = SRT_RES_IDX(CaptureSrt, PerFrame, gCapture);
     d[0].ppBuffers = &gCaptureCb[fi];
     d[1].mIndex = SRT_RES_IDX(CaptureSrt, PerFrame, gInstances);
@@ -627,7 +636,7 @@ void probes_render(uint64_t address)
     d[3].ppBuffers = &F->materials;
     d[4].mIndex = SRT_RES_IDX(CaptureSrt, PerFrame, gLights);
     d[4].ppBuffers = &lights;
-    updateDescriptorSet(gRenderer, fi, gCaptureSet, 5, d);
+    updateDescriptorSet(gRenderer, fi, gCaptureSet, 6, d);
 
     cmdBeginDebugMarker(cmd, 0.5f, 0.9f, 0.9f, "Renderer reflection probes");
     for (uint32_t t = 0; t < gTodoCount; ++t)

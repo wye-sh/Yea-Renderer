@@ -179,6 +179,8 @@ import renderer_rt void rt_run(u64 frame)
 import renderer_upscale bool upscale_prepare(u64 frame) = false
 import renderer_upscale void upscale_run(u64 frame)
 import renderer_post u64 post_prepare(u64 frame) = 0
+import renderer_sky bool sky_prepare(u64 frame) = false
+import renderer_sky void sky_run(u64 frame)
 import renderer_post void post_run(u64 frame)
 
 category Exposure
@@ -187,6 +189,9 @@ player exposure_ev
 setting bool auto_exposure true
 setting float manual_ev100 9
 setting float adapt_speed 1.5 0 inf
+# How much auto exposure brightens scenes darker than a sunset (dusk, night, dim interiors): 1 all the way, as bright as
+# day; lower keeps them looking dark.
+setting float dark_adaptation 0.6 0 1
 # How the bright HDR image is fitted to the screen. Khronos PBR Neutral keeps material colours true; AgX rolls
 # bright, saturated light (coloured lamps, the sun) towards white as film does; Hable Filmic is the Uncharted 2
 # curve; Reinhard compresses brightness alone; None clips; ACES Fitted is Stephen Hill's fit of the film

@@ -22,9 +22,22 @@ float4 PS_MAIN(VSOutput In)
     if (dot(N, gViews[In.View].eye.xyz - P) < 0.0)
         N = -N;
     float3 diffuse = m.albedoRough.rgb * (1.0 - 0.5 * saturate(m.params.x));
-    float3 up = lerp(gCapture.skyHorizon.rgb, gCapture.skyZenith.rgb, 0.6);
-    float3 down = lerp(gCapture.skyHorizon.rgb, gCapture.skyGround.rgb, 0.85);
-    float3 c = lerp(down, up, N.y * 0.5 + 0.5) * gCapture.skyGround.w * diffuse;
+    float3 sky;
+    if (gCapture.counts.y != 0u)
+    {
+        // renderer_sky's cosine-convolved SH (the core's skyIrradiance).
+        sky = gSkySh[0].rgb * 0.282095 + (gSkySh[1].rgb * N.y + gSkySh[2].rgb * N.z + gSkySh[3].rgb * N.x) * 0.488603 +
+              (gSkySh[4].rgb * (N.x * N.y) + gSkySh[5].rgb * (N.y * N.z) + gSkySh[7].rgb * (N.x * N.z)) * 1.092548 +
+              gSkySh[6].rgb * (0.315392 * (3.0 * N.z * N.z - 1.0)) + gSkySh[8].rgb * (0.546274 * (N.x * N.x - N.y * N.y));
+        sky = max(sky, float3(0.0, 0.0, 0.0));
+    }
+    else
+    {
+        float3 up = lerp(gCapture.skyHorizon.rgb, gCapture.skyZenith.rgb, 0.6);
+        float3 down = lerp(gCapture.skyHorizon.rgb, gCapture.skyGround.rgb, 0.85);
+        sky = lerp(down, up, N.y * 0.5 + 0.5);
+    }
+    float3 c = sky * gCapture.skyGround.w * diffuse;
     float3 light = gCapture.sunColor.rgb * saturate(dot(N, gCapture.sunDir.xyz)) * gCapture.sunDir.w;
     for (uint i = 0u; i < gCapture.counts.x; ++i)
     {
