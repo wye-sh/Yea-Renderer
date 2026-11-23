@@ -23,6 +23,11 @@
 // feet stay planted), so one model can hold the clips every character uses:
 //   MODEL(hero, "models/Hero.rmodel");   MODEL(moves, "models/Moves.rmodel");
 //   mdl::play(heroPlacement, moves, "Run");
+// Layers (UE's Layered Blend per Bone and additive animation): mdl::layer(h, 1, "Wave", "spine_01") plays Wave over
+// whatever h plays, from that bone down (the legs keep walking); additive (true) adds what a clip does since its first
+// frame on top instead (a breath, a flinch, a lean), at its weight. Slots apply in order; a new clip in a slot crossfades
+// from the old; mdl::unlayer(h, 1) fades it out. Layers carry no root motion and leave morph weights to the base clip.
+//   mdl::layer(hero, 1, "Wave", "spine_01", 1.0f);  mdl::layer(hero, 2, "Breathe", nullptr, 0.6f, true);
 // Root motion: mdl::rootMotion(h, true) plays its clips in place (the travel and turn of the node that carries them left
 // out), and each frame mdl::takeRootMotion(h, m) hands over what was left out, for the game to move it by (as UE's
 // root motion: the game owns where the character is, so it can collide, follow a path or be networked):
@@ -126,11 +131,18 @@ struct Api
     // Retargeting (later in Api: check `size`): another skinned model's clip, played on this one's skeleton; 0 when
     // either isn't skinned or the source has no such clip.
     int (*playFrom)(uint32_t placement, uint32_t model, const char* clip, float speed, int loop, float fade);
+    // Layers (later in Api: check `size`). layer: slot's clip (model 0: its own) over the placement's pose from `bone`
+    // down (nullptr or "": all), overriding it or (additive) added to it, faded to `weight` over `fade` seconds; 0 when
+    // the clip or bone isn't there. unlayer: the slot faded out and gone.
+    int (*layer)(uint32_t placement, uint32_t slot, uint32_t model, const char* clip, const char* bone, float weight, int additive,
+                 float speed, int loop, float fade);
+    void (*unlayer)(uint32_t placement, uint32_t slot, float fade);
 };
 inline bool hasAnim(const Api* a) { return a->size >= offsetof(Api, morph); }
 inline bool hasMorph(const Api* a) { return a->size >= offsetof(Api, rootMotion); }
 inline bool hasRootMotion(const Api* a) { return a->size >= offsetof(Api, playFrom); }
-inline bool hasRetarget(const Api* a) { return a->size >= sizeof(Api); }
+inline bool hasRetarget(const Api* a) { return a->size >= offsetof(Api, layer); }
+inline bool hasLayers(const Api* a) { return a->size >= sizeof(Api); }
 
 struct Model;
 namespace detail
@@ -308,6 +320,29 @@ inline bool play(uint32_t placement, const Model& from, const char* clip, float 
 {
     const Api* a = detail::api();
     return a && placement && from.id && hasRetarget(a) && a->playFrom(placement, from.id, clip, speed, loop ? 1 : 0, fade);
+}
+// A clip as layer `slot` over what it plays (its own clips, or `from`'s retargeted onto it): from `bone` down (nullptr
+// or "": the whole body), overriding the pose there or, `additive`, adding what the clip does since its first frame;
+// faded to `weight` over `fade` seconds. False: no such clip or bone (or no layers in this renderer_models).
+inline bool layer(uint32_t placement, uint32_t slot, const char* clip, const char* bone = nullptr, float weight = 1.0f,
+                  bool additive = false, float fade = 0.2f, float speed = 1.0f, bool loop = true)
+{
+    const Api* a = detail::api();
+    return a && placement && hasLayers(a) && a->layer(placement, slot, 0, clip, bone, weight, additive ? 1 : 0, speed, loop ? 1 : 0, fade);
+}
+inline bool layer(uint32_t placement, uint32_t slot, const Model& from, const char* clip, const char* bone = nullptr,
+                  float weight = 1.0f, bool additive = false, float fade = 0.2f, float speed = 1.0f, bool loop = true)
+{
+    const Api* a = detail::api();
+    return a && placement && from.id && hasLayers(a) &&
+           a->layer(placement, slot, from.id, clip, bone, weight, additive ? 1 : 0, speed, loop ? 1 : 0, fade);
+}
+// Layer `slot` faded out over `fade` seconds, then gone.
+inline void unlayer(uint32_t placement, uint32_t slot, float fade = 0.2f)
+{
+    const Api* a = detail::api();
+    if (a && placement && hasLayers(a))
+        a->unlayer(placement, slot, fade);
 }
 // Root motion on (its clips play in place) or off (as authored). False: it isn't skinned.
 inline bool rootMotion(uint32_t placement, bool on)

@@ -41,6 +41,9 @@ float *            gWeights, *gFromWeights; // a placement's morph weights, and 
 // Retargeting (made in load()): a source's sampled poses and weights, pose()'s scratch, and the maps between two
 // skeletons (each made the first time a placement plays one's clips on the other, in this module's update).
 anim::Pose*        gSrcPoses;
+anim::Pose *       gLayerPoses, *gLayerRef; // a layer's clip as sampled, and its first frame (additive)
+uint8_t*           gLayerMask;              // the nodes it covers
+constexpr uint32_t kMaskPending = 0xFFFFFFFEu; // a layer's bone named while its model loads
 float*             gSrcWeights;
 retarget::Scratch  gRt;
 struct MapSlot
@@ -751,6 +754,39 @@ bool evaluate(const Entry& e, const PlacementAnim& a, const float* held = nullpt
         anim::blendPoses(gFrom, gPoses, n, f);
         memcpy(gPoses, gFrom, sizeof(anim::Pose) * n);
     }
+    // Its layers over that, in slot order (older first within a slot, so a slot's new clip crossfades over its old).
+    uint32_t order[16], count = 0;
+    for (uint32_t i = 0; placement && gLayerPoses && i < PlacementLayers.size() && count < 16; ++i)
+    {
+        const PlacementLayer& L = PlacementLayers[i];
+        if (L.placement != placement || L.weight <= 0 || L.want || L.mask == kMaskPending)
+            continue;
+        uint32_t k = count++;
+        for (; k > 0; --k) // insertion by (slot, seq)
+        {
+            const PlacementLayer& P = PlacementLayers[order[k - 1]];
+            if (P.slot < L.slot || (P.slot == L.slot && P.seq < L.seq))
+                break;
+            order[k] = order[k - 1];
+        }
+        order[k] = i;
+    }
+    for (uint32_t k = 0; k < count; ++k)
+    {
+        const PlacementLayer& L = PlacementLayers[order[k]];
+        const Entry*          s = sourceOf(e, L.source);
+        if (!s || L.clip >= s->skel->clipCount || !sampleAs(e, s, L.clip, L.time, L.loop, still, gLayerPoses, nullptr))
+            continue;
+        const float w = L.weight < 1 ? L.weight * L.weight * (3 - 2 * L.weight) : 1.0f; // eased, as clip fades
+        anim::layerMask(e.nodes, n, L.mask, gLayerMask);
+        if (L.additive)
+        {
+            if (sampleAs(e, s, L.clip, 0, false, still, gLayerRef, nullptr))
+                anim::layerAdd(gPoses, gLayerPoses, gLayerRef, gLayerMask, n, w);
+        }
+        else
+            anim::layerOverride(gPoses, gLayerPoses, gLayerMask, n, w);
+    }
     anim::palette(e.nodes, n, e.bones, e.skel->boneCount, gPoses, gWorld, gPalette);
     return true;
 }
@@ -779,6 +815,70 @@ int        apiJoint(uint32_t h, const char* name, float* out)
     anim::poseMatrix(placed, m);
     anim::mul34(m, &gWorld[node * 12], out);
     return 1;
+}
+void     apiUnlayer(uint32_t h, uint32_t slot, float fade);
+uint32_t nodeNamed(const Entry& e, const char* name)
+{
+    for (uint32_t i = 0; name && e.nodes && i < e.skel->nodeCount; ++i)
+        if (!strncmp(e.nodes[i].name, name, sizeof e.nodes[i].name))
+            return i;
+    return kNoClip;
+}
+int apiLayer(uint32_t h, uint32_t slot, uint32_t model, const char* clip, const char* bone, float weight, int additive, float speed,
+             int loop, float fade)
+{
+    const uint32_t row = placementRow(h);
+    const Entry*   t = row != 0xFFFFFFFFu ? byKey(Placements[row].key) : nullptr;
+    const Entry*   s = model ? byId(model) : t;
+    if (!t || !s || !clip || !clip[0] || t->state == 2 || s->state == 2 || (t->state == 1 && !t->anim) || (s->state == 1 && !s->anim))
+        return 0;
+    if (!(weight > 0))
+    {
+        apiUnlayer(h, slot, fade);
+        return 1;
+    }
+    const bool     ready = t->state == 1 && s->state == 1;
+    const uint32_t key = s == t ? 0 : s->key;
+    uint32_t       c = kNoClip, mask = bone && bone[0] ? kMaskPending : kNoClip;
+    if (ready)
+    {
+        c = clipNamed(*s, clip);
+        if (c == kNoClip)
+            return 0;
+        if (bone && bone[0] && (mask = nodeNamed(*t, bone)) == kNoClip)
+            return 0;
+    }
+    const uint32_t want = ready ? 0 : clipHash(clip, 48), maskHash = bone && bone[0] ? clipHash(bone, 48) : 0;
+    uint32_t       seq = 0;
+    for (uint32_t i = 0; i < PlacementLayers.size(); ++i)
+    {
+        PlacementLayer& L = PlacementLayers[i];
+        if (L.placement != h || L.slot != slot)
+            continue;
+        seq = L.seq + 1 > seq ? L.seq + 1 : seq;
+        if (L.target <= 0)
+            continue; // already leaving
+        if (L.source == key && L.clip == c && L.want == want && L.maskHash == maskHash && L.additive == (additive ? 1u : 0u))
+        {
+            L.target = weight, L.fade = fade, L.speed = speed, L.loop = loop ? 1 : 0; // the same layer: re-weighed, its time kept
+            return 1;
+        }
+        L.target = 0, L.fade = fade; // another clip in the slot: the old fades out under the new
+    }
+    PlacementLayer* L = PlacementLayers.add();
+    if (!L)
+        return 0;
+    *L = PlacementLayer{};
+    L->placement = h, L->slot = slot, L->seq = seq, L->source = key, L->clip = c, L->want = want, L->mask = mask,
+    L->maskHash = maskHash, L->additive = additive ? 1 : 0, L->speed = speed, L->loop = loop ? 1 : 0;
+    L->weight = fade > 0 ? 0.0f : weight, L->target = weight, L->fade = fade;
+    return 1;
+}
+void apiUnlayer(uint32_t h, uint32_t slot, float fade)
+{
+    for (uint32_t i = 0; i < PlacementLayers.size(); ++i)
+        if (PlacementLayers[i].placement == h && PlacementLayers[i].slot == slot)
+            PlacementLayers[i].target = 0, PlacementLayers[i].fade = fade;
 }
 uint32_t morphNamed(const Entry& e, const char* name)
 {
@@ -879,7 +979,8 @@ const char* apiClip(uint32_t model, uint32_t index, float* duration)
 }
 mdl::Api gApi = { mdl::kApi, sizeof(mdl::Api), 0,       apiBegin, apiDefine, apiEnd,   apiKnobs, apiPlace, apiMove,
                   apiRemove, apiPlaced,        apiCount, apiInfo,  apiPlay,   apiTime,  apiJoint, apiClips, apiClip,
-                  apiMorph,  apiUnmorph,       apiMorphs, apiMorphTarget, apiRootMotion, apiTakeMotion, apiPlayFrom };
+                  apiMorph,  apiUnmorph,       apiMorphs, apiMorphTarget, apiRootMotion, apiTakeMotion, apiPlayFrom,
+                  apiLayer,  apiUnlayer };
 
 // --- Building models in the renderer's scene (this module's own update) ------------------------------------------
 
@@ -1424,6 +1525,49 @@ void animate(float dt)
         a.speed = gPreview.speed;
         advanceClip(ce, fe, a, gPreview.playing ? dt : 0.0f);
     }
+    // Layers: names taken once their models load, times and weights moved on, faded-out ones and those of placements
+    // that are gone dropped.
+    for (uint32_t i = PlacementLayers.size(); i-- > 0;)
+    {
+        PlacementLayer& L = PlacementLayers[i];
+        const uint32_t  row = placementRow(L.placement);
+        const Entry*    e = row != 0xFFFFFFFFu && Placements[row].alive ? byKey(Placements[row].key) : nullptr;
+        if (!e || e->state == 2 || (e->state == 1 && !e->anim))
+        {
+            PlacementLayers.remove(i);
+            continue;
+        }
+        const Entry* s = e->state == 1 ? sourceOf(*e, L.source) : nullptr;
+        if (!s)
+            continue; // either still loading
+        bool gone = false;
+        if (L.want)
+        {
+            L.clip = clipHashed(*s, L.want), L.want = 0;
+            gone = L.clip == kNoClip;
+        }
+        if (L.mask == kMaskPending)
+        {
+            L.mask = kNoClip;
+            for (uint32_t n = 0; n < e->skel->nodeCount && L.mask == kNoClip; ++n)
+                if (clipHash(e->nodes[n].name, sizeof e->nodes[n].name) == L.maskHash)
+                    L.mask = n;
+            gone = gone || L.mask == kNoClip; // no such bone: the layer goes rather than cover the whole body
+        }
+        const float d = L.target - L.weight;
+        L.weight = L.fade > 0 ? L.weight + (d > 0 ? 1.0f : -1.0f) * fminf(fabsf(d), dt / L.fade) : L.target;
+        if (gone || (L.weight <= 0 && L.target <= 0))
+        {
+            PlacementLayers.remove(i);
+            continue;
+        }
+        if (s != e)
+            mapFor(*e, *s, true);
+        const float dur = s->clips[L.clip].duration;
+        L.time += dt * L.speed;
+        if (dur > 0)
+            L.time = L.loop ? (fmodf(L.time, dur) + (L.time < 0 ? dur : 0)) : (L.time < 0 ? 0 : (L.time > dur ? dur : L.time));
+    }
     // Held weights of placements that are gone go with them.
     for (uint32_t i = MorphOverrides.size(); i-- > 0;)
         if (placementRow(MorphOverrides[i].placement) == 0xFFFFFFFFu)
@@ -1545,6 +1689,9 @@ int load(int reloaded)
     gWeights = new float[kRmodelMaxTargets];
     gFromWeights = new float[kRmodelMaxTargets];
     gSrcPoses = new anim::Pose[kMaxNodes];
+    gLayerPoses = new anim::Pose[kMaxNodes];
+    gLayerRef = new anim::Pose[kMaxNodes];
+    gLayerMask = new uint8_t[kMaxNodes];
     gSrcWeights = new float[kRmodelMaxTargets];
     gRt = { new float[kMaxNodes * 12], new float[kMaxNodes * 4], new float[kMaxNodes * 12], new float[kMaxNodes * 4] };
     gMaps = new MapSlot[kMaps]();
@@ -1579,6 +1726,10 @@ void unload()
     delete[] gMaps;
     delete[] gSrcPoses;
     delete[] gSrcWeights;
+    delete[] gLayerPoses;
+    delete[] gLayerRef;
+    delete[] gLayerMask;
+    gLayerPoses = gLayerRef = nullptr, gLayerMask = nullptr;
     delete[] gRt.sw, delete[] gRt.sq, delete[] gRt.tw, delete[] gRt.tq;
     gMaps = nullptr, gSrcPoses = nullptr, gSrcWeights = nullptr, gRt = {};
     gPoses = gFrom = nullptr;

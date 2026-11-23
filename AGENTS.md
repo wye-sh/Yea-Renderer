@@ -449,12 +449,21 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   morph weights (by target name) come along. A map per pair of skeletons is made in `animate()` (this module's update,
   32 cached, logged once) and remade when either reloads or its Up Axis changes. Table `PlacementRetarget`: whose clip
   plays and whose it fades from. A leg goal out of reach first lowers the pelvis by the least that brings both legs'
-  goals within reach (as UE's IK Rig), so feet stay planted with no stretch; out of reach sideways, the nearest point. Clips are sampled with
+  goals within reach (as UE's IK Rig), so feet stay planted with no stretch; out of reach sideways, the nearest point. Layers
+  (`hasLayers(a)`; UE's Layered Blend per Bone and additive animation): `mdl::layer(h, slot, [otherModel,] "Wave",
+  "spine_01", weight, additive, fade)` plays a clip over the placement's pose from that bone down (nullptr: every node),
+  overriding it there (translation and scale lerped, rotation nlerped by the weight) or, additive, adding what the clip
+  does since its first frame (rotation slerped from identity on the shorter arc, translation added, scale multiplied);
+  up to 16 a placement, applied after the crossfade in slot order; through `sampleAs`, so retargeted and in-place clips
+  layer too. The same clip again in a slot re-weighs it and keeps its time; another crossfades from it; weight eased by
+  smoothstep over `fade`; `mdl::unlayer(h, slot, fade)` fades it out. Bone and clip names wait for the models to load;
+  a layer whose bone, clip or placement is gone is dropped. Layers carry no root motion and no morph weights (the base
+  clip's). Table `PlacementLayer` (8192: placement, slot, order, clip, mask, weight, time), emptied by Reset. Clips are sampled with
   `anim.h` (shared with the cooker: smallest-three rotations, quantised tracks, `sampleClip`, `blendPoses`, `palette`)
   in `YEA_PHASE_LATE` into scratch made in load(), and each part instance gets the palette through `instance_pose`.
   Its tables: `Placement` (a row per
   placement, keyed by the model's owner and name), `PlacementAnim` (beside it: clip, time, speed, loop and the clip
-  it fades from), `PlacementMotion` (beside it: root motion on, and what it gathered), `PlacementRetarget` (beside it), `PartInstance` (the core's instances, one per part), `ModelPart` (each
+  it fades from), `PlacementMotion` (beside it: root motion on, and what it gathered), `PlacementRetarget` (beside it), `PlacementLayer` (a row per layer), `PartInstance` (the core's instances, one per part), `ModelPart` (each
   model's meshes and materials in the core, found again after a reload), state `Scene` (the core's scene_epoch they belong
   to: when it changes, every part and instance is made again). It builds and syncs in `YEA_PHASE_LATE`, after the game's
   modules moved things. Each MODEL line gets the knobs of its each block (scale, up_axis, lod_quality, cast_shadows,

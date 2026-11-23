@@ -235,6 +235,64 @@ inline void palette(const RmodelNode* nodes, uint32_t nodeCount, const RmodelBon
         mul34(&world[bones[b].node * 12], bones[b].invBind, &out[b * 12]);
 }
 
+// Layers (UE's Layered Blend per Bone): `in` marks the nodes a layer covers (a bone and everything under it, or all).
+// Override: each covered node's pose moves toward the layer's by w (lerped, rotations nlerped). Additive: each covered
+// node takes on what the layer did since its reference pose `ref` (its clip's first frame), times w, on top of its own:
+// rotation base * slerp(1, ref⁻¹ * layer, w), translation base + w (layer - ref), scale base * lerp(1, layer / ref, w).
+inline void layerMask(const RmodelNode* nodes, uint32_t count, uint32_t root, uint8_t* in)
+{
+    for (uint32_t n = 0; n < count; ++n)
+        in[n] = root >= count || n == root || (nodes[n].parent >= 0 && in[nodes[n].parent]);
+}
+inline void layerOverride(Pose* base, const Pose* layer, const uint8_t* in, uint32_t count, float w)
+{
+    for (uint32_t n = 0; n < count; ++n)
+        if (in[n])
+        {
+            for (int i = 0; i < 3; ++i)
+                base[n].t[i] += (layer[n].t[i] - base[n].t[i]) * w, base[n].s[i] += (layer[n].s[i] - base[n].s[i]) * w;
+            float q[4];
+            nlerp(base[n].r, layer[n].r, w, q);
+            memcpy(base[n].r, q, 16);
+        }
+}
+inline void layerAdd(Pose* base, const Pose* layer, const Pose* ref, const uint8_t* in, uint32_t count, float w)
+{
+    for (uint32_t n = 0; n < count; ++n)
+        if (in[n])
+        {
+            const float* a = ref[n].r;
+            const float* b = layer[n].r;
+            // d = a⁻¹ b (the turn the layer added), on the shorter arc, scaled by w from no turn
+            float d[4] = { a[3] * b[0] - a[0] * b[3] - a[1] * b[2] + a[2] * b[1], a[3] * b[1] + a[0] * b[2] - a[1] * b[3] - a[2] * b[0],
+                           a[3] * b[2] - a[0] * b[1] + a[1] * b[0] - a[2] * b[3], a[3] * b[3] + a[0] * b[0] + a[1] * b[1] + a[2] * b[2] };
+            if (d[3] < 0)
+                for (float& c : d)
+                    c = -c;
+            const float id[4] = { 0, 0, 0, 1 };
+            float       dw[4];
+            const float h = acosf(d[3] > 1 ? 1 : d[3]), sh = sinf(h);
+            if (sh > 1e-6f) // slerp from no turn: the angle scaled
+            {
+                const float k = sinf(w * h) / sh;
+                for (int i = 0; i < 3; ++i)
+                    dw[i] = d[i] * k;
+                dw[3] = cosf(w * h);
+            }
+            else
+                nlerp(id, d, w, dw);
+            const float* r = base[n].r;
+            const float  o[4] = { r[3] * dw[0] + r[0] * dw[3] + r[1] * dw[2] - r[2] * dw[1], r[3] * dw[1] - r[0] * dw[2] + r[1] * dw[3] + r[2] * dw[0],
+                                  r[3] * dw[2] + r[0] * dw[1] - r[1] * dw[0] + r[2] * dw[3], r[3] * dw[3] - r[0] * dw[0] - r[1] * dw[1] - r[2] * dw[2] };
+            memcpy(base[n].r, o, 16);
+            for (int i = 0; i < 3; ++i)
+            {
+                base[n].t[i] += w * (layer[n].t[i] - ref[n].t[i]);
+                base[n].s[i] *= 1 + w * (ref[n].s[i] != 0 ? layer[n].s[i] / ref[n].s[i] - 1 : 0);
+            }
+        }
+}
+
 // The rest pose of every node.
 inline void restPoses(const RmodelNode* nodes, uint32_t nodeCount, Pose* out)
 {

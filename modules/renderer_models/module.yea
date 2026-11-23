@@ -86,6 +86,25 @@ table PlacementRetarget none 4096
   u32 clip
   u32 from
 end
+# Animation layers (mdl::layer): a clip over a placement's own from a bone down (or whole), overriding or added,
+# faded in and out by weight; applied in slot order, then by seq (older first).
+table PlacementLayer none 8192
+  u32 placement
+  u32 slot
+  u32 seq
+  u32 source
+  u32 clip
+  u32 want
+  u32 mask
+  u32 maskHash
+  u32 additive
+  float time
+  float speed
+  u32 loop
+  float weight
+  float target
+  float fade
+end
 # The renderer's instances a placement draws with, one per part of its model.
 table PartInstance none 65536
   u32 placement
