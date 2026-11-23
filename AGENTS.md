@@ -167,7 +167,8 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   jittered inside it each frame (R2 across, golden ratio along) the medium and the light it scatters to the camera: the
   sun as it arrives through one filtered compare in its cascade (none while renderer_rt traces the sun: no cascades
   then), the sky's mean radiance (the SH's first band, else the gradient's exact average) times the core's ambient, and
-  the local lights in the core's z-bin at that depth (windowed inverse square, spot cone, rects and discs one-sided, area
+  the local lights in the group's own list (each 4x4x4 group first culls every visible light's sphere against its froxels'
+  view-space box into a shared bitmask, read in light order: the same sum as over all lights; windowed inverse square, spot cone, rects and discs one-sided, area
   lights no nearer than their size) with one compare in their shadow map; a Henyey-Greenstein phase (anisotropy). It
   blends 0.9 of last frame's froxel at the same world point (reprojected with last frame's camera; off with temporal,
   or after a resize, a skipped frame or a quality change). INTEGRATE (8x8, one thread a column) runs Frostbite's

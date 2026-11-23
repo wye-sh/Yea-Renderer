@@ -12,6 +12,12 @@
 
 #define FOG_PI 3.14159265
 
+#if defined(VULKAN)
+#define FirstBitLow(x) uint(findLSB(x))
+#else
+#define FirstBitLow(x) firstbitlow(x)
+#endif
+
 // Where slice edge s (fractional) lies in view depth.
 float sliceDepth(float s) { return gFog.depth.x * (exp2(s * gFog.depth.y * gFog.depth.w) - 1.0); }
 
@@ -101,11 +107,46 @@ float3 localLight(uint i, float3 P, float3 V, float g, bool maps)
     return l.color.rgb * (atten * phaseHG(dot(V, L), g));
 }
 
+// The group's own light list: a bit per light (up to 4096) whose sphere reaches the group's 4 x 4 x 4 froxels.
+#define MAX_WORDS 128u
+GroupShared(uint, gsMask[MAX_WORDS]);
+
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(4, 4, 4)
-void CS_MAIN(SV_DispatchThreadID(uint3) id)
+void CS_MAIN(SV_DispatchThreadID(uint3) id, SV_GroupID(uint3) gid, SV_GroupIndex(uint) gi)
 {
     INIT_MAIN;
+    // Cull the lights against the group's froxels, every thread taking a share. A light left out has its sphere wholly
+    // outside them, where it adds exactly nothing: the sum over the list is the sum over every light, in the same order.
+    uint words = min((gFog.counts.x + 31u) / 32u, MAX_WORDS);
+    for (uint w = gi; w < words; w += 64u)
+        gsMask[w] = 0u;
+    GroupMemoryBarrier();
+    {
+        // The group's box in view space (+z forward): its columns' screen rectangle between its slices' depths.
+        float2 res = float2(gFog.camPos.w, gFog.albedo.w);
+        float2 uv0 = float2(gid.xy * 4u * gFog.size.w) / res;
+        float2 uv1 = float2(min(gid.xy * 4u + 4u, gFog.size.xy) * gFog.size.w) / res;
+        float  z0 = sliceDepth(float(gid.z * 4u));
+        float  z1 = sliceDepth(float(min(gid.z * 4u + 4u, gFog.size.z)));
+        float  nx0 = uv0.x * 2.0 - 1.0, nx1 = uv1.x * 2.0 - 1.0;
+        float  ny0 = 1.0 - uv1.y * 2.0, ny1 = 1.0 - uv0.y * 2.0;
+        float3 lo = float3(nx0 * (nx0 < 0.0 ? z1 : z0) / gFog.proj.x, ny0 * (ny0 < 0.0 ? z1 : z0) / gFog.proj.y, z0);
+        float3 hi = float3(nx1 * (nx1 > 0.0 ? z1 : z0) / gFog.proj.x, ny1 * (ny1 > 0.0 ? z1 : z0) / gFog.proj.y, z1);
+        uint   n = min(gFog.counts.x, MAX_WORDS * 32u);
+        for (uint i = gi; i < n; i += 64u)
+        {
+            float4 sp = float4(gLights[i].sphere.xyz, 1.0);
+            float3 c = float3(dot(gFog.view[0], sp), dot(gFog.view[1], sp), dot(gFog.view[2], sp));
+            float3 d = max(lo - c, float3(0.0, 0.0, 0.0)) + max(c - hi, float3(0.0, 0.0, 0.0));
+            if (dot(d, d) <= gLights[i].sphere.w * gLights[i].sphere.w)
+            {
+                uint prev;
+                AtomicOr(gsMask[i >> 5], 1u << (i & 31u), prev);
+            }
+        }
+    }
+    GroupMemoryBarrier();
     if (id.x >= gFog.size.x || id.y >= gFog.size.y || id.z >= gFog.size.z)
         RETURN();
     // A point jittered inside the froxel (the jitter changes each frame; the history averages it).
@@ -139,18 +180,15 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
         if (gFog.sunDir.w > 0.0)
             Lin += gFog.sunColor.rgb * (sunVisibility(P, viewZ) * phaseHG(dot(V, gFog.sunDir.xyz), g));
         bool maps = (gFog.counts.z & 1u) != 0u;
-        if ((gFog.counts.z & 2u) != 0u)
+        for (uint w = 0u; w < words; ++w)
         {
-            // The core's depth bins: the lights (sorted by view depth) whose spheres reach this depth.
-            uint bin = gZBins[min(uint(viewZ * gFog.misc.x), gFog.counts.w - 1u)];
-            uint last = min(bin >> 16, gFog.counts.x - 1u);
-            for (uint i = bin & 0xFFFFu; i <= last && gFog.counts.x > 0u; ++i)
-                Lin += localLight(i, P, V, g, maps);
-        }
-        else
-        {
-            for (uint i = 0u; i < gFog.counts.x; ++i)
-                Lin += localLight(i, P, V, g, maps);
+            uint mask = gsMask[w];
+            while (mask != 0u)
+            {
+                uint b = FirstBitLow(mask);
+                mask &= mask - 1u;
+                Lin += localLight(w * 32u + b, P, V, g, maps);
+            }
         }
         now.rgb = scatter * Lin;
     }

@@ -55,7 +55,7 @@ Pipeline*      gPipe[kPasses];
 Sampler*       gShadowCmp;
 DescriptorSet* gPersistent, *gSet;
 Buffer*        gCb[kMaxFrames], *gVolumeBuf[kMaxFrames];
-Buffer*        gDummyViews, *gDummyBins, *gDummySh;
+Buffer*        gDummyViews, *gDummySh;
 RenderTarget*  gDummyAtlas;
 Texture*       gLight[2], *gVolume; // this frame's and last frame's light (ping-pong), the integrated volume
 uint32_t       gGrid[3], gPixels, gCur;
@@ -66,7 +66,7 @@ FogData  gData;
 bool     gOn, gHaveHistory;
 uint64_t gLastFrame;
 float    gPrevView[3][4], gPrevProj[4];
-Buffer*  gLights, *gShapes, *gBins, *gViews, *gSh;
+Buffer*  gLights, *gShapes, *gViews, *gSh;
 Texture* gSunAtlas, *gLocalAtlas;
 
 Buffer* makeBuffer(uint64_t size, uint32_t stride, uint32_t descriptors, const char* name)
@@ -214,7 +214,6 @@ int load(int reloaded)
         addRenderTarget(gRenderer, &t, &gDummyAtlas);
     }
     gDummyViews = makeBuffer(sizeof(RenderGpuShadowView) * 4, sizeof(RenderGpuShadowView), DESCRIPTOR_TYPE_BUFFER, "renderer_fog_no_views");
-    gDummyBins = makeBuffer(16, 4, DESCRIPTOR_TYPE_BUFFER, "renderer_fog_no_bins");
     gDummySh = makeBuffer(9 * 16, 16, DESCRIPTOR_TYPE_BUFFER, "renderer_fog_no_sh");
     for (uint32_t i = 0; i < gFrames; ++i)
     {
@@ -226,13 +225,12 @@ int load(int reloaded)
     DescriptorSetDesc perFrame = SRT_SET_DESC(FogSrt, PerFrame, gFrames * kPasses, 0);
     addDescriptorSet(gRenderer, &perFrame, &gSet);
     waitForAllResourceLoads();
-    bool ok = gShadowCmp && gDummyAtlas && gDummyAtlas->pTexture && gDummyViews && gDummyBins && gDummySh && gPersistent && gSet;
+    bool ok = gShadowCmp && gDummyAtlas && gDummyAtlas->pTexture && gDummyViews && gDummySh && gPersistent && gSet;
     for (uint32_t i = 0; i < gFrames; ++i)
         ok = ok && gCb[i] && gCb[i]->pCpuMappedAddress && gVolumeBuf[i] && gVolumeBuf[i]->pCpuMappedAddress;
     if (!ok)
         return 1;
     memset(gDummySh->pCpuMappedAddress, 0, 9 * 16);
-    memset(gDummyBins->pCpuMappedAddress, 0xFF, 16);
     memset(gDummyViews->pCpuMappedAddress, 0, sizeof(RenderGpuShadowView) * 4);
     DescriptorData s = {};
     s.mIndex = SRT_RES_IDX(FogSrt, Persistent, gShadowCmp);
@@ -256,7 +254,7 @@ void unload()
             removeResource(gVolumeBuf[i]);
         gCb[i] = gVolumeBuf[i] = nullptr;
     }
-    Buffer** bufs[] = { &gDummyViews, &gDummyBins, &gDummySh };
+    Buffer** bufs[] = { &gDummyViews, &gDummySh };
     for (Buffer** b : bufs)
     {
         if (*b)
@@ -446,16 +444,13 @@ bool fog_prepare(uint64_t address)
         for (int k = 0; k < 3; ++k)
             d.ambient[k] = (F->skyHorizon[k] * (1.0f / 3.0f + 1.0f / 6.0f) + F->skyZenith[k] * (2.0f / 3.0f) + F->skyGround[k] * (5.0f / 6.0f)) *
                            0.5f * F->ambient;
-    d.misc[0] = F->zbins ? F->binScale : 0.0f;
     d.misc[2] = F->sunTexel;
     d.misc[3] = F->localTexel;
     d.counts[0] = F->lightCount;
     d.counts[1] = volumes;
-    d.counts[2] = (shadowMaps ? 1u : 0u) | (F->zbins && F->binCount ? 2u : 0u);
-    d.counts[3] = F->binCount;
+    d.counts[2] = shadowMaps ? 1u : 0u;
     gLights = F->lightBuffer;
     gShapes = F->lightShapes;
-    gBins = F->zbins ? F->zbins : gDummyBins;
     gViews = shadowMaps ? F->shadowViews : gDummyViews;
     gSh = F->skySh ? F->skySh : gDummySh;
     gSunAtlas = shadowMaps ? F->sunAtlas->pTexture : gDummyAtlas->pTexture;
@@ -496,30 +491,28 @@ void fog_run(uint64_t address)
         Texture*       in = pass == kLight ? before : now;
         Texture*       out = pass == kLight ? now : gVolume;
         Buffer*        volumes = gVolumeBuf[F->frameIndex];
-        DescriptorData p[11] = {};
+        DescriptorData p[10] = {};
         p[0].mIndex = SRT_RES_IDX(FogSrt, PerFrame, gFog);
         p[0].ppBuffers = &gCb[F->frameIndex];
         p[1].mIndex = SRT_RES_IDX(FogSrt, PerFrame, gLights);
         p[1].ppBuffers = &gLights;
         p[2].mIndex = SRT_RES_IDX(FogSrt, PerFrame, gShapes);
         p[2].ppBuffers = &gShapes;
-        p[3].mIndex = SRT_RES_IDX(FogSrt, PerFrame, gZBins);
-        p[3].ppBuffers = &gBins;
-        p[4].mIndex = SRT_RES_IDX(FogSrt, PerFrame, gViews);
-        p[4].ppBuffers = &gViews;
-        p[5].mIndex = SRT_RES_IDX(FogSrt, PerFrame, gVolumes);
-        p[5].ppBuffers = &volumes;
-        p[6].mIndex = SRT_RES_IDX(FogSrt, PerFrame, gSkySh);
-        p[6].ppBuffers = &gSh;
-        p[7].mIndex = SRT_RES_IDX(FogSrt, PerFrame, gSunAtlas);
-        p[7].ppTextures = &gSunAtlas;
-        p[8].mIndex = SRT_RES_IDX(FogSrt, PerFrame, gLocalAtlas);
-        p[8].ppTextures = &gLocalAtlas;
-        p[9].mIndex = SRT_RES_IDX(FogSrt, PerFrame, gIn);
-        p[9].ppTextures = &in;
-        p[10].mIndex = SRT_RES_IDX(FogSrt, PerFrame, gOut);
-        p[10].ppTextures = &out;
-        updateDescriptorSet(gRenderer, index, gSet, 11, p);
+        p[3].mIndex = SRT_RES_IDX(FogSrt, PerFrame, gViews);
+        p[3].ppBuffers = &gViews;
+        p[4].mIndex = SRT_RES_IDX(FogSrt, PerFrame, gVolumes);
+        p[4].ppBuffers = &volumes;
+        p[5].mIndex = SRT_RES_IDX(FogSrt, PerFrame, gSkySh);
+        p[5].ppBuffers = &gSh;
+        p[6].mIndex = SRT_RES_IDX(FogSrt, PerFrame, gSunAtlas);
+        p[6].ppTextures = &gSunAtlas;
+        p[7].mIndex = SRT_RES_IDX(FogSrt, PerFrame, gLocalAtlas);
+        p[7].ppTextures = &gLocalAtlas;
+        p[8].mIndex = SRT_RES_IDX(FogSrt, PerFrame, gIn);
+        p[8].ppTextures = &in;
+        p[9].mIndex = SRT_RES_IDX(FogSrt, PerFrame, gOut);
+        p[9].ppTextures = &out;
+        updateDescriptorSet(gRenderer, index, gSet, 10, p);
         barrierTex(cmd, out, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
         cmdBindPipeline(cmd, gPipe[pass]);
         cmdBindDescriptorSet(cmd, 0, gPersistent);
