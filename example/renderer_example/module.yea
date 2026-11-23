@@ -113,8 +113,10 @@ category Glass, Decals and Models
 setting bool glass true
 # A scorch, a puddle, worn painted lines, patina on the copper block and a glowing strip on the stone ledge.
 setting bool decals true
-# The four sample models (lantern, flight helmet, water bottle, boom box).
+# The sample models (lantern, flight helmet, water bottle, boom box and the Knight).
 setting bool models true
+# The Knight alone (a skinned character: its skinning each frame and its shadow redrawn each frame).
+setting bool knight true
 category Camera
 setting float fov 55 20 100
 setting float look_sensitivity 1 0.1 inf

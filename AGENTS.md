@@ -859,7 +859,7 @@ never kept in the repository): a street lamp by the white boxes, the flight helm
 in front, the boom box on the copper block, placed whole through renderer_models (`state Models`; their sizes are
 `default <model>_scale` lines), and KayKit's Knight (CC0, Kay Lousberg; the same script fetches it at a pinned commit and
 cooks it with one sword and the badge shield, `--hide` the rest), a skinned character with 76 clips idling between the
-shapes and the copper block (`Idle`; Benchmark View holds it at the clip's first frame), in the Model Viewer too, a free-look camera: holding its `look` action (left mouse button) after a press on the game
+shapes and the copper block (`Idle`; Benchmark View holds it at the clip's first frame; its own `knight` knob, under `models`, takes it out), in the Model Viewer too, a free-look camera: holding its `look` action (left mouse button) after a press on the game
 asks the host for the mouse each frame (`yea::captureMouse(true)`: hidden, kept in the window) and turns by
 `yea_mouse_dx`/`yea_mouse_dy` (`look_sensitivity`); the move keys fly (WASD, Q/E down/up, `move_speed`).
 The host lets go when the button is up (it is no longer asked), F1 opens, focus is lost, or on a view switch

@@ -236,6 +236,12 @@ void placeModels()
         models->waterBottle = mdl::place(water_bottle, { 7.4f, 0.52f, 4.4f }, toView);
     if (!mdl::placed(models->boomBox)) // on the copper block
         models->boomBox = mdl::place(boom_box, { 5.0f, 1.4f, 2.0f }, toView);
+    if (!settings.knight)
+    {
+        if (mdl::placed(models->knight))
+            mdl::remove(models->knight); // its skinning and its shadow's redraw go with it
+        return;
+    }
     if (!mdl::placed(models->knight)) // on the floor between the shapes and the copper block, facing the start view
         models->knight = mdl::place(knight, { 2.7f, 0.0f, 1.0f }, toView), models->knightSpeed = 0;
     // It idles; Benchmark View holds it at the clip's first frame, as it holds the lights and shapes.
