@@ -269,7 +269,7 @@ void animate(State* s)
         yea_float4 q = axisAngle({ d.z, 0, -d.x }, acosf(d.y < -1 ? -1 : (d.y > 1 ? 1 : d.y))); // +y onto d
         renderer::instance_place(s->spotHousings[i], { p.x - d.x * 0.16f, p.y - d.y * 0.16f, p.z - d.z * 0.16f }, q, { 0.26f, 0.3f, 0.26f });
         renderer::instance_place(s->spotMarkers[i], { p.x + d.x * 0.0f, p.y + d.y * 0.0f, p.z + d.z * 0.0f }, q, { 0.2f, 0.02f, 0.2f });
-        renderer::light_range(s->spots[i], 16);
+        renderer::light_range(s->spots[i], 20); // reaches the far edge of the sweep (11.9 m) at 77% of the inverse square
     }
     for (uint32_t i = 0; i < s->spinCount; ++i)
         renderer::instance_place(s->spin[i], s->spinPos[i], axisAngle(s->spinAxis[i], t * 0.6f + (float)i), s->spinScale[i]);
