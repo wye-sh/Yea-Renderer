@@ -1,0 +1,82 @@
+module renderer_particles
+
+# Particle emitters games place (dust, steam, smoke, sparks). Rows are never moved; a removed emitter's particles live
+# out their lives.
+table Emitter none 64
+  float3 pos
+  float3 dir
+  float3 extent
+  u32 shape
+  float rate
+  u32 burst
+  float carry
+  float speed
+  float speed_jitter
+  float spread
+  float gravity
+  float drag
+  float turbulence
+  float life_min
+  float life_max
+  float3 color_start
+  float3 color_end
+  float opacity
+  float size_start
+  float size_end
+  float emissive
+  float anisotropy
+  u32 additive
+  u32 gen
+  u32 alive
+end
+
+# Reset starts the pool empty.
+state Pool
+  u32 epoch
+end
+
+# A new emitter at pos (a point; 4294967295 when all 64 are taken): 20 particles a second, rising at 0.5 m/s over a
+# 20 degree cone, living 2 to 3 s, white, 5 cm to 15 cm across, half opaque, lit, alpha-blended.
+export handle particle_emitter_add(float3 pos)
+# Where it is and the direction its particles leave in.
+export void particle_emitter_place(handle e, float3 pos, float3 dir)
+# Where in it they start: shape 0 at its point, 1 in a box of half size `extent`, 2 in a sphere of radius extent.x.
+export void particle_emitter_shape(handle e, u32 shape, float3 extent)
+# Particles a second, and a burst made once at the next frame.
+export void particle_emitter_rate(handle e, float per_second, u32 burst)
+# speed (m/s) along its direction, spread over a cone (degrees from it; 180: every way), speed_jitter (0..1: as slow as
+# speed x (1 - it)), gravity (m/s^2 downwards; negative rises, as steam), drag (per second), turbulence (m/s^2 of
+# swirling air).
+export void particle_emitter_motion(handle e, float speed, float spread_deg, float speed_jitter, float gravity, float drag, float turbulence)
+# Each particle lives a random time between these (s).
+export void particle_emitter_life(handle e, float min_s, float max_s)
+# Its colour at birth and at death (the albedo the light falls on, or the colour of its glow), its radius (m) at birth
+# and death, and how opaque it is at its heart (0..1). It fades in over the first tenth of its life and out over the last
+# two-fifths.
+export void particle_emitter_look(handle e, float3 color_start, float3 color_end, float size_start, float size_end, float opacity)
+# emissive: its own glow (nits per unit of colour; 0: lit only); anisotropy: how much light it sends on forwards
+# (0 all ways, towards 1 bright looking into the light, as dust and mist); additive: adds light without hiding what's
+# behind (sparks, embers), else blended (dust, steam, smoke).
+export void particle_emitter_light(handle e, float emissive, float anisotropy, bool additive)
+export void particle_emitter_remove(handle e)
+# Removes every emitter (their particles live out their lives).
+export void particle_emitter_clear()
+
+# Called by renderer (the core) each frame with the address of its RenderFrame (frame.h): particles_on before the
+# shadows are planned (whether it needs the shadow maps), particles_prepare after fog_prepare, particles_run after
+# fog_run (emit, simulate, light, sort), particles_draw after the forward pass (into hdr, with depth in SHADER_RESOURCE).
+export bool particles_on()
+export bool particles_prepare(u64 frame)
+export void particles_run(u64 frame)
+export void particles_draw(u64 frame)
+
+category Particles
+# Dust, steam, smoke and sparks from the game's emitters.
+setting bool particles true
+player particles
+# The most particles alive at once (memory: 48 bytes each, plus 24 to draw and light them).
+setting int max_particles 32768 1024 65536
+# How far before the scene behind them particles fade out, so they never cut a hard line into it (m).
+setting float soft_distance 0.3 0 inf
+# How close to the camera they fade out (m).
+setting float near_fade 0.3 0 inf

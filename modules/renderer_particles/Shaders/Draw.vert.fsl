@@ -1,0 +1,47 @@
+// A camera-facing quad per listed particle, back to front: vertex 6 q + c is corner c of the list's entry q. Drawn
+// with first vertex 0 (SV_VertexID); entries past the list's end collapse to nothing.
+#include "ParticleData.h.fsl"
+#include "Draw.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float2, Corner, TEXCOORD0);
+    DATA(float4, Color, TEXCOORD1); // rgb its radiance, a its opacity
+    DATA(float2, Depth, TEXCOORD2); // x view depth, y 1: additive
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN(SV_VertexID(uint) vid)
+{
+    INIT_MAIN;
+    VSOutput Out;
+    Out.Position = float4(-2.0, -2.0, 0.5, 1.0);
+    Out.Corner = float2(0.0, 0.0);
+    Out.Color = float4(0.0, 0.0, 0.0, 0.0);
+    Out.Depth = float2(0.0, 0.0);
+    uint q = vid / 6u, c = vid % 6u;
+    if (q >= gCounters[1])
+        RETURN(Out);
+    uint     slot = gList[q].y;
+    Particle p = gParticles[slot];
+    Emitter  e = gEmitters[p.info.x];
+    float    t = saturate(p.pos.w / max(p.vel.w, 1e-6));
+    float    size = lerp(e.size.x, e.size.y, t);
+    // Corners 0 1 2, 0 2 3 of the square, turned by the particle's own angle so neighbours don't line up.
+    float2 corner = c == 0u || c == 3u ? float2(-1.0, -1.0) : (c == 1u ? float2(1.0, -1.0) : (c == 2u || c == 4u ? float2(1.0, 1.0) : float2(-1.0, 1.0)));
+    float  a = float(p.info.y & 0xFFFFu) * (2.0 * PART_PI / 65536.0);
+    float2 turned = float2(corner.x * cos(a) - corner.y * sin(a), corner.x * sin(a) + corner.y * cos(a));
+    float4 w = float4(p.pos.xyz, 1.0);
+    float3 v = float3(dot(gFrame.view[0], w), dot(gFrame.view[1], w), dot(gFrame.view[2], w));
+    v.xy += turned * size;
+    // The core's projection: reversed-Z, infinite far, with this frame's jitter.
+    Out.Position = float4(v.x * gFrame.proj.x + gFrame.proj.z * v.z, v.y * gFrame.proj.y + gFrame.proj.w * v.z, gFrame.camPos.w, v.z);
+    Out.Corner = corner;
+    float3 color = lerp(e.colorStart.rgb, e.colorEnd.rgb, t);
+    // Fading in over its first tenth and out over its last two-fifths.
+    float  opacity = e.colorStart.w * smoothstep(0.0, 0.1, t) * (1.0 - smoothstep(0.6, 1.0, t));
+    Out.Color = float4(color * (gLit[slot].rgb + e.colorEnd.w), opacity);
+    Out.Depth = float2(v.z, e.size.w);
+    RETURN(Out);
+}

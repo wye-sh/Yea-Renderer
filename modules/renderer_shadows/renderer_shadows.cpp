@@ -849,8 +849,8 @@ bool shadows_prepare(uint64_t address)
         memset(views, 0, sizeof(RenderGpuShadowView) * kSunViews);
         gCascades = 0;
     }
-    // Traced: renderer_rt has it, unless fog reads the cascades (fogShadowMaps).
-    if (!gFrozen && settings.enabled && F->sunOn && F->sunShadow && (!F->rtSunShadows || F->fogShadowMaps))
+    // Traced: renderer_rt has it, unless fog or particles read the cascades (keepShadowMaps).
+    if (!gFrozen && settings.enabled && F->sunOn && F->sunShadow && (!F->rtSunShadows || F->keepShadowMaps))
     {
         gCascades = cascades;
         v3    toSun = normalize(V(F->sunDir[0], F->sunDir[1], F->sunDir[2]));
@@ -945,7 +945,7 @@ bool shadows_prepare(uint64_t address)
     {
         RenderLight& l = F->lights[i];
         l.shadow = -1;
-        if (!l.castShadow || !wanted || (l.traced >= 0 && !F->fogShadowMaps)) // traced: renderer_rt has them, unless fog reads the maps
+        if (!l.castShadow || !wanted || (l.traced >= 0 && !F->keepShadowMaps)) // traced: renderer_rt has them, unless fog or particles read the maps
             continue;
         v3    d = V(l.pos[0], l.pos[1], l.pos[2]) - camPos;
         float dist = maxf(length(d) - l.range, 1.0f);

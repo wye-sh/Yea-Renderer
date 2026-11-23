@@ -1,5 +1,5 @@
 // The frame contract between the renderer modules: renderer (the core) fills a RenderFrame each
-// frame and passes its address (as u64) to the other renderer modules (culling, shadows, taa, ao, contact, probes, ssr, vrs, rt, upscale, sky, fog, post). The same
+// frame and passes its address (as u64) to the other renderer modules (culling, shadows, taa, ao, contact, probes, ssr, vrs, rt, upscale, sky, fog, particles, post). The same
 // file sits in each of them; keep the copies identical and raise RENDER_FRAME_VERSION on any change.
 #pragma once
 #include <stdint.h>
@@ -10,7 +10,7 @@ struct Buffer;
 struct RenderTarget;
 struct Texture;
 
-#define RENDER_FRAME_VERSION 19u
+#define RENDER_FRAME_VERSION 20u
 #define RENDER_RT_MAX_TRACED 8u
 #define RENDER_MAX_CASCADES  4u
 #define RENDER_VIEW_SHIFT    20u // shadow instance stream entry: instance | view << 20
@@ -311,7 +311,14 @@ struct RenderFrame
     // mean light scattered in. Set by fog_prepare; fogMedium[0] 0 without fog.
     float    fogMedium[4]; // x density (1/m) at and below z (base height, m), y falloff above it (1/m), w anisotropy g
     float    fogAlbedo[4]; // rgb scattering albedo, w the fog's range (m): how much of it a ray that leaves (the sky) crosses
-    uint32_t fogShadowMaps; // set by the core before rt_pick while renderer_fog runs: renderer_shadows keeps the sun's
-                            // cascades and traced lights' tiles even when renderer_rt traces them (the fog reads the maps)
+    uint32_t keepShadowMaps; // set by the core before rt_pick while renderer_fog or renderer_particles runs (frame v20; v19
+                             // fogShadowMaps): renderer_shadows keeps the sun's cascades and traced lights' tiles even when
+                             // renderer_rt traces them (fog and particles read the maps)
+
+    // Particles (renderer_particles, frame v20). particles_prepare runs after fog_prepare (nullptr reactive without it),
+    // particles_run after fog_run, particles_draw after the forward pass, into hdr at render size, with depth in
+    // SHADER_RESOURCE; before exposure, TAA and the upscaler.
+    Texture* reactive;      // R8 at render size, SHADER_RESOURCE after particles_draw: how much of each pixel is particle (0
+                            // where none drew), for TAA and the upscalers (their reactive or bias masks); nullptr: none drawn
 };
 #define RENDER_RT_MISS 60000.0f

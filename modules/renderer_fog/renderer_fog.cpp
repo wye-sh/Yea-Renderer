@@ -422,7 +422,7 @@ bool fog_prepare(uint64_t address)
     d.height[3] = fminf(fmaxf(settings.anisotropy, -0.9f), 0.95f);
     d.albedo[0] = fminf(fmaxf(albedo.x, 0), 1), d.albedo[1] = fminf(fmaxf(albedo.y, 0), 1), d.albedo[2] = fminf(fmaxf(albedo.z, 0), 1);
     d.albedo[3] = (float)F->height;
-    // The sun as it arrives, shadowed by its cascades (kept while renderer_rt traces it: the core sets fogShadowMaps).
+    // The sun as it arrives, shadowed by its cascades (kept while renderer_rt traces it: the core sets keepShadowMaps).
     const bool shadowMaps = F->shadowViews && F->sunAtlas && F->localAtlas;
     if (F->sunOn)
     {
@@ -432,7 +432,7 @@ bool fog_prepare(uint64_t address)
             d.sunDir[k] = l > 0 ? d.sunDir[k] / l : 0.0f;
         d.sunDir[3] = 1.0f;
         memcpy(d.sunColor, F->sunColor, sizeof F->sunColor);
-        d.sunColor[3] = shadowMaps && F->sunShadow && (!F->rtSunShadows || F->fogShadowMaps) ? (float)F->cascadeCount : 0.0f;
+        d.sunColor[3] = shadowMaps && F->sunShadow && (!F->rtSunShadows || F->keepShadowMaps) ? (float)F->cascadeCount : 0.0f;
         memcpy(d.cascadeEnd, F->cascadeEnd, sizeof d.cascadeEnd);
     }
     // The sky's light from all round: its mean radiance (the physical sky's first harmonic, else the gradient's average:

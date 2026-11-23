@@ -771,8 +771,8 @@ void barrierBuf(Cmd* cmd, Buffer* buf, ResourceState from, ResourceState to)
 // (that frame's fence has passed by then, so nothing waits), averaged and logged every 10 s.
 namespace
 {
-enum Timing : uint32_t { kTimeSky, kTimeShadows, kTimeProbes, kTimePrepass, kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeVrs, kTimeRt, kTimeFog, kTimeForward, kTimeExposure, kTimeTaa, kTimeUpscale, kTimePost, kTimeTonemap, kTimeComposite, kTimeTotal, kTimings };
-const char* const kTimingNames[kTimings] = { "sky", "shadows", "probes", "prepass", "culling", "ao", "contact", "ssr", "vrs", "rt", "fog", "forward+sky", "exposure", "taa", "upscale", "post", "tonemap", "composite", "total" };
+enum Timing : uint32_t { kTimeSky, kTimeShadows, kTimeProbes, kTimePrepass, kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeVrs, kTimeRt, kTimeFog, kTimeParticles, kTimeForward, kTimeParticlesDraw, kTimeExposure, kTimeTaa, kTimeUpscale, kTimePost, kTimeTonemap, kTimeComposite, kTimeTotal, kTimings };
+const char* const kTimingNames[kTimings] = { "sky", "shadows", "probes", "prepass", "culling", "ao", "contact", "ssr", "vrs", "rt", "fog", "particles", "forward+sky", "particles-draw", "exposure", "taa", "upscale", "post", "tonemap", "composite", "total" };
 QueryPool*        gTimePool[kMaxFrames];
 uint32_t          gTimeUsed[kMaxFrames]; // bits: what that frame recorded
 double            gTimeTicks;            // per second
@@ -1680,9 +1680,10 @@ void draw(uint32_t pass, const YeaFrame* yf)
         F.lightCount = kMaxUnculledLights;
     // Ray-traced shadows (renderer_rt): its pick comes first, so renderer_shadows draws nothing for what it traces.
     const bool rtGate = taa && !viewMode && gRaytracing && gSurface && gDepthSurfacePipe[0] && gDepthSurfacePipe[1] && F.previous;
-    // While fog runs it reads the shadow maps: renderer_shadows keeps them even for what renderer_rt traces.
+    // While fog or particles run they read the shadow maps: renderer_shadows keeps them even for what renderer_rt traces.
     const bool fogMaps = !viewMode && renderer_fog::fog_on();
-    F.fogShadowMaps = fogMaps ? 1u : 0u;
+    const bool particlesOn = !viewMode && renderer_particles::particles_on();
+    F.keepShadowMaps = fogMaps || particlesOn ? 1u : 0u;
     const bool rtPicked = rtGate && renderer_rt::rt_pick((uint64_t)(uintptr_t)&F);
     if (!rtPicked)
     {
@@ -1706,6 +1707,8 @@ void draw(uint32_t pass, const YeaFrame* yf)
     // Volumetric fog (renderer_fog): it reads the lights, their bins and shadow views, and the sky, all set by now; probes
     // and ray-traced reflections then read its height fog (fogMedium).
     const bool fog = fogMaps && renderer_fog::fog_prepare((uint64_t)(uintptr_t)&F) && F.fogVolume;
+    // Particles (renderer_particles): lit from the same lights, shadows, sky and fog.
+    const bool particles = particlesOn && renderer_particles::particles_prepare((uint64_t)(uintptr_t)&F);
     bool probes = renderer_probes::probes_prepare((uint64_t)(uintptr_t)&F) && F.probes && F.probeData && F.probeCount;
     // Ray-traced reflections where the GPU has ray queries; screen-space ones otherwise.
     F.surface = gSurface;
@@ -2178,6 +2181,13 @@ void draw(uint32_t pass, const YeaFrame* yf)
         renderer_fog::fog_run((uint64_t)(uintptr_t)&F);
         timeEnd(cmd, fi, kTimeFog);
     }
+    if (particles)
+    {
+        if (timed)
+            timeBegin(cmd, fi, kTimeParticles);
+        renderer_particles::particles_run((uint64_t)(uintptr_t)&F);
+        timeEnd(cmd, fi, kTimeParticles);
+    }
 
     bool geometry = gPosBuf && gIndexBuf && count > 0;
     if (gDepthState != RESOURCE_STATE_DEPTH_WRITE)
@@ -2299,6 +2309,16 @@ void draw(uint32_t pass, const YeaFrame* yf)
     gDepthState = RESOURCE_STATE_DEPTH_WRITE;
     cmdEndDebugMarker(cmd);
     timeEnd(cmd, fi, kTimeForward);
+    // Particles over the lit scene, soft against its depth, before exposure meters it and TAA or the upscaler resolve it.
+    if (particles)
+    {
+        if (timed)
+            timeBegin(cmd, fi, kTimeParticlesDraw);
+        barrierRt(cmd, gDepth, RESOURCE_STATE_DEPTH_WRITE, RESOURCE_STATE_SHADER_RESOURCE);
+        gDepthState = RESOURCE_STATE_SHADER_RESOURCE;
+        renderer_particles::particles_draw((uint64_t)(uintptr_t)&F);
+        timeEnd(cmd, fi, kTimeParticlesDraw);
+    }
 
     // Auto exposure: histogram, then the adapted exposure. Held still in a view mode or a debug view,
     // so it never meters (and chases) the debug image, and is where it was when it ends.
@@ -2323,7 +2343,8 @@ void draw(uint32_t pass, const YeaFrame* yf)
         const uint32_t slot = upscaled ? kTimeUpscale : kTimeTaa;
         if (timed)
             timeBegin(cmd, fi, slot);
-        barrierRt(cmd, gDepth, RESOURCE_STATE_DEPTH_WRITE, RESOURCE_STATE_SHADER_RESOURCE);
+        if (gDepthState != RESOURCE_STATE_SHADER_RESOURCE)
+            barrierRt(cmd, gDepth, gDepthState, RESOURCE_STATE_SHADER_RESOURCE);
         gDepthState = RESOURCE_STATE_SHADER_RESOURCE;
         if (upscaled)
             renderer_upscale::upscale_run((uint64_t)(uintptr_t)&F);

@@ -232,6 +232,8 @@ void build(State* s)
     s->built = 0;
     renderer::clear();
     renderer_probes::probe_clear();
+    renderer_particles::particle_emitter_clear();
+    particles->dust = particles->steam = 0;
     s->lightCount = s->spinCount = 0;
     s->sun = kNone;
     // Segments so the silhouettes stay round in the close-ups (a sphere filling the screen at 2560x1356 is under a
@@ -429,6 +431,53 @@ void addArea(State* s, uint32_t i)
 bool areaOn(uint32_t type)
 {
     return type == 3 ? settings.rects : type == 4 ? settings.discs : type == 5 ? settings.spheres : settings.tubes;
+}
+
+// The particle emitters the knobs ask for (a handle + 1 in `slot`, 0 none): one switched off is removed, its particles
+// living out their lives; one that couldn't be made (renderer_particles not loaded yet) is tried again next frame.
+void syncEmitter(uint32_t& slot, bool on, yea_handle (*make)())
+{
+    if (on && !slot)
+    {
+        yea_handle h = make();
+        slot = h == kNone ? 0 : h + 1;
+    }
+    else if (!on && slot)
+    {
+        renderer_particles::particle_emitter_remove(slot - 1);
+        slot = 0;
+    }
+}
+
+// Dust over the middle of the floor, among the spheres and shapes: tiny, slow, lasting, scattering forwards so it
+// glints looking towards the sun and the lamps and stays dark in shadow.
+yea_handle makeDust()
+{
+    yea_handle d = renderer_particles::particle_emitter_add({ 0, 1.6f, 1.0f });
+    if (d == kNone)
+        return d;
+    renderer_particles::particle_emitter_shape(d, 1, { 6.0f, 1.4f, 4.5f });
+    renderer_particles::particle_emitter_rate(d, 500, 3500);
+    renderer_particles::particle_emitter_motion(d, 0.03f, 180, 1, 0.002f, 0.8f, 0.06f);
+    renderer_particles::particle_emitter_life(d, 6, 10);
+    renderer_particles::particle_emitter_look(d, { 0.9f, 0.85f, 0.75f }, { 0.9f, 0.85f, 0.75f }, 0.012f, 0.012f, 0.9f);
+    renderer_particles::particle_emitter_light(d, 0, 0.7f, false);
+    return d;
+}
+
+// Steam off the top of the steel drum (0.5, 0.8, 2.2; radius 0.8): rising, spreading and thinning as it swirls.
+yea_handle makeSteam()
+{
+    yea_handle s = renderer_particles::particle_emitter_add({ 0.5f, 0.82f, 2.2f });
+    if (s == kNone)
+        return s;
+    renderer_particles::particle_emitter_shape(s, 1, { 0.5f, 0.01f, 0.5f });
+    renderer_particles::particle_emitter_rate(s, 40, 0);
+    renderer_particles::particle_emitter_motion(s, 0.5f, 15, 0.5f, -0.3f, 0.6f, 0.5f);
+    renderer_particles::particle_emitter_life(s, 2.5f, 4);
+    renderer_particles::particle_emitter_look(s, { 0.95f, 0.95f, 0.95f }, { 0.95f, 0.95f, 0.95f }, 0.15f, 0.8f, 0.3f);
+    renderer_particles::particle_emitter_light(s, 0, 0.3f, false);
+    return s;
 }
 
 // The lights the knobs ask for: switched-off types removed (not just dark, so their cost goes too).
@@ -655,6 +704,8 @@ void update(uint32_t phase, float dt)
         s->t += dt; // Benchmark View holds the lights and shapes still, so timings repeat
     placeModels();
     syncLights(s);
+    syncEmitter(particles->dust, settings.dust, makeDust);
+    syncEmitter(particles->steam, settings.steam, makeSteam);
     animate(s);
     moveCamera(s, dt);
     s->epoch = renderer::scene_epoch();

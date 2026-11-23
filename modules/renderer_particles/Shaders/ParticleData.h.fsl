@@ -1,0 +1,83 @@
+// renderer_particles' layouts (renderer_particles.cpp mirrors them) and the core's it reads.
+#define PART_PI 3.14159265
+
+// The frame's constants: every pass reads them.
+STRUCT(PartFrame)
+{
+    DATA(float4, view[3], None);    // rows, world -> view (+z forward)
+    DATA(float4, camPos, None);     // xyz, w near (m)
+    DATA(float4, proj, None);       // x p00, y p11, zw the TAA jitter in ndc (x right, y up)
+    DATA(float4, screen, None);     // render width, height, 1 / width, 1 / height
+    DATA(float4, soft, None);       // x soft distance (m), y near fade (m), z time (s), w dt (s)
+    DATA(float4, sunDir, None);     // towards the sun, w 1 when on
+    DATA(float4, sunColor, None);   // rgb lux as it arrives, w cascades with maps (0: unshadowed)
+    DATA(float4, cascadeEnd, None);
+    DATA(float4, ambient, None);    // rgb the sky's mean radiance times the core's ambient, w > 0: from gSkySh (its strength)
+    DATA(float4, texel, None);      // x sun atlas texel, y local atlas texel, z bins per metre, w frame number
+    DATA(float4, fog, None);        // frame.h fogParams (x 0: no fog)
+    DATA(float4, fog2, None);       // xy frame.h fogUv
+    DATA(uint4, counts, None);      // x lights, y bins, z flags (1 local lights' maps, 2 z-bins), w the pool's size
+    DATA(uint4, spawn, None);       // x particles to emit this frame, y emitters in gSpawn, z the sort's size (power of 2), w seed
+};
+
+// A particle in the pool.
+STRUCT(Particle)
+{
+    DATA(float4, pos, None);  // xyz, w age (s)
+    DATA(float4, vel, None);  // xyz (m/s), w lifetime (s; 0: dead)
+    DATA(uint4, info, None);  // x its emitter's row, y a random seed
+};
+
+// An emitter's look and motion, by table row (rows never move, so particles keep theirs once it is gone).
+STRUCT(Emitter)
+{
+    DATA(float4, pos, None);        // xyz, w shape (0 point, 1 box, 2 sphere)
+    DATA(float4, extent, None);     // xyz box half size, x sphere radius; w the spread's cosine
+    DATA(float4, dir, None);        // xyz the direction particles leave in, w speed (m/s)
+    DATA(float4, motion, None);     // x gravity (m/s^2, down), y drag (1/s), z turbulence (m/s), w speed jitter (0..1)
+    DATA(float4, colorStart, None); // rgb albedo or colour at birth, w opacity
+    DATA(float4, colorEnd, None);   // rgb at death, w emissive (nits per unit colour)
+    DATA(float4, size, None);       // x radius at birth (m), y at death, z phase anisotropy g, w 1: additive
+    DATA(float4, life, None);       // x shortest life (s), y longest
+};
+
+// This frame's emission: emitter `row` makes `count` particles, numbered from `first` among all made this frame.
+STRUCT(Spawn)
+{
+    DATA(uint4, info, None); // x row, y first, z count
+};
+
+STRUCT(PartLight)
+{
+    DATA(float4, pos, None);    // xyz, w range
+    DATA(float4, color, None);  // rgb candela, w type (2 spot; area lights 1)
+    DATA(float4, dir, None);    // xyz spot direction, w spot scale
+    DATA(float4, params, None); // x spot offset, y first shadow view or -1, z 1/range^2
+    DATA(float4, sphere, None);
+};
+
+STRUCT(PartLightShape)
+{
+    DATA(float4, ex, None); // w kind: 0 point or spot, 3 rect, 4 disc, 5 sphere, 6 tube
+    DATA(float4, ey, None); // w kinds 3 to 6: 1 / area
+};
+
+STRUCT(PartShadowView)
+{
+    DATA(float4, row0, None);
+    DATA(float4, row1, None);
+    DATA(float4, row2, None);
+    DATA(float4, row3, None);
+    DATA(float4, rect, None);
+    DATA(float4, info, None); // lights: yzw drawn from
+    DATA(float4, inv0, None);
+    DATA(float4, inv1, None);
+    DATA(float4, inv2, None);
+};
+
+// One sort pass: the bitonic network's stage k and step j (SORT_GLOBAL), or k alone (SORT_LOCAL: 0 the whole local
+// sort, else the steps below 1024 of stage k).
+STRUCT(SortStep)
+{
+    DATA(uint4, kj, None);
+};

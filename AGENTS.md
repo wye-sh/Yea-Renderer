@@ -195,6 +195,23 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   before rt_pick) sets frame `fogShadowMaps`: renderer_shadows then keeps the sun's cascades and traced lights' tiles
   even while renderer_rt traces them, so sunbeams and lamp shafts stay shadowed (surfaces still read the traced
   shadows). fog_prepare runs just before probes_prepare. Every GPU object is freed in `unload()`.
+- `renderer_particles`: GPU particles (on by default, `particles`; nothing runs while no emitter exists and no particle
+  can be alive). Up to 64 emitters (`Emitter` table, exports below), a pool of `max_particles` (rounded up to a power
+  of two). `particles_prepare` (core, after fog_prepare) counts this frame's emission per emitter on the CPU and bounds
+  the particles alive from a ring of what was made and its longest life; `particles_run` (after fog_run, timed
+  \"particles\"; `Sim.comp.fsl`): EMIT (each new particle takes a free slot; it also empties the draw list), SIMULATE
+  (age, death into the free list, gravity, drag, divergence-free turbulence; one in view is lit once where it is: the
+  sun through one cascade compare, the sky's mean light, the local lights in the core's z-bin at its depth with one
+  map compare each (z-bins, not screen tiles: the tiles end at the opaque depth), a 4x Henyey-Greenstein phase per
+  emitter, and listed with its view depth), then while any alpha-blended emitter made particles a bitonic sort of the
+  list back to front (1024 a group in shared memory, larger strides a pass each). `particles_draw` (right after the
+  forward pass, depth in SHADER_RESOURCE, timed \"particles-draw\"): camera-facing round sprites, premultiplied into
+  `hdr` (additive ones write alpha 0), soft against the prepass depth (`soft_distance`) and the camera (`near_fade`),
+  behind the froxel fog at their depth, before exposure, TAA and the upscaler; a second target, `reactive` (frame
+  v20, R8, render size, cleared each draw), gets their coverage: TAA takes up to 0.6 more of the current frame there;
+  renderer_upscale's FSR reactive and DLSS bias masks read it (the upscaling agent's). Only at one sample (no MSAA).
+  The core sets frame `keepShadowMaps` (v19's fogShadowMaps) while fog or particles run. Every GPU object is freed in
+  `unload()`.
 - `renderer_post`: post-processing on the resolved (TAA or upscaled) scene-linear HDR image at display size, before
   the core's tonemapper, so it works the same with every upscaler (NVIDIA's DLSS guide and UE5 place it there).
   `post_prepare` (after the core's composite constants, before its descriptors) returns the image the tonemap pass and
@@ -275,7 +292,7 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   the out target, and leaves everything in SHADER_RESOURCE; the panel shows it with `yea::canvasImage`. The core's
   preview pipelines and buffers are made in its own `load()` (`preview_core.h`); a failure turns only the preview off.
 - The core calls the others through optional imports with a `RenderFrame*` (as `u64`): `frame.h`, copied
-  identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes`, `renderer_ssr`, `renderer_vrs`, `renderer_rt`, `renderer_upscale`, `renderer_post`, `renderer_sky` and `renderer_fog` (`mathx.h` into the
+  identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes`, `renderer_ssr`, `renderer_vrs`, `renderer_rt`, `renderer_upscale`, `renderer_post`, `renderer_sky`, `renderer_fog` and `renderer_particles` (`mathx.h` into the
   first three). Change all copies together and raise `RENDER_FRAME_VERSION`. Geometry (frame v16): two vertex streams, `positions`
   (float3, `RENDER_POSITION_STRIDE`) and `attributes` (`RENDER_ATTRIBUTE_STRIDE`: octahedral normal and tangent snorm16x2,
   uv0, rgba8 colour; frame.h says how to decode), and u32 `indices`. They are GPU-only, made with half again as much room
@@ -374,12 +391,18 @@ version), shadows (ray-traced shadows), traced_lights (0-8, besides the sun).
 `renderer_fog`: fog, density, height_falloff, base_height, albedo, anisotropy, quality (Low, Medium, High), range,
 temporal. Its exports: `fog_volume_add(shape, center, half_size)` (0 box, 1 ellipsoid; density 0.1, white, softness
 0.25), `fog_volume_place`, `fog_volume_medium(v, density, albedo, softness)`, `fog_volume_remove`, `fog_volume_clear`.
+`renderer_particles`: particles, max_particles, soft_distance, near_fade. Its exports: `particle_emitter_add(pos)`
+(defaults: 20 a second, 0.5 m/s up over 20°, 2 to 3 s, white, 5 to 15 cm, half opaque, lit, blended),
+`particle_emitter_place(e, pos, dir)`, `_shape(e, shape, extent)` (0 point, 1 box, 2 sphere), `_rate(e, per_second,
+burst)`, `_motion(e, speed, spread_deg, speed_jitter, gravity, drag, turbulence)`, `_life(e, min_s, max_s)`,
+`_look(e, color_start, color_end, size_start, size_end, opacity)`, `_light(e, emissive, anisotropy, additive)`,
+`_remove`, `_clear` (particles live out their lives).
 `renderer_models` (per MODEL line, in the Model Viewer only): scale, up_axis (Auto, Y, Z: Z up in the file turned to Y up),
 lod_quality, cast_shadows, double_sided.
 Players of a released game tune (`player` lines): upscaler, quality_mode, dlss_model, exposure_ev (brightness), lod_error,
 TAA's sharpen, shadows' sun_resolution, shadow_distance, pcss and light_shadows, and enabled for AO, contact shadows, SSR,
-ray-traced reflections, ray-traced shadows and VRS, with half_resolution for AO, SSR and ray-traced reflections, probes' resolution, and
-fog with its quality.
+ray-traced reflections, ray-traced shadows and VRS, with half_resolution for AO, SSR and ray-traced reflections, probes' resolution,
+fog with its quality, and particles.
 Debug views and show_ knobs never. renderer_rt's `enabled` needs `raytracing` and renderer_vrs' `shadingrate` (hidden and
 false without them); each still returns from `load()` before touching its service when that is nullptr, as `load()` runs
 either way.
@@ -404,7 +427,8 @@ library keeps its licence file beside its source, since the component's reposito
 ## Reset
 
 All scene data is in `renderer`'s tables and state: Reset empties the scene; the feature's link module
-builds it again. renderer_fog's volumes are in its table: Reset removes them too. renderer_models' placements go with it: a game places its models again whenever `mdl::placed(h)` is
+builds it again. renderer_fog's volumes and renderer_particles' emitters are in their tables: Reset removes them too (and starts the
+particle pool empty). renderer_models' placements go with it: a game places its models again whenever `mdl::placed(h)` is
 false. GPU objects and shadow caches are rebuilt on load.
 
 ## Cost
@@ -427,7 +451,10 @@ traced_lights or the size changes), one full-screen TAA resolve (when on; with a
 exposure copy instead, every scene pass then at the render size), one full-screen composite. With fog on, two
 dispatches: one thread per froxel (240 x 135 x 128 at 1080p on High: 4.1 M, each a cascade compare and its z-bin's lights
 with a compare each) and one per column, plus 3 RGBA16F froxel volumes (about 33 MB at 1080p on High, 17 MB on Medium),
-and one bilinear volume read per pixel in the forward and sky passes. The Model Viewer's preview costs
+and one bilinear volume read per pixel in the forward and sky passes. With particles alive: emit and simulate
+dispatches over the pool (one thread a slot), the sort (log² passes, only while blended particles live), and one
+draw of 6 vertices a listed particle (their overdraw is the main cost); 72 bytes a pool slot (2.4 MB at 32768) and an
+R8 render-size mask. The Model Viewer's preview costs
 nothing unless its panel is open and showing a model: then, per frame, one 1024² shadow map pass and one 4-sample pass of
 that model at twice the canvas size, and a resolve (about 6 MB of targets at a 520 × 320 canvas). No per-frame allocation. GPU memory at the defaults:
 HDR + depth at 4x MSAA, sun atlas 4096² D32 (64 MB), local atlas 4096² (64 MB), a screen-size R32F depth copy
@@ -489,7 +516,7 @@ for screen reflections (a quarter of it at half resolution).
 
 ## Example view (`example/renderer_example`)
 
-The view has two features: Base Settings (the component's 11 modules: what a game using the Renderer gets) and
+The view has two features: Base Settings (the component's modules: what a game using the Renderer gets) and
 Example Scene (`renderer_example` alone, its scene knobs). `renderer_example` is the example module, with no `use`
 line, so the hub's one-use-per-view rule doesn't count it.
 Floor, gold and red sphere rows sweeping roughness, pillars and assorted shapes, spinning tori, a sun,
@@ -498,7 +525,9 @@ every fifth slot a spot, else every slot the type left on (20 by default: 16 poi
 colour (`point_intensity`, `point_range`); spots are lamps (a dark body aimed along the beam, its lens glowing; neither
 casts shadows; `spot_intensity`, range 20). The first `shadowed_lights` slots cast shadows (all by default). Light
 Types: `sun`, `points`, `spots`, `rects`, `discs`, `spheres`, `tubes`, each off removing that type's lights and
-emitters (their fittings stay). Four area lights at `area_luminance` (cd/m²; the pendant at three times it): a
+emitters (their fittings stay). Particles (`state Particles`, each emitter's handle + 1): `dust` (motes over the
+middle of the floor, 500 a second, 6 to 10 s, scattering forwards so they glint towards the sun and lamps) and `steam`
+(off the steel drum's top, rising and spreading), each off removing its emitter; `build()` clears them with the scene. Four area lights at `area_luminance` (cd/m²; the pendant at three times it): a
 softbox on a stand by the sphere rows, a pendant disc over the white boxes, a fluorescent tube on the stone ledge,
 the glowing sphere on the steel drum, a 4 × 3 stained-glass panel on a stand opposite the softbox (a rect with a
 light_image, its panes glowing slabs in their colours, at twice `area_luminance`; under Rects), two reflection probes (the sphere rows, the whole yard), four sample models (Khronos' glTF samples, CC0; cooked
@@ -509,7 +538,7 @@ in front, the boom box on the copper block, placed whole through renderer_models
 asks the host for the mouse each frame (`yea::captureMouse(true)`: hidden, kept in the window) and turns by
 `yea_mouse_dx`/`yea_mouse_dy` (`look_sensitivity`); the move keys fly (WASD, Q/E down/up, `move_speed`).
 The host lets go when the button is up (it is no longer asked), F1 opens, focus is lost, or on a view switch
-or Reset. Reset: lights and camera
-back to the start. `benchmark_view` holds the camera at its start view (field of view 55), or at the gold or
+or Reset. Reset: lights, camera, dust and steam
+back to the start (the particle pool starts empty). `benchmark_view` holds the camera at its start view (field of view 55), or at the gold or
 mirror sphere's close-up (`benchmark_camera`, field of view 40), without moving the user's own, and holds the lights and shapes still, so GPU Timings compare between versions; the project's
 `modules/test_renderer_bench` (a test on the user's machine) drives it. Exports `picture` (a fixed angle).
