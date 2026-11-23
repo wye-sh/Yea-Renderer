@@ -82,6 +82,7 @@ STRUCT(ProbeData)
 #define FLAG_DECALS   2097152u // decals: gDecals, binned (with FLAG_CULLED) in gDecalMasks and gDecalBins
 #define FLAG_RT_TINT  8388608u // renderer_rt: gRtShadowTint, the colour glass lets through to each traced shadow (frame rtShadowTint)
 #define FLAG_REFRACTION 4194304u // the see-through pass: gSceneColor holds the scene behind glass, for gRefraction's materials
+#define FLAG_GLASS_SHADOW 16777216u // renderer_shadows: glass tints the shadow maps (gShadowTints, gTintDepth, gTintColor)
 #define FLAG_AREA     65536u // gLightShapes is filled: some light has a shape or its own size (area lights take LTC terms)
 #define RT_MISS       60000.0
 
@@ -140,6 +141,15 @@ STRUCT(LightShape)
 {
     DATA(float4, ex, None);
     DATA(float4, ey, None);
+};
+
+// Glass over a shadow view (frame.h RenderGpuShadowTint, at the view's index): its square of the tint maps.
+STRUCT(ShadowTint)
+{
+    DATA(float4, area, None);   // xy map uv where the square starts, z its texels per map uv, w its side in texels
+    DATA(uint4, layers0, None); // layers 0-3: each one's copy of the square at texel (x & 0xFFFF, x >> 16)
+    DATA(uint4, layers1, None); // layers 4-7
+    DATA(uint4, count, None);   // x layers (0: no glass)
 };
 
 STRUCT(ShadowView)

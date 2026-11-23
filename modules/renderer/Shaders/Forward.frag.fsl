@@ -626,7 +626,7 @@ float4 PS_MAIN(VSOutput In)
         if (dot(N, L) <= 0.0)
             continue;
         float3 shadow = (d == 0u && (sunFlags & FLAG_RT_SUN) != 0u) ? tracedShadow(s.pixel, 0)
-                      : (d == 0u && (sunFlags & FLAG_SHADOWS) != 0u) ? float3(1.0, 1.0, 1.0) * sunShadow(In.WorldPos, N, viewZ, s.rot, dither)
+                      : (d == 0u && (sunFlags & FLAG_SHADOWS) != 0u) ? sunShadow(In.WorldPos, N, viewZ, s.rot, dither)
                       : float3(1.0, 1.0, 1.0);
         if (d == 0u)
             shadow *= contact;

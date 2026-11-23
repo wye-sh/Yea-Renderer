@@ -1,37 +1,6 @@
 // What the shadow passes read: the core's instance rows, the views, and (alpha-tested casters) the material maps.
 #ifndef SHADOW_COMMON_H
 #define SHADOW_COMMON_H
-STRUCT(InstanceData)
-{
-    DATA(float4, row0, None);
-    DATA(float4, row1, None);
-    DATA(float4, row2, None);
-    DATA(uint4, misc, None);
-};
-
-STRUCT(ShadowView)
-{
-    DATA(float4, row0, None);
-    DATA(float4, row1, None);
-    DATA(float4, row2, None);
-    DATA(float4, row3, None);
-    DATA(float4, rect, None);
-    DATA(float4, info, None);
-    DATA(float4, inv0, None);
-    DATA(float4, inv1, None);
-    DATA(float4, inv2, None);
-};
-
-// The core's MaterialMapData (renderer's Shaders/Common.h.fsl): base colour slot + 1 in maps.x, its factor's alpha in
-// baseFactor.a, the cutoff in misc.x, misc.y 1 when the maps were given (vertex alpha counts).
-STRUCT(MaterialMapData)
-{
-    DATA(uint4, maps, None);
-    DATA(float4, baseFactor, None);
-    DATA(float4, factors, None);
-    DATA(float4, misc, None);
-};
-#define MAX_TEXTURES 1024
-
+#include "ShadowTypes.h.fsl"
 #include "Shadow.srt.h"
 #endif

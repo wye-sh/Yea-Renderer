@@ -1,0 +1,64 @@
+// Glass into the tint maps: see-through casters from an instance-rate stream of (instance | pass << 20 | two-sided << 31),
+// never SV_InstanceID; the pass (TintPass) names the shadow view. The normal and tangent as the core's Forward.vert makes them.
+#include "TintCommon.h.fsl"
+
+STRUCT(VSInput)
+{
+    DATA(float3, Position, POSITION);
+    DATA(float2, Normal, NORMAL); // octahedral
+    DATA(uint, Entry, TEXCOORD1);
+    DATA(int2, Tangent, TANGENT); // octahedral snorm16 as integers: y's lowest bit the bitangent's sign (odd: -1)
+    DATA(float2, Uv, TEXCOORD0);
+    DATA(float4, Color, COLOR);
+};
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float3, WorldPos, TEXCOORD0);
+    DATA(float3, Normal, TEXCOORD1);
+    DATA(FLAT(uint), Material, TEXCOORD2);
+    DATA(FLAT(uint), Flags, TEXCOORD3);
+    DATA(FLAT(uint), Pass, TEXCOORD4);
+    DATA(float2, Uv, TEXCOORD5);
+    DATA(float4, Tangent, TEXCOORD6);
+    DATA(float4, Color, TEXCOORD7);
+};
+
+float3 octDecode(float2 f)
+{
+    float3 n = float3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    float  t = saturate(-n.z);
+    n.x += n.x >= 0.0 ? -t : t;
+    n.y += n.y >= 0.0 ? -t : t;
+    return normalize(n);
+}
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN(VSInput In)
+{
+    INIT_MAIN;
+    VSOutput     Out;
+    InstanceData inst = gInstances[In.Entry & 0xFFFFFu];
+    uint         pass = (In.Entry >> 20) & 0x7FFu;
+    ShadowView   v = gViews[gPasses[pass].info.x];
+    float4       p = float4(In.Position, 1.0);
+    float3       world = float3(dot(inst.row0, p), dot(inst.row1, p), dot(inst.row2, p));
+    float4       w = float4(world, 1.0);
+    Out.Position = float4(dot(v.row0, w), dot(v.row1, w), dot(v.row2, w), dot(v.row3, w));
+    Out.WorldPos = world;
+    float3 a = inst.row0.xyz;
+    float3 b = inst.row1.xyz;
+    float3 c = inst.row2.xyz;
+    float3 n = octDecode(In.Normal);
+    Out.Normal = float3(dot(cross(b, c), n), dot(cross(c, a), n), dot(cross(a, b), n));
+    float2 tf = max(float2(In.Tangent) * (1.0 / 32767.0), float2(-1.0, -1.0));
+    float3 t = octDecode(tf);
+    Out.Tangent = float4(normalize(float3(dot(a, t), dot(b, t), dot(c, t))), ((In.Tangent.y & 1) != 0 ? -1.0 : 1.0) * length(Out.Normal));
+    Out.Material = inst.misc.x;
+    Out.Flags = In.Entry >> 31; // its material is double-sided
+    Out.Pass = pass;
+    Out.Uv = In.Uv;
+    Out.Color = In.Color;
+    RETURN(Out);
+}

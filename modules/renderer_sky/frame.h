@@ -10,7 +10,7 @@ struct Buffer;
 struct RenderTarget;
 struct Texture;
 
-#define RENDER_FRAME_VERSION 25u
+#define RENDER_FRAME_VERSION 26u
 #define RENDER_RT_MAX_TRACED 8u
 #define RENDER_MAX_CASCADES  4u
 #define RENDER_MAX_TEXTURES  1024u // texture maps the shaders' array holds (the core's Texture table)
@@ -18,6 +18,7 @@ struct Texture;
 #define RENDER_MAX_DECALS     256u // decals drawn in a frame (frame v23)
 #define RENDER_MAX_WORLD_DECALS 1024u // decals captures and ray hits see (frame v25)
 #define RENDER_VIEW_SHIFT    20u // shadow instance stream entry: instance | view << 20
+#define RENDER_MAX_TINT_LAYERS 8u // glass layers a shadow view's tint keeps at most (frame v26)
 // Vertex streams (positions, attributes): bytes per vertex.
 #define RENDER_POSITION_STRIDE  12u // float3
 #define RENDER_ATTRIBUTE_STRIDE 20u // 5 u32: [0] normal, [1] tangent, [2..3] uv0 (float2), [4] colour (rgba8 unorm, r lowest).
@@ -63,6 +64,17 @@ struct RenderGpuShadowView
     float rect[4];   // tile in the atlas: u, v, width, height
     float info[4];   // x world size of a texel (at distance 1 when perspective); sun: y depth range; lights: yzw drawn from
     float inv[3][4]; // columns 0-2 of row's inverse: a world plane p (n, -n.P) is dot(inv[i], p) x + ... = 0 in the view's ndc
+};
+
+// Glass over a shadow view (frame v26, renderer's Shaders/Common.h.fsl ShadowTint): the square of the tint maps that covers
+// it. Map uv (the atlas's, as viewToAtlas) u is the square's texel (u - area.xy) * area.z; layer i's copy of the square
+// starts at texel (layer[i] & 0xFFFF, layer[i] >> 16) of tintDepth and tintColor.
+struct RenderGpuShadowTint
+{
+    float    area[4];  // xy the map uv where the square starts, z its texels per map uv, w its side in texels
+    uint32_t layer[RENDER_MAX_TINT_LAYERS];
+    uint32_t count;    // layers (0: no glass over this view)
+    uint32_t pad[3];
 };
 
 // A reflection probe as the shaders read it (renderer's Shaders/Common.h.fsl ProbeData).
@@ -375,7 +387,8 @@ struct RenderFrame
     Buffer*      decalBins;         // set by cull_prepare: per z-bin (as zbins), the first decal in it | the last << 16
     // See-through instances (frame v25): every live blended instance (material_blend), on screen or not, laid out as
     // drawables (by mesh; the core's LOD), set before shadows_prepare. They are in neither casters nor drawables, so probes,
-    // GI captures and shadow maps skip them. castShadow is its instance_shadow.
+    // GI captures and the shadow maps' depth skip them; the shadow maps' tint draws them (frame v26). castShadow is its
+    // instance_shadow.
     const RenderCaster* seeThrough;
     uint32_t            seeThroughCount;
     // Two float4 a material (renderer's Shaders/Scene.srt.h gRefraction): x ior, y thickness, z shape (0 thin, 1 solid),
@@ -399,8 +412,20 @@ struct RenderFrame
     Buffer*  decalItems;    // uint
     float    decalGrid[2][4]; // [0] xyz the grid's world corner, w cells a metre; [1] xyz its cells along x, y, z
     uint64_t decalsChanged;
-    // The core's split-sum table (renderer's Shaders/Brdf.h.fsl dfgLookup, gDfg): 32 x 32 float2, SHADER_RESOURCE, the same
-    // every frame, so passes outside the core weigh specular reflection and transmission (glass) by the same numbers.
+    // The core's split-sum table (renderer's Shaders/Brdf.h.fsl dfgLookup, gDfg): 128 x 128 float2 (frame v26), x sqrt(NoV),
+    // y roughness; SHADER_RESOURCE, the same every frame, so passes outside the core weigh specular reflection and
+    // transmission (glass) by the same numbers.
     Buffer*  dfg;
+    // Glass in the shadow maps (frame v26), out from renderer_shadows: what see-through casters (seeThrough with castShadow)
+    // let through to what lies behind them, from each shadow view, in layers out from the light (a deep shadow map), each
+    // layer the next glass surface a light ray meets: its depth in the view (as the atlas's) in tintDepth (R32F) and what it
+    // lets through, (1 - coverage) * tint * (1 - its specular reflection), in tintColor (RGB10A2, rgb). The last layer also
+    // carries every surface behind it, so a view is exact while its glass needs no more layers than it has; renderer_shadows
+    // gives a view more (up to RENDER_MAX_TINT_LAYERS) when it finds more. A point at depth z in a view gets the product of
+    // its layers nearer than z. shadowTints: RenderGpuShadowTint[], as shadowViews. All SHADER_RESOURCE after shadows_render;
+    // tintDepth and tintColor nullptr when no view has glass this frame.
+    RenderTarget* tintDepth;
+    RenderTarget* tintColor;
+    Buffer*       shadowTints;
 };
 #define RENDER_RT_MISS 60000.0f

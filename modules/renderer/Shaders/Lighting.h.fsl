@@ -224,7 +224,51 @@ float localPcfWide(float3 c, float2 g, float radius, float4 bounds, uint taps, f
     return sum * inv;
 }
 
-float sunCascade(uint cascade, float3 P, float3 N, float2 rot)
+// What glass lets through to a point at map uv c.xy of shadow view `view`: renderer_shadows' tint layers nearer the light
+// than tz, multiplied (a deep shadow map: each layer the next glass surface out from the light, its depth and what it lets
+// through). tz is the point's depth moved towards the light by a few texels (tintDepth), so glass never tints its own lit
+// side. Averaged over four taps across the filter's disk, so a tinted shadow's edge is as soft as its visibility's; the
+// caller multiplies the two.
+float3 glassTint(uint view, float2 c, float tz, float radius, float2 rot)
+{
+    if ((gFrame.counts.z & FLAG_GLASS_SHADOW) == 0u)
+        return float3(1.0, 1.0, 1.0);
+    ShadowTint t = gShadowTints[view];
+    uint       n = t.count.x;
+    if (n == 0u)
+        return float3(1.0, 1.0, 1.0);
+    float3 sum = float3(0.0, 0.0, 0.0);
+    float2 dir = rot;
+    for (uint i = 0u; i < 4u; ++i, dir = vogelTurn(dir))
+    {
+        float2 q = (c + dir * (sqrt((float(i) + 0.5) * 0.25) * radius) - t.area.xy) * t.area.z;
+        float3 through = float3(1.0, 1.0, 1.0);
+        if (min(q.x, q.y) >= 0.0 && max(q.x, q.y) < t.area.w)
+        {
+            int2 texel = int2(q);
+            for (uint k = 0u; k < n; ++k)
+            {
+                uint  o = k < 4u ? t.layers0[k] : t.layers1[k - 4u];
+                int2  at = texel + int2(int(o & 0xFFFFu), int(o >> 16));
+                float z = LoadTex2D(gTintDepth, NO_SAMPLER, at, 0).r;
+                if (z >= tz) // the layers go out from the light: the rest lie behind the point too
+                    break;
+                through *= LoadTex2D(gTintColor, NO_SAMPLER, at, 0).rgb;
+            }
+        }
+        sum += through;
+    }
+    return sum * 0.25;
+}
+
+// The depth glassTint compares with: P moved towards the light (L) by two texels and the normal bias, at least 5 mm.
+float tintDepth(ShadowView v, float3 P, float3 L, float texelWorld)
+{
+    return viewToAtlas(v, P + L * max((2.0 + gFrame.shadow.w) * texelWorld, 0.005)).z;
+}
+
+// The sun's shadow from one cascade: visibility times what glass lets through.
+float3 sunCascade(uint cascade, float3 P, float3 N, float2 rot)
 {
     ShadowView v = gShadowViews[cascade];
     float  texel = gFrame.shadow2.x;
@@ -232,7 +276,7 @@ float sunCascade(uint cascade, float3 P, float3 N, float2 rot)
     float3 c = viewToAtlas(v, Pb);
     float4 bounds = float4(v.rect.xy + texel, v.rect.xy + v.rect.zw - texel);
     if (c.z >= 1.0)
-        return 1.0;
+        return float3(1.0, 1.0, 1.0);
     float2 g = receiverSlope(v, Pb, N, dot(N, gFrame.sunDir[0].xyz));
     float radius = gFrame.shadow.y * texel;
     uint  taps = gFrame.counts.w;
@@ -256,12 +300,13 @@ float sunCascade(uint cascade, float3 P, float3 N, float2 rot)
             }
         }
         if (count == 0.0)
-            return 1.0;
+            return glassTint(cascade, c.xy, tintDepth(v, P, gFrame.sunDir[0].xyz, v.info.x), radius, rot);
         float gap = (c.z - blockers / count) * v.info.y;
         radius = clamp(gap * tanSize / v.info.x, 1.0, 32.0) * texel + radius * 0.25;
     }
 #endif
-    return sunPcf(c, g, radius, bounds, taps, rot);
+    float lit = sunPcf(c, g, radius, bounds, taps, rot);
+    return lit > 0.0 ? lit * glassTint(cascade, c.xy, tintDepth(v, P, gFrame.sunDir[0].xyz, v.info.x), radius, rot) : float3(0.0, 0.0, 0.0);
 }
 
 uint sunCascadeIndex(float viewZ)
@@ -283,12 +328,12 @@ float3 tracedShadow(int2 pixel, int slice)
     return tint * v;
 }
 
-float sunShadow(float3 P, float3 N, float viewZ, float2 rot, float dither)
+float3 sunShadow(float3 P, float3 N, float viewZ, float2 rot, float dither)
 {
     uint count = uint(gFrame.shadow.x);
     uint c = sunCascadeIndex(viewZ);
     if (c >= count)
-        return 1.0;
+        return float3(1.0, 1.0, 1.0);
     // Into the next cascade over the last tenth of this one. With TAA, one cascade per pixel, the next
     // one picked for a share of the pixels that grows across the band: TAA averages them, and each pixel
     // pays for one lookup. Without it, both blended.
@@ -298,24 +343,24 @@ float sunShadow(float3 P, float3 N, float viewZ, float2 rot, float dither)
     if (dither >= 0.0)
     {
         if (dither < w)
-            return c + 1u < count ? sunCascade(c + 1u, P, N, rot) : 1.0;
+            return c + 1u < count ? sunCascade(c + 1u, P, N, rot) : float3(1.0, 1.0, 1.0);
         return sunCascade(c, P, N, rot);
     }
-    float s = sunCascade(c, P, N, rot);
+    float3 s = sunCascade(c, P, N, rot);
     if (w > 0.0)
     {
-        float next = c + 1u < count ? sunCascade(c + 1u, P, N, rot) : 1.0;
+        float3 next = c + 1u < count ? sunCascade(c + 1u, P, N, rot) : float3(1.0, 1.0, 1.0);
         s = lerp(s, next, w);
     }
     return s;
 }
 
 // dist: the light's distance; NoL: N.L towards it (both from the caller, which has them).
-// size: the light's radius for contact-hardening (0: none).
-float localShadow(LightData l, float3 P, float3 N, float dist, float NoL, float2 rot, float size)
+// size: the light's radius for contact-hardening (0: none). Visibility times what glass lets through.
+float3 localShadow(LightData l, float3 P, float3 N, float dist, float NoL, float2 rot, float size)
 {
     if (l.params.y < 0.0)
-        return 1.0;
+        return float3(1.0, 1.0, 1.0);
     uint view = uint(l.params.y);
     if (l.color.w < 1.5)
     {
@@ -371,7 +416,7 @@ float localShadow(LightData l, float3 P, float3 N, float dist, float NoL, float2
             count += dot(inFront, float4(1.0, 1.0, 1.0, 1.0));
         }
         if (count == 0.0)
-            return 1.0;
+            return glassTint(view, c.xy, tintDepth(v, P, normalize(l.pos.xyz - P), v.info.x * dist), radius, rot);
         dir = rot;
         for (uint i = 0u; i < 4u; ++i, dir = vogelTurn(dir))
         {
@@ -387,9 +432,8 @@ float localShadow(LightData l, float3 P, float3 N, float dist, float NoL, float2
         radius = clamp(pen, 1.0, widest) * texel + radius * 0.25;
     }
     float wide = radius / texel;
-    if (wide > 8.0)
-        return localPcfWide(c, g, radius, bounds, gFrame.counts.w, rot, wide);
-    return localPcf(c, g, radius, bounds, gFrame.counts.w, rot);
+    float lit = wide > 8.0 ? localPcfWide(c, g, radius, bounds, gFrame.counts.w, rot, wide) : localPcf(c, g, radius, bounds, gFrame.counts.w, rot);
+    return lit > 0.0 ? lit * glassTint(view, c.xy, tintDepth(v, P, normalize(l.pos.xyz - P), v.info.x * dist), radius, rot) : float3(0.0, 0.0, 0.0);
 }
 
 // --- Area lights: linearly transformed cosines --------------------------------------------------

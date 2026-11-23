@@ -15,6 +15,7 @@
 #include <Common_3/Graphics/FSL/defaults.h>
 #define MAX_TEXTURES RENDER_MAX_TEXTURES
 #include "Shaders/Shadow.srt.h"
+#include "Shaders/Tint.srt.h"
 
 using namespace mx;
 
@@ -92,6 +93,67 @@ uint32_t gPending[kGroups];
 uint32_t gPendingCount;
 uint32_t gStreamUsed;
 
+// --- Glass in the shadow maps (frame v26 tintDepth, tintColor, shadowTints) --------------------------------------------
+// A deep shadow map of the glass over each shadow view that sees any: layer k holds the k-th glass surface out from the
+// light (depth peeling), the last layer every surface behind it too (depth min, what they let through multiplied, how many
+// added up). A view's layers are squares of the tint maps over just its glass's footprint, at the view's own texel size or
+// coarser; they are drawn when the view is, or when its glass changes. Its last layer's surfaces are counted (an occlusion
+// query of the texels holding more than one): where any is, the view gets one layer more, up to RENDER_MAX_TINT_LAYERS, so
+// stacked panes stay exact and a view with one pane on each light ray pays for two.
+const uint32_t kTintCells = 64;     // the tint maps' cells per side
+const uint32_t kTintStart = 2;      // layers a view starts with
+const uint32_t kMaxTintPasses = 1024;
+const uint32_t kTintCounts = 32;    // views counted a frame
+const uint32_t kTintPeel = 1, kTintLocal = 2, kTintRest = 4; // TintPass info.y (Shaders/ShadowTypes.h.fsl TINT_PEEL, TINT_LOCAL)
+
+struct TintPassCpu
+{
+    float    light[4];
+    uint32_t info[4];
+    uint32_t info2[4];
+    float    extra[4];
+};
+
+struct TintView
+{
+    uint32_t layers;  // squares held (0: none), each k x k cells in the tint maps, plus one in the scratch
+    uint32_t want;    // layers it needs: kTintStart, more as its counts find them
+    uint32_t k;
+    uint8_t  cx[RENDER_MAX_TINT_LAYERS], cy[RENDER_MAX_TINT_LAYERS], sx, sy;
+    uint64_t sig;     // the glass over it and its look when last drawn
+    float    area[4]; // as drawn (RenderGpuShadowTint area)
+    uint32_t drawn;   // its squares hold what area says
+    uint32_t serial;  // changes with its squares, so a count is taken for the layers it measured
+    uint32_t wantK;   // the square side it last asked for (cells), which it may have got smaller
+};
+
+TintView              gTint[kMaxViews];
+RenderGpuShadowTint gTintCpu[kMaxViews];
+uint64_t              gTintOcc[kTintCells], gScratchOcc[kTintCells];
+uint32_t              gTintSize, gTintCell;
+RenderTarget *        gTintDepth, *gTintColor, *gScratchZ, *gScratchColor, *gScratchDepth;
+Shader *              gTintShader, *gTintRestShader, *gTintCopyShader;
+Pipeline *            gTintPipe, *gTintLastPipe, *gTintCopyPipe, *gTintCountPipe;
+DescriptorSet*        gTintSet;
+Buffer *              gTintBuf[kMaxFrames], *gPassBuf[kMaxFrames], *gTriBuf;
+QueryPool*            gCountPool[kMaxFrames];
+uint32_t              gCountView[kMaxFrames][kTintCounts], gCountSerial[kMaxFrames][kTintCounts], gCountUsed[kMaxFrames];
+uint32_t              gTintTexBound[kMaxFrames];
+TintPassCpu           gPassCpu[kMaxTintPasses];
+uint32_t              gPassCount;
+struct TintDraw
+{
+    uint32_t view, pass, counted; // its first pass (layer 0; then a layer each, then the two counts)
+};
+TintDraw gTintDraw[kMaxViews];
+uint32_t gTintDrawCount, gTintCountCount; // views drawn this frame, and of them counted
+bool     gTintOn;                         // this frame's frame has the tint maps
+uint32_t gTintRefused;                    // views left without their tint (the tint maps full)
+uint32_t gTintShrink, gTintRoomy;         // squares capped at (kTintCells / 2) >> shrink cells; frames the maps sat roomy
+uint64_t gNoGlassSince;                   // frame glass last cast a shadow
+uint32_t gTintSerial;
+uint32_t gTintTexVersion; // the frame's textureVersion the views' tint was drawn with
+
 uint64_t mix64(uint64_t x)
 {
     x += 0x9E3779B97F4A7C15ull;
@@ -104,18 +166,18 @@ uint32_t clampu(int32_t v, uint32_t lo, uint32_t hi) { return v < (int32_t)lo ? 
 
 uint64_t rowMask(uint32_t x, uint32_t k) { return (k >= 64 ? ~0ull : ((1ull << k) - 1)) << x; }
 
-bool cellsFree(uint32_t x, uint32_t y, uint32_t k)
+bool cellsFree(uint32_t x, uint32_t y, uint32_t k, const uint64_t* occ = gOcc)
 {
     for (uint32_t r = y; r < y + k; ++r)
-        if (gOcc[r] & rowMask(x, k))
+        if (occ[r] & rowMask(x, k))
             return false;
     return true;
 }
 
-void cellsMark(uint32_t x, uint32_t y, uint32_t k, bool on)
+void cellsMark(uint32_t x, uint32_t y, uint32_t k, bool on, uint64_t* occ = gOcc)
 {
     for (uint32_t r = y; r < y + k; ++r)
-        gOcc[r] = on ? gOcc[r] | rowMask(x, k) : gOcc[r] & ~rowMask(x, k);
+        occ[r] = on ? occ[r] | rowMask(x, k) : occ[r] & ~rowMask(x, k);
 }
 
 uint32_t compactBits(uint32_t v)
@@ -129,13 +191,13 @@ uint32_t compactBits(uint32_t v)
 
 // A free k x k square aligned to k, the first in Morton order: small squares fill one corner of a
 // larger one before the next, which leaves room for large ones.
-bool cellsAlloc(uint32_t k, uint32_t* x, uint32_t* y)
+bool cellsAlloc(uint32_t k, uint32_t* x, uint32_t* y, uint64_t* occ = gOcc, uint32_t side = gSide)
 {
-    uint32_t n = gSide / k;
+    uint32_t n = side / k;
     for (uint32_t i = 0; i < n * n; ++i)
     {
         uint32_t bx = compactBits(i) * k, by = compactBits(i >> 1) * k;
-        if (cellsFree(bx, by, k))
+        if (cellsFree(bx, by, k, occ))
         {
             *x = bx;
             *y = by;
@@ -388,6 +450,7 @@ void lightKey(const RenderLight& l, float key[10])
 // When the faces' sizes change, at most every 20 s: how many faces hold each size, and how full the atlas is.
 double   gLogTime = -1e9; // when the faces were last logged (s)
 uint32_t gLogSizes[5];
+uint32_t gLogGlass[RENDER_MAX_TINT_LAYERS + 2]; // views of glass at each layer count, then those refused
 uint32_t gWanted; // cells the faces wanted this frame, before they were fitted into the atlas
 uint32_t gLocalAuto;      // the lights' atlas size it has grown to (0: not yet chosen)
 bool     gRefusedLogged; // the last growth asked for was refused and logged (log the next refusal only after a growth)
@@ -407,15 +470,35 @@ void logAtlas()
             sizes[i]++;
             used += g.k[f] * g.k[f];
         }
+    // Glass: how many views hold it at each layer count (the counts grow them), and how full the tint maps are.
+    uint32_t glass[RENDER_MAX_TINT_LAYERS + 2] = {}, cells = 0, views = 0;
+    for (uint32_t v = 0; v < kMaxViews; ++v)
+        if (gTintCpu[v].count)
+        {
+            glass[gTintCpu[v].count]++;
+            cells += gTint[v].layers * gTint[v].k * gTint[v].k;
+            views++;
+        }
+    glass[RENDER_MAX_TINT_LAYERS + 1] = gTintRefused;
     double now = secondsNow();
-    if (!memcmp(sizes, gLogSizes, sizeof sizes) || now < gLogTime + 20.0)
+    if ((!memcmp(sizes, gLogSizes, sizeof sizes) && !memcmp(glass, gLogGlass, sizeof glass)) || now < gLogTime + 20.0)
         return;
     memcpy(gLogSizes, sizes, sizeof sizes);
+    memcpy(gLogGlass, glass, sizeof glass);
     gLogTime = now;
-    char line[160];
-    snprintf(line, sizeof line, "renderer_shadows: light faces at 128/256/512/1024/2048: %u/%u/%u/%u/%u; local atlas %u%% full (%u), %u%% wanted",
-             sizes[0], sizes[1], sizes[2], sizes[3], sizes[4], gSide ? used * 100 / (gSide * gSide) : 0, gSide * kCell,
-             gSide ? gWanted * 100 / (gSide * gSide) : 0);
+    char line[400];
+    int  n = snprintf(line, sizeof line, "renderer_shadows: light faces at 128/256/512/1024/2048: %u/%u/%u/%u/%u; local atlas %u%% full (%u), %u%% wanted",
+                      sizes[0], sizes[1], sizes[2], sizes[3], sizes[4], gSide ? used * 100 / (gSide * gSide) : 0, gSide * kCell,
+                      gSide ? gWanted * 100 / (gSide * gSide) : 0);
+    if (views || gTintRefused)
+    {
+        n += snprintf(line + n, sizeof line - n, "; glass over %u views, at 1-%u layers:", views, RENDER_MAX_TINT_LAYERS);
+        for (uint32_t i = 1; i <= RENDER_MAX_TINT_LAYERS; ++i)
+            n += snprintf(line + n, sizeof line - n, "%s%u", i > 1 ? "/" : " ", glass[i]);
+        n += snprintf(line + n, sizeof line - n, ", tint maps %u%% full (%u)", cells * 100 / (kTintCells * kTintCells), gTintSize);
+        if (gTintRefused)
+            snprintf(line + n, sizeof line - n, ", %u views without (no room)", gTintRefused);
+    }
     yea::log(line);
 }
 
@@ -729,6 +812,779 @@ void drawCasters(Cmd* cmd, const RenderFrame* F, uint32_t view, const RenderGpuS
         cmdDrawIndexedInstanced(cmd, c.indexCount, c.firstIndex, 1, (uint32_t)c.vertexOffset, 0);
     }
 }
+// --- Glass tint (frame v26) ------------------------------------------------------------------------------------------
+
+uint64_t hashBytes(uint64_t h, const void* p, size_t n)
+{
+    const uint8_t* b = (const uint8_t*)p;
+    for (size_t i = 0; i < n; ++i)
+        h = (h ^ b[i]) * 0x100000001B3ull;
+    return h;
+}
+
+uint32_t pow2Ceil(uint32_t v)
+{
+    uint32_t p = 1;
+    while (p < v)
+        p *= 2;
+    return p;
+}
+
+// A see-through caster's shape, place and look: its views' tint is redrawn when any changes.
+uint64_t glassLook(const RenderFrame* F, const RenderCaster& c)
+{
+    uint64_t h = mix64(c.moved ^ ((uint64_t)c.generation << 32));
+    h = hashBytes(h, c.sphere, sizeof c.sphere);
+    h = mix64(h ^ ((uint64_t)c.firstIndex << 32 | c.indexCount) ^ ((uint64_t)(uint32_t)c.vertexOffset << 7) ^ c.twoSided);
+    uint32_t m = F->instanceRows[c.instance].material;
+    if (m < renderer::Materials.size())
+        h = hashBytes(h, &renderer::Materials[m], sizeof(renderer::Material));
+    if (m < renderer::MaterialBlends.size())
+        h = hashBytes(h, &renderer::MaterialBlends[m], sizeof(renderer::MaterialBlend));
+    if (m < renderer::MaterialRefractions.size())
+        h = hashBytes(h, &renderer::MaterialRefractions[m], sizeof(renderer::MaterialRefraction));
+    if (m < renderer::MaterialMaps.size())
+        h = hashBytes(h, &renderer::MaterialMaps[m], sizeof(renderer::MaterialMap));
+    return mix64(h);
+}
+
+// Whether a caster can tint a view (inside its frustum), and where in the view's ndc, conservatively: lo, hi (x, y).
+bool glassOver(const RenderGpuShadowView& v, const mx::Plane* planes, bool persp, const RenderCaster& c, float lo[2], float hi[2])
+{
+    const float* s = c.sphere;
+    if (!sphereInside(planes, 6, V(s[0], s[1], s[2]), s[3]))
+        return false;
+    float x = v.row[0][0] * s[0] + v.row[0][1] * s[1] + v.row[0][2] * s[2] + v.row[0][3];
+    float y = v.row[1][0] * s[0] + v.row[1][1] * s[1] + v.row[1][2] * s[2] + v.row[1][3];
+    float rx = s[3] * length(V(v.row[0][0], v.row[0][1], v.row[0][2]));
+    float ry = s[3] * length(V(v.row[1][0], v.row[1][1], v.row[1][2]));
+    lo[0] = x - rx, hi[0] = x + rx, lo[1] = y - ry, hi[1] = y + ry;
+    if (persp)
+    {
+        // w: the distance along the face's axis (row 3, a unit vector); across the light's near plane, the whole face.
+        float w = v.row[3][0] * s[0] + v.row[3][1] * s[1] + v.row[3][2] * s[2] + v.row[3][3];
+        float n = w - s[3], f = w + s[3];
+        if (n <= 1e-3f)
+            lo[0] = lo[1] = -1.0f, hi[0] = hi[1] = 1.0f;
+        else
+        {
+            lo[0] = minf(lo[0] / n, lo[0] / f), hi[0] = maxf(hi[0] / n, hi[0] / f);
+            lo[1] = minf(lo[1] / n, lo[1] / f), hi[1] = maxf(hi[1] / n, hi[1] / f);
+        }
+    }
+    lo[0] = maxf(lo[0], -1.0f), lo[1] = maxf(lo[1], -1.0f), hi[0] = minf(hi[0], 1.0f), hi[1] = minf(hi[1], 1.0f);
+    return lo[0] < hi[0] && lo[1] < hi[1];
+}
+
+RenderTarget* makeTintTarget(uint32_t size, TinyImageFormat format, const char* name, float clear, float clearAlpha, ResourceState start)
+{
+    RenderTargetDesc d = {};
+    d.mWidth = d.mHeight = size;
+    d.mDepth = d.mArraySize = d.mMipLevels = 1;
+    d.mSampleCount = SAMPLE_COUNT_1;
+    d.mFormat = format;
+    d.mStartState = start;
+    d.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+    d.mClearValue = {};
+    if (format == TinyImageFormat_D32_SFLOAT)
+        d.mClearValue.depth = clear;
+    else
+    {
+        d.mClearValue.r = d.mClearValue.g = d.mClearValue.b = clear;
+        d.mClearValue.a = clearAlpha;
+    }
+    d.pName = name;
+    RenderTarget* rt = nullptr;
+    addRenderTarget(gRenderer, &d, &rt);
+    return rt;
+}
+
+void freeTintTargets()
+{
+    freeTarget(gTintDepth);
+    freeTarget(gTintColor);
+    freeTarget(gScratchZ);
+    freeTarget(gScratchColor);
+    freeTarget(gScratchDepth);
+    gTintSize = 0;
+    memset(gTint, 0, sizeof gTint);
+    memset(gTintCpu, 0, sizeof gTintCpu);
+    memset(gTintOcc, 0, sizeof gTintOcc);
+    memset(gScratchOcc, 0, sizeof gScratchOcc);
+    gTintShrink = gTintRoomy = 0;
+}
+
+// The tint maps (depth R32F, colour RGB10A2: white, nothing in front) and the scratch a layer is drawn into (depth R32F,
+// colour RGBA16F: alpha the surfaces it holds; a depth buffer), all size x size.
+bool tintTargets(uint32_t size)
+{
+    if (gTintSize == size && gTintDepth && gTintColor && gScratchZ && gScratchColor && gScratchDepth)
+        return true;
+    if (gTintSize)
+        waitQueueIdle(gQueue);
+    freeTintTargets();
+    gTintDepth = makeTintTarget(size, TinyImageFormat_R32_SFLOAT, "renderer_tint_depth", 1.0f, 1.0f, RESOURCE_STATE_SHADER_RESOURCE);
+    gTintColor = makeTintTarget(size, TinyImageFormat_R10G10B10A2_UNORM, "renderer_tint_color", 1.0f, 1.0f, RESOURCE_STATE_SHADER_RESOURCE);
+    gScratchZ = makeTintTarget(size, TinyImageFormat_R32_SFLOAT, "renderer_tint_scratch_depth", 1.0f, 1.0f, RESOURCE_STATE_SHADER_RESOURCE);
+    gScratchColor = makeTintTarget(size, TinyImageFormat_R16G16B16A16_SFLOAT, "renderer_tint_scratch_color", 1.0f, 0.0f, RESOURCE_STATE_SHADER_RESOURCE);
+    gScratchDepth = makeTintTarget(size, TinyImageFormat_D32_SFLOAT, "renderer_tint_scratch_z", 1.0f, 0.0f, RESOURCE_STATE_DEPTH_WRITE);
+    if (!gTintDepth || !gTintColor || !gScratchZ || !gScratchColor || !gScratchDepth)
+    {
+        freeTintTargets();
+        return false;
+    }
+    gTintSize = size;
+    gTintCell = size / kTintCells;
+    return true;
+}
+
+void tintFree(TintView& t)
+{
+    for (uint32_t l = 0; l < t.layers; ++l)
+        cellsMark(t.cx[l], t.cy[l], t.k, false, gTintOcc);
+    if (t.layers)
+        cellsMark(t.sx, t.sy, t.k, false, gScratchOcc);
+    t.layers = 0;
+    t.drawn = 0;
+}
+
+// layers squares of k x k cells in the tint maps and one in the scratch, or none.
+bool tintAlloc(TintView& t, uint32_t k, uint32_t layers)
+{
+    uint32_t x, y, l = 0;
+    for (; l < layers && cellsAlloc(k, &x, &y, gTintOcc, kTintCells); ++l)
+    {
+        cellsMark(x, y, k, true, gTintOcc);
+        t.cx[l] = (uint8_t)x, t.cy[l] = (uint8_t)y;
+    }
+    bool ok = l == layers && cellsAlloc(k, &x, &y, gScratchOcc, kTintCells);
+    if (!ok)
+    {
+        while (l-- > 0)
+            cellsMark(t.cx[l], t.cy[l], k, false, gTintOcc);
+        return false;
+    }
+    cellsMark(x, y, k, true, gScratchOcc);
+    t.sx = (uint8_t)x, t.sy = (uint8_t)y;
+    t.k = k;
+    t.layers = layers;
+    t.drawn = 0;
+    t.serial = ++gTintSerial;
+    return true;
+}
+
+uint32_t tintOrigin(uint32_t cx, uint32_t cy) { return (cx * gTintCell) | ((cy * gTintCell) << 16); }
+
+// After the views are final (shadows_prepare): each view's glass, its squares, and which views' tint is drawn this frame.
+void prepareTints(RenderFrame* F)
+{
+    const uint32_t fi = F->frameIndex;
+    gTintDrawCount = gTintCountCount = gPassCount = 0;
+    gTintOn = false;
+    // Last time this frame's slot ran, its counts: a view whose last layer held more than one surface somewhere gets
+    // another layer; one whose last layer held nothing gives one back (never under kTintStart).
+    for (uint32_t i = 0; i < gCountUsed[fi]; ++i)
+    {
+        TintView& t = gTint[gCountView[fi][i]];
+        if (t.serial != gCountSerial[fi][i] || !t.want)
+            continue;
+        QueryData more = {}, any = {};
+        getQueryData(gRenderer, gCountPool[fi], 2 * i, &more);
+        getQueryData(gRenderer, gCountPool[fi], 2 * i + 1, &any);
+        if (more.mOcclusionCounts > 0 && t.want < RENDER_MAX_TINT_LAYERS)
+            t.want++;
+        else if (any.mOcclusionCounts == 0 && t.want > kTintStart)
+            t.want--;
+    }
+    gCountUsed[fi] = 0;
+
+    bool glass = false;
+    for (uint32_t i = 0; i < F->seeThroughCount && !glass; ++i)
+        glass = F->seeThrough[i].castShadow != 0;
+    const bool on = settings.glass_shadows && glass && gTintPipe && F->instanceRows && F->materials && F->materialMaps && F->refraction &&
+                    F->dfg && F->textures && F->positions && F->attributes && F->indices && F->instances;
+    if (on)
+        gNoGlassSince = F->frameNumber;
+    if (!on)
+    {
+        for (uint32_t v = 0; v < kMaxViews; ++v)
+        {
+            if (gTint[v].layers)
+                tintFree(gTint[v]);
+            gTint[v].want = 0;
+            gTintCpu[v].count = 0;
+        }
+        // The maps go once glass has cast no shadow for 10 s (a pane hidden a moment keeps them).
+        if (gTintSize && F->frameNumber > gNoGlassSince + 600)
+        {
+            waitQueueIdle(gQueue);
+            freeTintTargets();
+        }
+        gTintRefused = 0;
+        return;
+    }
+    if (!gFrozen && tintTargets(pow2Floor(clampu(settings.glass_resolution, 1024, 4096))))
+    {
+        bool groupDrawn[kGroups] = {};
+        for (uint32_t k = 0; k < gPendingCount; ++k)
+            groupDrawn[gPending[k]] = true;
+        const bool textures = F->textureVersion != gTintTexVersion;
+        gTintTexVersion = F->textureVersion;
+        uint32_t refused = 0;
+        v3       sunRay = -normalize(V(F->sunDir[0], F->sunDir[1], F->sunDir[2]));
+        for (uint32_t view = 0; view < kMaxViews; ++view)
+        {
+            const bool sun = view < kSunViews;
+            bool       active, redraw;
+            if (sun)
+            {
+                active = view < gCascades && (gSunValid & (1u << view));
+                redraw = (gSunDirty >> view) & 1u;
+            }
+            else
+            {
+                const Group& g = gGroups[(view - kSunViews) / 6];
+                active = g.valid && g.nfaces && (view - kSunViews) % 6 < g.faces;
+                redraw = groupDrawn[(view - kSunViews) / 6];
+            }
+            TintView& t = gTint[view];
+            // The glass over the view: its footprint, and a sum of hashes of it (order-free).
+            const RenderGpuShadowView& v = gViewsCpu[view];
+            float                        lo[2] = { 2, 2 }, hi[2] = { -2, -2 };
+            uint64_t                     sig = 0;
+            bool                         any = false;
+            if (active)
+            {
+                mx::Plane planes[6];
+                clipPlanes(v.row, planes);
+                for (uint32_t i = 0; i < F->seeThroughCount; ++i)
+                {
+                    const RenderCaster& c = F->seeThrough[i];
+                    float               a[2], b[2];
+                    if (!c.castShadow || !glassOver(v, planes, !sun, c, a, b))
+                        continue;
+                    any = true;
+                    lo[0] = minf(lo[0], a[0]), lo[1] = minf(lo[1], a[1]), hi[0] = maxf(hi[0], b[0]), hi[1] = maxf(hi[1], b[1]);
+                    sig += glassLook(F, c);
+                }
+            }
+            if (!any)
+            {
+                if (t.layers)
+                    tintFree(t);
+                t.want = 0;
+                gTintCpu[view].count = 0;
+                continue;
+            }
+            // The footprint in atlas texels with two of margin, inside the view's tile, at the view's own texel size, or
+            // coarser by powers of two when it would take more than half the maps' side (less while they are crowded).
+            const float S = sun ? (float)gSunSize : (float)(gSide * kCell);
+            const float tx = v.rect[0] * S, ty = v.rect[1] * S, tn = v.rect[2] * S;
+            float       ax = maxf(floorf((v.rect[0] + (lo[0] * 0.5f + 0.5f) * v.rect[2]) * S) - 2.0f, tx);
+            float       ay = maxf(floorf((v.rect[1] + (0.5f - hi[1] * 0.5f) * v.rect[3]) * S) - 2.0f, ty);
+            float       bx = minf(ceilf((v.rect[0] + (hi[0] * 0.5f + 0.5f) * v.rect[2]) * S) + 2.0f, tx + tn);
+            float       by = minf(ceilf((v.rect[1] + (0.5f - lo[1] * 0.5f) * v.rect[3]) * S) + 2.0f, ty + tn);
+            float       side = maxf(bx - ax, by - ay);
+            uint32_t    wantK = 1;
+            for (uint32_t m = 0;; ++m)
+            {
+                wantK = pow2Ceil((uint32_t)ceilf(side / (float)(1u << m) / (float)gTintCell));
+                if (wantK <= ((kTintCells / 2) >> gTintShrink))
+                    break;
+            }
+            if (!t.want)
+                t.want = kTintStart;
+            bool fresh = false;
+            if (t.layers != t.want || t.wantK != wantK)
+            {
+                // Its squares at the size wanted, else smaller (coarser texels), else fewer layers (never under two).
+                tintFree(t);
+                t.wantK = wantK;
+                for (uint32_t layers = t.want; layers >= kTintStart && !t.layers; --layers)
+                    for (uint32_t k = wantK; k >= 1 && !tintAlloc(t, k, layers); k /= 2)
+                        ;
+                fresh = true;
+            }
+            if (!t.layers)
+            {
+                refused++;
+                gTintCpu[view].count = 0;
+                continue;
+            }
+            uint32_t m = 0;
+            while (side / (float)(1u << m) > (float)(t.k * gTintCell))
+                ++m;
+            const float step = (float)(1u << m);
+            float       area[4] = { floorf(ax / step) * step / S, floorf(ay / step) * step / S, S / step, (float)(t.k * gTintCell) };
+            bool        changed = fresh || !t.drawn || sig != t.sig || memcmp(area, t.area, sizeof area) != 0 || textures;
+            if ((redraw || changed) && gPassCount + t.layers + 3 <= kMaxTintPasses)
+            {
+                TintDraw& d = gTintDraw[gTintDrawCount++];
+                d.view = view;
+                d.pass = gPassCount;
+                d.counted = gTintCountCount < kTintCounts ? gTintCountCount + 1 : 0;
+                if (d.counted)
+                {
+                    gCountView[fi][gTintCountCount] = view;
+                    gCountSerial[fi][gTintCountCount] = t.serial;
+                    gTintCountCount++;
+                }
+                // Passes: each layer, the two counts, then the last layer's rest.
+                for (uint32_t l = 0; l < t.layers + 3; ++l)
+                {
+                    TintPassCpu& p = gPassCpu[gPassCount++];
+                    uint32_t     layer = l < t.layers ? l : t.layers - 1; // the counts and the rest are the last layer's
+                    memset(&p, 0, sizeof p);
+                    if (sun)
+                        p.light[0] = sunRay.x, p.light[1] = sunRay.y, p.light[2] = sunRay.z;
+                    else
+                        p.light[0] = v.info[1], p.light[1] = v.info[2], p.light[2] = v.info[3], p.light[3] = 1.0f;
+                    p.info[0] = view;
+                    p.info[1] = (layer ? kTintPeel : 0u) | (sun ? 0u : kTintLocal);
+                    p.info[2] = layer ? tintOrigin(t.cx[layer - 1], t.cy[layer - 1]) : 0u;
+                    p.info[3] = tintOrigin(t.sx, t.sy);
+                    p.info2[0] = tintOrigin(t.cx[layer], t.cy[layer]);
+                    p.extra[0] = l == t.layers ? 1.5f : l == t.layers + 1 ? 0.5f : 0.0f;
+                    if (l == t.layers + 2)
+                        p.info[1] |= kTintRest;
+                }
+                t.sig = sig;
+                memcpy(t.area, area, sizeof area);
+                t.drawn = 1;
+            }
+            RenderGpuShadowTint& out = gTintCpu[view];
+            memset(&out, 0, sizeof out);
+            if (!t.drawn)
+                continue;
+            memcpy(out.area, t.area, sizeof out.area);
+            for (uint32_t l = 0; l < t.layers; ++l)
+                out.layer[l] = tintOrigin(t.cx[l], t.cy[l]);
+            out.count = t.layers;
+        }
+        gTintRefused = refused;
+        // Crowded (a view found no room): every view's squares are capped a power of two smaller, so the largest go
+        // coarser, as the light atlas halves its most over-served face. Roomy (under an eighth full, so four times the
+        // area still fits) for 2 s: the cap goes back up a step.
+        uint32_t cells = 0;
+        for (uint32_t v = 0; v < kMaxViews; ++v)
+            cells += gTint[v].layers * gTint[v].k * gTint[v].k;
+        if (refused)
+        {
+            gTintShrink += gTintShrink < 5; // 32 >> 5: one cell
+            gTintRoomy = 0;
+        }
+        else if (gTintShrink && cells * 8 < kTintCells * kTintCells)
+        {
+            if (++gTintRoomy >= 120)
+                gTintShrink--, gTintRoomy = 0;
+        }
+        else
+            gTintRoomy = 0;
+    }
+    if (!gTintSize)
+        return;
+    bool shown = false;
+    for (uint32_t v = 0; v < kMaxViews && !shown; ++v)
+        shown = gTintCpu[v].count != 0;
+    if (!shown && !gTintDrawCount)
+        return;
+    memcpy(gTintBuf[fi]->pCpuMappedAddress, gTintCpu, sizeof gTintCpu);
+    if (gPassCount)
+        memcpy(gPassBuf[fi]->pCpuMappedAddress, gPassCpu, sizeof(TintPassCpu) * gPassCount);
+    gTintOn = true;
+    F->tintDepth = gTintDepth;
+    F->tintColor = gTintColor;
+    F->shadowTints = gTintBuf[fi];
+}
+
+// The see-through casters over a view, into the scratch (pass: the layer's TintPass), batched where they share vertices.
+void drawGlass(Cmd* cmd, const RenderFrame* F, const RenderGpuShadowView& v, bool persp, uint32_t pass, uint32_t* stream, Buffer* streamBuf)
+{
+    mx::Plane planes[6];
+    clipPlanes(v.row, planes);
+    float lo[2], hi[2];
+    auto  takes = [&](const RenderCaster& c) { return c.castShadow && glassOver(v, planes, persp, c, lo, hi); };
+    for (uint32_t i = 0; i < F->seeThroughCount && gStreamUsed < kMaxEntries;)
+    {
+        const RenderCaster& c = F->seeThrough[i];
+        uint32_t            end = i + 1;
+        if (!takes(c))
+        {
+            i = end;
+            continue;
+        }
+        const uint32_t first = gStreamUsed;
+        stream[gStreamUsed++] = c.instance | (pass << RENDER_VIEW_SHIFT) | (c.twoSided ? 0x80000000u : 0u);
+        for (; !c.dynamic && end < F->seeThroughCount && gStreamUsed < kMaxEntries; ++end)
+        {
+            const RenderCaster& n = F->seeThrough[end];
+            if (n.dynamic || n.firstIndex != c.firstIndex || n.indexCount != c.indexCount || n.vertexOffset != c.vertexOffset)
+                break;
+            if (takes(n))
+                stream[gStreamUsed++] = n.instance | (pass << RENDER_VIEW_SHIFT) | (n.twoSided ? 0x80000000u : 0u);
+        }
+        Buffer*  bufs[3] = { F->positions, F->attributes, streamBuf };
+        uint32_t strides[3] = { RENDER_POSITION_STRIDE, RENDER_ATTRIBUTE_STRIDE, 4 };
+        uint64_t offsets[3] = { 0, 0, (uint64_t)first * 4 };
+        cmdBindVertexBuffer(cmd, 3, bufs, strides, offsets);
+        cmdDrawIndexedInstanced(cmd, c.indexCount, c.firstIndex, gStreamUsed - first, (uint32_t)c.vertexOffset, 0);
+        i = end;
+    }
+}
+
+// In shadows_render after both atlases: each drawn view's layers, nearest the light first, into the scratch, each then
+// copied into its square of the tint maps; the last layer's two counts with it.
+void renderTints(Cmd* cmd, const RenderFrame* F, uint32_t fi, uint32_t* stream)
+{
+    if (gCountPool[fi])
+        cmdResetQuery(cmd, gCountPool[fi], 0, 2 * kTintCounts);
+    if (!gTintOn || !gTintDrawCount || gFrozen || F->tintDepth != gTintDepth)
+        return;
+    cmdBeginDebugMarker(cmd, 0.6f, 0.9f, 1.0f, "Renderer glass shadows");
+    DescriptorData p[13] = {};
+    Texture*       tex[5] = { gTintDepth->pTexture, gScratchZ->pTexture, gScratchColor->pTexture, gSunAtlas->pTexture, gLocalAtlas->pTexture };
+    Buffer*        bufs[7] = { F->instances, gViewBuf[fi], gPassBuf[fi], F->materials, F->materialMaps, F->refraction, F->dfg };
+    p[0].mIndex = SRT_RES_IDX(TintSrt, PerFrame, gInstances);
+    p[1].mIndex = SRT_RES_IDX(TintSrt, PerFrame, gViews);
+    p[2].mIndex = SRT_RES_IDX(TintSrt, PerFrame, gPasses);
+    p[3].mIndex = SRT_RES_IDX(TintSrt, PerFrame, gMaterials);
+    p[4].mIndex = SRT_RES_IDX(TintSrt, PerFrame, gMaterialMaps);
+    p[5].mIndex = SRT_RES_IDX(TintSrt, PerFrame, gRefraction);
+    p[6].mIndex = SRT_RES_IDX(TintSrt, PerFrame, gDfg);
+    for (uint32_t i = 0; i < 7; ++i)
+        p[i].ppBuffers = &bufs[i];
+    p[7].mIndex = SRT_RES_IDX(TintSrt, PerFrame, gTintPrev);
+    p[8].mIndex = SRT_RES_IDX(TintSrt, PerFrame, gScratchZ);
+    p[9].mIndex = SRT_RES_IDX(TintSrt, PerFrame, gScratchColor);
+    p[10].mIndex = SRT_RES_IDX(TintSrt, PerFrame, gSunAtlas);
+    p[11].mIndex = SRT_RES_IDX(TintSrt, PerFrame, gLocalAtlas);
+    for (uint32_t i = 0; i < 5; ++i)
+        p[7 + i].ppTextures = &tex[i];
+    uint32_t bindings = 12;
+    if (gTintTexBound[fi] != F->textureVersion)
+    {
+        p[12].mIndex = SRT_RES_IDX(TintSrt, PerFrame, gTextures);
+        p[12].ppTextures = (Texture**)F->textures;
+        p[12].mCount = RENDER_MAX_TEXTURES;
+        gTintTexBound[fi] = F->textureVersion;
+        bindings = 13;
+    }
+    updateDescriptorSet(gRenderer, fi, gTintSet, bindings, p);
+
+    uint32_t layers = 0;
+    for (uint32_t d = 0; d < gTintDrawCount; ++d)
+        layers = gTint[gTintDraw[d].view].layers > layers ? gTint[gTintDraw[d].view].layers : layers;
+    uint32_t counted = 0;
+    for (uint32_t l = 0; l < layers; ++l)
+    {
+        RenderTargetBarrier b[2] = { { gScratchZ, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_RENDER_TARGET },
+                                     { gScratchColor, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_RENDER_TARGET } };
+        cmdResourceBarrier(cmd, 0, nullptr, 0, nullptr, 2, b);
+        BindRenderTargetsDesc bind = {};
+        bind.mRenderTargetCount = 2;
+        bind.mRenderTargets[0] = { gScratchZ, LOAD_ACTION_CLEAR };
+        bind.mRenderTargets[1] = { gScratchColor, LOAD_ACTION_CLEAR };
+        bind.mDepthStencil = { gScratchDepth, LOAD_ACTION_CLEAR };
+        bind.mDepthStencil.mStoreAction = STORE_ACTION_DONTCARE;
+        cmdBindRenderTargets(cmd, &bind);
+        for (uint32_t d = 0; d < gTintDrawCount; ++d)
+        {
+            const TintView& t = gTint[gTintDraw[d].view];
+            if (l >= t.layers)
+                continue;
+            const RenderGpuShadowView& v = gViewsCpu[gTintDraw[d].view];
+            cmdBindPipeline(cmd, gTintPipe);
+            cmdBindDescriptorSet(cmd, fi, gTintSet);
+            cmdBindIndexBuffer(cmd, F->indices, INDEX_TYPE_UINT32, 0);
+            const float sx = (float)(t.sx * gTintCell), sy = (float)(t.sy * gTintCell), side = (float)(t.k * gTintCell);
+            cmdSetViewport(cmd, sx + (v.rect[0] - t.area[0]) * t.area[2], sy + (v.rect[1] - t.area[1]) * t.area[2], v.rect[2] * t.area[2],
+                           v.rect[3] * t.area[2], 0, 1);
+            cmdSetScissor(cmd, (uint32_t)sx, (uint32_t)sy, (uint32_t)side, (uint32_t)side);
+            drawGlass(cmd, F, v, gTintDraw[d].view >= kSunViews, gTintDraw[d].pass + l, stream, gStreamBuf[fi]);
+        }
+        cmdBindRenderTargets(cmd, nullptr);
+        {
+            // The last layer's rest, for views whose last layer this is: the kept depth is read, the colour blended.
+            RenderTargetBarrier r = { gScratchZ, RESOURCE_STATE_RENDER_TARGET, RESOURCE_STATE_SHADER_RESOURCE };
+            cmdResourceBarrier(cmd, 0, nullptr, 0, nullptr, 1, &r);
+            BindRenderTargetsDesc rest = {};
+            rest.mRenderTargetCount = 1;
+            rest.mRenderTargets[0] = { gScratchColor, LOAD_ACTION_LOAD };
+            bool bound = false;
+            for (uint32_t d = 0; d < gTintDrawCount; ++d)
+            {
+                const TintView& t = gTint[gTintDraw[d].view];
+                if (l + 1 != t.layers)
+                    continue;
+                if (!bound)
+                    cmdBindRenderTargets(cmd, &rest);
+                bound = true;
+                const RenderGpuShadowView& v = gViewsCpu[gTintDraw[d].view];
+                cmdBindPipeline(cmd, gTintLastPipe);
+                cmdBindDescriptorSet(cmd, fi, gTintSet);
+                cmdBindIndexBuffer(cmd, F->indices, INDEX_TYPE_UINT32, 0);
+                const float sx = (float)(t.sx * gTintCell), sy = (float)(t.sy * gTintCell), side = (float)(t.k * gTintCell);
+                cmdSetViewport(cmd, sx + (v.rect[0] - t.area[0]) * t.area[2], sy + (v.rect[1] - t.area[1]) * t.area[2], v.rect[2] * t.area[2],
+                               v.rect[3] * t.area[2], 0, 1);
+                cmdSetScissor(cmd, (uint32_t)sx, (uint32_t)sy, (uint32_t)side, (uint32_t)side);
+                drawGlass(cmd, F, v, gTintDraw[d].view >= kSunViews, gTintDraw[d].pass + t.layers + 2, stream, gStreamBuf[fi]);
+            }
+            if (bound)
+                cmdBindRenderTargets(cmd, nullptr);
+        }
+        RenderTargetBarrier c[3] = { { gScratchColor, RESOURCE_STATE_RENDER_TARGET, RESOURCE_STATE_SHADER_RESOURCE },
+                                     { gTintDepth, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_RENDER_TARGET },
+                                     { gTintColor, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_RENDER_TARGET } };
+        cmdResourceBarrier(cmd, 0, nullptr, 0, nullptr, 3, c);
+        BindRenderTargetsDesc copy = {};
+        copy.mRenderTargetCount = 2;
+        copy.mRenderTargets[0] = { gTintDepth, LOAD_ACTION_LOAD };
+        copy.mRenderTargets[1] = { gTintColor, LOAD_ACTION_LOAD };
+        cmdBindRenderTargets(cmd, &copy);
+        auto tri = [&](uint32_t pass) {
+            const uint32_t first = gStreamUsed;
+            stream[gStreamUsed++] = pass << RENDER_VIEW_SHIFT;
+            Buffer*  vb[2] = { gTriBuf, gStreamBuf[fi] };
+            uint32_t strides[2] = { 8, 4 };
+            uint64_t offsets[2] = { 0, (uint64_t)first * 4 };
+            cmdBindVertexBuffer(cmd, 2, vb, strides, offsets);
+            cmdDrawInstanced(cmd, 3, 0, 1, 0);
+        };
+        for (uint32_t d = 0; d < gTintDrawCount && gStreamUsed + 3 <= kMaxEntries; ++d)
+        {
+            const TintView& t = gTint[gTintDraw[d].view];
+            if (l >= t.layers)
+                continue;
+            const float x = (float)(t.cx[l] * gTintCell), y = (float)(t.cy[l] * gTintCell), side = (float)(t.k * gTintCell);
+            cmdSetViewport(cmd, x, y, side, side, 0, 1);
+            cmdSetScissor(cmd, (uint32_t)x, (uint32_t)y, (uint32_t)side, (uint32_t)side);
+            cmdBindPipeline(cmd, gTintCopyPipe);
+            cmdBindDescriptorSet(cmd, fi, gTintSet);
+            tri(gTintDraw[d].pass + l);
+            if (l + 1 != t.layers || !gTintDraw[d].counted || !gCountPool[fi])
+                continue;
+            // Its counts: texels whose last layer holds more than one surface, then more than none.
+            cmdBindPipeline(cmd, gTintCountPipe);
+            cmdBindDescriptorSet(cmd, fi, gTintSet);
+            for (uint32_t q = 0; q < 2; ++q)
+            {
+                QueryDesc qd = { 2 * (gTintDraw[d].counted - 1) + q };
+                cmdBeginQuery(cmd, gCountPool[fi], &qd);
+                tri(gTintDraw[d].pass + t.layers + q);
+                cmdEndQuery(cmd, gCountPool[fi], &qd);
+            }
+            counted = gTintDraw[d].counted > counted ? gTintDraw[d].counted : counted;
+        }
+        cmdBindRenderTargets(cmd, nullptr);
+        RenderTargetBarrier e[2] = { { gTintDepth, RESOURCE_STATE_RENDER_TARGET, RESOURCE_STATE_SHADER_RESOURCE },
+                                     { gTintColor, RESOURCE_STATE_RENDER_TARGET, RESOURCE_STATE_SHADER_RESOURCE } };
+        cmdResourceBarrier(cmd, 0, nullptr, 0, nullptr, 2, e);
+    }
+    if (counted)
+    {
+        cmdResolveQuery(cmd, gCountPool[fi], 0, 2 * counted);
+        gCountUsed[fi] = counted;
+    }
+    cmdEndDebugMarker(cmd);
+}
+
+
+
+// In load(): the tint passes' shaders, pipelines and buffers. Refused, glass casts no tinted shadows (glass_shadows reads
+// as off).
+void makeTintPasses()
+{
+    ShaderLoadDesc td = {};
+    td.mVert.pFileName = "renderer_shadow_tint.vert";
+    td.mFrag.pFileName = "renderer_shadow_tint.frag";
+    addShader(gRenderer, &td, &gTintShader);
+    td.mFrag.pFileName = "renderer_shadow_tint_rest.frag";
+    addShader(gRenderer, &td, &gTintRestShader);
+    ShaderLoadDesc cd = {};
+    cd.mVert.pFileName = "renderer_shadow_tint_copy.vert";
+    cd.mFrag.pFileName = "renderer_shadow_tint_copy.frag";
+    addShader(gRenderer, &cd, &gTintCopyShader);
+    if (!gTintShader || !gTintRestShader || !gTintCopyShader)
+        return;
+    DescriptorSetDesc setDesc = SRT_SET_DESC(TintSrt, PerFrame, gFrames, 0);
+    addDescriptorSet(gRenderer, &setDesc, &gTintSet);
+    if (!gTintSet)
+        return;
+
+    // The core's scene layout (renderer.cpp sceneLayout, without motion): positions, attributes, the instance-rate stream.
+    VertexLayout l = {};
+    l.mBindingCount = 3;
+    l.mBindings[0].mStride = RENDER_POSITION_STRIDE;
+    l.mBindings[1].mStride = RENDER_ATTRIBUTE_STRIDE;
+    l.mBindings[2].mStride = 4;
+    l.mBindings[2].mRate = VERTEX_BINDING_RATE_INSTANCE;
+    l.mAttribCount = 6;
+    const ShaderSemantic  sem[6] = { SEMANTIC_POSITION, SEMANTIC_NORMAL, SEMANTIC_TEXCOORD1, SEMANTIC_TANGENT, SEMANTIC_TEXCOORD0, SEMANTIC_COLOR };
+    const TinyImageFormat fmt[6] = { TinyImageFormat_R32G32B32_SFLOAT, TinyImageFormat_R16G16_SNORM,     TinyImageFormat_R32_UINT,
+                                     TinyImageFormat_R16G16_SINT,      TinyImageFormat_R32G32_SFLOAT,    TinyImageFormat_R8G8B8A8_UNORM };
+    const uint32_t        binding[6] = { 0, 1, 2, 1, 1, 1 }, offset[6] = { 0, 0, 0, 4, 8, 16 };
+    for (uint32_t i = 0; i < 6; ++i)
+    {
+        l.mAttribs[i].mSemantic = sem[i];
+        l.mAttribs[i].mFormat = fmt[i];
+        l.mAttribs[i].mBinding = binding[i];
+        l.mAttribs[i].mLocation = i;
+        l.mAttribs[i].mOffset = offset[i];
+    }
+    RasterizerStateDesc raster = {};
+    raster.mCullMode = CULL_MODE_NONE;
+    raster.mDepthClampEnable = true; // glass nearer than a cascade's near plane still tints
+    DepthStateDesc nearest = {};
+    nearest.mDepthTest = true;
+    nearest.mDepthWrite = true;
+    nearest.mDepthFunc = CMP_LESS;
+    DepthStateDesc  none = {};
+    TinyImageFormat scratch[2] = { TinyImageFormat_R32_SFLOAT, TinyImageFormat_R16G16B16A16_SFLOAT };
+    TinyImageFormat maps[2] = { TinyImageFormat_R32_SFLOAT, TinyImageFormat_R10G10B10A2_UNORM };
+
+    PipelineDesc desc = {};
+    desc.mType = PIPELINE_TYPE_GRAPHICS;
+    PIPELINE_LAYOUT_DESC(desc, NULL, SRT_LAYOUT_DESC(TintSrt, PerFrame), NULL, NULL);
+    GraphicsPipelineDesc& g = desc.mGraphicsDesc;
+    g.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+    g.mRenderTargetCount = 2;
+    g.pColorFormats = scratch;
+    g.mSampleCount = SAMPLE_COUNT_1;
+    g.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+    g.pRasterizerState = &raster;
+    g.pDepthState = &nearest;
+    g.pVertexLayout = &l;
+    g.pShaderProgram = gTintShader;
+    desc.pName = "renderer_shadow_tint";
+    addPipeline(gRenderer, &desc, &gTintPipe);
+    // The last layer's rest, into the scratch colour alone (one blend state, so nothing rests on per-target blending):
+    // what each surface past the kept one lets through multiplied in, and one added to the count for each.
+    BlendStateDesc blend = {};
+    blend.mRenderTargetMask = BLEND_STATE_TARGET_0;
+    blend.mSrcFactors[0] = BC_ZERO;
+    blend.mDstFactors[0] = BC_SRC_COLOR;
+    blend.mSrcAlphaFactors[0] = blend.mDstAlphaFactors[0] = BC_ONE;
+    blend.mBlendModes[0] = blend.mBlendAlphaModes[0] = BM_ADD;
+    blend.mColorWriteMasks[0] = COLOR_MASK_ALL;
+    TinyImageFormat restFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
+    g.mRenderTargetCount = 1;
+    g.pColorFormats = &restFormat;
+    g.mDepthStencilFormat = TinyImageFormat_UNDEFINED;
+    g.pDepthState = &none;
+    g.pBlendState = &blend;
+    g.pShaderProgram = gTintRestShader;
+    desc.pName = "renderer_shadow_tint_rest";
+    addPipeline(gRenderer, &desc, &gTintLastPipe);
+    g.mRenderTargetCount = 2;
+
+    VertexLayout cl = {};
+    cl.mBindingCount = 2;
+    cl.mBindings[0].mStride = 8;
+    cl.mBindings[1].mStride = 4;
+    cl.mBindings[1].mRate = VERTEX_BINDING_RATE_INSTANCE;
+    cl.mAttribCount = 2;
+    cl.mAttribs[0].mSemantic = SEMANTIC_POSITION;
+    cl.mAttribs[0].mFormat = TinyImageFormat_R32G32_SFLOAT;
+    cl.mAttribs[0].mBinding = 0;
+    cl.mAttribs[0].mLocation = 0;
+    cl.mAttribs[1].mSemantic = SEMANTIC_TEXCOORD1;
+    cl.mAttribs[1].mFormat = TinyImageFormat_R32_UINT;
+    cl.mAttribs[1].mBinding = 1;
+    cl.mAttribs[1].mLocation = 1;
+    RasterizerStateDesc plain = {};
+    plain.mCullMode = CULL_MODE_NONE;
+    g.pRasterizerState = &plain;
+    g.pColorFormats = maps;
+    g.mDepthStencilFormat = TinyImageFormat_UNDEFINED;
+    g.pBlendState = nullptr;
+    g.pVertexLayout = &cl;
+    g.pShaderProgram = gTintCopyShader;
+    desc.pName = "renderer_shadow_tint_copy";
+    addPipeline(gRenderer, &desc, &gTintCopyPipe);
+    BlendStateDesc mute = {};
+    mute.mRenderTargetMask = (BlendStateTargets)(BLEND_STATE_TARGET_0 | BLEND_STATE_TARGET_1);
+    mute.mIndependentBlend = true;
+    mute.mColorWriteMasks[0] = mute.mColorWriteMasks[1] = COLOR_MASK_NONE;
+    for (uint32_t t = 0; t < 2; ++t)
+    {
+        mute.mSrcFactors[t] = mute.mSrcAlphaFactors[t] = BC_ONE;
+        mute.mDstFactors[t] = mute.mDstAlphaFactors[t] = BC_ZERO;
+        mute.mBlendModes[t] = mute.mBlendAlphaModes[t] = BM_ADD;
+    }
+    g.pBlendState = &mute;
+    desc.pName = "renderer_shadow_tint_count";
+    addPipeline(gRenderer, &desc, &gTintCountPipe);
+    if (!gTintPipe || !gTintLastPipe || !gTintCopyPipe || !gTintCountPipe)
+    {
+        yea::host()->log(1, "renderer_shadows: the glass tint pipelines were refused; glass casts untinted light");
+        return;
+    }
+
+    for (uint32_t i = 0; i < gFrames; ++i)
+    {
+        BufferLoadDesc d = {};
+        d.mDesc.mDescriptors = DESCRIPTOR_TYPE_BUFFER;
+        d.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+        d.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+        d.mDesc.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+        d.mDesc.mSize = sizeof(RenderGpuShadowTint) * kMaxViews;
+        d.mDesc.mStructStride = sizeof(RenderGpuShadowTint);
+        d.mDesc.mElementCount = kMaxViews;
+        d.mDesc.pName = "renderer_shadow_tints";
+        d.ppBuffer = &gTintBuf[i];
+        addResource(&d, nullptr);
+        d.mDesc.mSize = sizeof(TintPassCpu) * kMaxTintPasses;
+        d.mDesc.mStructStride = sizeof(TintPassCpu);
+        d.mDesc.mElementCount = kMaxTintPasses;
+        d.mDesc.pName = "renderer_shadow_tint_passes";
+        d.ppBuffer = &gPassBuf[i];
+        addResource(&d, nullptr);
+        QueryPoolDesc qd = {};
+        qd.pName = "renderer_shadow_tint_counts";
+        qd.mType = QUERY_TYPE_OCCLUSION;
+        qd.mQueryCount = 2 * kTintCounts;
+        initQueryPool(gRenderer, &qd, &gCountPool[i]);
+        gCountUsed[i] = 0;
+        gTintTexBound[i] = 0;
+    }
+    BufferLoadDesc t = {};
+    t.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+    t.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+    t.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+    t.mDesc.mStartState = RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+    t.mDesc.mSize = 3 * 8;
+    t.mDesc.pName = "renderer_shadow_tint_triangle";
+    t.ppBuffer = &gTriBuf;
+    addResource(&t, nullptr);
+}
+
+void freeTintPasses()
+{
+    freeTintTargets();
+    for (uint32_t i = 0; i < gFrames; ++i)
+    {
+        if (gTintBuf[i])
+            removeResource(gTintBuf[i]);
+        if (gPassBuf[i])
+            removeResource(gPassBuf[i]);
+        if (gCountPool[i])
+            exitQueryPool(gRenderer, gCountPool[i]);
+    }
+    if (gTriBuf)
+        removeResource(gTriBuf);
+    Pipeline* pipes[4] = { gTintPipe, gTintLastPipe, gTintCopyPipe, gTintCountPipe };
+    for (Pipeline* p : pipes)
+        if (p)
+            removePipeline(gRenderer, p);
+    if (gTintSet)
+        removeDescriptorSet(gRenderer, gTintSet);
+    if (gTintShader)
+        removeShader(gRenderer, gTintShader);
+    if (gTintCopyShader)
+        removeShader(gRenderer, gTintCopyShader);
+    if (gTintRestShader)
+        removeShader(gRenderer, gTintRestShader);
+}
 } // namespace
 
 int load(int reloaded)
@@ -776,7 +1632,13 @@ int load(int reloaded)
         s.ppBuffer = &gStreamBuf[i];
         addResource(&s, nullptr);
     }
+    makeTintPasses();
     waitForAllResourceLoads();
+    if (gTriBuf && gTriBuf->pCpuMappedAddress)
+    {
+        const float tri[6] = { -1, -1, 3, -1, -1, 3 }; // a triangle over the square
+        memcpy(gTriBuf->pCpuMappedAddress, tri, sizeof tri);
+    }
     gStreamCpu = new uint32_t[kMaxEntries];
     gReady = true;
     return 0;
@@ -797,6 +1659,7 @@ void unload()
         removeShader(gRenderer, gMaskedShader);
     freeTarget(gSunAtlas);
     freeTarget(gLocalAtlas);
+    freeTintPasses();
     for (uint32_t i = 0; i < gFrames; ++i)
     {
         if (gViewBuf[i])
@@ -1289,6 +2152,7 @@ bool shadows_prepare(uint64_t address)
             memcpy(&views[kSunViews + g * 6], gGroups[g].views, sizeof gGroups[g].views);
 
     memcpy(gViewBuf[F->frameIndex]->pCpuMappedAddress, gViewsCpu, sizeof gViewsCpu);
+    prepareTints(F);
 
     F->sunAtlas = gSunAtlas;
     F->localAtlas = gLocalAtlas;
@@ -1442,6 +2306,7 @@ void shadows_render(uint64_t address)
         cmdResourceBarrier(cmd, 0, nullptr, 0, nullptr, 1, &b);
         cmdEndDebugMarker(cmd);
     }
+    renderTints(cmd, F, fi, stream);
     // The GPU reads the stream when this command list runs, after this copy.
     if (gStreamUsed)
         memcpy(gStreamBuf[fi]->pCpuMappedAddress, gStreamCpu, (size_t)gStreamUsed * 4);

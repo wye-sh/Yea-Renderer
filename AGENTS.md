@@ -58,6 +58,23 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   is the one painting code (decalPaint; decalsAt through the grid): renderer_probes and renderer_gi keep identical copies
   and paint their captures with it (probes recapture when `decalsChanged` moves; GI's raster captures catch up as they go
   round), and renderer_rt paints its hits (not glass hits).
+- `renderer_shadows`, glass (4.15.0, frame v26, knobs `glass_shadows`, `glass_resolution` in Glass): every shadow view
+  that see-through casters (`seeThrough`, castShadow) lie over gets a deep shadow map of them in the tint maps
+  (`tintDepth` R32F, `tintColor` RGB10A2; one square a layer over just the glass's footprint, at the view's texel size or
+  coarser by powers of two when it would take more than half the maps' side, a cap that halves while a view finds no
+  room and doubles back once they sit under an eighth full for 2 s; `shadowTints` says where). Layer k is the
+  k-th glass surface out from the light (depth peeling into a scratch square, `Tint.frag.fsl`, each copied into its square
+  by `TintCopy`): its depth and T = (1 - coverage) (1 - FssEss - Fms Ems) tint at the ray's cosine after the normal map,
+  the see-through pass's and renderer_rt's rule (same dfgLookup, glassCounts' faces, cut-outs; glass behind the opaque map
+  is left out). The last layer also multiplies in every surface past it (`TintRest.frag.fsl`, colour alone: no per-target
+  blending) and counts them in alpha; two occlusion queries a counted view (32 a frame, read a few frames later) give a
+  view whose last layer holds two or more surfaces one layer more (up to RENDER_MAX_TINT_LAYERS, 8), and take one back,
+  never under 2, when it holds none: a view stays exact however many panes stack. The log line counts the views at each
+  layer count. Tints are redrawn with their view, or when the glass over it, its look or the textures change; the maps
+  go 10 s after glass stops casting. Lighting.h.fsl `glassTint` multiplies a view's layers nearer than the point (moved
+  two texels and the normal bias towards the light, so a pane never tints its own lit side), averaged over four taps
+  across the filter's disk, into `sunShadow` and `localShadow`, which return RGB. FSL: a file has one PS_MAIN signature
+  however Shaders.list defines it, so output variants are separate files.
 - `renderer_shadows`: sun cascades (stabilised, PCF or PCSS; each redrawn only when its view or a caster over it
   changed) and a cached atlas for spot and point lights
   (6 tiles per point light), redrawn only when the light or a nearby caster moves. Each face's tile is a square of
@@ -508,7 +525,8 @@ surface's luminance is that over its area). Colours linear RGB.
   `material_maps(m, base_color, orm, normal, emissive)`, `material_factors` (glTF's), `material_alpha(m, cutoff)` (cut out
   below it; 0 opaque). Tables `TextureMap` (a row a shader slot), `TexturePath`, `MaterialMap`.
 - See-through: `material_blend(m, opacity)` (glass, lenses, visors, water; opacity times the base colour's alpha is how
-  much of the surface is there, its reflection stays whole; 0 opaque). Blended surfaces tint ray-traced shadows (instance_shadow on); shadow maps don't see them yet.
+  much of the surface is there, its reflection stays whole; 0 opaque). With instance_shadow on (the default), a blended
+  surface tints the light that passes it, in ray-traced shadows and (4.15.0) in the shadow maps alike.
   `material_refraction(m, ior, thickness, shape, tint)`: how it bends (thin pane 0, solid ball or block 1), blurs (by its
   roughness: frosted glass) and tints what is behind it. Knob `refraction` (Performance) turns the bending and blur off.
   renderer_models calls `material_blend(m, 1)` for glTF BLEND materials, their alpha in the factors.
@@ -565,7 +583,8 @@ sun_disk (degrees), near_plane, gpu_timings (logs each pass's GPU time every 10 
 texture_detail (Full, Half, Quarter: top mips left out; more when GPU memory is short). `renderer_culling`: enabled, max_lights, tile_size (8/16/32), z_bins,
 heatmap. `renderer_shadows`: enabled (the sun's), cascades, shadow_distance, cascade_split, sun_resolution, softness,
 filter_taps, pcss, sun_size, normal_bias, slope_bias, receiver_plane, light_shadows, shadowed_lights, local_atlas_resolution,
-updates_per_frame, max_tile_resolution, contact_hardening, light_size (m), show_cascades, show_atlas (the light shadow atlas, top right). `renderer_taa`: enabled, history_weight, clamp_width, sharpen, jitter,
+updates_per_frame, max_tile_resolution, contact_hardening, light_size (m), show_cascades, show_atlas (the light shadow atlas, top right),
+glass_shadows, glass_resolution (the tint maps' side). `renderer_taa`: enabled, history_weight, clamp_width, sharpen, jitter,
 jitter_phases. `renderer_upscale`: upscaler (TAA, FSR, DLSS), quality_mode (Native, Quality 67%, Balanced 59%,
 Performance 50%, Ultra_Performance 33%; for an upscaler only), dlss_model (Auto: Transformer where the GPU runs FP8, CNN
 elsewhere, CNN until Yea reports FP8; Transformer: NVIDIA's default per mode, K/M/L; CNN: preset E, two to five times cheaper on RTX 20 and 30, falling back to the default in a mode where it's refused and the default then runs, said once per mode; Transformer is
@@ -605,6 +624,9 @@ either way.
 Run by agents in their orb; never compiled into a module, kept out of `licenses.json` (they ship nothing). Each vendored
 library keeps its licence file beside its source, since the component's repository redistributes it.
 - `tools/ltc_fit.cpp`: fits the area-light LTC tables (`modules/renderer/Assets/ltc.bin`). Our own code.
+- `tools/dfg_bake.cpp`: bakes the split-sum table (`modules/renderer/Assets/dfg.bin`, 128 x 128 at x sqrt(N.V), y roughness;
+  visible-normal sampling) that `dfgLookup` reads; every copy of `dfgLookup` (core, renderer_rt, renderer_shadows) stays
+  identical to Brdf.h.fsl's. Our own code.
 - `tools/model_cook/` (`build.sh` → `build/tools/model_cook in.glb out.rmodel`): glTF/GLB (Draco too), FBX and OBJ to
   `.rmodel` with a report. Our
   own code plus `vendor/cgltf` (MIT, Johannes Kuhlmann; v1.15), `vendor/meshoptimizer` (MIT, Arseny Kapoulkine; v1.3),

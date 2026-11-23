@@ -48,5 +48,8 @@ BEGIN_SRT(SceneSrt)
                                                              // w 1 given; then rgb tint
         DECL_TEXTURE(PerFrame, Tex2D(float4), gSceneColor)  // the scene colour chain glass refracts (FLAG_REFRACTION)
         DECL_TEXTURE(PerFrame, Tex2DArray(float4), gRtShadowTint) // glass's colour in traced shadows (FLAG_RT_TINT)
+        DECL_BUFFER(PerFrame, Buffer(ShadowTint), gShadowTints)  // glass in the shadow maps (FLAG_GLASS_SHADOW)
+        DECL_TEXTURE(PerFrame, Tex2D(float), gTintDepth)
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gTintColor)
     END_SRT_SET(PerFrame)
 END_SRT(SceneSrt)

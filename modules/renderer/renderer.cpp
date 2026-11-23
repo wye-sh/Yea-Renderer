@@ -129,7 +129,8 @@ const uint32_t kFlagCulled = 1, kFlagHeatmap = 2, kFlagCascades = 4, kFlagShadow
                kFlagContactDebug = 128, kFlagUnlit = 256, kFlagSsr = 512, kFlagSsrDebug = 1024,
                kFlagReceiverPlane = 2048, kFlagRt = 4096, kFlagRtDebug = 8192, kFlagRtShadows = 16384,
                kFlagRtSun = 32768, kFlagArea = 65536, kFlagSky = 131072, kFlagFog = 262144,
-               kFlagGi = 524288, kFlagGiDebug = 1048576, kFlagDecals = 2097152, kFlagRefraction = 4194304, kFlagRtTint = 8388608;
+               kFlagGi = 524288, kFlagGiDebug = 1048576, kFlagDecals = 2097152, kFlagRefraction = 4194304, kFlagRtTint = 8388608,
+               kFlagGlassShadow = 16777216;
 const uint32_t kMaxFrames = 4;
 const uint32_t kMaxUnculledLights = 256;
 const uint32_t kHistogramBins = 128;
@@ -218,7 +219,7 @@ Texture*       gLightImages; // the rect lights' images (images.cpp)
 uint32_t*      gLookCpu;     // per GPU light: its image + 1, 0 none (gLightLooks)
 RenderGpuLightShape* gShapeCpu;
 v3                   gCamRight = { 1, 0, 0 }; // the view's right last frame, for a camera looking exactly straight down or up
-Buffer *       gDfg, *gExposure, *gHistogram, *gDummyU32, *gDummyViews, *gDummyProbes;
+Buffer *       gDfg, *gExposure, *gHistogram, *gDummyU32, *gDummyViews, *gDummyProbes, *gDummyTints;
 Buffer*        gDummySh;     // stands in for renderer_sky's ambient (9 float4)
 Texture*       gDummyVolume; // and its aerial perspective (2 x 2 x 2)
 Buffer *       gPosBuf, *gAttrBuf, *gIndexBuf; // the vertex streams and indices (uploadMeshes)
@@ -389,14 +390,18 @@ Shader* loadShader(const char* vert, const char* frag, const char* comp)
 
 // The split-sum DFG table, 32 x 32 over (N.V, perceptual roughness), with height-correlated
 // Smith visibility: x scales F0, y is the bias. Our own numeric integration.
+// The split-sum table (Brdf.h.fsl dfgLookup): kDfg x kDfg, x sqrt(NoV) so grazing angles, where it changes fastest, get
+// the finest steps; y roughness.
+const uint32_t kDfg = 128;
 void buildDfg(float* out)
 {
     const uint32_t n = 256;
-    for (uint32_t j = 0; j < 32; ++j)
-        for (uint32_t i = 0; i < 32; ++i)
+    for (uint32_t j = 0; j < kDfg; ++j)
+        for (uint32_t i = 0; i < kDfg; ++i)
         {
-            float NoV = maxf((float)i / 31.0f, 1e-3f);
-            float r = maxf((float)j / 31.0f, 0.02f);
+            float x = (float)i / (float)(kDfg - 1);
+            float NoV = maxf(x * x, 1e-4f);
+            float r = maxf((float)j / (float)(kDfg - 1), 0.02f);
             float a = r * r, a2 = a * a;
             v3    Vd = V(sqrtf(1 - NoV * NoV), 0, NoV);
             float A = 0, B = 0;
@@ -427,8 +432,8 @@ void buildDfg(float* out)
                     B += fc * g;
                 }
             }
-            out[(j * 32 + i) * 2 + 0] = A / n;
-            out[(j * 32 + i) * 2 + 1] = B / n;
+            out[(j * kDfg + i) * 2 + 0] = A / n;
+            out[(j * kDfg + i) * 2 + 1] = B / n;
         }
 }
 
@@ -1969,14 +1974,32 @@ int load(int reloaded)
     gDummyU32 = makeBuffer(256, 4, DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_dummy_u32");
     gDummyViews = makeBuffer(sizeof(RenderGpuShadowView) * 4, sizeof(RenderGpuShadowView), DESCRIPTOR_TYPE_BUFFER, cpu, sr,
                              "renderer_dummy_views");
+    gDummyTints = makeBuffer(sizeof(RenderGpuShadowTint) * 4, sizeof(RenderGpuShadowTint), DESCRIPTOR_TYPE_BUFFER, cpu, sr,
+                             "renderer_dummy_tints");
     gDummyProbes = makeBuffer(sizeof(RenderGpuProbe) * 4, sizeof(RenderGpuProbe), DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_dummy_probes");
     gDummySh = makeBuffer(9 * 16, 16, DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_dummy_sky_sh");
 
-    float* dfg = new float[32 * 32 * 2];
-    buildDfg(dfg);
-    gDfg = makeBuffer(32 * 32 * 8, 8, DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_dfg");
+    // The split-sum table: baked by tools/dfg_bake.cpp (visible-normal sampling, 16384 samples a cell) into Assets/dfg.bin;
+    // missing, built here with 256 samples a cell (up to 1% off at grazing angles on smooth surfaces).
+    float* dfg = new float[kDfg * kDfg * 2];
+    {
+        char  path[1024];
+        FILE* f = yea::asset("dfg.bin", path, sizeof path) ? fopen(path, "rb") : nullptr;
+        char  magic[4] = {};
+        int   n = 0;
+        bool  ok = f && fread(magic, 1, 4, f) == 4 && !memcmp(magic, "DFG1", 4) && fread(&n, 4, 1, f) == 1 && n == (int)kDfg &&
+                  fread(dfg, 8, kDfg * kDfg, f) == kDfg * kDfg;
+        if (f)
+            fclose(f);
+        if (!ok)
+        {
+            buildDfg(dfg);
+            yea::host()->log(1, "renderer: Assets/dfg.bin is missing or not the split-sum table; built a coarser one");
+        }
+    }
+    gDfg = makeBuffer(kDfg * kDfg * 8, 8, DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_dfg");
     if (gDfg && gDfg->pCpuMappedAddress)
-        memcpy(gDfg->pCpuMappedAddress, dfg, 32 * 32 * 8);
+        memcpy(gDfg->pCpuMappedAddress, dfg, kDfg * kDfg * 8);
     // The area lights' tables (tools/ltc_fit.cpp): 64 x 64 inverse transforms, then 64 x 64 norms and the horizon
     // table, float4 each. Missing, area lights stay dark.
     gLtc = makeBuffer(2 * 64 * 64 * 16, 16, DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_ltc");
@@ -2045,7 +2068,7 @@ int load(int reloaded)
     // module cleanly instead of crashing on it later.
     lightImagesInit();
     gLightImages = lightImagesMake();
-    bool made = gDfg && gLtc && gLightImages && gExposure && gHistogram && gDummyU32 && gDummyViews && gDummyProbes && gDummySh && gDummyVolume && gDummyDepth && gDummyColor &&
+    bool made = gDfg && gLtc && gLightImages && gExposure && gHistogram && gDummyU32 && gDummyViews && gDummyTints && gDummyProbes && gDummySh && gDummyVolume && gDummyDepth && gDummyColor &&
                 gDummyRates && gDummyArray && gScenePersistent && gSceneFrame && gCompositeSet && gExposureSet && gTonemapSet && gShadowSampler &&
                 gChainSet && gChainMsSet;
     for (uint32_t i = 0; i < gFrames * kChainCopies * kChainLevels; ++i)
@@ -2201,6 +2224,7 @@ void unload()
     }
     freeBuffer(gDummyU32);
     freeBuffer(gDummyViews);
+    freeBuffer(gDummyTints);
     freeBuffer(gDummyProbes);
     freeBuffer(gDummySh);
     if (gDummyVolume)
@@ -2870,14 +2894,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
             F.lights[i].traced = -1;
         F.rtSunShadows = F.rtLightCount = 0;
     }
-    bool shadows = renderer_shadows::shadows_prepare((uint64_t)(uintptr_t)&F) && F.shadowViews && F.sunAtlas && F.localAtlas;
-    bool ao = renderer_ao::ao_prepare((uint64_t)(uintptr_t)&F) && F.aoOn && F.ao;
-    // Contact shadows refine the sun's: off with them.
-    bool contact = shadows && F.cascadeCount && renderer_contact::contact_prepare((uint64_t)(uintptr_t)&F) && F.contactOn && F.contact;
-    const yea_float3 zen = settings.sky_color, hor = settings.horizon_color, gnd = settings.ground_color;
-    float            L = settings.sky_luminance;
-    F.drawables = gDrawables;
-    F.drawableCount = count - blendAll;
+    // Glass: ray tracing and the shadow maps' tint (renderer_shadows) draw it.
     F.seeThrough = gSeeThrough;
     F.seeThroughCount = seeThrough;
     qsort(gSeeThrough, seeThrough, sizeof(RenderCaster), [](const void* a, const void* b) {
@@ -2886,8 +2903,19 @@ void draw(uint32_t pass, const YeaFrame* yf)
     });
     F.refraction = gRefractBuf[fi];
     F.dfg = gDfg;
-    F.rtShadowTint = nullptr; // renderer_rt's rt_prepare sets it
     F.materials = gMaterialBuf[fi];
+    F.tintDepth = F.tintColor = nullptr;
+    F.shadowTints = nullptr;
+    bool shadows = renderer_shadows::shadows_prepare((uint64_t)(uintptr_t)&F) && F.shadowViews && F.sunAtlas && F.localAtlas;
+    const bool glassShadows = shadows && F.tintDepth && F.tintColor && F.shadowTints;
+    bool ao = renderer_ao::ao_prepare((uint64_t)(uintptr_t)&F) && F.aoOn && F.ao;
+    // Contact shadows refine the sun's: off with them.
+    bool contact = shadows && F.cascadeCount && renderer_contact::contact_prepare((uint64_t)(uintptr_t)&F) && F.contactOn && F.contact;
+    const yea_float3 zen = settings.sky_color, hor = settings.horizon_color, gnd = settings.ground_color;
+    float            L = settings.sky_luminance;
+    F.drawables = gDrawables;
+    F.drawableCount = count - blendAll;
+    F.rtShadowTint = nullptr; // renderer_rt's rt_prepare sets it
     F.skyZenith[0] = zen.x * L, F.skyZenith[1] = zen.y * L, F.skyZenith[2] = zen.z * L;
     F.skyHorizon[0] = hor.x * L, F.skyHorizon[1] = hor.y * L, F.skyHorizon[2] = hor.z * L;
     F.skyGround[0] = gnd.x * L, F.skyGround[1] = gnd.y * L, F.skyGround[2] = gnd.z * L;
@@ -3050,7 +3078,8 @@ void draw(uint32_t pass, const YeaFrame* yf)
                     (shadows && F.receiverPlane ? kFlagReceiverPlane : 0) | (rt ? kFlagRt : 0) | (rt && F.rtDebug ? kFlagRtDebug : 0) |
                     (rtShadows ? kFlagRtShadows : 0) | (rtShadows && F.rtSunShadows ? kFlagRtSun : 0) | (anyShape ? kFlagArea : 0) | (sky ? kFlagSky : 0) | (fog ? kFlagFog : 0) |
                     (gi ? kFlagGi : 0) | (gi && F.giDebug ? kFlagGiDebug : 0) | (decals ? kFlagDecals : 0) |
-                    (refractVisible ? kFlagRefraction : 0) | (rtShadows && F.rtShadowTint ? kFlagRtTint : 0);
+                    (refractVisible ? kFlagRefraction : 0) | (rtShadows && F.rtShadowTint ? kFlagRtTint : 0) |
+                    (glassShadows ? kFlagGlassShadow : 0);
     gf->refraction[0] = (float)gChainMips;
     if (ssr)
     {
@@ -3224,7 +3253,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         Buffer*  masks = culled ? F.tileMasks : gDummyU32;
         Buffer*  bins = culled ? F.zbins : gDummyU32;
         Buffer*  views = shadows ? F.shadowViews : gDummyViews;
-        DescriptorData p[38] = {};
+        DescriptorData p[41] = {};
         Texture*       ssrDepth = ssr ? F.ssrDepth : gDummyDepth->pTexture;
         Texture*       previous = ssr ? F.previous->pTexture : gDummyColor->pTexture;
         Texture*       probeTex = probes ? F.probes->pTexture : gDummyArray->pTexture;
@@ -3323,14 +3352,24 @@ void draw(uint32_t pass, const YeaFrame* yf)
         p[35].ppTextures = &sceneColor;
         p[36].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gRtShadowTint);
         p[36].ppTextures = &rtTint;
-        uint32_t bindings = 37;
+        // Glass in the shadow maps (renderer_shadows), or stand-ins.
+        Buffer*  tints = glassShadows ? F.shadowTints : gDummyTints;
+        Texture* tintDepth = glassShadows ? F.tintDepth->pTexture : gDummyDepth->pTexture;
+        Texture* tintColor = glassShadows ? F.tintColor->pTexture : gDummyColor->pTexture;
+        p[37].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gShadowTints);
+        p[37].ppBuffers = &tints;
+        p[38].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gTintDepth);
+        p[38].ppTextures = &tintDepth;
+        p[39].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gTintColor);
+        p[39].ppTextures = &tintColor;
+        uint32_t bindings = 40;
         if (gTexturesBound[fi] != F.textureVersion)
         {
-            p[37].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gTextures);
-            p[37].ppTextures = (Texture**)F.textures;
-            p[37].mCount = RENDER_MAX_TEXTURES;
+            p[40].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gTextures);
+            p[40].ppTextures = (Texture**)F.textures;
+            p[40].mCount = RENDER_MAX_TEXTURES;
             gTexturesBound[fi] = F.textureVersion;
-            bindings = 38;
+            bindings = 41;
         }
         updateDescriptorSet(gRenderer, fi, gSceneFrame, bindings, p);
 
