@@ -70,6 +70,39 @@ table Light none 4096
   u32 gen
   u32 alive
 end
+# Texture maps (textures.cpp): each a mip chain at `offset` in a file (its path in TexturePath), which the renderer reads
+# and uploads in its own frames, a few at a time, and again after it restarts. Rows as Mesh's (handles row | gen << 20);
+# a row is a slot in the shaders' texture array.
+table TextureMap none 1024
+  u32 pathFirst
+  u32 pathLength
+  u64 offset
+  u64 bytes
+  u32 format
+  u32 width
+  u32 height
+  u32 mips
+  u32 gen
+  u32 alive
+end
+table TexturePath none 262144
+  u8 c
+end
+# A material's texture maps (material_maps), at its Material row: each map's texture handle (4294967295 none), the
+# factors the maps are multiplied by, and its alpha cutoff (0: opaque). set: 1 maps given, 2 factors given.
+table MaterialMap none 4096
+  u32 baseColor
+  u32 orm
+  u32 normal
+  u32 emissive
+  float4 baseFactor
+  float roughness
+  float metallic
+  float normalScale
+  float occlusion
+  float cutoff
+  u32 set
+end
 # Images for rect lights (light_image): up to 16, each 65536 rows (256 x 256, sRGB rgba8, row 0 at the top) one after
 # another; LightLook's rows match Light's (image + 1, 0 none).
 table LightTexel none 1048576
@@ -110,6 +143,23 @@ export void material_reflections(handle m, bool on)
 # its triangles face (see mesh_triangle), which is cheaper; for closed shapes. On: open or thin
 # surfaces such as leaves, cloth or a single plane seen from below.
 export void material_double_sided(handle m, bool on)
+# A texture map from a cooked model's file (renderer_models' rmodel.h RmodelTexture): `path` a C string, the full path of
+# the file; its mips (`mips` of them, the largest `width` x `height` first) `bytes` long at `offset`. format: 1 BC7 sRGB,
+# 2 BC7 linear, 3 BC5. The renderer reads it in its own frames (never during this call), leaving out top mips for
+# texture_detail or GPU memory. Its texture, 4294967295 when full.
+export handle texture_add(u64 path, u64 offset, u64 bytes, u32 format, u32 width, u32 height, u32 mips)
+# 0 no such texture, 1 loading, 2 drawn with, 3 failed (its file unreadable or the GPU refused it).
+export u32 texture_state(handle t)
+export void texture_remove(handle t)
+# A material's texture maps (4294967295: none): base colour (rgb, alpha), ORM (occlusion, roughness, metallic), normal
+# (tangent space x, y) and emissive. With a map, the material draws factor times map (factors from material_factors);
+# until it has loaded, and without one, as material_set and material_emissive say.
+export void material_maps(handle m, handle base_color, handle orm, handle normal, handle emissive)
+# The factors the maps multiply (glTF's): base colour and alpha, roughness, metallic, the normal map's x and y scale, and
+# how strongly the occlusion map darkens (0 not at all, 1 fully).
+export void material_factors(handle m, float4 base_color, float roughness, float metallic, float normal_scale, float occlusion)
+# Alpha-tested (cut out) where base colour alpha is below cutoff, for leaves, fences and cloth; 0 opaque (the default).
+export void material_alpha(handle m, float cutoff)
 
 export handle instance_add(u32 mesh, handle material)
 export void instance_place(handle i, float3 pos, float4 rotation, float3 scale)
@@ -222,3 +272,7 @@ setting bool gpu_timings true
 # draws the finest. Built-in shapes only: meshes made vertex by vertex have one version.
 setting float lod_error 0.5 0 inf
 player lod_error
+# Texture maps' finest detail: Half and Quarter leave out their largest mips, for GPUs short of memory (the renderer also
+# leaves out more by itself when the GPU's free memory can't hold a texture).
+setting choice texture_detail Full Full Half Quarter
+player texture_detail

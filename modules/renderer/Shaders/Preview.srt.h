@@ -11,5 +11,7 @@ BEGIN_SRT(PreviewSrt)
         DECL_BUFFER(PerFrame, Buffer(InstanceData), gInstances)
         DECL_BUFFER(PerFrame, Buffer(MaterialData), gMaterials)
         DECL_TEXTURE(PerFrame, Depth2D(float), gShadowMap)
+        DECL_BUFFER(PerFrame, Buffer(MaterialMapData), gMaterialMaps) // each part's, as the forward pass's
+        DECL_ARRAY_TEXTURES(PerFrame, Tex2D(float4), gTextures, MAX_TEXTURES)
     END_SRT_SET(PerFrame)
 END_SRT(PreviewSrt)

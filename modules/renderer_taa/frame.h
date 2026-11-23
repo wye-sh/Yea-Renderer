@@ -10,9 +10,10 @@ struct Buffer;
 struct RenderTarget;
 struct Texture;
 
-#define RENDER_FRAME_VERSION 20u
+#define RENDER_FRAME_VERSION 21u
 #define RENDER_RT_MAX_TRACED 8u
 #define RENDER_MAX_CASCADES  4u
+#define RENDER_MAX_TEXTURES  1024u // texture maps the shaders' array holds (the core's Texture table)
 #define RENDER_VIEW_SHIFT    20u // shadow instance stream entry: instance | view << 20
 // Vertex streams (positions, attributes): bytes per vertex.
 #define RENDER_POSITION_STRIDE  12u // float3
@@ -84,6 +85,8 @@ struct RenderCaster
     uint32_t castShadow;  // it casts shadows (every caster does; a drawable may not)
     uint32_t generation;  // when its mesh's data was last written to the buffers (a frame number's low 32 bits, never 0):
                           // the same generation, buffers and ranges mean the same data
+    uint32_t masked;      // its material is alpha-tested (cut out where its base colour's alpha is under its cutoff): draw it
+                          // with uv0 and the material maps (textures, materialMaps)
 };
 
 // A visible local light, sorted by view depth (nearest first).
@@ -320,5 +323,14 @@ struct RenderFrame
     // SHADER_RESOURCE; before exposure, TAA and the upscaler.
     Texture* reactive;      // R8 at render size, SHADER_RESOURCE after particles_draw: how much of each pixel is particle (0
                             // where none drew), for TAA and the upscalers (their reactive or bias masks); nullptr: none drawn
+
+    // Texture maps (frame v21), set before shadows_prepare. A material's maps are materialMaps[its index] (renderer's
+    // Shaders/Common.h.fsl MaterialMapData: each map's slot in textures + 1, 0 none); a pass that draws masked casters or
+    // shades materials binds both. textures has RENDER_MAX_TEXTURES entries, a 2 x 2 stand-in where a slot is empty or
+    // still loading, every one in SHADER_RESOURCE; bind them again whenever textureVersion changes (and on a set's first
+    // use), never per frame. Sample with mipBias added.
+    Buffer*         materialMaps;
+    Texture* const* textures;
+    uint32_t        textureVersion;
 };
 #define RENDER_RT_MISS 60000.0f

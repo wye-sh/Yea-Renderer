@@ -130,3 +130,22 @@
 #frag renderer_preview_resolve.frag
 #include "PreviewResolve.frag.fsl"
 #end
+
+#frag renderer_depth_masked.frag
+#include "Masked.frag.fsl"
+#end
+
+#frag renderer_depth_masked_motion.frag
+#define MOTION
+#include "Masked.frag.fsl"
+#end
+
+#frag renderer_gloss_masked.frag
+#define MASKED
+#include "Gloss.frag.fsl"
+#end
+
+#frag renderer_surface_masked.frag
+#define MASKED
+#include "Surface.frag.fsl"
+#end

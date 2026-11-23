@@ -24,6 +24,17 @@ STRUCT(MaterialData)
     DATA(float4, emissive, None);
 };
 
+// A material's texture maps (the core's MaterialMapData): base colour slot + 1 in maps.x, emissive in maps.w; the base
+// colour's factor; misc.x the alpha cutoff (0 opaque), misc.y 1 when the maps were given (vertex colours count).
+STRUCT(MaterialMapData)
+{
+    DATA(uint4, maps, None);
+    DATA(float4, baseFactor, None);
+    DATA(float4, factors, None);
+    DATA(float4, misc, None);
+};
+#define MAX_TEXTURES 1024
+
 STRUCT(LightData)
 {
     DATA(float4, pos, None);          // xyz, w range

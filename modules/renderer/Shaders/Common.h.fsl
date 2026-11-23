@@ -43,6 +43,7 @@ STRUCT(FrameData)
     DATA(float4, fog2, None);                // xy frame.h fogUv
     DATA(float4, fogMedium, None);           // frame.h's: height fog for reflected rays (x 0: none)
     DATA(float4, fogAlbedo, None);
+    DATA(float4, textures, None);            // x texture mip bias (log2 of render over display width; 0 at native)
     DATA(float4, taps[32], None);            // xy: the shadow filters' Vogel disk of counts.w taps, unturned
 };
 
@@ -98,6 +99,18 @@ STRUCT(MaterialData)
     DATA(float4, params, None);       // x metallic, y f0 (dielectric), z reflections on
     DATA(float4, emissive, None);     // rgb luminance
 };
+
+// A material's texture maps (gMaterialMaps, at its material's index): maps x base colour, y ORM (occlusion, roughness,
+// metallic), z normal (BC5 x, y), w emissive, each its slot in gTextures + 1, 0 when it has none or it hasn't loaded yet
+// (the material then takes MaterialData's look for that part). The emissive map multiplies MaterialData's emissive.
+STRUCT(MaterialMapData)
+{
+    DATA(uint4, maps, None);
+    DATA(float4, baseFactor, None);   // rgb times the base colour map, a times its alpha
+    DATA(float4, factors, None);      // x roughness, y metallic (times ORM's g, b), z normal scale, w occlusion strength
+    DATA(float4, misc, None);         // x alpha cutoff (0: opaque), y 1 when the maps were given (vertex colours count)
+};
+#define MAX_TEXTURES 1024
 
 STRUCT(LightData)
 {

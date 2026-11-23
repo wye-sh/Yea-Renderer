@@ -10,6 +10,8 @@ STRUCT(VSOutput)
     DATA(float3, Normal, TEXCOORD1);
     DATA(FLAT(uint), Material, TEXCOORD2);
     DATA(FLAT(uint), View, TEXCOORD3);
+    DATA(float2, Uv, TEXCOORD4);
+    DATA(float4, Color, TEXCOORD5);
 };
 
 // The height fog between the probe and P (the core's applyHeightFog in Lighting.h.fsl: exact optical depth, the sun
@@ -43,11 +45,36 @@ float3 applyHeightFog(float3 color, float3 O, float3 d, float t)
     return color * T + gCapture.fogAlbedo.rgb * L * (1.0 - T);
 }
 
+float4 sampleMap(uint slot, float2 uv, float2 dx, float2 dy)
+{
+    float4 c = float4(1.0, 1.0, 1.0, 1.0);
+    uint   texSlot = slot - 1u;
+    BeginNonUniformResourceIndex(texSlot, MAX_TEXTURES);
+        c = SampleGradTex2D(gTextures[texSlot], gSamplerAnisotropic, uv, dx, dy);
+    EndNonUniformResourceIndex();
+    return c;
+}
+
 ROOT_SIGNATURE(DefaultRootSignature)
 float4 PS_MAIN(VSOutput In)
 {
     INIT_MAIN;
-    MaterialData m = gMaterials[In.Material];
+    MaterialData    m = gMaterials[In.Material];
+    MaterialMapData mm = gMaterialMaps[In.Material];
+    if (mm.misc.y > 0.5)
+    {
+        // The base colour and emissive maps (as the forward pass reads them); alpha-tested materials cut out.
+        float2 dx = ddx(In.Uv);
+        float2 dy = ddy(In.Uv);
+        float4 base = mm.maps.x != 0u ? sampleMap(mm.maps.x, In.Uv, dx, dy) : float4(1.0, 1.0, 1.0, 1.0);
+        if (mm.misc.x > 0.0)
+            clip(base.a * mm.baseFactor.a * In.Color.a - mm.misc.x);
+        if (mm.maps.x != 0u)
+            m.albedoRough.rgb = mm.baseFactor.rgb * base.rgb;
+        m.albedoRough.rgb *= In.Color.rgb;
+        if (mm.maps.w != 0u)
+            m.emissive.rgb *= sampleMap(mm.maps.w, In.Uv, dx, dy).rgb;
+    }
     float3 P = In.WorldPos;
     float3 N = normalize(In.Normal);
     if (dot(N, gViews[In.View].eye.xyz - P) < 0.0)

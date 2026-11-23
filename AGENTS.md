@@ -8,7 +8,8 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
 ## Modules
 
 - `renderer`: the core. Scene tables and exports, camera, depth prepass, forward shading, sky, exposure,
-  tonemap, composite. Code: `renderer.cpp` (frame), `scene.cpp` (exports), `Shaders/`.
+  tonemap, composite. Code: `renderer.cpp` (frame), `scene.cpp` (exports), `textures.cpp` (texture maps), `Shaders/`
+  (`Material.h.fsl`: the maps, shared by every pass that shades materials or clips cut-outs).
 - `renderer_culling`: Z-bins (CPU, lights sorted by view depth) and per-tile light bitmasks (compute,
   tile depth range from the prepass). Switch off: every pixel loops all visible lights (capped at 256).
 - `renderer_shadows`: sun cascades (stabilised, PCF or PCSS; each redrawn only when its view or a caster over it
@@ -273,8 +274,10 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   shape (box, sphere, cylinder, cone, torus, plane), or a cooked model, `models/<name>.rmodel` in the declaring module's
   `Assets/` (`rmodel.h`; written by `tools/model_cook`), read in this module's own update from the owner's `yea::assets()`
   path: each part (one per material) a LOD chain of the core's meshes (`mesh_packed`, linked with `mesh_lod`) and a material
-  from its factors (textures come with stage 2). A file that is missing, damaged or of another version fails that model only,
-  logged and shown in the Viewer. Its tables: `Placement` (a row per
+  from its factors, texture maps (`texture_add` with the file's path and offsets: the core streams them itself) and alpha mask
+  (cutoff 0.5 unless the file says); emissive is the file's factor times strength times `emissive_nits`. A file that is
+  missing, damaged or of another version fails that model only, logged and shown in the Viewer; state `Format` rebuilds
+  every model when `rmodel.h`'s kRmodelVersion changes. Its tables: `Placement` (a row per
   placement, keyed by the model's owner and name), `PartInstance` (the core's instances, one per part), `ModelPart` (each
   model's meshes and materials in the core, found again after a reload), state `Scene` (the core's scene_epoch they belong
   to: when it changes, every part and instance is made again). It builds and syncs in `YEA_PHASE_LATE`, after the game's
@@ -299,7 +302,11 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   and appended to with the queue idle when meshes are added (remade only when full or the scene starts over), always in
   vertex/index plus shader-resource state (never barriered), with RT build-input flags and 4-byte `Buffer(uint)` views
   while ray queries are on. `RenderCaster.generation` changes whenever that mesh's data was written. Shadow maps bind
-  positions only; the scene, probes and preview bind positions and attributes. Ray-traced shadows (frame v15): renderer_rt's `rt_pick`, called just
+  positions only (masked casters also attributes, for uv0); the scene, probes and preview bind positions and attributes.
+  Texture maps (frame v21): `materialMaps` (a material's maps, Common.h.fsl MaterialMapData) and `textures`
+  (RENDER_MAX_TEXTURES, a stand-in where empty or loading, all SHADER_RESOURCE), rebound only when `textureVersion`
+  changes; FrameData.textures.x is the mip bias. Probes clip cut-outs and read base colour and emissive maps; masked
+  shadow casters redraw and probes recapture when textureVersion changes. Ray-traced shadows (frame v15): renderer_rt's `rt_pick`, called just
   before `shadows_prepare`, marks the lights (`RenderLight.traced`) and the sun (`rtSunShadows`) it traces; renderer_shadows
   then draws no cascades for a traced sun and no tiles for traced lights, the core writes LightData params.w = 2 + n for
   them, and the forward pass reads `rtShadows` (slice 0 the sun, 1 + n light n) instead of their maps. While renderer_rt
@@ -328,6 +335,10 @@ surface's luminance is that over its area). Colours linear RGB.
   `material_reflections(m, on)`: off, the material shows no reflected image (probes or sky), only the sky's
   soft light, however shiny or metallic it is. `material_double_sided(m, on)` (off by default): drawn from
   both sides, for open or thin surfaces (a lone plane, leaves, cloth).
+- Texture maps (from cooked files; renderer_models calls these): `texture_add(path, offset, bytes, format, w, h, mips)`
+  (BC7 sRGB/linear or BC5, read from the file over the next frames, up to 24 MB a frame), `texture_state`, `texture_remove`;
+  `material_maps(m, base_color, orm, normal, emissive)`, `material_factors` (glTF's), `material_alpha(m, cutoff)` (cut out
+  below it; 0 opaque). Tables `TextureMap` (a row a shader slot), `TexturePath`, `MaterialMap`.
 - Instances: `instance_add(mesh, material)`, `instance_place(i, pos, quat, scale)`, `instance_material`,
   `instance_shadow(i, cast)`, `instance_remove`. Only call `instance_place` when it moved: a move redraws
   local shadows near it.
@@ -372,7 +383,8 @@ AgX (our own constants, in Tonemap.h.fsl), Hable_Filmic, Reinhard, None, ACES_Fi
 compiles only while the shader's TONEMAPPER_ACES_FITTED is 1, which a build baking another tonemapper sets to 0),
 Tony_McMapface (its table, Assets/tony_mc_mapface.dds, is read only while it is picked; Khronos PBR Neutral stands in
 when missing); the shader's mode is its index, so new options go at the end; both licences are tied to their options), msaa (1/2/4/8), specular_aa, sky/horizon/ground colours, sky_luminance, ambient,
-sun_disk (degrees), near_plane, gpu_timings (logs each pass's GPU time every 10 s: avg/max ms), lod_error (display pixels; 0: always the finest). `renderer_culling`: enabled, max_lights, tile_size (8/16/32), z_bins,
+sun_disk (degrees), near_plane, gpu_timings (logs each pass's GPU time every 10 s: avg/max ms), lod_error (display pixels; 0: always the finest),
+texture_detail (Full, Half, Quarter: top mips left out; more when GPU memory is short). `renderer_culling`: enabled, max_lights, tile_size (8/16/32), z_bins,
 heatmap. `renderer_shadows`: enabled (the sun's), cascades, shadow_distance, cascade_split, sun_resolution, softness,
 filter_taps, pcss, sun_size, normal_bias, slope_bias, receiver_plane, light_shadows, shadowed_lights, local_atlas_resolution,
 updates_per_frame, max_tile_resolution, contact_hardening, light_size (m), show_cascades, show_atlas (the light shadow atlas, top right). `renderer_taa`: enabled, history_weight, clamp_width, sharpen, jitter,
@@ -397,9 +409,9 @@ temporal. Its exports: `fog_volume_add(shape, center, half_size)` (0 box, 1 elli
 burst)`, `_motion(e, speed, spread_deg, speed_jitter, gravity, drag, turbulence)`, `_life(e, min_s, max_s)`,
 `_look(e, color_start, color_end, size_start, size_end, opacity)`, `_light(e, emissive, anisotropy, additive)`,
 `_remove`, `_clear` (particles live out their lives).
-`renderer_models` (per MODEL line, in the Model Viewer only): scale, up_axis (Auto, Y, Z: Z up in the file turned to Y up),
+`renderer_models`: emissive_nits (a model's emissive 1 at strength 1, cd/m²); per MODEL line, in the Model Viewer only: scale, up_axis (Auto, Y, Z: Z up in the file turned to Y up),
 lod_quality, cast_shadows, double_sided.
-Players of a released game tune (`player` lines): upscaler, quality_mode, dlss_model, exposure_ev (brightness), lod_error,
+Players of a released game tune (`player` lines): upscaler, quality_mode, dlss_model, exposure_ev (brightness), lod_error, texture_detail,
 TAA's sharpen, shadows' sun_resolution, shadow_distance, pcss and light_shadows, and enabled for AO, contact shadows, SSR,
 ray-traced reflections, ray-traced shadows and VRS, with half_resolution for AO, SSR and ray-traced reflections, probes' resolution,
 fog with its quality, and particles.
@@ -413,9 +425,10 @@ Run by agents in their orb; never compiled into a module, kept out of `licenses.
 library keeps its licence file beside its source, since the component's repository redistributes it.
 - `tools/ltc_fit.cpp`: fits the area-light LTC tables (`modules/renderer/Assets/ltc.bin`). Our own code.
 - `tools/model_cook/` (`build.sh` → `build/tools/model_cook in.glb out.rmodel`): glTF/GLB to `.rmodel` with a report. Our
-  own code plus `vendor/cgltf` (MIT, Johannes Kuhlmann; v1.15), `vendor/meshoptimizer` (MIT, Arseny Kapoulkine; v1.3)
-  and `vendor/stb` (stb_image v2.34, MIT or public domain, Sean Barrett). Until the renderer reads textures (stage 2), each
-  material's colour, roughness and metallic are its factors times its textures' averages over their images.
+  own code plus `vendor/cgltf` (MIT, Johannes Kuhlmann; v1.15), `vendor/meshoptimizer` (MIT, Arseny Kapoulkine; v1.3),
+  `vendor/stb` (stb_image v2.34, MIT or public domain, Sean Barrett) and `vendor/bc7e` (Basis Universal's bc7e scalar
+  port, Apache-2.0, Binomial LLC; its NOTICE beside it). Texture maps (rmodel v2) go in with full mips: BC7 for colour and
+  ORM, BC5 for normals.
   It normalises units (node scales applied; warns past 500 m or under 1 cm) and axes (+Y up kept, Z negated into the
   renderer's left-handed space, triangle order flipped), generates flat normals and MikkTSpace-compatible tangents where
   missing, merges primitives by material into parts (64 at most), and builds each part's LOD chain with meshoptimizer's
@@ -433,7 +446,8 @@ false. GPU objects and shadow caches are rebuilt on load.
 
 ## Cost
 
-Per frame: one depth prepass and one forward pass (draws grouped by mesh and sidedness, instanced; back
+Per frame: one depth prepass and one forward pass (draws grouped by mesh, sidedness and cut-out, instanced; cut-outs
+clip in a prepass of their own and the forward pass draws them depth-equal; back
 faces culled except for double-sided materials; a leaner forward shader unless PCSS or a debug view is on), one culling
 dispatch per 16 px tile, a GTAO dispatch and `denoise` blur dispatches (at half size with half_resolution; the forward pass upsamples), one contact shadow dispatch (all full size; 64-pixel stretches of rays from the sun's point on screen, two bilinear depth reads per pixel), one
 rate dispatch per 16 px tile and a small dilation dispatch with variable-rate shading (the forward pass then shades smooth tiles at 2x2), one
@@ -458,7 +472,9 @@ dispatches over the pool (one thread a slot), the sort (log² passes, only while
 draw of 6 vertices a listed particle (their overdraw is the main cost); 72 bytes a pool slot (2.4 MB at 32768) and an
 R8 render-size mask. The Model Viewer's preview costs
 nothing unless its panel is open and showing a model: then, per frame, one 1024² shadow map pass and one 4-sample pass of
-that model at twice the canvas size, and a resolve (about 6 MB of targets at a 520 × 320 canvas). No per-frame allocation. GPU memory at the defaults:
+that model at twice the canvas size, and a resolve (about 6 MB of targets at a 520 × 320 canvas). Texture maps: their mips
+in GPU memory (BC7/BC5, 1 byte a texel; a 2048² map about 5.6 MB with mips), read from file while loading (24 MB a
+frame at most), one sample per map per pixel. No per-frame allocation. GPU memory at the defaults:
 HDR + depth at 4x MSAA, sun atlas 4096² D32 (64 MB), local atlas 4096² (64 MB), a screen-size R32F depth copy
 for screen reflections (a quarter of it at half resolution).
 
@@ -515,6 +531,9 @@ for screen reflections (a quarter of it at half resolution).
   renderer_rt's 1x1 `addResource` D32 stand-in, bound while renderer_shadows was reloading, most likely crashed
   Direct3D 12 in 2.2.1.
 - A probe sees the objects inside its box too, so a shiny object reflects itself where it is near the probe.
+- Scene pipelines come in fours per pass (opaque or cut-out, one- or two-sided) and are made on first use: the prepass
+  and sky ones in `load()`, cut-out ones once a material is alpha-tested, each forward variant when first drawn. Making
+  them all in `load()` took past Yea's 2 s hang limit on the orb's software GPU (about 400 ms a forward pipeline).
 
 ## Example view (`example/renderer_example`)
 

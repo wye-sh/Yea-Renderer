@@ -10,6 +10,7 @@
 #include <Common_3/Graphics/Interfaces/IGraphics.h>
 #include <Common_3/Resources/ResourceLoader/Interfaces/IResourceLoader.h>
 #include <Common_3/Graphics/FSL/defaults.h>
+#define MAX_TEXTURES RENDER_MAX_TEXTURES
 #include "Shaders/Capture.srt.h"
 #include "Shaders/Filter.srt.h"
 
@@ -69,6 +70,9 @@ uint32_t       gOcta, gLevels; // probe image size and its mips (also the captur
 bool           gReady;
 
 uint64_t gCapturedAt[kMaxProbes]; // frame each probe slot was captured in (0: never)
+uint32_t gTexSeen;                 // the core's textureVersion last frame
+uint64_t gTexChanged;              // the frame it last changed: every probe captures again (maps came in)
+uint32_t gTexBound[kMaxFrames];    // the textureVersion each frame's set holds (0: none yet)
 uint32_t gCapturedGen[kMaxProbes];
 uint32_t gNext;                   // round robin
 uint32_t gTodo[kMaxPerFrame], gTodoCount;
@@ -264,7 +268,7 @@ Pipeline* capturePipeline(CullMode cull)
     l.mBindings[1].mStride = RENDER_ATTRIBUTE_STRIDE;
     l.mBindings[2].mStride = 4;
     l.mBindings[2].mRate = VERTEX_BINDING_RATE_INSTANCE;
-    l.mAttribCount = 3;
+    l.mAttribCount = 5;
     l.mAttribs[0] = {};
     l.mAttribs[0].mSemantic = SEMANTIC_POSITION;
     l.mAttribs[0].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
@@ -278,6 +282,18 @@ Pipeline* capturePipeline(CullMode cull)
     l.mAttribs[2].mFormat = TinyImageFormat_R32_UINT;
     l.mAttribs[2].mBinding = 2;
     l.mAttribs[2].mLocation = 2;
+    l.mAttribs[3] = {};
+    l.mAttribs[3].mSemantic = SEMANTIC_TEXCOORD0; // uv0 and the colour, for the material's maps
+    l.mAttribs[3].mFormat = TinyImageFormat_R32G32_SFLOAT;
+    l.mAttribs[3].mBinding = 1;
+    l.mAttribs[3].mLocation = 3;
+    l.mAttribs[3].mOffset = 8;
+    l.mAttribs[4] = {};
+    l.mAttribs[4].mSemantic = SEMANTIC_COLOR;
+    l.mAttribs[4].mFormat = TinyImageFormat_R8G8B8A8_UNORM;
+    l.mAttribs[4].mBinding = 1;
+    l.mAttribs[4].mLocation = 4;
+    l.mAttribs[4].mOffset = 16;
 
     RasterizerStateDesc raster = {};
     raster.mCullMode = cull;
@@ -483,6 +499,8 @@ bool probes_prepare(uint64_t address)
     // Wireframe or Overdraw, which would change the capture's pipelines: the probes keep what they had.
     uint32_t rows = Probes.size() < kMaxProbes ? Probes.size() : kMaxProbes;
     uint32_t todoRows = yea::viewMode() ? 0 : rows;
+    if (F->textureVersion != gTexSeen)
+        gTexSeen = F->textureVersion, gTexChanged = F->frameNumber;
     uint32_t extra = settings.updates_per_frame < 0 ? 0 : (uint32_t)settings.updates_per_frame;
     uint32_t budget = extra > kMaxPerFrame ? kMaxPerFrame : (extra ? extra : 1);
     for (uint32_t i = 0; i < todoRows; ++i)
@@ -493,7 +511,7 @@ bool probes_prepare(uint64_t address)
             gCapturedAt[i] = 0;
             continue;
         }
-        bool dirty = !gCapturedAt[i] || gCapturedGen[i] != p.gen || p.changed >= gCapturedAt[i];
+        bool dirty = !gCapturedAt[i] || gCapturedGen[i] != p.gen || p.changed >= gCapturedAt[i] || gTexChanged >= gCapturedAt[i];
         if (dirty && gTodoCount < budget)
             gTodo[gTodoCount++] = i;
     }
@@ -621,13 +639,13 @@ bool probes_prepare(uint64_t address)
 void probes_render(uint64_t address)
 {
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
-    if (!gReady || !F || !gTodoCount || F->probes != gProbeRt || !F->instances || !F->indices)
+    if (!gReady || !F || !gTodoCount || F->probes != gProbeRt || !F->instances || !F->indices || !F->materialMaps || !F->textures)
         return;
     Cmd*     cmd = F->cmd;
     uint32_t fi = F->frameIndex;
     Buffer*  lights = F->lightBuffer ? F->lightBuffer : gProbeBuf[fi]; // unread when there are none
     Buffer*        skySh = F->skySh ? F->skySh : gNoSkySh; // unread without renderer_sky
-    DescriptorData d[6] = {};
+    DescriptorData d[8] = {};
     d[5].mIndex = SRT_RES_IDX(CaptureSrt, PerFrame, gSkySh);
     d[5].ppBuffers = &skySh;
     d[0].mIndex = SRT_RES_IDX(CaptureSrt, PerFrame, gCapture);
@@ -640,7 +658,18 @@ void probes_render(uint64_t address)
     d[3].ppBuffers = &F->materials;
     d[4].mIndex = SRT_RES_IDX(CaptureSrt, PerFrame, gLights);
     d[4].ppBuffers = &lights;
-    updateDescriptorSet(gRenderer, fi, gCaptureSet, 6, d);
+    d[6].mIndex = SRT_RES_IDX(CaptureSrt, PerFrame, gMaterialMaps);
+    d[6].ppBuffers = (Buffer**)&F->materialMaps;
+    uint32_t bindings = 7;
+    if (gTexBound[fi] != F->textureVersion) // 1024 descriptors: only when the core's slots changed
+    {
+        d[7].mIndex = SRT_RES_IDX(CaptureSrt, PerFrame, gTextures);
+        d[7].ppTextures = (Texture**)F->textures;
+        d[7].mCount = RENDER_MAX_TEXTURES;
+        gTexBound[fi] = F->textureVersion;
+        bindings = 8;
+    }
+    updateDescriptorSet(gRenderer, fi, gCaptureSet, bindings, d);
 
     cmdBeginDebugMarker(cmd, 0.5f, 0.9f, 0.9f, "Renderer reflection probes");
     for (uint32_t t = 0; t < gTodoCount; ++t)

@@ -10,3 +10,12 @@
 #vert renderer_shadow_clear.vert
 #include "ShadowClear.vert.fsl"
 #end
+
+#vert renderer_shadow_masked.vert
+#define MASKED
+#include "Shadow.vert.fsl"
+#end
+
+#frag renderer_shadow_masked.frag
+#include "ShadowMasked.frag.fsl"
+#end

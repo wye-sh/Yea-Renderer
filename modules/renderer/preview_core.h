@@ -27,6 +27,8 @@ Shader *       gPreviewShader, *gPreviewShadowShader, *gPreviewGroundShader, *gP
 Pipeline *     gPreviewPipe[2], *gPreviewShadowPipe, *gPreviewGroundPipe, *gPreviewResolvePipe;
 DescriptorSet *gPreviewPersistent, *gPreviewFrame, *gPreviewShadowFrame, *gPreviewResolveFrame;
 Buffer *       gPreviewCb[kMaxFrames], *gPreviewInst[kMaxFrames], *gPreviewMat[kMaxFrames], *gPreviewStream[kMaxFrames];
+Buffer*        gPreviewMap[kMaxFrames];          // each part's texture maps
+uint32_t       gPreviewTexBound[kMaxFrames];     // textureVersion() each frame's set holds (0: none yet)
 bool           gPreviewReady;
 
 void previewUnload()
@@ -42,6 +44,7 @@ void previewUnload()
         freeBuffer(gPreviewCb[i]);
         freeBuffer(gPreviewInst[i]);
         freeBuffer(gPreviewMat[i]);
+        freeBuffer(gPreviewMap[i]);
         freeBuffer(gPreviewStream[i]);
     }
     DescriptorSet** sets[4] = { &gPreviewPersistent, &gPreviewFrame, &gPreviewShadowFrame, &gPreviewResolveFrame };
@@ -87,9 +90,12 @@ void previewLoad()
                                      cpu, sr, "renderer_preview_instances");
         gPreviewMat[i] = makeBuffer(RENDER_PREVIEW_PARTS * sizeof(GpuMaterial), sizeof(GpuMaterial), DESCRIPTOR_TYPE_BUFFER, cpu, sr,
                                     "renderer_preview_materials");
+        gPreviewMap[i] = makeBuffer(RENDER_PREVIEW_PARTS * sizeof(GpuMaterialMap), sizeof(GpuMaterialMap), DESCRIPTOR_TYPE_BUFFER, cpu,
+                                    sr, "renderer_preview_material_maps");
+        gPreviewTexBound[i] = 0;
         gPreviewStream[i] = makeBuffer(RENDER_PREVIEW_PARTS * 4, 0, DESCRIPTOR_TYPE_VERTEX_BUFFER, cpu,
                                        RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, "renderer_preview_stream");
-        made = made && gPreviewCb[i] && gPreviewInst[i] && gPreviewMat[i] && gPreviewStream[i] && gPreviewCb[i]->pCpuMappedAddress &&
+        made = made && gPreviewMap[i] && gPreviewMap[i]->pCpuMappedAddress && gPreviewCb[i] && gPreviewInst[i] && gPreviewMat[i] && gPreviewStream[i] && gPreviewCb[i]->pCpuMappedAddress &&
                gPreviewInst[i]->pCpuMappedAddress && gPreviewMat[i]->pCpuMappedAddress && gPreviewStream[i]->pCpuMappedAddress;
     }
     if (!made)
@@ -240,6 +246,7 @@ bool preview_draw(uint64_t address)
     // picks per instance), or the one asked for; its instance row and its material, numbered within the preview.
     RenderGpuInstance* inst = (RenderGpuInstance*)gPreviewInst[fi]->pCpuMappedAddress;
     GpuMaterial*       mats = (GpuMaterial*)gPreviewMat[fi]->pCpuMappedAddress;
+    GpuMaterialMap*    maps = (GpuMaterialMap*)gPreviewMap[fi]->pCpuMappedAddress;
     uint32_t           drawMesh[RENDER_PREVIEW_PARTS];
     const uint32_t     meshCount = Meshes.size(), lodRows = MeshLods.size() < meshCount ? MeshLods.size() : meshCount;
     const float        p11 = 1.0f / tanf(clampf(p->fov, 5.0f, 150.0f) * 0.5f * 3.14159265f / 180.0f);
@@ -274,8 +281,10 @@ bool preview_draw(uint64_t address)
         mats[k].albedoRough[0] = mats[k].albedoRough[1] = mats[k].albedoRough[2] = 0.7f;
         mats[k].albedoRough[3] = 0.5f;
         mats[k].params[1] = 0.04f;
+        maps[k] = GpuMaterialMap{};
         if (row < Materials.size() && Materials[row].alive && Materials[row].gen == (p->material[k] >> 20))
         {
+            fillMaterialMap(maps[k], row);
             const Material& mt = Materials[row];
             mats[k].albedoRough[0] = mt.albedo.x;
             mats[k].albedoRough[1] = mt.albedo.y;
@@ -323,7 +332,7 @@ bool preview_draw(uint64_t address)
     c.mode[1] = p->width, c.mode[2] = p->height;
 
     {
-        DescriptorData d[4] = {};
+        DescriptorData d[6] = {};
         d[0].mIndex = SRT_RES_IDX(PreviewSrt, PerFrame, gPreview);
         d[0].ppBuffers = &gPreviewCb[fi];
         d[1].mIndex = SRT_RES_IDX(PreviewSrt, PerFrame, gInstances);
@@ -332,7 +341,18 @@ bool preview_draw(uint64_t address)
         d[2].ppBuffers = &gPreviewMat[fi];
         d[3].mIndex = SRT_RES_IDX(PreviewSrt, PerFrame, gShadowMap);
         d[3].ppTextures = &p->shadow->pTexture;
-        updateDescriptorSet(gRenderer, fi, gPreviewFrame, 4, d);
+        d[4].mIndex = SRT_RES_IDX(PreviewSrt, PerFrame, gMaterialMaps);
+        d[4].ppBuffers = &gPreviewMap[fi];
+        uint32_t bindings = 5;
+        if (gPreviewTexBound[fi] != textureVersion())
+        {
+            d[5].mIndex = SRT_RES_IDX(PreviewSrt, PerFrame, gTextures);
+            d[5].ppTextures = (Texture**)textureSlots();
+            d[5].mCount = RENDER_MAX_TEXTURES;
+            gPreviewTexBound[fi] = textureVersion();
+            bindings = 6;
+        }
+        updateDescriptorSet(gRenderer, fi, gPreviewFrame, bindings, d);
         DescriptorData s[2] = {};
         s[0].mIndex = SRT_RES_IDX(PreviewShadowSrt, PerFrame, gPreview);
         s[0].ppBuffers = &gPreviewCb[fi];

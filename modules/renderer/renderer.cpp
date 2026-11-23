@@ -20,6 +20,7 @@
 #include <Common_3/Resources/ResourceLoader/ThirdParty/OpenSource/tinyimageformat/tinyimageformat_query.h>
 #include <Common_3/Graphics/FSL/defaults.h>
 #define SAMPLE_COUNT 1
+#define MAX_TEXTURES RENDER_MAX_TEXTURES
 #include "Shaders/Scene.srt.h"
 #include "Shaders/Composite.srt.h"
 #include "Shaders/Exposure.srt.h"
@@ -65,7 +66,16 @@ struct GpuFrame
     float    fog2[4]; // xy frame.h fogUv
     float    fogMedium[4]; // frame.h's (x 0: no height fog)
     float    fogAlbedo[4];
+    float    textures[4];    // x texture mip bias
     float    taps[32][4]; // xy: the shadow filters' Vogel disk, unturned
+};
+// A material's texture maps (Shaders/Common.h.fsl MaterialMapData).
+struct GpuMaterialMap
+{
+    uint32_t maps[4]; // base colour, ORM, normal, emissive: slot + 1, 0 none or not loaded
+    float    baseFactor[4];
+    float    factors[4]; // roughness, metallic, normal scale, occlusion strength
+    float    misc[4];    // alpha cutoff, maps given
 };
 struct GpuMaterial
 {
@@ -104,10 +114,10 @@ bool      gReady;
 Shader *gForwardDepthShader, *gForwardShader, *gSkyShader, *gCompositeShader[4], *gHistogramShader[4], *gAdaptShader;
 Shader *gMotionDepthShader, *gMotionShader, *gSkyMotionShader; // TAA on: with motion vectors
 Shader*        gGlossShader;   // the prepass with a reflection-roughness output, for renderer_vrs
-Pipeline*      gDepthGlossPipe[2];
+Pipeline*      gDepthGlossPipe[4];
 RenderTarget*  gGloss;
 Shader*        gSurfaceShader; // the prepass with roughness and normal outputs, for renderer_rt
-Pipeline*      gDepthSurfacePipe[2];
+Pipeline*      gDepthSurfacePipe[4];
 RenderTarget*  gSurface;
 Texture*       gLdr;          // the tonemap pass's packed output (R32_UINT), with TAA only
 const YeaRaytracing* gRaytracing; // nullptr: no ray queries on this GPU
@@ -116,8 +126,15 @@ const YeaRaytracing* gRaytracing; // nullptr: no ray queries on this GPU
 Shader *gForwardFullShader, *gMotionFullShader;
 Sampler*       gShadowSampler;
 DescriptorSet *gScenePersistent, *gSceneFrame, *gCompositeSet, *gExposureSet;
-// Scene pipelines in pairs: [0] culls back faces, [1] draws both sides (double-sided materials).
-Pipeline *     gDepthPipe[2], *gForwardPipe[2], *gForwardFullPipe[2], *gForwardDepthPipe[2];
+// Scene pipelines in fours: [0] culls back faces, [1] draws both sides (double-sided materials); [2] and [3] the same for
+// alpha-tested materials (the prepass cuts them out; the forward pass draws them only at the depth it left).
+Pipeline *     gDepthPipe[4], *gForwardPipe[4], *gForwardFullPipe[4], *gForwardDepthPipe[4];
+Shader *       gDepthMaskedShader, *gMotionDepthMaskedShader, *gGlossMaskedShader, *gSurfaceMaskedShader;
+Buffer*        gMaterialMapBuf[kMaxFrames];
+GpuMaterialMap* gMaterialMapCpu;
+uint32_t       gTexturesBound[kMaxFrames]; // textureVersion() each frame's set holds (0: none yet)
+uint32_t       gTexturesSeen;              // textureVersion() last frame
+uint64_t       gTexturesChanged;           // the frame it last changed: alpha-tested casters count as moved then
 Pipeline *     gSkyPipe, *gCompositePipe, *gHistogramPipe, *gAdaptPipe, *gTonemapPipe;
 Shader*        gTonemapShader;
 DescriptorSet* gTonemapSet;
@@ -150,6 +167,7 @@ uint32_t        gDisplayWidth, gDisplayHeight;   // the frame's size the targets
 bool            gTargetMotion;
 uint32_t        gPipeSamples;                    // the pipelines as made
 bool            gPipeMotion;
+bool            gPipeMasked;                     // the alpha-tested pipelines ([2] and [3]) are made too
 TinyImageFormat gFrameFormat = TinyImageFormat_UNDEFINED;
 uint32_t        gFrameSamples;
 ResourceState   gDepthState, gExposureState;
@@ -161,7 +179,7 @@ struct InstanceInfo
 {
     uint32_t mesh; // the version drawn
     uint32_t row;  // in the Instance table
-    uint32_t flags; // 1 visible, 2 casts shadow, 4 double-sided
+    uint32_t flags; // 1 visible, 2 casts shadow, 4 double-sided, 8 alpha-tested
     float    sphere[4];
     uint64_t moved;
 };
@@ -178,8 +196,8 @@ RenderCaster* gCasters;
 RenderCaster* gDrawables; // every instance, by mesh (reflection probes draw them all)
 RenderLight*  gLocal;
 uint32_t*     gOutside; // rows of lights outside the view, for what reflections see
-// Visible instances by key: mesh * 2 + double-sided, so single- and double-sided ones draw apart.
-uint32_t        gMeshCount[2048], gMeshStart[2048], gMeshCursor[2048];
+// Visible instances by key: mesh * 4 + masked * 2 + double-sided, so each kind draws with its own pipeline.
+uint32_t        gMeshCount[4096], gMeshStart[4096], gMeshCursor[4096];
 RenderFrame   gFrame;
 // Motion vectors: each instance row's world rows as last drawn, and the frame they were drawn in.
 struct PrevRows
@@ -312,7 +330,7 @@ VertexLayout sceneLayout()
     l.mBindings[1].mStride = RENDER_ATTRIBUTE_STRIDE;
     l.mBindings[2].mStride = 4;
     l.mBindings[2].mRate = VERTEX_BINDING_RATE_INSTANCE;
-    l.mAttribCount = 3;
+    l.mAttribCount = 6;
     l.mAttribs[0] = {};
     l.mAttribs[0].mSemantic = SEMANTIC_POSITION;
     l.mAttribs[0].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
@@ -329,12 +347,28 @@ VertexLayout sceneLayout()
     l.mAttribs[2].mBinding = 2;
     l.mAttribs[2].mLocation = 2;
     l.mAttribs[2].mOffset = 0;
+    // The rest of the attributes (Forward.vert's tangent, uv0 and colour): the texture maps read them.
+    l.mAttribs[3].mSemantic = SEMANTIC_TANGENT;
+    l.mAttribs[3].mFormat = TinyImageFormat_R16G16_SINT; // octahedral, the bitangent's sign in y's lowest bit
+    l.mAttribs[3].mBinding = 1;
+    l.mAttribs[3].mLocation = 3;
+    l.mAttribs[3].mOffset = 4;
+    l.mAttribs[4].mSemantic = SEMANTIC_TEXCOORD0;
+    l.mAttribs[4].mFormat = TinyImageFormat_R32G32_SFLOAT;
+    l.mAttribs[4].mBinding = 1;
+    l.mAttribs[4].mLocation = 4;
+    l.mAttribs[4].mOffset = 8;
+    l.mAttribs[5].mSemantic = SEMANTIC_COLOR;
+    l.mAttribs[5].mFormat = TinyImageFormat_R8G8B8A8_UNORM;
+    l.mAttribs[5].mBinding = 1;
+    l.mAttribs[5].mLocation = 5;
+    l.mAttribs[5].mOffset = 16;
     return l;
 }
 
 void destroyScenePipelines()
 {
-    for (uint32_t s = 0; s < 2; ++s)
+    for (uint32_t s = 0; s < 4; ++s)
     {
         freePipeline(gDepthPipe[s]);
         freePipeline(gDepthGlossPipe[s]);
@@ -346,10 +380,27 @@ void destroyScenePipelines()
     freePipeline(gSkyPipe);
     freePipeline(gHistogramPipe);
     gPipeSamples = 0;
+    gPipeMasked = false;
 }
 
-void createScenePipelines(uint32_t samples, bool motion)
+// Makes the scene pipelines still missing among those asked for: the prepass's and the sky's always, the alpha-tested
+// ones ([2] and [3]) once a material is, and of the forward pass only the variants in `forward` (kForward*), when a frame
+// first draws with them. The forward shaders are large, so a scene compiles only what it draws with.
+const uint32_t kForwardLean = 1, kForwardFull = 2, kForwardDepth = 4;
+void createScenePipelines(uint32_t samples, bool motion, bool masked, uint32_t forward)
 {
+    masked = masked || gPipeMasked;
+    const uint32_t sEnd = masked ? 4 : 2;
+    auto missing = [&](Pipeline* const* p) {
+        for (uint32_t s = 0; s < sEnd; ++s)
+            if (!p[s])
+                return true;
+        return false;
+    };
+    if (!missing(gDepthPipe) && !(motion && gGlossShader && missing(gDepthGlossPipe)) && !(motion && gSurfaceShader && missing(gDepthSurfacePipe)) &&
+        !((forward & kForwardLean) && missing(gForwardPipe)) && !((forward & kForwardFull) && missing(gForwardFullPipe)) &&
+        !((forward & kForwardDepth) && missing(gForwardDepthPipe)) && gSkyPipe && gHistogramPipe)
+        return; // every frame after the first: nothing to make
     VertexLayout        layout = sceneLayout();
     // Triangles wind counter-clockwise around their outward normal (cross(b - a, c - a) points out);
     // seen through the left-handed camera that is clockwise on screen. The Forge flips Vulkan's
@@ -378,24 +429,26 @@ void createScenePipelines(uint32_t samples, bool motion)
     g.pColorFormats = nullptr;
     g.pDepthState = &depthWrite;
     g.pVertexLayout = &layout;
-    g.pShaderProgram = motion ? gMotionDepthShader : gForwardDepthShader;
     desc.pName = "renderer_depth";
-    for (uint32_t s = 0; s < 2; ++s)
+    for (uint32_t s = 0; s < sEnd; ++s)
     {
-        raster.mCullMode = s ? CULL_MODE_NONE : CULL_MODE_BACK;
-        addPipeline(gRenderer, &desc, &gDepthPipe[s]);
+        raster.mCullMode = s & 1 ? CULL_MODE_NONE : CULL_MODE_BACK;
+        g.pShaderProgram = s < 2 ? (motion ? gMotionDepthShader : gForwardDepthShader) : (motion ? gMotionDepthMaskedShader : gDepthMaskedShader);
+        if (!gDepthPipe[s])
+            addPipeline(gRenderer, &desc, &gDepthPipe[s]);
     }
     if (motion && gGlossShader)
     {
         TinyImageFormat glossFormat = TinyImageFormat_R8_UNORM;
         g.mRenderTargetCount = 1;
         g.pColorFormats = &glossFormat;
-        g.pShaderProgram = gGlossShader;
         desc.pName = "renderer_depth_gloss";
-        for (uint32_t s = 0; s < 2; ++s)
+        for (uint32_t s = 0; s < sEnd; ++s)
         {
-            raster.mCullMode = s ? CULL_MODE_NONE : CULL_MODE_BACK;
-            addPipeline(gRenderer, &desc, &gDepthGlossPipe[s]);
+            raster.mCullMode = s & 1 ? CULL_MODE_NONE : CULL_MODE_BACK;
+            g.pShaderProgram = s < 2 ? gGlossShader : gGlossMaskedShader;
+            if (!gDepthGlossPipe[s])
+                addPipeline(gRenderer, &desc, &gDepthGlossPipe[s]);
         }
         g.mRenderTargetCount = 0;
         g.pColorFormats = nullptr;
@@ -405,12 +458,13 @@ void createScenePipelines(uint32_t samples, bool motion)
         TinyImageFormat surfaceFormats[2] = { TinyImageFormat_R16G16B16A16_SFLOAT, TinyImageFormat_R16G16_SFLOAT }; // surface, motion
         g.mRenderTargetCount = 2;
         g.pColorFormats = surfaceFormats;
-        g.pShaderProgram = gSurfaceShader;
         desc.pName = "renderer_depth_surface";
-        for (uint32_t s = 0; s < 2; ++s)
+        for (uint32_t s = 0; s < sEnd; ++s)
         {
-            raster.mCullMode = s ? CULL_MODE_NONE : CULL_MODE_BACK;
-            addPipeline(gRenderer, &desc, &gDepthSurfacePipe[s]);
+            raster.mCullMode = s & 1 ? CULL_MODE_NONE : CULL_MODE_BACK;
+            g.pShaderProgram = s < 2 ? gSurfaceShader : gSurfaceMaskedShader;
+            if (!gDepthSurfacePipe[s])
+                addPipeline(gRenderer, &desc, &gDepthSurfacePipe[s]);
         }
         g.mRenderTargetCount = 0;
         g.pColorFormats = nullptr;
@@ -422,37 +476,46 @@ void createScenePipelines(uint32_t samples, bool motion)
     depthTest.mDepthFunc = CMP_GEQUAL;
     g.mRenderTargetCount = motion ? 2 : 1;
     g.pColorFormats = formats;
+    DepthStateDesc depthEqual = depthTest; // alpha-tested: only where the prepass kept them
+    depthEqual.mDepthFunc = CMP_EQUAL;
     g.pDepthState = &depthTest;
-    for (uint32_t s = 0; s < 2; ++s)
+    for (uint32_t s = 0; s < sEnd; ++s)
     {
-        raster.mCullMode = s ? CULL_MODE_NONE : CULL_MODE_BACK;
-        g.pDepthState = &depthTest;
+        raster.mCullMode = s & 1 ? CULL_MODE_NONE : CULL_MODE_BACK;
+        g.pDepthState = s < 2 ? &depthTest : &depthEqual;
         g.pShaderProgram = motion ? gMotionShader : gForwardShader;
         desc.pName = "renderer_forward";
-        addPipeline(gRenderer, &desc, &gForwardPipe[s]);
+        if ((forward & kForwardLean) && !gForwardPipe[s])
+            addPipeline(gRenderer, &desc, &gForwardPipe[s]);
         g.pShaderProgram = motion ? gMotionFullShader : gForwardFullShader;
         desc.pName = "renderer_forward_full";
-        addPipeline(gRenderer, &desc, &gForwardFullPipe[s]);
-        // F1's view modes skip the prepass (Wireframe would draw it as edges): the forward pass writes depth itself.
+        if ((forward & kForwardFull) && !gForwardFullPipe[s])
+            addPipeline(gRenderer, &desc, &gForwardFullPipe[s]);
+        // F1's view modes skip the prepass (Wireframe would draw it as edges): the forward pass writes depth itself
+        // (alpha-tested materials whole, uncut).
         g.pDepthState = &depthWrite;
         desc.pName = "renderer_forward_depth";
-        addPipeline(gRenderer, &desc, &gForwardDepthPipe[s]);
+        if ((forward & kForwardDepth) && !gForwardDepthPipe[s])
+            addPipeline(gRenderer, &desc, &gForwardDepthPipe[s]);
     }
     g.pDepthState = &depthTest;
     raster.mCullMode = CULL_MODE_NONE;
 
+    gPipeMasked = masked;
     // The sky: a full-screen triangle at depth 0 (reversed-Z far), only where nothing was drawn.
     g.pVertexLayout = nullptr;
     g.pShaderProgram = motion ? gSkyMotionShader : gSkyShader;
     desc.pName = "renderer_sky";
-    addPipeline(gRenderer, &desc, &gSkyPipe);
+    if (!gSkyPipe)
+        addPipeline(gRenderer, &desc, &gSkyPipe);
 
     PipelineDesc cdesc = {};
     cdesc.mType = PIPELINE_TYPE_COMPUTE;
     PIPELINE_LAYOUT_DESC(cdesc, NULL, SRT_LAYOUT_DESC(ExposureSrt, PerFrame), NULL, NULL);
     cdesc.mComputeDesc.pShaderProgram = gHistogramShader[sampleIndex(samples)];
     cdesc.pName = "renderer_histogram";
-    addPipeline(gRenderer, &cdesc, &gHistogramPipe);
+    if (!gHistogramPipe)
+        addPipeline(gRenderer, &cdesc, &gHistogramPipe);
     gPipeSamples = samples;
     gPipeMotion = motion;
 }
@@ -727,17 +790,18 @@ void bindGeometry(Cmd* cmd, Buffer* stream, uint32_t first)
     cmdBindVertexBuffer(cmd, 3, bufs, strides, offsets);
 }
 
-// Single-sided instances with pipes[0] (back faces culled), then double-sided ones with pipes[1].
-void drawVisible(Cmd* cmd, uint32_t fi, Pipeline* const pipes[2])
+// Single-sided instances with pipes[0] (back faces culled), then double-sided ones with pipes[1], then alpha-tested ones
+// with pipes[2] and [3].
+void drawVisible(Cmd* cmd, uint32_t fi, Pipeline* const pipes[4])
 {
     uint32_t meshCount = Meshes.size() < 1024 ? Meshes.size() : 1024;
-    for (uint32_t s = 0; s < 2; ++s)
+    for (uint32_t s = 0; s < 4; ++s)
     {
         bool bound = false;
         for (uint32_t m = 0; m < meshCount; ++m)
         {
-            uint32_t key = m * 2 + s;
-            if (!gMeshCount[key])
+            uint32_t key = m * 4 + s;
+            if (!gMeshCount[key] || !pipes[s]) // alpha-tested ones wait for their pipelines (made before this frame draws)
                 continue;
             if (!bound)
             {
@@ -752,6 +816,29 @@ void drawVisible(Cmd* cmd, uint32_t fi, Pipeline* const pipes[2])
             cmdDrawIndexedInstanced(cmd, mesh.indexCount, mesh.firstIndex, gMeshCount[key], mesh.firstVertex, 0);
         }
     }
+}
+
+// A material row's texture maps as the shaders read them: a slot only once its texture is loaded (until then the
+// material's flat look stands in).
+void fillMaterialMap(GpuMaterialMap& out, uint32_t row)
+{
+    out = GpuMaterialMap{};
+    if (row >= MaterialMaps.size())
+        return;
+    const MaterialMap& mm = MaterialMaps[row];
+    out.misc[0] = mm.cutoff;
+    if (!(mm.set & 1))
+        return;
+    out.maps[0] = textureSlot(mm.baseColor);
+    out.maps[1] = textureSlot(mm.orm);
+    out.maps[2] = textureSlot(mm.normal);
+    out.maps[3] = textureSlot(mm.emissive);
+    memcpy(out.baseFactor, &mm.baseFactor, sizeof out.baseFactor);
+    out.factors[0] = mm.roughness;
+    out.factors[1] = mm.metallic;
+    out.factors[2] = mm.normalScale;
+    out.factors[3] = mm.occlusion;
+    out.misc[1] = 1;
 }
 
 void barrierRt(Cmd* cmd, RenderTarget* rt, ResourceState from, ResourceState to)
@@ -962,12 +1049,17 @@ int load(int reloaded)
     gSkyMotionShader = loadShader("renderer_fullscreen.vert", "renderer_sky_motion.frag", nullptr);
     gGlossShader = loadShader("renderer_forward_motion.vert", "renderer_gloss.frag", nullptr);
     gSurfaceShader = gRaytracing ? loadShader("renderer_forward_motion.vert", "renderer_surface.frag", nullptr) : nullptr;
+    gDepthMaskedShader = loadShader("renderer_forward.vert", "renderer_depth_masked.frag", nullptr);
+    gMotionDepthMaskedShader = loadShader("renderer_forward_motion.vert", "renderer_depth_masked_motion.frag", nullptr);
+    gGlossMaskedShader = loadShader("renderer_forward_motion.vert", "renderer_gloss_masked.frag", nullptr);
+    gSurfaceMaskedShader = gSurfaceShader ? loadShader("renderer_forward_motion.vert", "renderer_surface_masked.frag", nullptr) : nullptr;
     const char* composite[4] = { "renderer_composite_1.frag", "renderer_composite_2.frag", "renderer_composite_4.frag",
                                  "renderer_composite_8.frag" };
     const char* histogram[4] = { "renderer_histogram_1.comp", "renderer_histogram_2.comp", "renderer_histogram_4.comp",
                                  "renderer_histogram_8.comp" };
     bool ok = gForwardDepthShader && gForwardShader && gSkyShader && gMotionDepthShader && gMotionShader && gSkyMotionShader &&
-              gForwardFullShader && gMotionFullShader && gGlossShader;
+              gForwardFullShader && gMotionFullShader && gGlossShader && gDepthMaskedShader && gMotionDepthMaskedShader && gGlossMaskedShader &&
+              (!gSurfaceShader || gSurfaceMaskedShader);
     for (int i = 0; i < 4; ++i)
     {
         gCompositeShader[i] = loadShader("renderer_fullscreen.vert", composite[i], nullptr);
@@ -1015,6 +1107,9 @@ int load(int reloaded)
                                      DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_instances");
         gMaterialBuf[i] = makeBuffer((uint64_t)Materials.capacity() * sizeof(GpuMaterial), sizeof(GpuMaterial), DESCRIPTOR_TYPE_BUFFER,
                                      cpu, sr, "renderer_materials");
+        gMaterialMapBuf[i] = makeBuffer((uint64_t)Materials.capacity() * sizeof(GpuMaterialMap), sizeof(GpuMaterialMap),
+                                        DESCRIPTOR_TYPE_BUFFER, cpu, sr, "renderer_material_maps");
+        gTexturesBound[i] = 0;
         gLightBuf[i] = makeBuffer((uint64_t)Lights.capacity() * sizeof(RenderGpuLight), sizeof(RenderGpuLight), DESCRIPTOR_TYPE_BUFFER,
                                   cpu, sr, "renderer_lights");
         gShapeBuf[i] = makeBuffer((uint64_t)Lights.capacity() * sizeof(RenderGpuLightShape), sizeof(RenderGpuLightShape),
@@ -1106,7 +1201,7 @@ int load(int reloaded)
     bool made = gDfg && gLtc && gLightImages && gExposure && gHistogram && gDummyU32 && gDummyViews && gDummyProbes && gDummySh && gDummyVolume && gDummyDepth && gDummyColor &&
                 gDummyRates && gDummyArray && gScenePersistent && gSceneFrame && gCompositeSet && gExposureSet && gTonemapSet && gShadowSampler;
     for (uint32_t i = 0; i < gFrames; ++i)
-        made = made && gFrameCb[i] && gCompositeCb[i] && gExposureCb[i] && gInstanceBuf[i] && gMaterialBuf[i] && gLightBuf[i] && gShapeBuf[i] && gLookBuf[i] && gLookBuf[i]->pCpuMappedAddress &&
+        made = made && gMaterialMapBuf[i] && gMaterialMapBuf[i]->pCpuMappedAddress && gFrameCb[i] && gCompositeCb[i] && gExposureCb[i] && gInstanceBuf[i] && gMaterialBuf[i] && gLightBuf[i] && gShapeBuf[i] && gLookBuf[i] && gLookBuf[i]->pCpuMappedAddress &&
                gStreamBuf[i] && gPrevBuf[i] && gFrameCb[i]->pCpuMappedAddress && gCompositeCb[i]->pCpuMappedAddress &&
                gExposureCb[i]->pCpuMappedAddress && gInstanceBuf[i]->pCpuMappedAddress && gMaterialBuf[i]->pCpuMappedAddress &&
                gLightBuf[i]->pCpuMappedAddress && gShapeBuf[i]->pCpuMappedAddress && gStreamBuf[i]->pCpuMappedAddress && gPrevBuf[i]->pCpuMappedAddress;
@@ -1147,6 +1242,8 @@ int load(int reloaded)
     gShapeCpu = new RenderGpuLightShape[Lights.capacity()];
     gLookCpu = new uint32_t[Lights.capacity()];
     gMaterialCpu = new GpuMaterial[Materials.capacity()];
+    gMaterialMapCpu = new GpuMaterialMap[Materials.capacity()];
+    texturesInit(gDummyColor->pTexture);
     gCasters = new RenderCaster[Instances.capacity()];
     gDrawables = new RenderCaster[Instances.capacity()];
     gLocal = new RenderLight[Lights.capacity()];
@@ -1171,6 +1268,7 @@ void unload()
         return;
     waitQueueIdle(gQueue);
     previewUnload();
+    texturesFree();
     for (uint32_t i = 0; i < gFrames; ++i)
         if (gTimePool[i])
             exitQueryPool(gRenderer, gTimePool[i]), gTimePool[i] = nullptr;
@@ -1196,6 +1294,7 @@ void unload()
         freeBuffer(gExposureCb[i]);
         freeBuffer(gInstanceBuf[i]);
         freeBuffer(gMaterialBuf[i]);
+        freeBuffer(gMaterialMapBuf[i]);
         freeBuffer(gLightBuf[i]);
         freeBuffer(gShapeBuf[i]);
         freeBuffer(gLookBuf[i]);
@@ -1229,7 +1328,8 @@ void unload()
         removeSampler(gRenderer, gShadowSampler), gShadowSampler = nullptr;
     // Each one let go and forgotten, so a second unload (after a load that gave up) frees nothing twice.
     Shader** shaders[] = { &gForwardDepthShader, &gForwardShader, &gSkyShader, &gAdaptShader, &gMotionDepthShader, &gMotionShader,
-                           &gSkyMotionShader, &gForwardFullShader, &gMotionFullShader, &gGlossShader, &gSurfaceShader, &gTonemapShader };
+                           &gSkyMotionShader, &gForwardFullShader, &gMotionFullShader, &gGlossShader, &gSurfaceShader, &gTonemapShader,
+                           &gDepthMaskedShader, &gMotionDepthMaskedShader, &gGlossMaskedShader, &gSurfaceMaskedShader };
     for (Shader** s : shaders)
         if (*s)
             removeShader(gRenderer, *s), *s = nullptr;
@@ -1337,13 +1437,19 @@ void draw(uint32_t pass, const YeaFrame* yf)
         }
         gTargetsFailed = false;
     }
+    // Alpha-tested pipelines once some material is (and kept while the others are).
+    bool masked = gPipeMasked;
+    for (uint32_t i = 0; i < MaterialMaps.size() && i < Materials.size() && !masked; ++i)
+        masked = Materials[i].alive && MaterialMaps[i].cutoff > 0;
     if (samples != gPipeSamples || taa != gPipeMotion)
     {
         waitQueueIdle(gQueue);
         destroyScenePipelines();
-        createScenePipelines(samples, taa);
+        createScenePipelines(samples, taa, masked, 0);
         gFrameFormat = TinyImageFormat_UNDEFINED;
     }
+    else if (masked && !gPipeMasked)
+        createScenePipelines(samples, taa, true, 0);
     if (target->mFormat != gFrameFormat || (uint32_t)target->mSampleCount != gFrameSamples)
     {
         waitQueueIdle(gQueue);
@@ -1353,6 +1459,12 @@ void draw(uint32_t pass, const YeaFrame* yf)
     }
     uploadMeshes();
     lightImagesUpload(gLightImages);
+    texturesUpdate(gQueue);
+    F.materialMaps = gMaterialMapBuf[fi];
+    F.textures = textureSlots();
+    F.textureVersion = textureVersion();
+    if (F.textureVersion != gTexturesSeen)
+        gTexturesSeen = F.textureVersion, gTexturesChanged = F.frameNumber; // cut-outs appear: cached shadows redraw them
 
     // --- Camera -----------------------------------------------------------------------------
     CameraState* cam = cameraState();
@@ -1394,8 +1506,8 @@ void draw(uint32_t pass, const YeaFrame* yf)
     uint32_t             count = 0, casterTotal = 0;
     float                lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
     memset(gMeshCount, 0, sizeof gMeshCount);
-    uint32_t keyCount = meshCount * 2;
-    uint32_t casterCount[1024], drawCount[2048];
+    uint32_t keyCount = meshCount * 4;
+    uint32_t casterCount[1024], drawCount[4096];
     memset(casterCount, 0, sizeof casterCount);
     memset(drawCount, 0, sizeof drawCount);
     // Mesh versions: display pixels per world unit at view depth 1, and the error allowed on screen (0: always the finest).
@@ -1432,8 +1544,11 @@ void draw(uint32_t pass, const YeaFrame* yf)
         info.moved = in.moved;
         v3 sc = V(info.sphere[0], info.sphere[1], info.sphere[2]);
         bool twoSided = in.material < Materials.size() && Materials[in.material].doubleSided;
+        bool masked = in.material < MaterialMaps.size() && in.material < Materials.size() && MaterialMaps[in.material].cutoff > 0;
         bool visible = sphereInside(frustum, 5, sc, info.sphere[3]);
-        info.flags = (visible ? 1u : 0u) | (in.shadow ? 2u : 0u) | (twoSided ? 4u : 0u);
+        info.flags = (visible ? 1u : 0u) | (in.shadow ? 2u : 0u) | (twoSided ? 4u : 0u) | (masked ? 8u : 0u);
+        if (masked && gTexturesChanged > info.moved)
+            info.moved = gTexturesChanged;
         // The simplest version whose error stays under lod_error display pixels where the instance is nearest the
         // camera: at its nearest view depth, stretched by how far off-axis it is (a flat projection widens things
         // towards the screen's edges). Off screen it is seen only in reflections, which are at least as far away, and
@@ -1458,7 +1573,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         }
         info.mesh = lod;
         info.row = row;
-        uint32_t key = lod * 2 + (twoSided ? 1 : 0);
+        uint32_t key = lod * 4 + (masked ? 2 : 0) + (twoSided ? 1 : 0);
         drawCount[key]++;
         if (info.flags & 1)
             gMeshCount[key]++;
@@ -1475,7 +1590,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         }
         count++;
     }
-    uint32_t start = 0, casterStart[1024], casterCursor[1024], drawCursor[2048];
+    uint32_t start = 0, casterStart[1024], casterCursor[1024], drawCursor[4096];
     for (uint32_t k = 0; k < keyCount; ++k)
     {
         gMeshStart[k] = gMeshCursor[k] = start;
@@ -1497,7 +1612,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     for (uint32_t i = 0; i < count; ++i)
     {
         const InstanceInfo& info = gInfo[i];
-        uint32_t            key = info.mesh * 2 + ((info.flags >> 2) & 1);
+        uint32_t            key = info.mesh * 4 + ((info.flags >> 2) & 3);
         if (info.flags & 1)
             stream[gMeshCursor[key]++] = i;
         {
@@ -1514,6 +1629,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
             c.vertexCount = mesh.vertexCount;
             c.castShadow = (info.flags >> 1) & 1;
             c.generation = gMeshGen[info.mesh];
+            c.masked = (info.flags >> 3) & 1;
         }
         if (info.flags & 2)
         {
@@ -1529,6 +1645,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
             c.vertexCount = mesh.vertexCount;
             c.castShadow = 1;
             c.generation = gMeshGen[info.mesh];
+            c.masked = (info.flags >> 3) & 1;
         }
     }
     (void)casterStart;
@@ -1820,6 +1937,8 @@ void draw(uint32_t pass, const YeaFrame* yf)
         gm[i].emissive[1] = m.emissive.y;
         gm[i].emissive[2] = m.emissive.z;
     }
+    for (uint32_t i = 0; i < Materials.size(); ++i)
+        fillMaterialMap(gMaterialMapCpu[i], i);
 
     // Frame constants.
     memcpy(gf->viewProj, viewProj, sizeof viewProj);
@@ -1914,6 +2033,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         gf->misc[0] = F.binScale;
     }
     gf->misc[1] = settings.specular_aa;
+    gf->textures[0] = F.mipBias;
     gf->misc[2] = settings.sun_disk > 0 ? cosf(settings.sun_disk * 0.5f * 3.14159265f / 180.0f) : 1.0f;
     if (shadows)
     {
@@ -1940,6 +2060,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     memcpy(gShapeBuf[fi]->pCpuMappedAddress, gShapeCpu, (size_t)F.allLightCount * sizeof(RenderGpuLightShape));
     memcpy(gLookBuf[fi]->pCpuMappedAddress, gLookCpu, (size_t)F.allLightCount * 4);
     memcpy(gMaterialBuf[fi]->pCpuMappedAddress, gMaterialCpu, (size_t)Materials.size() * sizeof(GpuMaterial));
+    memcpy(gMaterialMapBuf[fi]->pCpuMappedAddress, gMaterialMapCpu, (size_t)Materials.size() * sizeof(GpuMaterialMap));
     memcpy(gFrameCb[fi]->pCpuMappedAddress, &gFrameCpu, sizeof gFrameCpu);
     if (taa)
         memcpy(gPrevBuf[fi]->pCpuMappedAddress, gPrevCpu, (size_t)count * sizeof gPrevCpu[0]);
@@ -2021,7 +2142,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         Buffer*  masks = culled ? F.tileMasks : gDummyU32;
         Buffer*  bins = culled ? F.zbins : gDummyU32;
         Buffer*  views = shadows ? F.shadowViews : gDummyViews;
-        DescriptorData p[26] = {};
+        DescriptorData p[28] = {};
         Texture*       ssrDepth = ssr ? F.ssrDepth : gDummyDepth->pTexture;
         Texture*       previous = ssr ? F.previous->pTexture : gDummyColor->pTexture;
         Texture*       probeTex = probes ? F.probes->pTexture : gDummyArray->pTexture;
@@ -2087,7 +2208,19 @@ void draw(uint32_t pass, const YeaFrame* yf)
         Texture* fogVolume = fog ? F.fogVolume : gDummyVolume;
         p[25].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gFogVolume);
         p[25].ppTextures = &fogVolume;
-        updateDescriptorSet(gRenderer, fi, gSceneFrame, 26, p);
+        p[26].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gMaterialMaps);
+        p[26].ppBuffers = &gMaterialMapBuf[fi];
+        // The texture array only when a slot changed since this frame's set last had it (1024 descriptors).
+        uint32_t bindings = 27;
+        if (gTexturesBound[fi] != F.textureVersion)
+        {
+            p[27].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gTextures);
+            p[27].ppTextures = (Texture**)F.textures;
+            p[27].mCount = RENDER_MAX_TEXTURES;
+            gTexturesBound[fi] = F.textureVersion;
+            bindings = 28;
+        }
+        updateDescriptorSet(gRenderer, fi, gSceneFrame, bindings, p);
 
         DescriptorData c[7] = {};
         c[0].mIndex = SRT_RES_IDX(CompositeSrt, PerFrame, gComposite);
@@ -2293,6 +2426,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     if (geometry)
     {
         bool full = (gf->counts[2] & (kFlagHeatmap | kFlagCascades | kFlagAoDebug | kFlagContactDebug | kFlagSsrDebug | kFlagRtDebug)) || (shadows && F.lightSize > 0);
+        createScenePipelines(samples, taa, gPipeMasked, viewMode ? kForwardDepth : full ? kForwardFull : kForwardLean); // first use only
         drawVisible(cmd, fi, viewMode ? gForwardDepthPipe : full ? gForwardFullPipe : gForwardPipe);
     }
     if (!viewMode)
@@ -2383,3 +2517,4 @@ void draw(uint32_t pass, const YeaFrame* yf)
     gRenderedFi = fi;
 }
 } // namespace renderer
+

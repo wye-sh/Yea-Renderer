@@ -19,9 +19,9 @@
 //   the chain stops when the simplifier can't take a tenth off, the error passes a quarter of the part's size, or a
 //   level has under 64 triangles.
 // - Writes the file and prints the report: units and axes, parts, triangles and error per LOD, what it generated or
-//   ignored. Textures, skins, animations, Draco and other extensions come with later stages and are listed as ignored.
-// - Until the renderer reads textures (stage 2), each material also gets its look with every texture averaged over its
-//   image (stb_image): the base colour (sRGB decoded), roughness and metallic the renderer draws meanwhile.
+//   ignored. Skins, animations, Draco and other extensions come with later stages and are listed as ignored.
+// - Texture maps (rmodel v2): each image used as base colour, ORM, normal or emissive is decoded (stb_image) and written
+//   with its full mip chain, BC7 (sRGB for colour) or BC5 for normals (bc7e, Apache-2.0).
 #define CGLTF_IMPLEMENTATION
 #include "vendor/cgltf/cgltf.h"
 #include "vendor/meshoptimizer/meshoptimizer.h"
@@ -496,14 +496,20 @@ bool textureMean(const cgltf_texture* tex, bool srgb, float out[4])
     return true;
 }
 
+} // namespace
+#include "cook_textures.h"
+namespace
+{
 size_t align16(size_t x) { return (x + 15) & ~(size_t)15; }
 } // namespace
 
 int main(int argc, char** argv)
 {
-    if (argc != 3)
+    if (argc == 5 && !strcmp(argv[3], "--max-size"))
+        cook::gMaxSize = (uint32_t)atoi(argv[4]);
+    if (argc != 3 && !(argc == 5 && cook::gMaxSize >= 4))
     {
-        fprintf(stderr, "usage: model_cook <in.gltf|in.glb> <out.rmodel>\n");
+        fprintf(stderr, "usage: model_cook <in.gltf|in.glb> <out.rmodel> [--max-size <pixels, at least 4>]\n");
         return 2;
     }
     gDir = argv[1];
@@ -598,30 +604,49 @@ int main(int argc, char** argv)
                         o.flatColor[c] *= mean[c];
                 if (textureMean(m.pbr_metallic_roughness.metallic_roughness_texture.texture, false, mean))
                     o.flatRoughness *= mean[1], o.flatMetallic *= mean[2]; // glTF: roughness in green, metallic in blue
-                textured += m.pbr_metallic_roughness.base_color_texture.texture || m.pbr_metallic_roughness.metallic_roughness_texture.texture;
             }
             else if (m.has_pbr_specular_glossiness)
                 warn("material %s uses specular-glossiness: cooked as a plain metallic-roughness material", o.name);
-            textured += m.normal_texture.texture || m.emissive_texture.texture || m.occlusion_texture.texture;
             memcpy(o.emissive, m.emissive_factor, 12);
             if (m.has_emissive_strength)
                 o.emissiveStrength = m.emissive_strength.emissive_strength;
             o.alpha = m.alpha_mode == cgltf_alpha_mode_mask ? RmodelMask : (m.alpha_mode == cgltf_alpha_mode_blend ? RmodelBlend : RmodelOpaque);
             o.alphaCutoff = m.alpha_cutoff;
             o.doubleSided = m.double_sided;
-            if (o.alpha != RmodelOpaque)
-                warn("material %s is alpha %s: drawn opaque until textures and alpha come (stage 2)", o.name,
-                     o.alpha == RmodelMask ? "mask" : "blend");
+            if (o.alpha == RmodelBlend)
+                warn("material %s is alpha blend: drawn as a mask at its cutoff (0.5) until transparency comes", o.name);
+            o.normalScale = m.normal_texture.texture ? m.normal_texture.scale : 1;
+            o.occlusionStrength = m.occlusion_texture.texture ? m.occlusion_texture.scale : 1;
+            const float cutoff = o.alpha == RmodelOpaque ? 0 : (o.alpha == RmodelBlend ? 0.5f : o.alphaCutoff);
+            const cgltf_texture_view views[5] = { m.pbr_metallic_roughness.base_color_texture, m.pbr_metallic_roughness.metallic_roughness_texture,
+                                                  m.occlusion_texture, m.normal_texture, m.emissive_texture };
+            for (const cgltf_texture_view& v : views)
+            {
+                if (v.texture && v.texcoord != 0)
+                    warn("material %s reads a texture with UV set %d: the cooker keeps only the first set, so it reads that", o.name, v.texcoord);
+                if (v.texture && v.has_transform)
+                    warn("material %s moves a texture (KHR_texture_transform): ignored", o.name);
+            }
+            if (m.has_pbr_metallic_roughness)
+            {
+                o.textures[0] = cook::cook(m.pbr_metallic_roughness.base_color_texture.texture, nullptr, cook::KindBase, cutoff);
+                o.textures[1] = cook::cook(m.pbr_metallic_roughness.metallic_roughness_texture.texture, m.occlusion_texture.texture,
+                                           cook::KindOrm, 0);
+            }
+            o.textures[2] = cook::cook(m.normal_texture.texture, nullptr, cook::KindNormal, 0);
+            o.textures[3] = cook::cook(m.emissive_texture.texture, nullptr, cook::KindEmissive, 0);
+            for (int t = 0; t < 4; ++t)
+                textured += o.textures[t] >= 0;
         }
         else
+            {
             snprintf(o.name, sizeof o.name, "(default)");
+            o.normalScale = o.occlusionStrength = 1;
+        }
         if (p.material >= data->materials_count || !data->materials[p.material].has_pbr_metallic_roughness)
             memcpy(o.flatColor, o.baseColor, 12), o.flatRoughness = o.roughness, o.flatMetallic = o.metallic;
         mats.push_back(o);
     }
-    if (textured)
-        warn("%u texture use%s not drawn yet (base colour, ORM, normal, emissive maps come with stage 2): each material's look averaged over its textures stands in",
-             textured, textured == 1 ? " is" : "s are");
     if (data->animations_count)
         warn("%zu animation%s ignored (animation is a later stage)", (size_t)data->animations_count, data->animations_count == 1 ? " is" : "s are");
 
@@ -669,6 +694,10 @@ int main(int argc, char** argv)
     h.positions = (uint32_t)at, at = align16(at + (size_t)h.vertexCount * 12);
     h.attributes = (uint32_t)at, at = align16(at + (size_t)h.vertexCount * 20);
     h.indices = (uint32_t)at, at = align16(at + (size_t)h.indexCount * 4);
+    h.textureCount = (uint32_t)cook::gTextures.size();
+    h.textures = (uint32_t)at, at = align16(at + cook::gTextures.size() * sizeof(RmodelTexture));
+    for (cook::Cooked& c : cook::gTextures)
+        c.t.offset = at, at = align16(at + c.data.size());
     if (at > 100u * 1024 * 1024)
     {
         fprintf(stderr, "error: the cooked model would be %.1f MB; Yea allows 100 MB a file\n", at / 1048576.0);
@@ -690,6 +719,11 @@ int main(int argc, char** argv)
             memcpy(&file[h.attributes + (size_t)fl.firstVertex * 20], l.attributes.data(), l.attributes.size() * 4);
             memcpy(&file[h.indices + (size_t)fl.firstIndex * 4], l.indices.data(), l.indices.size() * 4);
         }
+    for (size_t i = 0; i < cook::gTextures.size(); ++i)
+    {
+        memcpy(&file[h.textures + i * sizeof(RmodelTexture)], &cook::gTextures[i].t, sizeof(RmodelTexture));
+        memcpy(&file[cook::gTextures[i].t.offset], cook::gTextures[i].data.data(), cook::gTextures[i].data.size());
+    }
     FILE* f = fopen(argv[2], "wb");
     if (!f || fwrite(file.data(), 1, file.size(), f) != file.size())
     {
@@ -726,6 +760,21 @@ int main(int argc, char** argv)
             printf(" %.2g", l.error * 1000.0f);
         printf(" mm; drawn until textures as colour %.2f %.2f %.2f, roughness %.2f, metallic %.2f\n", mats[i].flatColor[0],
                mats[i].flatColor[1], mats[i].flatColor[2], mats[i].flatRoughness, mats[i].flatMetallic);
+    }
+    if (!cook::gTextures.empty())
+    {
+        size_t bytes = 0;
+        for (const cook::Cooked& c : cook::gTextures)
+            bytes += c.data.size();
+        printf("%zu texture%s (%u map%s used), %.1f MB with every mip:", cook::gTextures.size(), cook::gTextures.size() == 1 ? "" : "s",
+               textured, textured == 1 ? "" : "s", bytes / 1048576.0);
+        static const char* kinds[] = { "colour", "ORM", "normal", "emissive" };
+        for (const cook::Cooked& c : cook::gTextures)
+            printf(" %s %ux%u%s;", kinds[c.kind], c.t.width, c.t.height, c.b ? " (occlusion merged)" : "");
+        printf("\n");
+        if (cook::gSkipped)
+            note("--max-size %u: %u top mip level%s left out over all textures (the source images are unchanged)", cook::gMaxSize, cook::gSkipped,
+                 cook::gSkipped == 1 ? "" : "s");
     }
     for (const std::string& s : gNotes)
         printf("%s\n", s.c_str());

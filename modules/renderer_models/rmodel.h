@@ -11,7 +11,7 @@
 #include <stdint.h>
 
 constexpr uint32_t kRmodelMagic = 0x4C444D52u; // "RMDL"
-constexpr uint32_t kRmodelVersion = 1;
+constexpr uint32_t kRmodelVersion = 2;
 
 struct RmodelHeader
 {
@@ -22,7 +22,8 @@ struct RmodelHeader
     uint32_t materials, parts, lods;                    // section offsets
     uint32_t positions, attributes, indices;
     uint32_t clusters, clusterBytes; // reserved for cluster LOD (meshlet hierarchy): 0 for now
-    uint32_t reserved[4];
+    uint32_t textureCount, textures; // RmodelTexture[] (its offset); each one's mips follow at its own offset
+    uint32_t reserved[2];
 };
 
 enum RmodelAlpha : uint32_t
@@ -41,13 +42,32 @@ struct RmodelMaterial
     uint32_t alpha;            // RmodelAlpha
     float    alphaCutoff;
     uint32_t doubleSided;
-    int32_t  textures[4]; // base colour, ORM, normal, emissive: -1 (textures come with stage 2)
+    int32_t  textures[4]; // RmodelTexture indices, -1 none: base colour (BC7 sRGB, alpha), ORM (BC7 linear: occlusion,
+                          // roughness, metallic; glTF's occlusion map merged in), normal (BC5: x, y; z rebuilt), emissive (BC7 sRGB)
     char     name[64];
     // Its look with each texture averaged over its image: the colour (linear rgb, factor times texture), roughness and
     // metallic a renderer without the textures draws (stage 1). The factors alone when it has none.
     float    flatColor[3];
     float    flatRoughness, flatMetallic;
-    uint32_t pad[2];
+    float    normalScale;       // glTF's normalTexture.scale: the normal map's x and y times it
+    float    occlusionStrength; // glTF's occlusionTexture.strength: lerp(1, occlusion, it)
+};
+
+enum RmodelFormat : uint32_t
+{
+    RmodelBC7Srgb = 1,
+    RmodelBC7Linear = 2,
+    RmodelBC5 = 3, // two channels, unsigned (a normal's x, y as 0..1)
+};
+
+// A texture: its full mip chain, the largest first, each mip's 4x4 blocks row by row (16 bytes a block), mips packed
+// one after another from `offset`. Width and height are the top mip's; a mip is max(1, size >> level) wide, in
+// max(1, (size + 3) / 4) blocks. The loader may skip top mips to keep within memory (the cooker never shrinks them).
+struct RmodelTexture
+{
+    uint32_t format; // RmodelFormat
+    uint32_t width, height, mips;
+    uint64_t offset, bytes; // from the file's start, every mip
 };
 
 struct RmodelPart
@@ -68,3 +88,4 @@ static_assert(sizeof(RmodelHeader) == 112, "rmodel header");
 static_assert(sizeof(RmodelMaterial) == 160, "rmodel material");
 static_assert(sizeof(RmodelPart) == 48, "rmodel part");
 static_assert(sizeof(RmodelLod) == 32, "rmodel lod");
+static_assert(sizeof(RmodelTexture) == 32, "rmodel texture");

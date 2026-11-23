@@ -10,6 +10,9 @@ STRUCT(VSInput)
     DATA(float3, Position, POSITION);
     DATA(float2, Normal, NORMAL); // octahedral
     DATA(uint, Instance, TEXCOORD1);
+    DATA(int2, Tangent, TANGENT); // octahedral snorm16 as integers: y's lowest bit the bitangent's sign (odd: -1)
+    DATA(float2, Uv, TEXCOORD0);
+    DATA(float4, Color, COLOR);
 };
 
 STRUCT(VSOutput)
@@ -22,6 +25,9 @@ STRUCT(VSOutput)
     DATA(float4, CurrClip, TEXCOORD3);
     DATA(float4, PrevClip, TEXCOORD4);
 #endif
+    DATA(float2, Uv, TEXCOORD5);
+    DATA(float4, Tangent, TEXCOORD6); // world, w the bitangent's sign
+    DATA(float4, Color, TEXCOORD7);
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -45,6 +51,11 @@ VSOutput VS_MAIN(VSInput In)
     float3 n = octDecode(In.Normal);
     Out.Normal = float3(dot(c0, n), dot(c1, n), dot(c2, n));
     Out.Material = inst.misc.x;
+    float2 tf = max(float2(In.Tangent) * (1.0 / 32767.0), float2(-1.0, -1.0));
+    float3 t = octDecode(tf);
+    Out.Tangent = float4(dot(a, t), dot(b, t), dot(c, t), (In.Tangent.y & 1) != 0 ? -1.0 : 1.0);
+    Out.Uv = In.Uv;
+    Out.Color = In.Color;
 #ifdef MOTION
     PrevInstanceData prev = gPrevInstances[In.Instance];
     float4 pw = float4(dot(prev.row0, p), dot(prev.row1, p), dot(prev.row2, p), 1.0);

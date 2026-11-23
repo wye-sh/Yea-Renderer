@@ -509,6 +509,7 @@ yea_handle material_add(yea_float3 albedo, float roughness, float metallic)
         return 0xFFFFFFFFu;
     m->reflectance = 0.5f;
     m->reflections = 1;
+    materialMapsReset(row);
     yea_handle h = handleOf(Materials, row);
     material_set(h, albedo, roughness, metallic);
     return h;
@@ -775,6 +776,9 @@ void clear()
     Lights.clear();
     LightTexels.clear();
     LightLooks.clear();
+    TextureMaps.clear();
+    TexturePaths.clear();
+    MaterialMaps.clear();
     build()->active = 0;
     sceneState()->removed = yea::host()->frame();
     newEpoch();

@@ -1,0 +1,30 @@
+// The depth prepass for alpha-tested materials: cut out where the base colour's alpha is under the material's cutoff, so
+// the forward pass (an equal depth test) draws only what is left. MOTION: after the motion-vector vertex shader.
+#include "Common.h.fsl"
+#include "Scene.srt.h"
+#include "Material.h.fsl"
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float3, WorldPos, TEXCOORD0);
+    DATA(float3, Normal, TEXCOORD1);
+    DATA(FLAT(uint), Material, TEXCOORD2);
+#ifdef MOTION
+    DATA(float4, CurrClip, TEXCOORD3);
+    DATA(float4, PrevClip, TEXCOORD4);
+#endif
+    DATA(float2, Uv, TEXCOORD5);
+    DATA(float4, Tangent, TEXCOORD6);
+    DATA(float4, Color, TEXCOORD7);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+void PS_MAIN(VSOutput In)
+{
+    INIT_MAIN;
+    MaterialMapData mm = gMaterialMaps[In.Material];
+    float           uvScale = exp2(gFrame.textures.x);
+    clip(materialAlpha(mm, In.Uv, ddx(In.Uv) * uvScale, ddy(In.Uv) * uvScale, mm.misc.y > 0.5 ? In.Color.a : 1.0) - mm.misc.x);
+    RETURN();
+}

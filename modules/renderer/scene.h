@@ -3,6 +3,7 @@
 #include "yea_renderer.h"
 
 typedef struct Texture Texture;
+typedef struct Queue   Queue;
 
 namespace renderer
 {
@@ -35,4 +36,13 @@ Texture* lightImagesMake();                  // the texture array (16 images of 
 void     lightImagesUpload(Texture* tex);    // before the frame's lights: uploads when the images changed
 uint32_t lightImageOf(uint32_t lightRow);    // a rect light row's image + 1 (uploaded), else 0
 void     lightImageForget(uint32_t lightRow); // a light row made afresh has none
+
+// Texture maps and material maps (textures.cpp).
+void              texturesInit(Texture* standIn); // in load(): standIn fills the slots without a texture
+void              texturesFree();                 // in unload(), the GPU idle
+void              texturesUpdate(Queue* queue);   // in draw, before the frame: frees gone ones, loads waiting ones
+Texture* const*   textureSlots();                 // RENDER_MAX_TEXTURES of them, for the shaders' array
+uint32_t          textureVersion();               // changes whenever textureSlots() does
+uint32_t          textureSlot(yea_handle t);      // a texture's slot + 1 once it is drawn with, else 0
+void              materialMapsReset(uint32_t materialRow); // a material row made afresh has no maps
 } // namespace renderer

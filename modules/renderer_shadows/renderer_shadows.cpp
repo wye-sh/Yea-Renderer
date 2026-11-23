@@ -13,6 +13,7 @@
 #include <Common_3/Graphics/Interfaces/IGraphics.h>
 #include <Common_3/Resources/ResourceLoader/Interfaces/IResourceLoader.h>
 #include <Common_3/Graphics/FSL/defaults.h>
+#define MAX_TEXTURES RENDER_MAX_TEXTURES
 #include "Shaders/Shadow.srt.h"
 
 using namespace mx;
@@ -52,6 +53,12 @@ uint32_t       gFrames;
 bool           gReady;
 Shader *       gShader, *gClearShader;
 Pipeline *     gPipe, *gClearPipe;
+// Alpha-tested casters (RenderCaster::masked): uv0 and the base colour map, cut out as the camera's passes cut them. Opaque
+// casters stay on gPipe's positions-only path.
+Shader*        gMaskedShader;
+Pipeline*      gMaskedPipe;
+uint32_t       gTexBound[kMaxFrames]; // the frame's textureVersion each set holds (0: none yet)
+bool           gMaskedNow;            // this frame draws alpha-tested casters on gMaskedPipe (the maps are bound)
 float          gPipeSlope = -1;
 float          gGuardKey = -1; // what the point lights' face margins were drawn for
 DescriptorSet* gSet;
@@ -218,6 +225,9 @@ void makePipelines(float slope)
         removePipeline(gRenderer, gPipe);
     if (gClearPipe)
         removePipeline(gRenderer, gClearPipe);
+    if (gMaskedPipe)
+        removePipeline(gRenderer, gMaskedPipe);
+    gPipe = gClearPipe = gMaskedPipe = nullptr;
     VertexLayout l = {};
     l.mBindingCount = 2; // the frame's positions (nothing else is read), then the instance-rate stream
     l.mBindings[0].mStride = RENDER_POSITION_STRIDE;
@@ -259,6 +269,34 @@ void makePipelines(float slope)
     g.pShaderProgram = gShader;
     desc.pName = "renderer_shadow";
     addPipeline(gRenderer, &desc, &gPipe);
+    if (gMaskedShader)
+    {
+        // Positions, then the attributes (uv0 at 8, the colour at 16), then the instance-rate stream.
+        VertexLayout m = {};
+        m.mBindingCount = 3;
+        m.mBindings[0].mStride = RENDER_POSITION_STRIDE;
+        m.mBindings[1].mStride = RENDER_ATTRIBUTE_STRIDE;
+        m.mBindings[2].mStride = 4;
+        m.mBindings[2].mRate = VERTEX_BINDING_RATE_INSTANCE;
+        m.mAttribCount = 4;
+        m.mAttribs[0] = l.mAttribs[0];
+        m.mAttribs[1] = l.mAttribs[1];
+        m.mAttribs[1].mBinding = 2;
+        m.mAttribs[2].mSemantic = SEMANTIC_TEXCOORD0;
+        m.mAttribs[2].mFormat = TinyImageFormat_R32G32_SFLOAT;
+        m.mAttribs[2].mBinding = 1;
+        m.mAttribs[2].mLocation = 2;
+        m.mAttribs[2].mOffset = 8;
+        m.mAttribs[3].mSemantic = SEMANTIC_COLOR;
+        m.mAttribs[3].mFormat = TinyImageFormat_R8G8B8A8_UNORM;
+        m.mAttribs[3].mBinding = 1;
+        m.mAttribs[3].mLocation = 3;
+        m.mAttribs[3].mOffset = 16;
+        g.pVertexLayout = &m;
+        g.pShaderProgram = gMaskedShader;
+        desc.pName = "renderer_shadow_masked";
+        addPipeline(gRenderer, &desc, &gMaskedPipe);
+    }
 
     RasterizerStateDesc plain = {};
     plain.mCullMode = CULL_MODE_NONE;
@@ -602,7 +640,9 @@ uint32_t shadowVersion(const RenderCaster& c, bool sun, const RenderGpuShadowVie
 
 // Draws the casters inside a view's frustum, one instanced draw per run of the same mesh version. The casters come
 // sorted by the version the screen draws; each such run is drawn once per version it takes here, simplest last.
-void drawCasters(Cmd* cmd, const RenderFrame* F, uint32_t view, const RenderGpuShadowView& v, uint32_t* stream, Buffer* streamBuf)
+// masked: only the alpha-tested casters (gMaskedPipe bound, with the attributes), else only the others (gPipe).
+void drawCasters(Cmd* cmd, const RenderFrame* F, uint32_t view, const RenderGpuShadowView& v, uint32_t* stream, Buffer* streamBuf,
+                 bool masked)
 {
     mx::Plane planes[6];
     clipPlanes(v.row, planes);
@@ -611,12 +651,24 @@ void drawCasters(Cmd* cmd, const RenderFrame* F, uint32_t view, const RenderGpuS
         if (!count)
             return;
         const renderer::Mesh& m = renderer::Meshes[mesh];
-        Buffer*  bufs[2] = { F->positions, streamBuf };
-        uint32_t strides[2] = { RENDER_POSITION_STRIDE, 4 };
-        uint64_t offsets[2] = { 0, (uint64_t)first * 4 };
-        cmdBindVertexBuffer(cmd, 2, bufs, strides, offsets);
+        if (masked)
+        {
+            Buffer*  bufs[3] = { F->positions, F->attributes, streamBuf };
+            uint32_t strides[3] = { RENDER_POSITION_STRIDE, RENDER_ATTRIBUTE_STRIDE, 4 };
+            uint64_t offsets[3] = { 0, 0, (uint64_t)first * 4 };
+            cmdBindVertexBuffer(cmd, 3, bufs, strides, offsets);
+        }
+        else
+        {
+            Buffer*  bufs[2] = { F->positions, streamBuf };
+            uint32_t strides[2] = { RENDER_POSITION_STRIDE, 4 };
+            uint64_t offsets[2] = { 0, (uint64_t)first * 4 };
+            cmdBindVertexBuffer(cmd, 2, bufs, strides, offsets);
+        }
         cmdDrawIndexedInstanced(cmd, m.indexCount, m.firstIndex, count, m.firstVertex, 0);
     };
+    // Without the masked pipeline (its shaders refused), alpha-tested casters draw whole with the others.
+    auto ours = [&](const RenderCaster& c) { return gMaskedNow ? (c.masked != 0) == masked : !masked; };
     for (uint32_t i = 0; i < F->casterCount && gStreamUsed < kMaxEntries;)
     {
         // The run of casters the screen draws with one version (the core sorts them by it).
@@ -633,7 +685,7 @@ void drawCasters(Cmd* cmd, const RenderFrame* F, uint32_t view, const RenderGpuS
             {
                 const RenderCaster& c = F->casters[k];
                 uint32_t m = shadowVersion(c, sun, v);
-                if (m >= floor && m < pick && sphereInside(planes, 6, V(c.sphere[0], c.sphere[1], c.sphere[2]), c.sphere[3]))
+                if (ours(c) && m >= floor && m < pick && sphereInside(planes, 6, V(c.sphere[0], c.sphere[1], c.sphere[2]), c.sphere[3]))
                     pick = m;
             }
             if (pick == 0xFFFFFFFFu)
@@ -642,7 +694,7 @@ void drawCasters(Cmd* cmd, const RenderFrame* F, uint32_t view, const RenderGpuS
             for (uint32_t k = i; k < end && gStreamUsed < kMaxEntries; ++k)
             {
                 const RenderCaster& c = F->casters[k];
-                if (shadowVersion(c, sun, v) == pick && sphereInside(planes, 6, V(c.sphere[0], c.sphere[1], c.sphere[2]), c.sphere[3]))
+                if (ours(c) && shadowVersion(c, sun, v) == pick && sphereInside(planes, 6, V(c.sphere[0], c.sphere[1], c.sphere[2]), c.sphere[3]))
                     stream[gStreamUsed++] = c.instance | (view << RENDER_VIEW_SHIFT);
             }
             draw(pick, first, gStreamUsed - first);
@@ -667,6 +719,12 @@ int load(int reloaded)
     addShader(gRenderer, &cd, &gClearShader);
     if (!gShader || !gClearShader)
         return 1;
+    ShaderLoadDesc md = {};
+    md.mVert.pFileName = "renderer_shadow_masked.vert";
+    md.mFrag.pFileName = "renderer_shadow_masked.frag";
+    addShader(gRenderer, &md, &gMaskedShader); // refused: alpha-tested casters cast whole shadows
+    for (uint32_t i = 0; i < kMaxFrames; ++i)
+        gTexBound[i] = 0;
     DescriptorSetDesc setDesc = SRT_SET_DESC(ShadowSrt, PerFrame, gFrames, 0);
     addDescriptorSet(gRenderer, &setDesc, &gSet);
     for (uint32_t i = 0; i < gFrames; ++i)
@@ -707,6 +765,10 @@ void unload()
         removePipeline(gRenderer, gPipe);
     if (gClearPipe)
         removePipeline(gRenderer, gClearPipe);
+    if (gMaskedPipe)
+        removePipeline(gRenderer, gMaskedPipe);
+    if (gMaskedShader)
+        removeShader(gRenderer, gMaskedShader);
     freeTarget(gSunAtlas);
     freeTarget(gLocalAtlas);
     for (uint32_t i = 0; i < gFrames; ++i)
@@ -1232,13 +1294,47 @@ void shadows_render(uint64_t address)
     gStreamUsed = 0;
     bool geometry = F->positions && F->indices && F->instances && F->casterCount;
 
-    DescriptorData p[2] = {};
+    DescriptorData p[4] = {};
     p[0].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gInstances);
     p[0].ppBuffers = &F->instances;
     p[1].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gViews);
     p[1].ppBuffers = &gViewBuf[fi];
+    // The material maps for alpha-tested casters; the texture array only when the core's slots changed (1024 of them).
+    const bool maps = gMaskedPipe && F->materialMaps && F->textures;
+    uint32_t   bindings = 2;
+    if (maps)
+    {
+        p[2].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gMaterialMaps);
+        p[2].ppBuffers = (Buffer**)&F->materialMaps;
+        bindings = 3;
+        if (gTexBound[fi] != F->textureVersion)
+        {
+            p[3].mIndex = SRT_RES_IDX(ShadowSrt, PerFrame, gTextures);
+            p[3].ppTextures = (Texture**)F->textures;
+            p[3].mCount = RENDER_MAX_TEXTURES;
+            gTexBound[fi] = F->textureVersion;
+            bindings = 4;
+        }
+    }
     if (F->instances)
-        updateDescriptorSet(gRenderer, fi, gSet, 2, p);
+        updateDescriptorSet(gRenderer, fi, gSet, bindings, p);
+    bool anyMasked = false;
+    for (uint32_t i = 0; maps && i < F->casterCount && !anyMasked; ++i)
+        anyMasked = F->casters[i].masked != 0;
+    gMaskedNow = anyMasked;
+    // A view's casters: the opaque ones on gPipe, then the alpha-tested ones on gMaskedPipe (left bound as gPipe after).
+    auto drawView = [&](uint32_t view, const RenderGpuShadowView& v) {
+        drawCasters(cmd, F, view, v, stream, gStreamBuf[fi], false);
+        if (!anyMasked)
+            return;
+        cmdBindPipeline(cmd, gMaskedPipe);
+        cmdBindDescriptorSet(cmd, fi, gSet);
+        cmdBindIndexBuffer(cmd, F->indices, INDEX_TYPE_UINT32, 0);
+        drawCasters(cmd, F, view, v, stream, gStreamBuf[fi], true);
+        cmdBindPipeline(cmd, gPipe);
+        cmdBindDescriptorSet(cmd, fi, gSet);
+        cmdBindIndexBuffer(cmd, F->indices, INDEX_TYPE_UINT32, 0);
+    };
     const RenderGpuShadowView* views = gViewsCpu;
 
     if (gCascades && !gFrozen && gSunDirty)
@@ -1274,7 +1370,7 @@ void shadows_render(uint64_t address)
                     cmdBindDescriptorSet(cmd, fi, gSet);
                     cmdBindIndexBuffer(cmd, F->indices, INDEX_TYPE_UINT32, 0);
                 }
-                drawCasters(cmd, F, i, v, stream, gStreamBuf[fi]);
+                drawView(i, v);
             }
         }
         cmdBindRenderTargets(cmd, nullptr);
@@ -1311,7 +1407,7 @@ void shadows_render(uint64_t address)
                     cmdBindPipeline(cmd, gPipe);
                     cmdBindDescriptorSet(cmd, fi, gSet);
                     cmdBindIndexBuffer(cmd, F->indices, INDEX_TYPE_UINT32, 0);
-                    drawCasters(cmd, F, kSunViews + idx, g.views[f], stream, gStreamBuf[fi]);
+                    drawView(kSunViews + idx, g.views[f]);
                 }
             }
         }

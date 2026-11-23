@@ -14,6 +14,11 @@ import renderer u32 mesh_packed(u64 positions, u64 attributes, u32 vertex_count,
 import renderer void mesh_lod(u32 mesh, float error, u32 simpler)
 import renderer handle material_add(float3 albedo, float roughness, float metallic) = 4294967295
 import renderer void material_double_sided(handle m, bool on)
+import renderer void material_emissive(handle m, float3 color, float luminance)
+import renderer handle texture_add(u64 path, u64 offset, u64 bytes, u32 format, u32 width, u32 height, u32 mips) = 4294967295
+import renderer void material_maps(handle m, handle base_color, handle orm, handle normal, handle emissive)
+import renderer void material_factors(handle m, float4 base_color, float roughness, float metallic, float normal_scale, float occlusion)
+import renderer void material_alpha(handle m, float cutoff)
 import renderer handle instance_add(u32 mesh, handle material) = 4294967295
 import renderer void instance_place(handle i, float3 pos, float4 rotation, float3 scale)
 import renderer void instance_shadow(handle i, bool cast)
@@ -51,11 +56,21 @@ table ModelPart none 4096
   u32 twoSided
   float3 lo
   float3 hi
+  float3 emissive
 end
 # The renderer's scene the rows above were made in (its scene_epoch).
 state Scene
   u32 epoch
 end
+# The cooked file version this module's models were made from (rmodel.h's kRmodelVersion): a newer one rebuilds them.
+state Format
+  u32 version
+end
+
+category Models
+# How bright a model's glowing parts are: the luminance (cd/m2) of an emissive colour of 1 at strength 1 in its file
+# (glTF gives emission no unit).
+setting float emissive_nits 1000 0 inf
 
 # Every model's knobs (ModelLink.h's mdl::Knobs, in that order): a module that imports this one gets them for each of its
 # MODEL lines (chair_scale), tuned only in the Model Viewer.

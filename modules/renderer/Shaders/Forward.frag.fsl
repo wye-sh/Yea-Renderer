@@ -3,6 +3,7 @@
 #include "Common.h.fsl"
 #include "Scene.srt.h"
 #include "Lighting.h.fsl"
+#include "Material.h.fsl"
 
 STRUCT(VSOutput)
 {
@@ -14,6 +15,9 @@ STRUCT(VSOutput)
     DATA(float4, CurrClip, TEXCOORD3);
     DATA(float4, PrevClip, TEXCOORD4);
 #endif
+    DATA(float2, Uv, TEXCOORD5);
+    DATA(float4, Tangent, TEXCOORD6);
+    DATA(float4, Color, TEXCOORD7);
 };
 
 #ifdef MOTION
@@ -230,6 +234,21 @@ float4 PS_MAIN(VSOutput In)
 #endif
     }
 #endif
+    // Texture maps (cooked models): the material's look at this pixel replaces its flat one. Alpha-tested materials were
+    // cut out by the depth prepass, and draw here only where it kept them (an equal depth test).
+    MaterialMapData mm = gMaterialMaps[In.Material];
+    float  occlusion = 1.0;
+    float  uvScale = exp2(gFrame.textures.x);
+    float2 uvDx = ddx(In.Uv) * uvScale;
+    float2 uvDy = ddy(In.Uv) * uvScale;
+    if (mm.misc.y > 0.5)
+    {
+        MaterialLook look = materialLook(m, mm, In.Uv, uvDx, uvDy, In.Color);
+        m.albedoRough = float4(look.albedo, look.rough);
+        m.params.x = look.metallic;
+        m.emissive.rgb = look.emissive;
+        occlusion = look.occlusion;
+    }
     float3 N = normalize(In.Normal);
     float3 V = normalize(gFrame.camPos.xyz - In.WorldPos);
     float  rough = clamp(m.albedoRough.a, 0.03, 1.0);
@@ -242,10 +261,18 @@ float4 PS_MAIN(VSOutput In)
     a2 = saturate(a2 + min(2.0 * variance, 0.18));
     // Two-sided: shade the face towards the viewer.
     float NoV = dot(N, V);
+    float facing = 1.0;
     if (NoV < 0.0)
     {
         N = -N;
         NoV = -NoV;
+        facing = -1.0;
+    }
+    if (mm.maps.z != 0u)
+    {
+        // The normal map's normal, turned with the face (a back face's whole tangent frame flips).
+        N = mappedNormal(mm, In.Normal, In.Tangent, In.Uv, uvDx, uvDy) * facing;
+        NoV = dot(N, V);
     }
     NoV = max(NoV, 1e-3);
 
@@ -288,42 +315,49 @@ float4 PS_MAIN(VSOutput In)
     float  ao = 1.0;
     float3 diffuseAo = float3(1.0, 1.0, 1.0);
     float  specularAo = 1.0;
-    if ((gFrame.counts.z & FLAG_AO) != 0u)
+    bool   ssao = (gFrame.counts.z & FLAG_AO) != 0u;
+    if (ssao || occlusion < 1.0)
     {
-        int2 p = int2(In.Position.xy);
-        if (gFrame.aoParams.z > 1.5)
+        // The texture's own occlusion map joins renderer_ao's (the darker of the two), as Filament does; without
+        // renderer_ao it alone, with multiple bounces and specular occlusion at full strength.
+        if (ssao)
         {
-            // Half size: the four nearest texels, bilinear weights times how close each one's depth (carried with it)
-            // is to this pixel's, so occlusion never bleeds across an edge; when none is close, the closest in depth.
-            int2   last = (int2(gFrame.screen.xy) + int2(1, 1)) / 2 - int2(1, 1);
-            int2   base = p / 2;
-            float2 f = float2(p - base * 2) * 0.5;
-            float  sum = 0.0;
-            float  total = 0.0;
-            float  best = 1e30;
-            float  nearest = 1.0;
-            for (int j = 0; j < 2; ++j)
+            int2 p = int2(In.Position.xy);
+            if (gFrame.aoParams.z > 1.5)
             {
-                for (int i = 0; i < 2; ++i)
+                // Half size: the four nearest texels, bilinear weights times how close each one's depth (carried with it)
+                // is to this pixel's, so occlusion never bleeds across an edge; when none is close, the closest in depth.
+                int2   last = (int2(gFrame.screen.xy) + int2(1, 1)) / 2 - int2(1, 1);
+                int2   base = p / 2;
+                float2 f = float2(p - base * 2) * 0.5;
+                float  sum = 0.0;
+                float  total = 0.0;
+                float  best = 1e30;
+                float  nearest = 1.0;
+                for (int j = 0; j < 2; ++j)
                 {
-                    float2 q = LoadTex2D(gAo, NO_SAMPLER, min(base + int2(i, j), last), 0).xy;
-                    float  dz = abs(q.y - viewZ);
-                    float  w = (i == 0 ? 1.0 - f.x : f.x) * (j == 0 ? 1.0 - f.y : f.y) * saturate(1.0 - dz / (viewZ * 0.03));
-                    sum += q.x * w;
-                    total += w;
-                    if (dz < best)
+                    for (int i = 0; i < 2; ++i)
                     {
-                        best = dz;
-                        nearest = q.x;
+                        float2 q = LoadTex2D(gAo, NO_SAMPLER, min(base + int2(i, j), last), 0).xy;
+                        float  dz = abs(q.y - viewZ);
+                        float  w = (i == 0 ? 1.0 - f.x : f.x) * (j == 0 ? 1.0 - f.y : f.y) * saturate(1.0 - dz / (viewZ * 0.03));
+                        sum += q.x * w;
+                        total += w;
+                        if (dz < best)
+                        {
+                            best = dz;
+                            nearest = q.x;
+                        }
                     }
                 }
+                ao = total > 1e-4 ? sum / total : nearest;
             }
-            ao = total > 1e-4 ? sum / total : nearest;
+            else
+                ao = LoadTex2D(gAo, NO_SAMPLER, p, 0).x;
         }
-        else
-            ao = LoadTex2D(gAo, NO_SAMPLER, p, 0).x;
+        ao = min(ao, occlusion);
         diffuseAo = float3(ao, ao, ao);
-        if (gFrame.aoParams.y > 0.0)
+        if (!ssao || gFrame.aoParams.y > 0.0)
         {
             float3 a = 2.0404 * albedo - 0.3324;
             float3 b = -4.7951 * albedo + 0.6417;
@@ -331,7 +365,7 @@ float4 PS_MAIN(VSOutput In)
             diffuseAo = max(diffuseAo, ((diffuseAo * a + b) * diffuseAo + c) * diffuseAo);
         }
         float so = saturate(pow(max(NoV + ao, 1e-4), exp2(-16.0 * sqrt(sqrt(a2)) - 1.0)) - 1.0 + ao);
-        specularAo = lerp(1.0, so, gFrame.aoParams.x);
+        specularAo = lerp(1.0, so, ssao ? gFrame.aoParams.x : 1.0);
     }
     float3 R = reflect(-V, N);
     float  horizon = saturate(1.0 + dot(R, normalize(In.Normal) * (dot(In.Normal, V) < 0.0 ? -1.0 : 1.0)));

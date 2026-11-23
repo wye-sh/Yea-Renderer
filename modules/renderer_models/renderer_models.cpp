@@ -59,6 +59,8 @@ uint32_t placementRow(uint32_t h)
     uint32_t row = h & 0xFFFFFu;
     return row < Placements.size() && Placements[row].alive && Placements[row].gen == (h >> 20) ? row : 0xFFFFFFFFu;
 }
+float gGlow = -1; // the emissive_nits the parts' materials have
+
 void dropInstances(uint32_t row)
 {
     for (uint32_t i = PartInstances.size(); i-- > 0;)
@@ -289,12 +291,21 @@ void loadCooked(Entry& e)
                               !inside(h.parts, (uint64_t)h.partCount * sizeof(RmodelPart)) ||
                               !inside(h.lods, (uint64_t)h.lodCount * sizeof(RmodelLod)) ||
                               !inside(h.positions, (uint64_t)h.vertexCount * 12) || !inside(h.attributes, (uint64_t)h.vertexCount * 20) ||
-                              !inside(h.indices, (uint64_t)h.indexCount * 4)
+                              !inside(h.indices, (uint64_t)h.indexCount * 4) ||
+                              !inside(h.textures, (uint64_t)h.textureCount * sizeof(RmodelTexture))
                           ? "its file is cut short"
                           : nullptr;
     const RmodelPart*     parts = (const RmodelPart*)(data + (bad ? 0 : h.parts));
     const RmodelLod*      lods = (const RmodelLod*)(data + (bad ? 0 : h.lods));
     const RmodelMaterial* mats = (const RmodelMaterial*)(data + (bad ? 0 : h.materials));
+    const RmodelTexture*  texs = (const RmodelTexture*)(data + (bad ? 0 : h.textures));
+    for (uint32_t t = 0; !bad && t < h.textureCount; ++t)
+        if (texs[t].format < RmodelBC7Srgb || texs[t].format > RmodelBC5 || !inside(texs[t].offset, texs[t].bytes))
+            bad = "its file is damaged";
+    for (uint32_t m = 0; !bad && m < h.materialCount; ++m)
+        for (int32_t t : mats[m].textures)
+            if (t >= (int32_t)h.textureCount)
+                bad = "its file is damaged";
     for (uint32_t k = 0; !bad && k < h.partCount; ++k)
     {
         const RmodelPart& p = parts[k];
@@ -309,6 +320,20 @@ void loadCooked(Entry& e)
         free(data);
         return fail(e, bad);
     }
+    // Its textures: handed to the renderer by file and offset (it reads them in its own frames), each once.
+    uint32_t texHandle[256];
+    for (uint32_t t = 0; t < 256; ++t)
+        texHandle[t] = 0xFFFFFFFEu;
+    auto texture = [&](int32_t t) -> uint32_t {
+        if (t < 0 || t >= 256 || (uint32_t)t >= h.textureCount)
+            return 0xFFFFFFFFu;
+        if (texHandle[t] == 0xFFFFFFFEu)
+        {
+            const RmodelTexture& x = texs[t];
+            texHandle[t] = renderer::texture_add((uint64_t)(uintptr_t)path, x.offset, x.bytes, x.format, x.width, x.height, x.mips);
+        }
+        return texHandle[t];
+    };
     uint32_t triangles = 0, made = 0;
     for (uint32_t k = 0; k < h.partCount; ++k)
     {
@@ -333,6 +358,17 @@ void loadCooked(Entry& e)
         ModelPart* row = material == 0xFFFFFFFFu ? nullptr : ModelParts.add();
         if (!row)
             break;
+        // Emission as glTF has it (factor times strength), emissive_nits cd/m2 for 1 (update() follows the knob); its maps,
+        // factors and cutoff.
+        const float glow = mt.emissiveStrength * settings.emissive_nits;
+        renderer::material_emissive(material, { mt.emissive[0], mt.emissive[1], mt.emissive[2] }, glow);
+        row->emissive = { mt.emissive[0] * mt.emissiveStrength, mt.emissive[1] * mt.emissiveStrength, mt.emissive[2] * mt.emissiveStrength };
+        renderer::material_factors(material, { mt.baseColor[0], mt.baseColor[1], mt.baseColor[2], mt.baseColor[3] }, mt.roughness,
+                                   mt.metallic, mt.normalScale, mt.occlusionStrength);
+        renderer::material_maps(material, texture(mt.textures[0]), texture(mt.textures[1]), texture(mt.textures[2]),
+                                texture(mt.textures[3]));
+        if (mt.alpha == RmodelMask)
+            renderer::material_alpha(material, mt.alphaCutoff > 0 ? mt.alphaCutoff : 0.5f);
         row->key = e.key;
         row->part = k;
         row->mesh = e.mesh[k] = chain[0];
@@ -601,10 +637,31 @@ void update(uint32_t phase, float dt)
             Placements[i].dirty = Placements[i].alive;
         scene->epoch = epoch;
     }
+    // Models made from an older cooked format (stage 1's flat materials): their instances go and they are made again, with
+    // their texture maps. What they had in the renderer's tables stays there, undrawn, until its scene starts over.
+    if (format->version != kRmodelVersion)
+    {
+        for (uint32_t i = 0; i < PartInstances.size(); ++i)
+            renderer::instance_remove(PartInstances[i].instance);
+        PartInstances.clear();
+        ModelParts.clear();
+        for (uint32_t i = 0; i < gEntryCount; ++i)
+            gEntries[i].state = 0, gEntries[i].parts = 0;
+        for (uint32_t i = 0; i < Placements.size(); ++i)
+            Placements[i].dirty = Placements[i].alive;
+        format->version = kRmodelVersion;
+    }
     for (uint32_t i = 0; i < gEntryCount; ++i)
         if (gEntries[i].state == 0)
             build(gEntries[i]);
     syncPlacements();
+    // emissive_nits, live: every cooked part's glow again when it changes (and once after this module restarts).
+    if (settings.emissive_nits != gGlow)
+    {
+        gGlow = settings.emissive_nits;
+        for (uint32_t i = 0; i < ModelParts.size(); ++i)
+            renderer::material_emissive(ModelParts[i].material, ModelParts[i].emissive, gGlow);
+    }
 
     // The preview's targets at the size the panel last asked for.
     const uint32_t w = gPreview.width, h = gPreview.height;
