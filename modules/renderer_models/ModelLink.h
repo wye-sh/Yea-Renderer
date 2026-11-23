@@ -18,6 +18,11 @@
 // world transform (3x4 rows), to attach something to it. Clips and joints are named as in the source file. A model
 // with morph targets (blend shapes: a face's smile, a blink) follows its clip's weights; mdl::morph(h, "Smile", 0.8f)
 // holds one at a weight over them, mdl::unmorph(h, "Smile") (or every one, with no name) hands it back to the clip.
+// Root motion: mdl::rootMotion(h, true) plays its clips in place (the travel and turn of the node that carries them left
+// out), and each frame mdl::takeRootMotion(h, m) hands over what was left out, for the game to move it by (as UE's
+// root motion: the game owns where the character is, so it can collide, follow a path or be networked):
+//   float m[4];
+//   if (mdl::takeRootMotion(h, m)) { pos += { m[0], m[1], m[2] }; yaw += m[3]; mdl::move(h, pos, yawQuat(yaw)); }
 //
 // Placements are kept by renderer_models (through its reloads); Reset State empties them, so place again whenever
 // mdl::placed(h) is false. The handle is 0 while renderer_models isn't running.
@@ -109,9 +114,14 @@ struct Api
     void (*unmorph)(uint32_t placement, const char* target);
     uint32_t (*morphs)(uint32_t model); // its targets, for a panel
     const char* (*morphTarget)(uint32_t model, uint32_t index, float* weight); // its name, and its default weight
+    // Root motion (later in Api: check `size`). rootMotion: on, its clips play in place; 0 when it has none to give.
+    // takeMotion: what they left out since the last take, world (out[0..2] metres, out[3] radians about +Y).
+    int (*rootMotion)(uint32_t placement, int on);
+    int (*takeMotion)(uint32_t placement, float* out);
 };
 inline bool hasAnim(const Api* a) { return a->size >= offsetof(Api, morph); }
-inline bool hasMorph(const Api* a) { return a->size >= sizeof(Api); }
+inline bool hasMorph(const Api* a) { return a->size >= offsetof(Api, rootMotion); }
+inline bool hasRootMotion(const Api* a) { return a->size >= sizeof(Api); }
 
 struct Model;
 namespace detail
@@ -282,6 +292,20 @@ inline bool morph(uint32_t placement, const char* target, float weight)
 {
     const Api* a = detail::api();
     return a && placement && hasMorph(a) && a->morph(placement, target, weight);
+}
+// Root motion on (its clips play in place) or off (as authored). False: it has no clips, or no node that carries them.
+inline bool rootMotion(uint32_t placement, bool on)
+{
+    const Api* a = detail::api();
+    return a && placement && hasRootMotion(a) && a->rootMotion(placement, on ? 1 : 0);
+}
+// The motion its clips left out since the last take, in the world: out[0..2] metres to move it by, out[3] radians to
+// turn it by about +Y (placed upright). False (and zeros) while root motion is off.
+inline bool takeRootMotion(uint32_t placement, float out[4])
+{
+    const Api* a = detail::api();
+    out[0] = out[1] = out[2] = out[3] = 0;
+    return a && placement && hasRootMotion(a) && a->takeMotion(placement, out);
 }
 // A held target (nullptr: every one) back to its clip's weight.
 inline void unmorph(uint32_t placement, const char* target = nullptr)

@@ -201,6 +201,8 @@ void panel_model_viewer()
             gPreview.anim.time = 0, gPreview.anim.from = kNoClip;
         u->slider("Speed##clip", &gPreview.speed, 0.0f, 2.0f, 0);
         u->slider("Crossfade (s)##clip", &gPreview.fade, 0.0f, 1.0f, 0);
+        if (sel->motionNode != kNoClip) // its clips with their travel (as authored) or in place (root motion on)
+            u->toggle("In Place##clip", &gPreview.inPlace);
         // Its morph targets: each one's weight now; dragging one holds it there over the clip, until Follow the Clip.
         if (sel->targets && sel->skel->targetCount)
         {

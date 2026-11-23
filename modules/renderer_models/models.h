@@ -35,6 +35,10 @@ struct Entry
     const RmodelBone*     bones;
     const RmodelClip*     clips;
     const RmodelMorphTarget* targets; // its morph targets (skel->targetCount of them; v4), in `anim`
+    // Root motion: the node that carries the clips' travel (every bone's nearest common ancestor; kNoClip none) and its
+    // parent's model-space transform at rest (3x3 rows `motionLin`, its inverse, and its translation).
+    uint32_t motionNode;
+    float    motionLin[9], motionInv[9], motionT[3];
 };
 // Every model the view's modules declared, in the order declared (made in load()).
 extern Entry*   gEntries;
@@ -64,6 +68,7 @@ struct Preview
     uint8_t       morphHeld[kRmodelMaxTargets];
     float         morphNow[kRmodelMaxTargets]; // the weights its last draw showed
     int           morphOpen;                   // its Morph Targets row unfolded
+    int           inPlace;                     // its clips shown in place (their root motion left out)
 };
 extern Preview gPreview;
 

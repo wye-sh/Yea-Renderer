@@ -408,12 +408,18 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   are named as in the source. `ModelLink.h`'s `hasAnim(a)` says the module has them (Api's size). Morph targets
   (rmodel v4, `hasMorph(a)`): a clip's weight tracks play and crossfade with its pose; `mdl::morph(h, "Smile", w)` holds a
   target over the clip (table `MorphOverride`, emptied with its placement and by Reset), `mdl::unmorph(h[, name])` hands
-  it back. Clips are sampled with
+  it back. Root motion (`hasRootMotion(a)`): `mdl::rootMotion(h, true)` (taken while loading) plays its clips in place,
+  the motion node's travel across the up and its turn about it held at each clip's first frame (the node: the nearest
+  common ancestor of the bones the clips move, found at load; its parent taken as at rest), and gathers what they left out
+  in table `PlacementMotion` (loops, clip ends, speed and crossfades as the pose blends); `mdl::takeRootMotion(h, m)`
+  hands it over in the world (m[0..2] metres, m[3] radians about +Y) for the game to move the placement by. Until taken,
+  the placement draws (and `joint` reads) moved on by it, so pose and place agree on every frame (switched on mid-clip,
+  what the clip did since its first frame starts pending, so the model stays put). Clips are sampled with
   `anim.h` (shared with the cooker: smallest-three rotations, quantised tracks, `sampleClip`, `blendPoses`, `palette`)
   in `YEA_PHASE_LATE` into scratch made in load(), and each part instance gets the palette through `instance_pose`.
   Its tables: `Placement` (a row per
   placement, keyed by the model's owner and name), `PlacementAnim` (beside it: clip, time, speed, loop and the clip
-  it fades from), `PartInstance` (the core's instances, one per part), `ModelPart` (each
+  it fades from), `PlacementMotion` (beside it: root motion on, and what it gathered), `PartInstance` (the core's instances, one per part), `ModelPart` (each
   model's meshes and materials in the core, found again after a reload), state `Scene` (the core's scene_epoch they belong
   to: when it changes, every part and instance is made again). It builds and syncs in `YEA_PHASE_LATE`, after the game's
   modules moved things. Each MODEL line gets the knobs of its each block (scale, up_axis, lod_quality, cast_shadows,
@@ -422,7 +428,8 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   the front; the turntable and Front View icons), the LOD shown (Auto as `lod_error` picks at that size, or each LOD), for
   a skinned model its clips (a dropdown with Rest Pose, play and pause, From the Start, Speed, Crossfade: the preview's
   own clip state in `gPreview.anim`, played in update and posed through `RenderPreview.palette`; a folding Morph
-  Targets list, a slider each, dragging one holds it until Follow the Clip; v3's `weights`), the
+  Targets list, a slider each, dragging one holds it until Follow the Clip; v3's `weights`; In Place, on by default, for
+  a model with a motion node), the
   model's knobs; Add Models (the header's +) and drops go to the agents. The preview: this module makes its targets in
   its own `update()` at twice the canvas size (RGBA16F and D32 at 4 samples, a 1024² D32 shadow map, an RGBA8 sRGB out),
   and in `draw(YEA_PASS_RENDER)`, only on frames the panel showed it, calls the core's `preview_draw` (a `RenderPreview*`,

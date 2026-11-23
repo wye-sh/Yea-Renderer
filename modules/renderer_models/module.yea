@@ -73,6 +73,13 @@ table MorphOverride none 4096
   u32 target
   float weight
 end
+# Root motion (mdl::rootMotion; rows as Placement's): on, its clips play in place and the motion they leave out gathers
+# here, in its own frame (metres before its scale; radians about its up), until the game takes it.
+table PlacementMotion none 4096
+  u32 on
+  float3 acc
+  float yaw
+end
 # The renderer's instances a placement draws with, one per part of its model.
 table PartInstance none 65536
   u32 placement

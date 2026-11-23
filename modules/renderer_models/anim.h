@@ -99,6 +99,34 @@ inline void frameAt(const RmodelClip& c, float time, bool loop, uint32_t& f0, ui
     f = f < 0 ? 0 : (f > 1 ? 1 : f);
 }
 
+// One node's local pose between two frames (frameAt's f0, f1, f).
+inline void sampleNode(const uint8_t* data, uint32_t node, uint32_t f0, uint32_t f1, float f, Pose& out)
+{
+    const RmodelTrack* tracks = (const RmodelTrack*)data;
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        const RmodelTrack& tr = tracks[node * 3 + k];
+        float*             dst = k == 0 ? out.t : (k == 1 ? out.r : out.s);
+        if (tr.data == 0xFFFFFFFFu)
+        {
+            memcpy(dst, tr.base, k == 1 ? 16 : 12);
+            continue;
+        }
+        const uint16_t* a = (const uint16_t*)(data + tr.data) + f0 * 3;
+        const uint16_t* b = (const uint16_t*)(data + tr.data) + f1 * 3;
+        if (k == 1)
+        {
+            float qa[4], qb[4];
+            decodeRotation(a, qa);
+            decodeRotation(b, qb);
+            nlerp(qa, qb, f, dst);
+        }
+        else
+            for (int i = 0; i < 3; ++i)
+                dst[i] = tr.base[i] + tr.extent[i] * ((float)a[i] * (1 - f) + (float)b[i] * f) * (1.0f / 65535.0f);
+    }
+}
+
 // Every node's local pose at `time` (seconds) into `out` (nodeCount poses). `data` is the clip's bytes (file + offset).
 inline bool sampleClip(const uint8_t* data, const RmodelClip& c, uint32_t nodeCount, float time, bool loop, Pose* out)
 {
@@ -107,30 +135,20 @@ inline bool sampleClip(const uint8_t* data, const RmodelClip& c, uint32_t nodeCo
     uint32_t f0, f1;
     float    f;
     frameAt(c, time, loop, f0, f1, f);
-    const RmodelTrack* tracks = (const RmodelTrack*)data;
     for (uint32_t n = 0; n < nodeCount; ++n)
-        for (uint32_t k = 0; k < 3; ++k)
-        {
-            const RmodelTrack& tr = tracks[n * 3 + k];
-            float*             dst = k == 0 ? out[n].t : (k == 1 ? out[n].r : out[n].s);
-            if (tr.data == 0xFFFFFFFFu)
-            {
-                memcpy(dst, tr.base, k == 1 ? 16 : 12);
-                continue;
-            }
-            const uint16_t* a = (const uint16_t*)(data + tr.data) + f0 * 3;
-            const uint16_t* b = (const uint16_t*)(data + tr.data) + f1 * 3;
-            if (k == 1)
-            {
-                float qa[4], qb[4];
-                decodeRotation(a, qa);
-                decodeRotation(b, qb);
-                nlerp(qa, qb, f, dst);
-            }
-            else
-                for (int i = 0; i < 3; ++i)
-                    dst[i] = tr.base[i] + tr.extent[i] * ((float)a[i] * (1 - f) + (float)b[i] * f) * (1.0f / 65535.0f);
-        }
+        sampleNode(data, n, f0, f1, f, out[n]);
+    return true;
+}
+
+// One node's local pose at `time` (root motion reads the motion node alone).
+inline bool sampleNodeAt(const uint8_t* data, const RmodelClip& c, uint32_t node, float time, bool loop, Pose& out)
+{
+    if (c.codec != RmodelCodecQuantized)
+        return false;
+    uint32_t f0, f1;
+    float    f;
+    frameAt(c, time, loop, f0, f1, f);
+    sampleNode(data, node, f0, f1, f, out);
     return true;
 }
 
