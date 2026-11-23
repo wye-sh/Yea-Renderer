@@ -215,7 +215,9 @@ void makePipelines(float slope)
     RasterizerStateDesc raster = {};
     raster.mCullMode = CULL_MODE_NONE;
     raster.mSlopeScaledDepthBias = slope;
+#if !defined(_WIN32)
     raster.mDepthBias = 1; // Vulkan's backend turns depth bias on only with a constant term; 1 is one ulp of float depth
+#endif
     raster.mDepthClampEnable = true; // casters behind a cascade's near plane still cast
     DepthStateDesc depth = {};
     depth.mDepthTest = true;
