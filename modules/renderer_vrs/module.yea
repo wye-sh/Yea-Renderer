@@ -9,6 +9,7 @@ category Variable Rate Shading
 # edges, highlights and fine detail stay at full rate. Only on GPUs with variable-rate shading, with
 # Anti-aliasing (TAA) on.
 setting bool enabled true
+player enabled
 # Higher: more of the screen at coarser rates (from last frame's contrast).
 setting float aggressiveness 1 0 4
 # How much faster movement lets shading coarsen (0: movement never coarsens it).

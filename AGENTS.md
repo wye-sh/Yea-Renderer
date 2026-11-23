@@ -117,8 +117,12 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   by `displayHeight`. renderer_vrs reads last frame's image through `_up` shader variants only while upscaled.
   Upscalers (`upscaler`: TAA, FSR, DLSS): DLSS through Yea's host service (`yea::dlss()`, Windows, NVIDIA RTX; the
   `service dlss when upscaler DLSS` line ties NVIDIA's files, which are Yea's own licence entries), taken in `load()`,
-  evaluated from `upscale_run`, released in `unload()`; Native is DLAA. FSR where DLSS can't run or stops; where FSR
-  can't either (logged once, with the reason), TAA.
+  evaluated from `upscale_run`, released in `unload()`; Native is DLAA. What a machine can't run is hidden by Yea's
+  `needs` lines (DLSS: `dlss`; FSR: `msvc 14.40`, as AMD builds with toolset 14.44 and its DLLs can crash in std::mutex
+  before 14.40, and `offer`, which `load()` says from FSR's files alone: Direct3D 12 and both DLLs in Assets/ on Windows,
+  always on Linux; Transformer: `fp8`), so what's picked runs; the code checks none of it. Only run-time failures
+  change it: a DLSS evaluate that fails gives way to FSR where Yea says FSR runs here (the upscaler's player setting's
+  `values`), else TAA; FSR's loader, context or dispatch failing gives way to TAA (logged once, with the reason).
   FSR on Windows (Direct3D 12): AMD's signed FSR SDK 2.4 DLLs in `Assets/windows/` (a Yea from 133 puts them at the
   top of Assets/), loaded only while picked, upscaler first, each by its full path with backslashes and
   `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS` (Assets/ isn't on Windows' DLL search path, and
@@ -133,9 +137,7 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   dispatch); the upscalers' own sharpening is off. After one records, The Forge's bound state is forgotten so its next binds
   are made in full. Lines said from `upscale_prepare` wait for this module's `update()`, so they are filed under
   renderer_upscale: which upscaler is picked and runs, its sizes, and why FSR can't run.
-  Before AMD's DLLs load (FSR, and DLSS's fallback to it), Microsoft's C++ runtime is checked: AMD builds with toolset
-  14.44 and its DLLs can crash in std::mutex before 14.40, so an older msvcp140.dll (the one in the process, else
-  System32's), or one whose version can't be read, means TAA, said once with the version. Nothing of Microsoft's ships.
+  Nothing of Microsoft's ships.
 - The core calls the others through optional imports with a `RenderFrame*` (as `u64`): `frame.h`, copied
   identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes`, `renderer_ssr`, `renderer_vrs`, `renderer_rt` and `renderer_upscale` (`mathx.h` into the
   first three). Change all copies together and raise `RENDER_FRAME_VERSION`. `upscale_prepare`, then `taa_prepare` run first,
@@ -191,7 +193,8 @@ filter_taps, pcss, sun_size, normal_bias, slope_bias, receiver_plane, light_shad
 updates_per_frame, max_tile_resolution, contact_hardening, light_size (m), show_cascades, show_atlas (the light shadow atlas, top right). `renderer_taa`: enabled, history_weight, clamp_width, sharpen, jitter,
 jitter_phases. `renderer_upscale`: upscaler (TAA, FSR, DLSS), quality_mode (Native, Quality 67%, Balanced 59%,
 Performance 50%, Ultra_Performance 33%; for an upscaler only), dlss_model (Auto: Transformer where the GPU runs FP8, CNN
-elsewhere, CNN until Yea reports FP8; Transformer: NVIDIA's default per mode, K/M/L; CNN: preset E, two to five times cheaper on RTX 20 and 30, falling back to the default in a mode where it's refused and the default then runs, said once per mode). `renderer_ao`: enabled, half_resolution (GTAO and its blur at half size, upsampled along edges in the forward pass), radius, intensity, falloff, slices, steps, denoise, specular_occlusion,
+elsewhere, CNN until Yea reports FP8; Transformer: NVIDIA's default per mode, K/M/L; CNN: preset E, two to five times cheaper on RTX 20 and 30, falling back to the default in a mode where it's refused and the default then runs, said once per mode; Transformer is
+hidden without FP8). `renderer_ao`: enabled, half_resolution (GTAO and its blur at half size, upsampled along edges in the forward pass), radius, intensity, falloff, slices, steps, denoise, specular_occlusion,
 multi_bounce, show_ao. `renderer_contact`: enabled, surface_thickness (a part of the distance), edge_threshold, contrast, ignore_edges,
 intensity, max_distance, show_contact. `renderer_probes`: enabled, resolution (64-512), updates_per_frame, intensity, blend, parallax.
 `renderer_ssr`: enabled, half_resolution, max_roughness, thickness, max_distance, steps, edge_fade, intensity,
@@ -200,6 +203,11 @@ show_rates (green half rate, blue 2x2, magenta coarser). `renderer_rt`: enabled,
 reflected_shadows (Scene, Rays, Off), history_frames, brightest, max_distance, show_hits (green: hit seen on screen, blue: lit at the hit, grey: sky),
 probe_rays (temporary: 0 off; traces 1 sun ray plus k-1 local-light rays per pixel and discards them, to measure ray-traced
 shadows' cost on the user's GPU; remove once measured).
+Players of a released game tune (`player` lines): upscaler, quality_mode, dlss_model, exposure_ev (brightness), lod_error,
+TAA's sharpen, shadows' sun_resolution, shadow_distance, pcss and light_shadows, and enabled for AO, contact shadows, SSR,
+ray-traced reflections and VRS, with half_resolution for AO, SSR and ray-traced reflections, and probes' resolution.
+Debug views and show_ knobs never. renderer_rt's and renderer_vrs' `enabled` get `needs ... raytracing`/`shadingrate`
+once Yea takes a need on a bool that defaults to true; till then each switches itself off without its service.
 
 ## Reset
 

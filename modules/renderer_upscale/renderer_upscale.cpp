@@ -15,6 +15,7 @@
 #include "Shaders/Exposure.srt.h"
 #include <yea/device.h>
 #include <yea/dlss.h>
+#include <yea/settings.h>
 
 #include <math.h>
 #include <stdio.h>
@@ -264,62 +265,11 @@ HMODULE fsrLoadAsset(const char* name)
 
 // AMD's upscaler, then its loader. The loader opens the upscaler by bare name, which Windows answers with the one
 // already loaded.
-// Microsoft's C++ runtime is new enough for AMD's DLLs: they're built with toolset 14.44 and can crash in std::mutex on
-// a runtime before 14.40. The copy already in the process if one is (the one AMD's DLLs would get), else System32's,
-// read from its version resource (kernel32 only). Checked once; an old runtime, or a failed check, is said once.
-int  gRuntimeOk = -1; // -1 not checked yet, 0 too old or unknown, 1 fine
-bool fsrRuntimeOk()
-{
-    if (gRuntimeOk >= 0)
-        return gRuntimeOk != 0;
-    HMODULE m = GetModuleHandleW(L"msvcp140.dll");
-    HMODULE ours = nullptr;
-    if (!m)
-        m = ours = LoadLibraryExW(L"msvcp140.dll", nullptr,
-                                  LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
-    uint32_t major = 0, minor = 0, build = 0;
-    if (m)
-    {
-        HRSRC res = FindResourceW(m, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(16)); // VS_VERSION_INFO, RT_VERSION
-        HGLOBAL data = res ? LoadResource(m, res) : nullptr;
-        const uint8_t* p = data ? (const uint8_t*)LockResource(data) : nullptr;
-        const DWORD n = res ? SizeofResource(m, res) : 0;
-        for (DWORD i = 0; p && i + 16 <= n; i += 4) // VS_FIXEDFILEINFO: its signature, then its version words
-        {
-            uint32_t w[4];
-            memcpy(w, p + i, sizeof w);
-            if (w[0] == 0xFEEF04BDu)
-            {
-                major = w[2] >> 16;
-                minor = w[2] & 0xFFFF;
-                build = w[3] >> 16;
-                break;
-            }
-        }
-    }
-    if (ours)
-        FreeLibrary(ours);
-    gRuntimeOk = major > 14 || (major == 14 && minor >= 40);
-    char line[192];
-    if (!gRuntimeOk && !major)
-        snprintf(line, sizeof line, "renderer_upscale: FSR needs Microsoft's Visual C++ runtime 14.40 or later, and this PC's "
-                                    "version couldn't be read%s; TAA instead", m ? "" : " (msvcp140.dll not found)");
-    else
-        snprintf(line, sizeof line, gRuntimeOk ? "renderer_upscale: Visual C++ runtime %u.%u.%u: FSR can load"
-                                               : "renderer_upscale: FSR needs Microsoft's Visual C++ runtime 14.40 or later, this PC "
-                                                 "has %u.%u.%u; TAA instead",
-                 major, minor, build);
-    say(line, gRuntimeOk ? 0 : 1);
-    return gRuntimeOk != 0;
-}
-
 bool fsrLoad()
 {
     if (gFfxDll)
         return true;
     if (gFfxFailed || gRenderer->mRendererApi != RENDERER_API_D3D12)
-        return false;
-    if (!fsrRuntimeOk())
         return false;
     if (!gFfxUpscalerDll)
         gFfxUpscalerDll = fsrLoadAsset("amd_fidelityfx_upscaler_dx12.dll");
@@ -654,7 +604,7 @@ void forgetForgeState(Cmd* cmd)
 #endif
 }
 
-// FSR ready for this display size (its files, its context): the upscaler for FSR, and DLSS's fallback.
+// FSR ready for this display size (its files, its context): for FSR, and when DLSS stops at run time.
 bool fsrReady(uint32_t dw, uint32_t dh)
 {
 #if defined(_WIN32)
@@ -687,7 +637,20 @@ enum class Active : uint32_t
 };
 const YeaDlss* gDlss;      // taken in load(); nullptr off NVIDIA RTX, off Windows, or in an older Yea
 bool           gDlssUsed;  // its view was evaluated (released when DLSS is let go, and in unload())
-bool           gDlssFailed; // an evaluate failed: FSR until the upscaler is picked again
+bool           gDlssFailed; // an evaluate failed: FSR (where it runs here) or TAA until the upscaler is picked again
+bool           gDlssToFsr;  // FSR runs on this machine, as Yea's needs lines decide it for the upscaler setting
+const YeaSettings* gSettingsApi;
+
+// Whether FSR runs on this machine, from Yea's own answer for the upscaler setting (its needs lines: the C++ runtime and
+// our offer), for DLSS's fallback when it fails at run time. An older host without the service: no.
+bool fsrRunsHere()
+{
+    YeaPlayerSetting s = {};
+    for (uint32_t i = 0, n = gSettingsApi ? gSettingsApi->playerCount() : 0; i < n; i++)
+        if (gSettingsApi->player(i, &s) && s.module && s.name && !strcmp(s.module, "renderer_upscale") && !strcmp(s.name, "upscaler"))
+            return (s.values >> (uint32_t)Upscaler::FSR) & 1;
+    return false;
+}
 Active         gActive, gLastActive;
 // The quality modes' DLSS modes: Native is DLAA.
 const uint32_t kDlssMode[5] = { YEA_DLSS_DLAA, YEA_DLSS_QUALITY, YEA_DLSS_BALANCED, YEA_DLSS_PERFORMANCE, YEA_DLSS_ULTRA_PERFORMANCE };
@@ -774,6 +737,27 @@ int load(int reloaded)
     gDevice = yea::device();
 #endif
     gDlss = yea::dlss();
+    gSettingsApi = yea::settingsApi();
+    // What only this module can tell for its needs lines' `offer`: FSR runs here. On Windows, Direct3D 12 with AMD's two
+    // DLLs in this version's assets (only checked to be there: loading them waits till FSR is picked); on Linux, compiled
+    // in. Yea's own facts hide DLSS (dlss) and FSR on an older C++ runtime (msvc 14.40).
+    {
+        bool fsr = true;
+#if defined(_WIN32)
+        fsr = gRenderer->mRendererApi == RENDERER_API_D3D12;
+        for (const char* dll : { "amd_fidelityfx_upscaler_dx12.dll", "amd_fidelityfx_loader_dx12.dll" })
+        {
+            char    path[1024];
+            wchar_t wide[1024];
+            if (!gAssets[0] || snprintf(path, sizeof path, "%s/%s", gAssets, dll) >= (int)sizeof path ||
+                !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide, 1024) ||
+                GetFileAttributesW(wide) == INVALID_FILE_ATTRIBUTES)
+                fsr = false;
+        }
+#endif
+        yea::offer(settings.upscaler, 1u << (uint32_t)Upscaler::TAA | 1u << (uint32_t)Upscaler::DLSS |
+                                          (fsr ? 1u << (uint32_t)Upscaler::FSR : 0u));
+    }
     {
         const YeaDevice* device = yea::device();
         gFp8 = device && (device->features & YEA_DEVICE_FP8);
@@ -843,9 +827,9 @@ void update(uint32_t phase, float dt)
         yea::host()->log(gSayLevel[i], gSay[i]);
     gSayCount = 0;
 #if !defined(_WIN32)
-    // FSR's working memory, in this module's own call: while an upscaler is picked (DLSS falls back to FSR here).
+    // FSR's working memory, in this module's own call: while FSR is picked (no DLSS on Linux).
     if (gReady)
-        fsrMemory(settings.upscaler != Upscaler::TAA && !yea::viewMode());
+        fsrMemory(settings.upscaler == Upscaler::FSR && !yea::viewMode());
 #endif
 }
 void draw(uint32_t pass, const YeaFrame* frame) {}
@@ -861,7 +845,9 @@ bool upscale_prepare(uint64_t address)
     if (settings.upscaler != Upscaler::DLSS)
         gDlssFailed = false; // a new pick tries DLSS again
 
-    // DLSS where it can run, else FSR (DLSS's fallback too), else TAA.
+    // What's picked runs (Yea's needs lines hide what this machine can't). Only a failure at run time changes it: DLSS
+    // whose evaluate failed (a lost device it couldn't set up again, say) gives way to FSR where FSR runs here, else TAA;
+    // FSR that fails gives way to TAA.
     uint32_t w = 0, h = 0;
     gActive = Active::Taa;
     if (picked && settings.upscaler == Upscaler::DLSS && gDlss && !gDlssFailed && gDlss->available())
@@ -876,14 +862,15 @@ bool upscale_prepare(uint64_t address)
     }
     if (gActive != Active::Dlss)
         dlssLetGo();
-    if (picked && gActive == Active::Taa && fsrReady(dw, dh))
+    const bool dlssStopped = settings.upscaler == Upscaler::DLSS && gDlssFailed && gDlssToFsr;
+    if (picked && gActive == Active::Taa && (settings.upscaler == Upscaler::FSR || dlssStopped) && fsrReady(dw, dh))
     {
         gActive = Active::Fsr;
         w = (uint32_t)((float)dw / kRatio[q]);
         h = (uint32_t)((float)dh / kRatio[q]);
     }
     if (gActive != Active::Fsr)
-        fsrLetGo(picked && gActive == Active::Taa);
+        fsrLetGo(picked && gActive == Active::Taa && (settings.upscaler == Upscaler::FSR || dlssStopped));
     // Which upscaler runs, and its sizes: said when they change (what F1's knobs picked, and what could run).
     {
         static uint32_t said[6] = { ~0u, 0, 0, 0, 0, 0 };
@@ -979,11 +966,13 @@ void upscale_run(uint64_t address)
         ok = dlssRun(F, out, reset, gQuality);
         if (!ok)
         {
-            // DLSS refused this frame (a lost device it couldn't set up again, say): FSR takes over, this frame on.
-            say("renderer_upscale: DLSS stopped; FSR instead");
+            // DLSS refused this frame (a lost device it couldn't set up again, say): FSR takes over, this frame on, where
+            // it runs here; else TAA from the next frame.
             gDlssFailed = true;
+            gDlssToFsr = fsrRunsHere();
+            say(gDlssToFsr ? "renderer_upscale: DLSS stopped; FSR instead" : "renderer_upscale: DLSS stopped; TAA instead");
             gActive = gLastActive = Active::Fsr;
-            ok = fsrReady(F->displayWidth, F->displayHeight) && fsrRun(F, out, true, dtMs);
+            ok = gDlssToFsr && fsrReady(F->displayWidth, F->displayHeight) && fsrRun(F, out, true, dtMs);
         }
     }
     else

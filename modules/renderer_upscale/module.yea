@@ -8,15 +8,24 @@ export void upscale_run(u64 frame)
 category Upscaling
 # TAA: the Renderer's own anti-aliasing at full resolution. FSR: AMD's upscaler (FSR 4 on Radeon RX 6000 and later,
 # FSR 3.1 elsewhere): the scene renders at the quality's resolution and FSR brings it back to the screen's. DLSS:
-# NVIDIA's, on GeForce RTX under Windows (Yea's service); FSR wherever DLSS can't run. Where neither can, TAA.
+# NVIDIA's, on GeForce RTX under Windows (Yea's service). Options this machine can't run are hidden.
 setting choice upscaler TAA TAA FSR DLSS
+needs upscaler DLSS dlss
+# AMD's DLLs are built with toolset 14.44 and can crash in std::mutex on an older Visual C++ runtime.
+needs upscaler FSR msvc 14.40
+# FSR's files are here (Windows: Direct3D 12 and AMD's two DLLs; Linux: compiled in): offered in load().
+needs upscaler FSR offer
+player upscaler
 # The render resolution for an upscaler: Native (100%, the upscaler's own anti-aliasing; DLAA for DLSS), Quality (67%),
 # Balanced (59%), Performance (50%), Ultra Performance (33%).
 setting choice quality_mode Quality Native Quality Balanced Performance Ultra_Performance
-# DLSS's model. Auto: Transformer on GPUs that run FP8 (RTX 40 and later), CNN elsewhere. CNN: NVIDIA's convolutional
+player quality_mode
+# DLSS's model. Auto: Transformer on GPUs that run FP8 (RTX 40 and later), CNN elsewhere (Transformer is hidden there). CNN: NVIDIA's convolutional
 # model, cheap on every RTX (about 0.7 ms at 1440p on an RTX 2080). Transformer: NVIDIA's newer model for each mode
 # (sharper, steadier detail), affordable with FP8 but two to five times CNN's cost on RTX 20 and 30, where it can cost
 # more than rendering at full size saves.
 setting choice dlss_model Auto Auto CNN Transformer
+needs dlss_model Transformer fp8
+player dlss_model
 # NVIDIA's DLSS files ship with the game only while DLSS is picked.
 service dlss when upscaler DLSS

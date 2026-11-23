@@ -6,8 +6,10 @@ export void ao_run(u64 frame)
 
 category Ambient Occlusion
 setting bool enabled true
+player enabled
 # Computed at half size and upsampled along edges: about a quarter of the cost, slightly softer in fine creases.
 setting bool half_resolution true
+player half_resolution
 # How far (metres) surfaces shade each other.
 setting float radius 1 0.1 inf
 setting float intensity 1 0 3

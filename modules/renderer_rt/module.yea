@@ -8,10 +8,12 @@ category Ray-Traced Reflections
 # Reflections found by tracing rays through the scene, also of what is off screen or hidden. Only on GPUs
 # with ray tracing, with Anti-aliasing (TAA) on; elsewhere Screen Reflections and the probes show.
 setting bool enabled true
+player enabled
 # Surfaces rougher than this keep the probes' blurred reflections; traced ones fade out towards it.
 setting float max_roughness 0.5 0 1
 # Rays for one pixel in four, filled in by matching depth and normal: about a quarter of the cost.
 setting bool half_resolution true
+player half_resolution
 # Surfaces smoother than this are traced at every pixel even at half resolution, so mirrors stay sharp.
 setting float full_below 0.15 0 1
 # Where what a ray hits is visible on screen, its fully lit colour from there (with all shadows and

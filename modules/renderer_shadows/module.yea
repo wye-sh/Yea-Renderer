@@ -14,11 +14,14 @@ category Sun Shadows
 setting bool enabled true
 setting int cascades 4 1 4
 setting float shadow_distance 60 5 inf
+player shadow_distance
 setting float cascade_split 0.75 0 1
 setting int sun_resolution 2048 512 4096
+player sun_resolution
 setting float softness 1.5 0 inf
 setting int filter_taps 16 4 32
 setting bool pcss false
+player pcss
 setting float sun_size 0.5 0.05 5
 setting float normal_bias 0.5 0 inf
 setting float slope_bias 2 0 inf
@@ -28,6 +31,7 @@ setting bool receiver_plane true
 setting bool show_cascades false
 category Light Shadows
 setting bool light_shadows true
+player light_shadows
 setting int shadowed_lights 24 0 32
 setting int local_atlas_resolution 4096 1024 8192
 setting int updates_per_frame 8 1 32

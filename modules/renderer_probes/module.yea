@@ -27,6 +27,7 @@ category Reflections
 setting bool enabled true
 # Size of each probe's image: sharper mirror reflections, more memory and capture time.
 setting int resolution 256 64 512
+player resolution
 # Probes captured again each frame, in turn, so moving things show in reflections (0: only when placed).
 setting int updates_per_frame 1 0 4
 setting float intensity 1 0 2

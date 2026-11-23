@@ -6,6 +6,7 @@ export void contact_run(u64 frame)
 
 category Contact Shadows
 setting bool enabled true
+player enabled
 # How thick each surface is taken to be, as a part of its distance from the camera (0.005: 5 cm at 10 m).
 setting float surface_thickness 0.005 0.0005 0.05
 # Neighbouring depths further apart than this (a part of the distance) are separate surfaces, not blended.
