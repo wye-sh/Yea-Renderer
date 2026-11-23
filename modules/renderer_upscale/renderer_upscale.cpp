@@ -695,9 +695,10 @@ bool dlssRun(const RenderFrame* F, RenderTarget* out, bool reset, uint32_t q)
     in.depth = F->depth->pTexture;
     in.motion = F->motion->pTexture;
     in.exposure = gExposureTex;
-    in.biasColour = F->reactive; // particles' and glass's coverage: trust this frame there (dlss.h version 2; nullptr: none)
-    // No transparency mask: Streamline 2.14 takes its resource state wrong and leaves it in COMMON after NGX, so the next
-    // barrier starts from the wrong state (Yea 152 ignores it; a device loss on an RTX 2080 in 6.1.0). FSR keeps its own.
+    // No masks (dlss.h version 2). biasColour: with it set, presentation stalled after DLSS evaluate on an RTX 2080
+    // (6.6.2), under investigation by Yea. transparency: Streamline 2.14 takes its resource state wrong and leaves it in
+    // COMMON after NGX (Yea 152 ignores it; a device loss in 6.1.0). FSR keeps its reactive and transparency masks.
+    in.biasColour = nullptr;
     in.transparency = nullptr;
     in.output = out->pTexture;
     in.renderWidth = F->width;
