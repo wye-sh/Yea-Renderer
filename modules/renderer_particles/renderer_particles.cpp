@@ -6,6 +6,7 @@
 // drawn indirectly just before its surface. Nothing runs while no emitter exists and no particle is alive.
 #include "yea_renderer_particles.h"
 #include "frame.h"
+#include <yea/pipelines.h>
 
 #include <Common_3/Graphics/Interfaces/IGraphics.h>
 #include <Common_3/Resources/ResourceLoader/Interfaces/IResourceLoader.h>
@@ -52,6 +53,12 @@ uint32_t       gFrames;
 Shader*        gShader[kPasses], *gDrawShader;
 Pipeline*      gPipe[kPasses], *gDrawPipe;
 TinyImageFormat gDrawFormat;
+// The draw pipeline is queued on Yea's compile threads by the first particles_prepare, for the core's HDR format (never
+// made on a frame that draws; until it is ready, particles simulate but aren't drawn). Without the service, made in
+// load(). (A compile queued inside load() is dropped by the host.)
+const YeaPipelines* gPipes;
+uint64_t            gDrawPending; // its handle while compiling, 0 none
+const TinyImageFormat kHdrFormat = TinyImageFormat_R16G16B16A16_SFLOAT; // the core's hdr (frame.h)
 Sampler*       gShadowCmp;
 DescriptorSet* gPersistent, *gSet, *gDrawSet;
 Buffer*        gFrameCb[kMaxFrames], *gStepCb[kMaxFrames * kSlots], *gEmitterBuf[kMaxFrames], *gSpawnBuf[kMaxFrames];
@@ -285,6 +292,7 @@ bool anyEmitter()
             return true;
     return false;
 }
+void makeDrawPipe(TinyImageFormat format, bool queue);
 } // namespace
 
 int load(int reloaded)
@@ -398,6 +406,11 @@ int load(int reloaded)
     s.mIndex = SRT_RES_IDX(PartSrt, Persistent, gShadowCmp);
     s.ppSamplers = &gShadowCmp;
     updateDescriptorSet(gRenderer, 0, gPersistent, 1, &s);
+    gPipes = yea::pipelines();
+    gDrawPending = 0;
+    gDrawPipe = nullptr;
+    if (!gPipes)
+        makeDrawPipe(kHdrFormat, false);
     gReady = true;
     return 0;
 }
@@ -456,6 +469,9 @@ void unload()
         gPipe[i] = nullptr;
         gShader[i] = nullptr;
     }
+    if (gDrawPending && gPipes)
+        gPipes->cancel(gDrawPending);
+    gDrawPending = 0;
     if (gDrawPipe)
         removePipeline(gRenderer, gDrawPipe);
     if (gDrawShader)
@@ -603,6 +619,8 @@ bool particles_prepare(uint64_t address)
     gPendingDt = 0;
     if (!F || F->version != RENDER_FRAME_VERSION)
         return false;
+    if (gReady && gPipes && !gDrawPipe && !gDrawPending)
+        makeDrawPipe(kHdrFormat, true); // compiling while this frame and the next run
     if (!gReady || !settings.particles || F->sampleCount != 1 || !F->hdr || !F->depth || !F->width || !F->height)
         return false;
     // Reset (or a first frame): the pool starts empty.
@@ -778,17 +796,10 @@ void particles_run(uint64_t address)
 
 namespace
 {
-// The pipeline for the core's see-through pass (hdr, reactive, transparency), made once, again if the format changes.
-bool ensureDrawPipe(TinyImageFormat format)
+// The draw pipeline for the core's see-through pass (hdr, reactive, transparency) in `format`: queued on Yea's threads
+// (`queue`, when it has them), else made now.
+void makeDrawPipe(TinyImageFormat format, bool queue)
 {
-    if (gDrawPipe && gDrawFormat == format)
-        return true;
-    if (gDrawPipe)
-    {
-        waitQueueIdle(gQueue);
-        removePipeline(gRenderer, gDrawPipe);
-        gDrawPipe = nullptr;
-    }
     RasterizerStateDesc raster = {};
     raster.mCullMode = CULL_MODE_NONE;
     DepthStateDesc depth = {};
@@ -836,8 +847,37 @@ bool ensureDrawPipe(TinyImageFormat format)
     g.pBlendState = &blend;
     g.pVertexLayout = &layout;
     desc.pName = "renderer_particles_draw";
-    addPipeline(gRenderer, &desc, &gDrawPipe);
     gDrawFormat = format;
+    if (queue && gPipes && (gDrawPending = gPipes->add(&desc)) != 0)
+        return;
+    addPipeline(gRenderer, &desc, &gDrawPipe);
+}
+
+// The draw pipeline for this frame's format: false while it is still compiling (particles wait a frame).
+bool ensureDrawPipe(TinyImageFormat format)
+{
+    if (gDrawPending)
+    {
+        void* out = nullptr;
+        int   r = gPipes->ready(gDrawPending, &out);
+        if (r == 0)
+            return false;
+        gDrawPending = 0;
+        gDrawPipe = (Pipeline*)out;
+        if (r < 0)
+            yea::log("renderer_particles: the draw pipeline's background compile failed: made on the main thread");
+    }
+    if (gDrawPipe && gDrawFormat == format)
+        return true;
+    // Only a failed compile or a format the core never uses: made here, a hitch, logged.
+    if (gDrawPipe)
+    {
+        waitQueueIdle(gQueue);
+        removePipeline(gRenderer, gDrawPipe);
+        gDrawPipe = nullptr;
+    }
+    makeDrawPipe(format, false);
+    yea::log("renderer_particles: draw pipeline made on a frame that drew");
     return gDrawPipe != nullptr;
 }
 

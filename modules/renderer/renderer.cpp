@@ -2888,8 +2888,8 @@ void draw(uint32_t pass, const YeaFrame* yf)
         }
         if (gBlendCount && !viewMode)
         {
-            // See-through pipelines: warmed with the rest (queued at load), held back until they are made.
-            createScenePipelines(samples, taa, false, kForwardBlend, clockMs() + kWarmMs);
+            // See-through pipelines: warmed with the rest (queued on Yea's threads when the pipelines are made, else a
+            // few a frame within kWarmMs), never made here; until they are, see-through surfaces wait.
             held = held || !gBlendPipe[0] || !gBlendPipe[1] || !gBlendPipe[2] || !gBlendPipe[3];
         }
         gHeldFrames += held ? 1 : 0;
