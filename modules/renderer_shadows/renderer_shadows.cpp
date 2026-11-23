@@ -7,6 +7,7 @@
 #include "mathx.h"
 
 #include <yea/device.h>
+#include <yea/pipelines.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -77,6 +78,16 @@ Pipeline*      gMaskedPipe;
 uint32_t       gTexBound[kMaxFrames]; // the frame's textureVersion each set holds (0: none yet)
 bool           gMaskedNow;            // this frame draws alpha-tested casters on gMaskedPipe (the maps are bound)
 float          gPipeSlope = -1;
+// A new slope's pipelines (gPipe's, gMaskedPipe's, gClearPipe's) while they compile on Yea's threads: the old ones
+// draw till all three are in (none on the first frames: no shadows yet). A failed compile queues all three again,
+// kSlopeTries times at most.
+const YeaPipelines* gPipes;
+float               gNextSlope = -1; // queued, -1 none
+uint64_t            gNextJob[3];
+Pipeline*           gNext[3];
+bool                gNextFailed;
+uint32_t            gNextTries;
+const uint32_t      kSlopeTries = 3;
 float          gGuardKey = -1; // what the point lights' face margins were drawn for
 DescriptorSet* gSet;
 Buffer *       gViewBuf[kMaxFrames], *gStreamBuf[kMaxFrames];
@@ -331,15 +342,14 @@ RenderTarget* makeAtlas(uint32_t size, const char* name)
     return rt;
 }
 
-void makePipelines(float slope)
+// A slope's pipelines into out (the casters', the alpha-tested casters', the clear's): each queued on Yea's compile
+// threads into jobs (when it has them), else made now.
+void makePipelines(float slope, Pipeline* out[3], uint64_t jobs[3])
 {
-    if (gPipe)
-        removePipeline(gRenderer, gPipe);
-    if (gClearPipe)
-        removePipeline(gRenderer, gClearPipe);
-    if (gMaskedPipe)
-        removePipeline(gRenderer, gMaskedPipe);
-    gPipe = gClearPipe = gMaskedPipe = nullptr;
+    auto make = [&](PipelineDesc& d, uint32_t i) {
+        if (!gPipes || !(jobs[i] = gPipes->add(&d)))
+            addPipeline(gRenderer, &d, &out[i]);
+    };
     VertexLayout l = {};
     l.mBindingCount = 2; // the frame's positions (nothing else is read), then the instance-rate stream
     l.mBindings[0].mStride = RENDER_POSITION_STRIDE;
@@ -380,7 +390,7 @@ void makePipelines(float slope)
     g.pVertexLayout = &l;
     g.pShaderProgram = gShader;
     desc.pName = "renderer_shadow";
-    addPipeline(gRenderer, &desc, &gPipe);
+    make(desc, 0);
     if (gMaskedShader)
     {
         // Positions, then the attributes (uv0 at 8, the colour at 16), then the instance-rate stream.
@@ -407,7 +417,7 @@ void makePipelines(float slope)
         g.pVertexLayout = &m;
         g.pShaderProgram = gMaskedShader;
         desc.pName = "renderer_shadow_masked";
-        addPipeline(gRenderer, &desc, &gMaskedPipe);
+        make(desc, 1);
     }
 
     RasterizerStateDesc plain = {};
@@ -421,8 +431,78 @@ void makePipelines(float slope)
     g.pVertexLayout = nullptr;
     g.pShaderProgram = gClearShader;
     desc.pName = "renderer_shadow_clear";
-    addPipeline(gRenderer, &desc, &gClearPipe);
-    gPipeSlope = slope;
+    make(desc, 2);
+}
+
+// The next slope's pipelines dropped: queued compiles cancelled, made ones (never bound) removed.
+void dropNext()
+{
+    for (uint32_t i = 0; i < 3; ++i)
+    {
+        if (gNextJob[i])
+            gPipes->cancel(gNextJob[i]);
+        if (gNext[i])
+            removePipeline(gRenderer, gNext[i]);
+        gNextJob[i] = 0;
+        gNext[i] = nullptr;
+    }
+    gNextFailed = false;
+}
+
+// Each frame: a new slope's pipelines queued (made here without Yea's compile threads), and swapped in once all three
+// are made; true then (the maps redraw with it). Never waits for a compile.
+bool slopePipelines(float slope)
+{
+    if (slope != gPipeSlope && slope != gNextSlope)
+    {
+        dropNext();
+        gNextSlope = slope;
+        gNextTries = 1;
+        makePipelines(slope, gNext, gNextJob);
+    }
+    if (gNextSlope < 0 || gNextTries > kSlopeTries) // none queued, or given up on this slope
+        return false;
+    bool waiting = false;
+    for (uint32_t i = 0; i < 3; ++i)
+        if (gNextJob[i])
+        {
+            void*     out = nullptr;
+            const int r = gPipes->ready(gNextJob[i], &out);
+            if (r == 0)
+            {
+                waiting = true;
+                continue;
+            }
+            gNextJob[i] = 0;
+            gNext[i] = (Pipeline*)out;
+            gNextFailed = gNextFailed || r < 0;
+        }
+    if (waiting)
+        return false;
+    if (gNextFailed || !gNext[0] || !gNext[2] || (gMaskedShader && !gNext[1]))
+    {
+        char line[200];
+        snprintf(line, sizeof line, "renderer_shadows: the GPU refused a shadow pipeline (%u of %u tries)%s", gNextTries, kSlopeTries,
+                 gNextTries < kSlopeTries ? ": queued again" : gPipe ? ": the last slope's stay" : ": shadows are off");
+        yea::log(line);
+        dropNext();
+        if (++gNextTries <= kSlopeTries)
+            makePipelines(gNextSlope, gNext, gNextJob);
+        return false;
+    }
+    if (gPipe || gClearPipe || gMaskedPipe)
+        waitQueueIdle(gQueue); // the old ones, still in flight (a slope change is a settings change)
+    if (gPipe)
+        removePipeline(gRenderer, gPipe);
+    if (gMaskedPipe)
+        removePipeline(gRenderer, gMaskedPipe);
+    if (gClearPipe)
+        removePipeline(gRenderer, gClearPipe);
+    gPipe = gNext[0], gMaskedPipe = gNext[1], gClearPipe = gNext[2];
+    gNext[0] = gNext[1] = gNext[2] = nullptr;
+    gPipeSlope = gNextSlope;
+    gNextSlope = -1;
+    return true;
 }
 
 // The view's rows and the first three columns of their inverse, from which the forward pass gets a
@@ -1697,6 +1777,7 @@ int load(int reloaded)
         memcpy(gTriBuf->pCpuMappedAddress, tri, sizeof tri);
     }
     gStreamCpu = new uint32_t[kMaxEntries];
+    gPipes = yea::pipelines(); // the pipelines are queued by the first shadows_prepare (the host drops load()'s)
     gReady = true;
     return 0;
 }
@@ -1706,6 +1787,8 @@ void unload()
     if (!gRenderer)
         return;
     waitQueueIdle(gQueue);
+    dropNext();
+    gNextSlope = -1;
     if (gPipe)
         removePipeline(gRenderer, gPipe);
     if (gClearPipe)
@@ -1737,7 +1820,18 @@ void unload()
         removeShader(gRenderer, gClearShader);
 }
 
-void update(uint32_t phase, float dt) {}
+// The slope's pipelines, here rather than in shadows_prepare: queued before the core's first frame (prepare comes only
+// once the core draws, behind all its warm-up), so the first picture has its shadows; and a compile is this module's to
+// take (one queued under the core's call, as prepare is, isn't).
+void update(uint32_t phase, float dt)
+{
+    if (gReady && slopePipelines(settings.slope_bias))
+    {
+        for (Group& g : gGroups)
+            g.valid = 0;
+        gSunValid = 0;
+    }
+}
 void draw(uint32_t pass, const YeaFrame* frame) {}
 
 // Frame versions (6.1.0): this module's frame layout, for the core; and whether the core's is the same (an older or newer
@@ -1871,8 +1965,7 @@ bool shadows_prepare(uint64_t address)
     else
         gOverSince = -1;
     uint32_t localSize = gLocalAuto;
-    float    slope = settings.slope_bias;
-    if (sunSize != gSunSize || localSize != gLocalSize || slope != gPipeSlope)
+    if (sunSize != gSunSize || localSize != gLocalSize)
     {
         waitQueueIdle(gQueue);
         if (sunSize != gSunSize)
@@ -1892,13 +1985,6 @@ bool shadows_prepare(uint64_t address)
             memset(gGroups, 0, sizeof gGroups);
             memset(gOcc, 0, sizeof gOcc);
             gSide = localSize / kCell;
-        }
-        if (slope != gPipeSlope)
-        {
-            makePipelines(slope);
-            for (Group& g : gGroups)
-                g.valid = 0;
-            gSunValid = 0;
         }
     }
     gSunRes = res;

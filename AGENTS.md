@@ -355,7 +355,8 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   the prepass depth (`soft_distance`) and the camera (`near_fade`), behind the froxel fog at their depth, before
   exposure, TAA and the upscaler; their coverage adds into the core's `reactive` (TAA takes up to 0.6 more of the
   current frame there; renderer_upscale's FSR reactive mask reads it). Only at one sample (no MSAA). The draw pipeline is queued on Yea's compile threads by the first particles_prepare (never made on a
-  drawing frame; particles simulate undrawn until it is ready; made in load() on a host without the service).
+  drawing frame; particles simulate undrawn until it is ready; made in load() on a host without the service). A failed
+  compile, or a frame in another format, queues it again (3 tries at most, each logged), never made in draw.
   The core sets frame `keepShadowMaps` (v19's fogShadowMaps) while fog or particles run. Every GPU object is freed in
   `unload()`.
 - `renderer_gi`: dynamic diffuse global illumination (on by default, `gi`): DDGI (Majercik et al. 2019, JCGT; 2021's
@@ -926,7 +927,9 @@ for the decals in its tile and z-bin (a box test, then up to three map reads or 
   states, formats, layout), queuing one whose twin is still compiling only once it is in (made now on the main thread,
   without the library, when a frame needs it). Queued compiles use the library on every API (`kQueuedCache`; 6.1.0 to
   6.6.0 kept Direct3D 12's out of it, until Yea 151 serialised a cache's twins). On an older host, warming makes the
-  rest 2 ms a frame, one at least. Either way no variant compiles on a frame that draws: until warmed, cut-outs wait (both passes, so depth and colour agree) and
+  rest 2 ms a frame, one at least. The composite pipeline (made again on a frame-format change) is queued the same way,
+  and the frame draws nothing till it is in. renderer_shadows queues its three pipelines (and a slope_bias change's) from its update(), drawing with
+  the last slope's till all are in (3 tries at most, logged). Either way no variant compiles on a frame that draws: until warmed, cut-outs wait (both passes, so depth and colour agree) and
   the full shader gives way to the lean one. A pipeline cache in Yea's data folder (`renderer_pipelines_d3d12.bin` or
   `_vulkan.bin`; a Direct3D 12 library from another driver starts empty, and so does one from other root signatures,
   since none of its pipelines would load or store again: the file starts with a hash of Yea's two `.rootsig` files;

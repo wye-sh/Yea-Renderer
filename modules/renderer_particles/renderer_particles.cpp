@@ -55,9 +55,12 @@ Pipeline*      gPipe[kPasses], *gDrawPipe;
 TinyImageFormat gDrawFormat;
 // The draw pipeline is queued on Yea's compile threads by the first particles_prepare, for the core's HDR format (never
 // made on a frame that draws; until it is ready, particles simulate but aren't drawn). Without the service, made in
-// load(). (A compile queued inside load() is dropped by the host.)
+// load(). (A compile queued inside load() is dropped by the host.) A failed compile, or a frame in another format, is
+// queued again the same way, kDrawTries times at most.
 const YeaPipelines* gPipes;
 uint64_t            gDrawPending; // its handle while compiling, 0 none
+uint32_t            gDrawFailed;  // compiles of it that failed
+const uint32_t      kDrawTries = 3;
 const TinyImageFormat kHdrFormat = TinyImageFormat_R16G16B16A16_SFLOAT; // the core's hdr (frame.h)
 Sampler*       gShadowCmp;
 DescriptorSet* gPersistent, *gSet, *gDrawSet;
@@ -408,6 +411,7 @@ int load(int reloaded)
     updateDescriptorSet(gRenderer, 0, gPersistent, 1, &s);
     gPipes = yea::pipelines();
     gDrawPending = 0;
+    gDrawFailed = 0;
     gDrawPipe = nullptr;
     if (!gPipes)
         makeDrawPipe(kHdrFormat, false);
@@ -643,7 +647,7 @@ bool particles_prepare(uint64_t address)
     gPendingDt = 0;
     if (!F || F->version != RENDER_FRAME_VERSION)
         return false;
-    if (gReady && gPipes && !gDrawPipe && !gDrawPending)
+    if (gReady && gPipes && !gDrawPipe && !gDrawPending && gDrawFailed < kDrawTries)
         makeDrawPipe(kHdrFormat, true); // compiling while this frame and the next run
     if (!gReady || !settings.particles || F->sampleCount != 1 || !F->hdr || !F->depth || !F->width || !F->height)
         return false;
@@ -880,7 +884,8 @@ void makeDrawPipe(TinyImageFormat format, bool queue)
     addPipeline(gRenderer, &desc, &gDrawPipe);
 }
 
-// The draw pipeline for this frame's format: false while it is still compiling (particles wait a frame).
+// The draw pipeline for this frame's format: false while it is still compiling (particles wait a frame). Never made
+// here while Yea has compile threads: a failed compile, or a format the core never uses, is queued again.
 bool ensureDrawPipe(TinyImageFormat format)
 {
     if (gDrawPending)
@@ -892,19 +897,26 @@ bool ensureDrawPipe(TinyImageFormat format)
         gDrawPending = 0;
         gDrawPipe = (Pipeline*)out;
         if (r < 0)
-            yea::log("renderer_particles: the draw pipeline's background compile failed: made on the main thread");
+        {
+            ++gDrawFailed;
+            char line[160];
+            snprintf(line, sizeof line, "renderer_particles: the draw pipeline's background compile failed (%u of %u tries)%s",
+                     gDrawFailed, kDrawTries, gDrawFailed < kDrawTries ? ": queued again" : ": particles aren't drawn");
+            yea::log(line);
+        }
     }
     if (gDrawPipe && gDrawFormat == format)
         return true;
-    // Only a failed compile or a format the core never uses: made here, a hitch, logged.
+    if (gDrawFailed >= kDrawTries)
+        return false;
     if (gDrawPipe)
     {
-        waitQueueIdle(gQueue);
+        waitQueueIdle(gQueue); // the old format's, still in flight
         removePipeline(gRenderer, gDrawPipe);
         gDrawPipe = nullptr;
+        yea::log("renderer_particles: the draw pipeline queued again for another format");
     }
-    makeDrawPipe(format, false);
-    yea::log("renderer_particles: draw pipeline made on a frame that drew");
+    makeDrawPipe(format, true); // made here only without the service (or once it stopped)
     return gDrawPipe != nullptr;
 }
 

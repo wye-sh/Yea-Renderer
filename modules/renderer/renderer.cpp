@@ -1225,8 +1225,14 @@ void pipesMadeOnDraw(uint32_t before, double t0)
     yea::log(line);
 }
 
+// Queued on Yea's compile threads, as the scene's are (nothing is drawn till it is in), else made here.
 void createCompositePipeline(TinyImageFormat format, uint32_t frameSamples, uint32_t samples)
 {
+    if (const int k = pendingOf(&gCompositePipe); k >= 0)
+    {
+        gPipes->cancel(gPending[k].handle);
+        gPending[k] = gPending[--gPendingCount];
+    }
     freePipeline(gCompositePipe);
     RasterizerStateDesc raster = {};
     raster.mCullMode = CULL_MODE_NONE;
@@ -1244,6 +1250,12 @@ void createCompositePipeline(TinyImageFormat format, uint32_t frameSamples, uint
     g.pRasterizerState = &raster;
     g.pDepthState = &depth;
     desc.pName = YEA_PIPELINE_PICTURE " renderer_composite"; // F1's Wireframe/Overdraw show the scene under it
+    if (gPipes && !gPipesFailed && gPendingCount < sizeof gPending / sizeof gPending[0])
+        if (const uint64_t h = gPipes->add(&desc))
+        {
+            gPending[gPendingCount++] = { &gCompositePipe, h, samples, false, descKey(desc) };
+            return;
+        }
     addPipeline(gRenderer, &desc, &gCompositePipe);
 }
 
@@ -2897,6 +2909,11 @@ void draw(uint32_t pass, const YeaFrame* yf)
         // material may turn up any frame), then every other variant, none waited for (below: nothing is drawn till the
         // first set is in). Without, those made here and the rest warmed later.
         createScenePipelines(samples, taa, masked, kForwardLean, 0, true);
+        // The composite right behind (its shader is per sample count): the first picture needs it too, and queued after
+        // every variant it waited for them all.
+        gFrameFormat = target->mFormat;
+        gFrameSamples = target->mSampleCount;
+        createCompositePipeline(gFrameFormat, gFrameSamples, samples);
         createScenePipelines(samples, taa, true, kForwardLean, 0, true);
         createScenePipelines(samples, taa, true, warmForward(), 0, true);
         if (!gPipes || gPipesFailed)
@@ -2909,7 +2926,6 @@ void draw(uint32_t pass, const YeaFrame* yf)
                      samples, samples > 1 ? "s" : "", taa ? " with motion" : "", gCancelledNow, gTaintedMade);
             yea::log(line);
         }
-        gFrameFormat = TinyImageFormat_UNDEFINED;
         gWarmLeft = true; // from the next frame
         gWarmFrames = 0;
         gWarmMs = gWarmWorstMs = 0;
@@ -2930,13 +2946,16 @@ void draw(uint32_t pass, const YeaFrame* yf)
     if (gPipes)
     {
         pollPipelines();
-        if (gPipesFailed ? gPendingCount > 0 : createScenePipelines(samples, taa, false, kForwardLean, 0, true))
+        if (gPipesFailed ? gPendingCount > 0
+                         : createScenePipelines(samples, taa, false, kForwardLean, 0, true) || pendingOf(&gCompositePipe) >= 0)
         {
             gFirstWaitFrames += gFirstWaitFrames == 0 ? (gFirstWaitStart = clockMs(), 1u) : 1u;
             return;
         }
         if (gPipesFailed)
             createScenePipelines(samples, taa, false, kForwardLean); // the one that failed (or was dropped), made here
+        if (gPipesFailed && !gCompositePipe)
+            createCompositePipeline(gFrameFormat, gFrameSamples, samples);
         if (gFirstWaitFrames)
         {
             char line[160];
