@@ -98,7 +98,11 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   (mask 1 every drawable, 2 shadow casters). Instances are forced opaque except alpha-tested ones
   (`RenderCaster.masked`, with the frame's material maps): those are non-opaque, and every ray query (reflections,
   their shadow rays, traced shadows, GI probe rays) loops over their candidates, cutting them out by base colour alpha at mip 0 as
-  the raster passes do (`Shaders/Cutout.h.fsl`; the material + 1 rides in gRtInstances' w). The core's vertex and index buffers get the device-address and
+  the raster passes do (`Shaders/Cutout.h.fsl`; the material + 1 rides in gRtInstances' w). Lit hits (reflections and GI
+  probe rays) read the material's maps as the forward pass does (base colour, ORM with its occlusion on the ambient,
+  normal, emissive; `hitMaterial` in Trace.comp.fsl), each map's mip from the ray cone (Akenine-Moller 2021: a pixel at
+  the surface, spreading by the pixel angle, twice the reflector's bend to its neighbours and the GGX alpha; a probe
+  ray by sqrt(4 pi / rays)) over the triangle's uv-to-world area, plus mipBias; positions are bound for that. The core's vertex and index buffers get the device-address and
   build-input flags and a uint view when the service exists. While it runs, the prepass writes `surface`
   (RGBA16F: x reflection roughness, yzw the normal; renderer_vrs reads x as its gloss). After the prepass, one
   full-size compute dispatch traces each pixel below `max_roughness` along one GGX visible-normal sample (R2

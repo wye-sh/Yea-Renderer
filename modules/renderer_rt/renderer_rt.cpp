@@ -67,7 +67,7 @@ const uint32_t kMaxFrames = 4;
 const uint32_t kMaxMeshes = 1024;
 const uint32_t kMaxRetired = 256;
 const uint32_t kMaxInstances = 65536; // the core's Instance table
-const uint32_t kFlagScreen = 1, kFlagDebug = 4;
+const uint32_t kFlagScreen = 1, kFlagDebug = 4, kFlagMaps = 8;
 // How hits are shadowed (Trace.comp.fsl SHADOWS_*): as the scene, rays for every light, none.
 enum { kShadowsScene, kShadowsRays, kShadowsOff };
 
@@ -744,7 +744,8 @@ bool rt_prepare(uint64_t address)
     memcpy(d.fogAlbedo, F->fogAlbedo, sizeof d.fogAlbedo);
     d.counts[0] = F->allLightCount;
     d.counts[1] = (uint32_t)F->frameNumber;
-    d.counts[2] = (settings.screen_colors ? kFlagScreen : 0) | (settings.show_hits ? kFlagDebug : 0);
+    d.counts[2] = (settings.screen_colors ? kFlagScreen : 0) | (settings.show_hits ? kFlagDebug : 0) |
+                  (F->materialMaps && F->textures ? kFlagMaps : 0);
     // Hits are shadowed as the scene is: from the local lights' maps (the same filter, normal bias and
     // contact-hardening as the forward pass), a ray where a light casts but has no map, a ray for the sun. When the
     // scene gains a ray-traced shadow mode, picking it here (kShadowsRays) is all reflections need.
@@ -770,6 +771,7 @@ bool rt_prepare(uint64_t address)
     d.params[0] = settings.max_distance < 1 ? 1 : settings.max_distance;
     d.params[1] = 0.05f;
     d.params[2] = settings.half_resolution ? (settings.full_below < 0 ? 0 : settings.full_below) : 2.0f; // 2: every pixel
+    d.params[3] = F->mipBias;
     // History only when it was written last frame, by the same camera path (not after a jump of frames).
     d.temporal[0] = settings.history_frames < 1 ? 1.0f : (float)settings.history_frames;
     d.temporal[1] = havePrev && gAccumFrame + 1 == F->frameNumber ? 1.0f : 0.0f;
@@ -1051,7 +1053,10 @@ void rt_run(uint64_t address)
     bool           maps = F->localAtlas && F->localAtlas->pTexture && F->shadowViews;
     Texture*       atlas = maps ? F->localAtlas->pTexture : gDummyAtlas->pTexture;
     Buffer*        views = maps ? F->shadowViews : gDummyViews;
-    DescriptorData p[32] = {};
+    DescriptorData p[33] = {};
+    Buffer*        positions = F->positions;
+    p[32].mIndex = SRT_RES_IDX(RtSrt, PerFrame, gPositions);
+    p[32].ppBuffers = &positions;
     bool           gi = gGiFrame == F->frameNumber && F->giProbeCount && F->giProbeData && F->giRayOut;
     Buffer*        giProbes = F->giProbeData ? F->giProbeData : gNoSkySh;
     Texture*       giIrr = F->giIrradiance && F->giDistance ? F->giIrradiance : gNoSky;
@@ -1128,7 +1133,7 @@ void rt_run(uint64_t address)
     if (gi)
     {
         // renderer_gi's probe rays (a thread each; renderer_gi reads them in gi_run, after this).
-        updateDescriptorSet(gRenderer, fi, gGiSet, 32, p);
+        updateDescriptorSet(gRenderer, fi, gGiSet, 33, p);
         bindCutouts(F, gGiSet, fi, kMaxFrames * 7 + fi, SRT_RES_IDX(RtSrt, PerFrame, gMaterialMaps), SRT_RES_IDX(RtSrt, PerFrame, gTextures));
         uint32_t       groups = (F->giProbeCount * F->giRaysPerProbe + 63) / 64, across = giAcross(F->giProbeCount * F->giRaysPerProbe);
         BufferBarrier  rb = { F->giRayOut, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS };
@@ -1146,19 +1151,19 @@ void rt_run(uint64_t address)
         cmdEndDebugMarker(cmd);
         return;
     }
-    updateDescriptorSet(gRenderer, fi * 4, gSet, 32, p);
+    updateDescriptorSet(gRenderer, fi * 4, gSet, 33, p);
     p[12].ppTextures = &gHalf;
     p[24].ppTextures = &gHalfRay;
-    updateDescriptorSet(gRenderer, fi * 4 + 1, gSet, 32, p);
+    updateDescriptorSet(gRenderer, fi * 4 + 1, gSet, 33, p);
     p[13].ppTextures = &gTex;
-    updateDescriptorSet(gRenderer, fi * 4 + 2, gSet, 32, p);
+    updateDescriptorSet(gRenderer, fi * 4 + 2, gSet, 33, p);
     // The filter reads this frame's accumulation and writes the trace texture, free by then, as rtReflection.
     p[13].ppTextures = &gAccum[w ^ 1];
     p[15].ppTextures = &gAccum[w];
     p[16].ppTextures = &gAccumZ[w];
     p[20].ppTextures = &gTex;
     p[21].ppTextures = &gAccumZ[w ^ 1];
-    updateDescriptorSet(gRenderer, fi * 4 + 3, gSet, 32, p);
+    updateDescriptorSet(gRenderer, fi * 4 + 3, gSet, 33, p);
     // Cut-outs, for the passes that trace: the trace (and the probe pass, on its set) and the reconstruction.
     for (uint32_t k = 0; k < 2; ++k)
         bindCutouts(F, gSet, fi * 4 + k, fi * 4 + k, SRT_RES_IDX(RtSrt, PerFrame, gMaterialMaps), SRT_RES_IDX(RtSrt, PerFrame, gTextures));

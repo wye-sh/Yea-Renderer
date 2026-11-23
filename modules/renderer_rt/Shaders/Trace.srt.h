@@ -43,5 +43,6 @@ BEGIN_SRT(RtSrt)
         DECL_TEXTURE(PerFrame, Tex2D(float4), gGiIrradiance)     // last frame's probes (giCounts.w): irradiance / pi
         DECL_TEXTURE(PerFrame, Tex2D(float4), gGiDistance)       // and their distances
         DECL_RWBUFFER(PerFrame, RWBuffer(float4), gGiRayOut)     // the GI pass: each probe ray's radiance and distance
+        DECL_BUFFER(PerFrame, Buffer(uint), gPositions)          // hits' texture mips: float3 a vertex (RENDER_POSITION_STRIDE)
     END_SRT_SET(PerFrame)
 END_SRT(RtSrt)

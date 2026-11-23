@@ -70,6 +70,7 @@ STRUCT(ShadowView)
 #define RT_FAR 1000.0 // the hit distance the history keeps for the sky (it averages them)
 #define FLAG_SCREEN 1u
 #define FLAG_DEBUG 4u
+#define FLAG_MAPS 8u // the frame has material maps (gMaterialMaps, gTextures bound): hits read them
 // How a hit's local lights are shadowed (shadowMode.y). The sun always takes a ray.
 #define SHADOWS_SCENE 0u // as the scene: from the light's shadow map where it has one, else a ray
 #define SHADOWS_RAYS 1u  // a ray for every light (the scene's ray-traced mode, or the comparison knob)
@@ -169,10 +170,9 @@ float3 skyIrradiance(float3 N)
     return lerp(down, up, N.y * 0.5 + 0.5);
 }
 
-// Vertex v's normal: octahedral snorm16x2 (x low, y high) in its attributes' first word, as frame.h packs it.
-float3 vertexNormal(uint v)
+// An octahedral snorm16x2 word (x low, y high), as frame.h packs normals and tangents.
+float3 octWord(uint w)
 {
-    uint   w = gAttributes[v * 5u];
     float2 f = max(float2(float(int(w << 16u) >> 16), float(int(w) >> 16)) / 32767.0, float2(-1.0, -1.0));
     float3 n = float3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
     float  t = saturate(-n.z);
@@ -180,6 +180,9 @@ float3 vertexNormal(uint v)
     n.y += n.y >= 0.0 ? -t : t;
     return normalize(n);
 }
+
+// Vertex v's normal: its attributes' first word.
+float3 vertexNormal(uint v) { return octWord(gAttributes[v * 5u]); }
 
 // GGX with height-correlated Smith visibility and Schlick's Fresnel, as the core's forward pass.
 float3 brdfLight(float3 N, float3 V, float3 L, float3 diffuse, float3 f0, float a2, float3 E)
@@ -225,7 +228,7 @@ float lightVisible(float3 P, float3 L, float tMax)
 // the rest; shadowed by their maps or rays, shadowMode.y, at most maxRays rays) and the light around: the sky's, or
 // where renderer_gi's probes hold it, their bounced light (diffuse). rot turns the maps' filter. probe: a GI probe
 // ray's hit, which takes no specular from the surroundings (diffuse probes; the sky's would leak indoors).
-float3 shadeHit(float3 P, float3 N, float3 V, MaterialData m, float2 rot, uint maxRays, bool probe)
+float3 shadeHit(float3 P, float3 N, float3 V, MaterialData m, float occlusion, float2 rot, uint maxRays, bool probe)
 {
     float  metallic = saturate(m.params.x);
     float3 albedo = m.albedoRough.rgb;
@@ -286,6 +289,16 @@ float3 shadeHit(float3 P, float3 N, float3 V, MaterialData m, float2 rot, uint m
     float  ambient = gRt.sunColor.w;
     float3 R = reflect(-V, N);
     float3 skySeen = probe ? float3(0.0, 0.0, 0.0) : (gRt.sky.x > 0.5 ? skyImage(R, rough) : lerp(skyRadiance(R), skyIrradiance(R), rough));
+    if (occlusion < 1.0)
+    {
+        // The occlusion map, as the forward pass takes it without renderer_ao: Jimenez 2016's multi-bounce fit on the
+        // diffuse ambient, Lagarde 2014's specular occlusion on the reflected sky.
+        float3 ao = float3(occlusion, occlusion, occlusion);
+        ao = max(ao, ((ao * (2.0404 * albedo - 0.3324) + (-4.7951 * albedo + 0.6417)) * ao + (2.7552 * albedo + 0.6903)) * ao);
+        diffuse *= ao;
+        float NoV = max(dot(N, V), 1e-3);
+        skySeen *= saturate(pow(max(NoV + occlusion, 1e-4), exp2(-16.0 * rough - 1.0)) - 1.0 + occlusion);
+    }
     if (gRt.giCounts.w == 0u)
         color += (diffuse * skyIrradiance(N) + f0 * skySeen) * ambient;
     else
@@ -365,6 +378,96 @@ float3 hitNormal(uint index, uint prim, float2 bary, out(uint) material)
     return normalize(float3(dot(c0, n), dot(c1, n), dot(c2, n)));
 }
 
+float3 vertexPosition(uint v) { return asfloat(uint3(gPositions[v * 3u], gPositions[v * 3u + 1u], gPositions[v * 3u + 2u])); }
+
+float4 vertexColor(uint v)
+{
+    uint c = gAttributes[v * 5u + 4u];
+    return float4(float(c & 0xFFu), float((c >> 8u) & 0xFFu), float((c >> 16u) & 0xFFu), float(c >> 24u)) * (1.0 / 255.0);
+}
+
+// Map `slot` (gTextures' index + 1) at uv, its mip from lod: log2 of the cone's footprint in uv units (the map's own
+// size added here, so one lod serves every map of the material).
+float4 sampleMapLod(uint slot, float2 uv, float lod)
+{
+    float4 c = float4(1.0, 1.0, 1.0, 1.0);
+    uint   texSlot = slot - 1u;
+    BeginNonUniformResourceIndex(texSlot, MAX_TEXTURES);
+        int2 size = GetDimensions(gTextures[texSlot], NO_SAMPLER);
+        c = SampleLvlTex2D(gTextures[texSlot], gSamplerTrilinearWrap, uv, max(lod + 0.5 * log2(float(size.x * size.y)), 0.0));
+    EndNonUniformResourceIndex();
+    return c;
+}
+
+// The material a hit shows (top-level instance index, triangle, barycentrics): its flat values, or with the core's
+// texture maps (renderer's Material.h.fsl materialLook and mappedNormal, as the forward pass draws it) where it has
+// them. The maps' mip comes from the ray cone (Akenine-Moller et al. 2021): `width` the cone's width at the hit (m),
+// R the ray's direction; the triangle's uv and world areas turn it into texels. N: the hit's normal (turned towards
+// the ray), replaced by the normal map's; occlusion: the occlusion map's (1: none).
+MaterialData hitMaterial(uint index, uint prim, float2 bary, float width, float3 R, inout(float3) N, out(float) occlusion)
+{
+    uint4        inst = gRtInstances[index];
+    InstanceData row = gInstances[inst.x];
+    MaterialData m = gMaterials[row.misc.x];
+    occlusion = 1.0;
+    if ((gRt.counts.z & FLAG_MAPS) == 0u)
+        return m;
+    MaterialMapData mm = gMaterialMaps[row.misc.x];
+    if (mm.misc.y <= 0.5)
+        return m;
+    uint   v0 = gIndices[inst.y + prim * 3u] + inst.z;
+    uint   v1 = gIndices[inst.y + prim * 3u + 1u] + inst.z;
+    uint   v2 = gIndices[inst.y + prim * 3u + 2u] + inst.z;
+    float3 b = float3(1.0 - bary.x - bary.y, bary.x, bary.y);
+    float2 t0 = vertexUv(v0), t1 = vertexUv(v1), t2 = vertexUv(v2);
+    float2 uv = t0 * b.x + t1 * b.y + t2 * b.z;
+    float4 color = vertexColor(v0) * b.x + vertexColor(v1) * b.y + vertexColor(v2) * b.z;
+    float3 a = row.row0.xyz, c = row.row1.xyz, d = row.row2.xyz;
+    float3 e1 = vertexPosition(v1) - vertexPosition(v0), e2 = vertexPosition(v2) - vertexPosition(v0);
+    e1 = float3(dot(a, e1), dot(c, e1), dot(d, e1));
+    e2 = float3(dot(a, e2), dot(c, e2), dot(d, e2));
+    float worldArea = length(cross(e1, e2));
+    float2 u1 = t1 - t0, u2 = t2 - t0;
+    float uvArea = abs(u1.x * u2.y - u2.x * u1.y);
+    float lod = 0.5 * log2(max(uvArea, 1e-20) / max(worldArea, 1e-20)) + log2(max(width, 1e-6) / max(abs(dot(N, R)), 0.05)) + gRt.params.w;
+
+    float4 albedoRough = float4(m.albedoRough.rgb, m.albedoRough.a);
+    if (mm.maps.x != 0u)
+        albedoRough.rgb = mm.baseFactor.rgb * sampleMapLod(mm.maps.x, uv, lod).rgb;
+    albedoRough.rgb *= color.rgb;
+    if (mm.maps.y != 0u)
+    {
+        float3 orm = sampleMapLod(mm.maps.y, uv, lod).rgb;
+        albedoRough.a = mm.factors.x * orm.g;
+        m.params.x = mm.factors.y * orm.b;
+        occlusion = 1.0 + mm.factors.w * (orm.r - 1.0);
+    }
+    m.albedoRough = albedoRough;
+    if (mm.maps.w != 0u)
+        m.emissive.rgb *= sampleMapLod(mm.maps.w, uv, lod).rgb;
+    if (mm.maps.z != 0u)
+    {
+        // MikkTSpace: the interpolated normal and tangent as they come, the bitangent from them and the tangent's
+        // sign; the whole frame turned with the face the ray hit.
+        float3 c0 = cross(c, d), c1 = cross(d, a), c2 = cross(a, c);
+        float3 n = vertexNormal(v0) * b.x + vertexNormal(v1) * b.y + vertexNormal(v2) * b.z;
+        n = float3(dot(c0, n), dot(c1, n), dot(c2, n));
+        uint   w0 = gAttributes[v0 * 5u + 1u];
+        float3 t = octWord(w0) * b.x + octWord(gAttributes[v1 * 5u + 1u]) * b.y + octWord(gAttributes[v2 * 5u + 1u]) * b.z;
+        t = float3(dot(a, t), dot(c, t), dot(d, t));
+        float  facing = dot(n, R) > 0.0 ? -1.0 : 1.0;
+        float2 xy = sampleMapLod(mm.maps.z, uv, lod).xy * 2.0 - 1.0;
+        float  z = sqrt(saturate(1.0 - dot(xy, xy)));
+        xy *= mm.factors.z;
+        float3 B = cross(n, t) * (((w0 >> 16u) & 1u) != 0u ? -1.0 : 1.0);
+        float3 mapped = t * xy.x + B * xy.y + n * z;
+        float  l = dot(mapped, mapped);
+        if (l > 1e-12)
+            N = mapped * (rsqrt(l) * facing);
+    }
+    return m;
+}
+
 STRUCT(Hit)
 {
     DATA(float4, result, None); // the finished sample (rgb, a distance; 0: not traced, RT_MISS: the sky); a < 0: light it
@@ -373,6 +476,8 @@ STRUCT(Hit)
     DATA(float4, ray, None);    // xyz the ray's direction, w the screen's share
     DATA(float4, screen, None); // rgb the screen's colour
     DATA(uint, material, None);
+    DATA(uint4, tri, None);     // the hit's top-level instance, triangle and barycentrics (as uints)
+    DATA(float, cone, None);    // the ray cone's width there (m)
     DATA(float, invPdf, None);  // 1 / the probability the ray was cast with (GGX visible normals), for its reuse
 };
 
@@ -387,6 +492,8 @@ Hit traceRay(int2 p, float4 surface, float d, uint seq)
     o.ray = float4(0.0, 0.0, 0.0, 0.0);
     o.screen = float4(0.0, 0.0, 0.0, 0.0);
     o.material = 0u;
+    o.tri = uint4(0u, 0u, 0u, 0u);
+    o.cone = 0.0;
     o.invPdf = 0.0;
     int2   size = int2(gRt.screen.xy);
     float  rough = surface.x;
@@ -486,15 +593,35 @@ Hit traceRay(int2 p, float4 surface, float d, uint seq)
     o.ray = float4(R, screenWeight);
     o.screen = float4(screenColor, 0.0);
     o.material = material;
+    o.tri = uint4(index, prim, asuint(bary));
+    // The ray cone (Akenine-Moller et al. 2021): a pixel wide at the surface, spreading by the pixel's angle, twice the
+    // surface's own bend across a pixel (the normal's change to the neighbours on the same surface) and the lobe's
+    // width (alpha) for a rough reflection, so distant and curved reflections pick blurrier mips instead of shimmering.
+    float pixelAngle = 2.0 / (gRt.up.w * gRt.screen.y);
+    float bend = 0.0;
+    for (uint k = 0u; k < 2u; ++k)
+    {
+        int2  q = clamp(p + int2(k == 0u ? 1 : 0, k == 1u ? 1 : 0), int2(0, 0), size - int2(1, 1));
+        float dq = LoadTex2D(gDepth, NO_SAMPLER, q, 0).r;
+        if (dq > 0.0 && abs(gRt.forward.w / dq - z) < 0.05 * z)
+            bend = max(bend, length(normalize(LoadTex2D(gSurface, NO_SAMPLER, q, 0).yzw) - N));
+    }
+    o.cone = z * pixelAngle + t * (pixelAngle + 2.0 * bend + alpha);
     return o;
 }
 
 // A hit traceRay left to light (for pixel p): lit where it is, blended with what the screen shows of it.
-float4 lightHit(float4 pos, float4 normal, float4 ray, float3 screen, uint material, int2 p)
+float4 lightHit(Hit h, int2 p)
 {
+    float4 pos = h.pos;
+    float4 ray = h.ray;
+    float3 screen = h.screen.rgb;
     // The maps' filter turned per pixel and frame, as the core's (TAA averages it).
-    float  phi = noise2(float2(p) + float(gRt.counts.y % 64u) * 5.588238) * 2.0 * PI;
-    float3 lit = shadeHit(pos.xyz, normal.xyz, -ray.xyz, gMaterials[material], float2(cos(phi), sin(phi)), MAX_SHADOW_RAYS, false);
+    float        phi = noise2(float2(p) + float(gRt.counts.y % 64u) * 5.588238) * 2.0 * PI;
+    float3       N = h.normal.xyz;
+    float        occlusion;
+    MaterialData m = hitMaterial(h.tri.x, h.tri.y, asfloat(h.tri.zw), h.cone, ray.xyz, N, occlusion);
+    float3       lit = shadeHit(pos.xyz, N, -ray.xyz, m, occlusion, float2(cos(phi), sin(phi)), MAX_SHADOW_RAYS, false);
     // The fog between the reflecting surface and the hit (what the screen shows of it already holds the camera's).
     lit = applyHeightFog(lit, pos.xyz - ray.xyz * pos.w, ray.xyz, pos.w);
     float3 color = lerp(lit, screen, ray.w);
@@ -509,7 +636,7 @@ float4 tracePixel(int2 p, float4 surface, float d)
     Hit h = traceRay(p, surface, d, gRt.counts.y);
     if (h.result.a >= 0.0)
         return h.result;
-    return lightHit(h.pos, h.normal, h.ray, h.screen.rgb, h.material, p);
+    return lightHit(h, p);
 }
 
 // Half resolution: each 2 x 2 block traces one pixel, a different one each frame (TAA gathers them).
@@ -554,7 +681,7 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
             Hit h = traceRay(p, surface, LoadTex2D(gDepth, NO_SAMPLER, p, 0).r, isHalf ? gRt.counts.y >> 2u : gRt.counts.y);
             // The maps' filter is turned by where the sample is written (the half-size texel at half resolution).
             if (h.result.a < 0.0)
-                h.result = lightHit(h.pos, h.normal, h.ray, h.screen.rgb, h.material, isHalf ? b : p);
+                h.result = lightHit(h, isHalf ? b : p);
             if (isHalf)
             {
                 Write2D(gOutHalf, b, h.result);
@@ -1125,7 +1252,11 @@ void CS_MAIN(SV_GroupID(uint3) gid, SV_GroupThreadID(uint3) tid)
         {
             float3 P = ray.Origin + ray.Direction * t;
             float  phi = float(pcgHash(index ^ (gRt.counts.y * 2654435761u)) & 0xFFFFu) * (2.0 * PI / 65536.0);
-            float3 lit = shadeHit(P, N, -ray.Direction, gMaterials[material], float2(cos(phi), sin(phi)), GI_SHADOW_RAYS, true);
+            // A probe ray's cone: its share of the sphere, sqrt(4 pi / rays) radians wide.
+            float        occlusion;
+            MaterialData m = hitMaterial(RayQueryInstanceID(hit), RayQueryPrimitiveIndex(hit), RayQueryBarycentrics(hit),
+                                         t * sqrt(4.0 * PI / float(max(rays, 1u))), ray.Direction, N, occlusion);
+            float3 lit = shadeHit(P, N, -ray.Direction, m, occlusion, float2(cos(phi), sin(phi)), GI_SHADOW_RAYS, true);
             result = float4(clampSample(applyHeightFog(lit, ray.Origin, ray.Direction, t)), t);
         }
     }
