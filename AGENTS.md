@@ -23,6 +23,10 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   dual-source blending), a double-sided one's far side first. Lit as every surface (Forward.frag TRANSLUCENT: no AO,
   contact, traced shadows or traced reflections, which are the opaque scene's pixels; maps kept via keepShadowMaps;
   lights from `sideMasks` ANDed with the z-bin, as tileMasks for opaque ones), fog and aerial perspective kept exact (f(c) - T f(0)). With one sample a pixel they draw
+- CPU timings (6.6.7, renderer.cpp `CPU_T`, `cpuSection`): every 30 s a "cpu ms avg/max" line, the main thread's time
+  in the renderer a frame (both passes), by part, largest first: each module hook by its name, the waits ("pipeline
+  wait", "queue idle", "gpu timings readback"), "pipeline warm", "descriptors", and the core's own work by section
+  ("core: instances", "core: record"...). Report a change's CPU ms from it with its GPU ms.
   in the see-through pass after the forward pass (timed "see-through", with its parts "glass", "chain" (the scene colour chain's copies) and "runs" (particles
   between the panes) summed from segments, `segSwitch`; BLEND_PASS: no depth target, the depth test
   against gSceneDepth in the shader) into hdr, `reactive` and `transparency` (R8, max-blended coverage; frame
