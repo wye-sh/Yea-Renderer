@@ -679,6 +679,11 @@ surface's luminance is that over its area). Colours linear RGB.
   never on a reload that keeps it; never 0 (0 is the stub: the renderer isn't running). `instance_lod_quality(i, q)`:
   that instance's `lod_error` divided by q (the models' LOD Quality knob). `preview_draw(preview)`: the Model Viewer's
   (renderer_models above).
+- Timings (7.3.0): `timing_ms(name, gpu)`, a C string as the timing lines name it: a GPU pass's ms in the latest
+  frame read back (while gpu_timings is on), or a main-thread part's (`"total"`); -1 when none ran (tests read it:
+  `modules/test_renderer_profile`). The Timings panel (`panels/Timings.cpp`, F1 only) shows both live as bars, each
+  part's average a frame over the last half second (`timings.h`: `liveGpu`, `liveCpu`, kept by `timeFrame` and
+  `cpuPassBegin`).
 
 Minimal link module: `use renderer`, a `preset` for every knob, and in `update(SIMULATE)` add meshes,
 materials, instances and lights once, then move what moves and set the camera. Build again whenever the
@@ -693,7 +698,7 @@ AgX (our own constants, in Tonemap.h.fsl), Hable_Filmic, Reinhard, None, ACES_Fi
 compiles only while the shader's TONEMAPPER_ACES_FITTED is 1, which a build baking another tonemapper sets to 0),
 Tony_McMapface (its table, Assets/tony_mc_mapface.dds, is read only while it is picked; Khronos PBR Neutral stands in
 when missing); the shader's mode is its index, so new options go at the end; both licences are tied to their options), msaa (1/2/4/8), specular_aa, sky/horizon/ground colours, sky_luminance, ambient,
-sun_disk (degrees), near_plane, gpu_timings (logs each pass's GPU time every 10 s: avg/max ms), lod_error (display pixels; 0: always the finest),
+sun_disk (degrees), near_plane, gpu_timings (logs each pass's GPU time every 30 s: avg/max ms; the Timings panel shows them live), lod_error (display pixels; 0: always the finest),
 texture_detail (Full, Half, Quarter: top mips left out; more when GPU memory is short). `renderer_culling`: enabled, max_lights, tile_size (8/16/32), z_bins,
 heatmap. `renderer_shadows`: enabled (the sun's), cascades, shadow_distance, cascade_split, sun_resolution, softness,
 filter_taps, pcss, sun_size, normal_bias, slope_bias, receiver_plane, light_shadows, shadowed_lights, local_atlas_resolution,

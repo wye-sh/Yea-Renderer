@@ -12,6 +12,7 @@
 #include "mathx.h"
 #include "scene.h"
 #include "skin.h"
+#include "timings.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -754,6 +755,7 @@ struct CpuSlot
 {
     const char* name;
     double      frame, sum, max;
+    double      last, live, shown; // the latest frame's, and the live view's (cpuLive, the Timings panel)
 };
 CpuSlot  gCpu[64];
 uint32_t gCpuCount, gCpuSection, gCpuDepth, gCpuFrames;
@@ -810,6 +812,21 @@ void cpuPassBegin(uint64_t frame)
                 total += gCpu[i].frame;
             static const uint32_t all = cpuSlot("total");
             gCpu[all].frame = total;
+            // The live view: each part's average a frame over the last half second.
+            static double   liveAt;
+            static uint32_t liveFrames;
+            const double    at = cpuNow();
+            liveFrames++;
+            const bool show = at - liveAt >= 500.0;
+            for (uint32_t i = 0; i < gCpuCount; ++i)
+            {
+                gCpu[i].last = gCpu[i].frame;
+                gCpu[i].live += gCpu[i].frame;
+                if (show)
+                    gCpu[i].shown = gCpu[i].live / liveFrames, gCpu[i].live = 0;
+            }
+            if (show)
+                liveAt = at, liveFrames = 0;
             for (uint32_t i = 0; i < gCpuCount; ++i)
             {
                 gCpu[i].sum += gCpu[i].frame;
@@ -2007,6 +2024,9 @@ double            gTimeTicks;            // per second
 double            gTimeSum[kTimings], gTimeMax[kTimings];
 uint32_t          gTimeCount[kTimings];
 double            gTimeLogged;
+// The live view (timeFrame): each pass's ms in the latest frame read back, and its average over the last half second.
+double            gTimeLast[kTimings], gTimeShown[kTimings], gTimeLive[kTimings], gTimeLiveAt;
+uint32_t          gTimeLiveRan, gTimeLiveFrames;
 bool              gTimedFrame; // this frame's render was timed (the composite follows it)
 
 // Breadcrumbs (6.1.0, for lost devices): the end of every pass above (timeEnd, timed or not) is noted with its frame.
@@ -2188,8 +2208,13 @@ void timeFrame(Cmd* cmd, uint32_t fi, bool on, const char* scene)
     if (!on || !gTimePool[fi])
     {
         gTimeUsed[fi] = gSegCount[fi] = 0;
+        for (uint32_t t = 0; t < kTimings; ++t)
+            gTimeLast[t] = gTimeShown[t] = -1;
         return;
     }
+    double now[kTimings];
+    for (uint32_t t = 0; t < kTimings; ++t)
+        now[t] = -1;
     double part[kTimings] = {};
     for (uint32_t s = 0; s < gSegCount[fi]; ++s)
     {
@@ -2200,6 +2225,7 @@ void timeFrame(Cmd* cmd, uint32_t fi, bool on, const char* scene)
     }
     for (uint32_t t = kTimeGlass; t <= kTimeRuns && gSegCount[fi]; ++t)
     {
+        now[t] = part[t];
         gTimeSum[t] += part[t];
         gTimeMax[t] = part[t] > gTimeMax[t] ? part[t] : gTimeMax[t];
         gTimeCount[t]++;
@@ -2213,14 +2239,31 @@ void timeFrame(Cmd* cmd, uint32_t fi, bool on, const char* scene)
         if (q.mEndTimestamp <= q.mBeginTimestamp)
             continue;
         double ms = (double)(q.mEndTimestamp - q.mBeginTimestamp) * 1000.0 / gTimeTicks;
+        now[t] = ms;
         gTimeSum[t] += ms;
         gTimeMax[t] = ms > gTimeMax[t] ? ms : gTimeMax[t];
         gTimeCount[t]++;
     }
     cmdResetQuery(cmd, gTimePool[fi], 0, kTimings + kSegs);
     gTimeUsed[fi] = gSegCount[fi] = 0;
-    double now = yea::host()->time();
-    if (now - gTimeLogged >= 30.0 && gTimeCount[kTimeTotal]) // 30 s in 6.1.0: Yea takes 10 lines a minute
+    // The live view (timing_ms, the Timings panel): this frame's, and each pass's average a frame over the last half
+    // second (a frame that skipped it adds 0; -1: none ran it).
+    const double at = yea::host()->time();
+    gTimeLiveFrames++;
+    for (uint32_t t = 0; t < kTimings; ++t)
+    {
+        gTimeLast[t] = now[t];
+        if (now[t] >= 0)
+            gTimeLive[t] += now[t], gTimeLiveRan |= 1u << t;
+    }
+    if (at - gTimeLiveAt >= 0.5)
+    {
+        for (uint32_t t = 0; t < kTimings; ++t)
+            gTimeShown[t] = gTimeLiveRan & (1u << t) ? gTimeLive[t] / gTimeLiveFrames : -1, gTimeLive[t] = 0;
+        gTimeLiveRan = gTimeLiveFrames = 0;
+        gTimeLiveAt = at;
+    }
+    if (at - gTimeLogged >= 30.0 && gTimeCount[kTimeTotal]) // 30 s in 6.1.0: Yea takes 10 lines a minute
     {
         char line[1024];
         int  n = snprintf(line, sizeof line, "gpu ms avg/max over %u frames:", gTimeCount[kTimeTotal]);
@@ -2239,11 +2282,54 @@ void timeFrame(Cmd* cmd, uint32_t fi, bool on, const char* scene)
         memset(gTimeSum, 0, sizeof gTimeSum);
         memset(gTimeMax, 0, sizeof gTimeMax);
         memset(gTimeCount, 0, sizeof gTimeCount);
-        gTimeLogged = now;
+        gTimeLogged = at;
     }
 }
 
 } // namespace
+
+uint32_t liveGpu(LiveTiming* out, uint32_t cap)
+{
+    uint32_t n = 0;
+    for (uint32_t t = 0; t < kTimings && n < cap && gTimeLiveAt > 0; ++t)
+        if (gTimeShown[t] >= 0)
+            out[n++] = { kTimingNames[t], (float)gTimeShown[t], (uint8_t)(t >= kTimeGlass && t <= kTimeRuns) };
+    return n;
+}
+
+uint32_t liveCpu(LiveTiming* out, uint32_t cap)
+{
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < gCpuCount && n < cap; ++i)
+        if (gCpu[i].shown >= 0.005)
+            out[n++] = { gCpu[i].name, (float)gCpu[i].shown, 0 };
+    for (uint32_t a = 1; a < n; ++a) // largest first: the total
+        for (uint32_t b = a; b > 0 && out[b].ms > out[b - 1].ms; --b)
+        {
+            LiveTiming t = out[b];
+            out[b] = out[b - 1];
+            out[b - 1] = t;
+        }
+    return n;
+}
+
+float timing_ms(uint64_t name, bool gpu)
+{
+    const char* s = (const char*)(uintptr_t)name;
+    if (!s)
+        return -1;
+    if (gpu)
+    {
+        for (uint32_t t = 0; t < kTimings; ++t)
+            if (!strcmp(kTimingNames[t], s))
+                return settings.gpu_timings ? (float)gTimeLast[t] : -1;
+        return -1;
+    }
+    for (uint32_t i = 0; i < gCpuCount; ++i)
+        if (!strcmp(gCpu[i].name, s))
+            return (float)gCpu[i].last;
+    return -1;
+}
 
 // One of the table's R9G9B9E5 channels (9-bit mantissa m, shared exponent e: m * 2^(e - 24)) as a half float. Every
 // such value is a half exactly: at most 9 significant bits, between 2^-24 and 65408.

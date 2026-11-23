@@ -318,6 +318,13 @@ export u32 scene_epoch()
 # The Model Viewer's preview (renderer_models' preview.h, a RenderPreview*): one model alone under a studio rig, into
 # the caller's own targets, from its draw(YEA_PASS_RENDER). False: nothing drawn (the renderer isn't ready).
 export bool preview_draw(u64 preview)
+# A part of the renderer's frame in the latest frame measured (ms), by the name the timing lines give it: gpu true a pass
+# on the GPU ("forward+sky", "shadows", "total"...), while gpu_timings is on; false the main thread's ("total",
+# "shadows_render"...). -1 when none by that name ran that frame (or GPU timings are off). name: a C string.
+export float timing_ms(u64 name, bool gpu)
+
+# Each pass's GPU time and the main thread's parts, live (panels/Timings.cpp).
+panel Timings 420x640
 
 import renderer_culling bool cull_prepare(u64 frame) = false
 import renderer_culling void cull_run(u64 frame)
