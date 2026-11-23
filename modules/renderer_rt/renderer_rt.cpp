@@ -73,8 +73,9 @@ const uint32_t kMaxInstances = 65536; // the core's Instance table
 const uint32_t kFlagScreen = 1, kFlagDebug = 4, kFlagMaps = 8, kFlagGlass = 16;
 // gRtInstances' w (Shaders/Cutout.h.fsl): the material + 1 in its low bits, and flags.
 const uint32_t kInstCut = 0x20000000u, kInstTwoSided = 0x40000000u, kInstGlass = 0x80000000u;
-// Instance masks (Shaders/Trace.comp.fsl): 1 seen in reflections, 2 casts shadows (glass too), 4 opaque and casts (GI).
-const uint8_t kMaskReflected = 1, kMaskCasts = 2, kMaskGi = 4;
+// Instance masks (Shaders/Trace.comp.fsl): 1 seen in reflections, 2 casts shadows (glass too), 4 opaque and casts (GI),
+// 8 glass (GI probe rays pass through it).
+const uint8_t kMaskReflected = 1, kMaskCasts = 2, kMaskGi = 4, kMaskGiGlass = 8;
 // How hits are shadowed (Trace.comp.fsl SHADOWS_*): as the scene, rays for every light, none.
 enum { kShadowsScene, kShadowsRays, kShadowsOff };
 
@@ -1381,7 +1382,7 @@ void rt_run(uint64_t address)
         desc.pBottomAS = blas;
         memcpy(desc.mTransform, F->instanceRows[c.instance].row, sizeof desc.mTransform);
         desc.mInstanceID = n;
-        desc.mInstanceMask = kMaskReflected | (c.castShadow ? kMaskCasts | (isGlass ? 0 : kMaskGi) : 0);
+        desc.mInstanceMask = kMaskReflected | (c.castShadow ? kMaskCasts | (isGlass ? 0 : kMaskGi) : 0) | (isGlass ? kMaskGiGlass : 0);
         const bool cut = cutouts && c.masked;
         desc.mFlags = cut || isGlass ? ACCELERATION_STRUCTURE_INSTANCE_FLAG_FORCE_NON_OPAQUE : ACCELERATION_STRUCTURE_INSTANCE_FLAG_FORCE_OPAQUE;
         gInstCpu[n * 4 + 0] = c.instance;

@@ -74,11 +74,12 @@ STRUCT(ShadowView)
 #define FLAG_DEBUG 4u
 #define FLAG_MAPS 8u // the frame has material maps (gMaterialMaps, gTextures bound): hits read them
 #define FLAG_GLASS 16u // see-through instances are in the top-level structure (Hit.h.fsl): rays look for their layers
-// Instance masks (renderer_rt.cpp): 1 seen in reflections, 2 casts shadows (glass too), 4 opaque and casts (GI probe
-// rays and their shadow rays: renderer_gi's raster captures skip glass, so traced probes do too).
+// Instance masks (renderer_rt.cpp): 1 seen in reflections, 2 casts shadows (glass too), 4 opaque and casts (what GI
+// probe rays hit), 8 glass (every see-through instance: what GI probe rays pass through, tinted).
 #define MASK_REFLECTED 1u
 #define MASK_CASTS 2u
 #define MASK_GI 4u
+#define MASK_GI_GLASS 8u
 // How a hit's local lights are shadowed (shadowMode.y). The sun always takes a ray.
 #define SHADOWS_SCENE 0u // as the scene: from the light's shadow map where it has one, else a ray
 #define SHADOWS_RAYS 1u  // a ray for every light (the scene's ray-traced mode, or the comparison knob)
@@ -199,8 +200,9 @@ float3 brdfLight(float3 N, float3 V, float3 L, float3 diffuse, float3 f0, float 
 }
 
 // What reaches P from a light along L, up to tMax (one any-hit ray): 0 where something opaque is in the way, else the
-// product of the glass layers it passes (white without). gi: a GI probe hit's ray, which sees no glass (MASK_GI).
-float3 lightVisible(float3 P, float3 L, float tMax, bool gi)
+// product of the glass layers it passes (white without), for reflections' and GI probe rays' hits alike, as direct
+// light arrives on screen.
+float3 lightVisible(float3 P, float3 L, float tMax)
 {
     if (gRt.shadowMode.y == SHADOWS_OFF)
         return float3(1.0, 1.0, 1.0);
@@ -210,7 +212,7 @@ float3 lightVisible(float3 P, float3 L, float tMax, bool gi)
     shadowRay.TMin = 0.0;
     shadowRay.TMax = tMax;
     float3 through = float3(1.0, 1.0, 1.0);
-    RayQueryAnyHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RT_RAY_FLAGS, shadowRay, gi ? MASK_GI : MASK_CASTS, occluded) // casters only
+    RayQueryAnyHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RT_RAY_FLAGS, shadowRay, MASK_CASTS, occluded) // casters only
     RayQueryBeginForEachCandidate(occluded)
     {
         uint   ci = RayQueryCandidateInstanceID(occluded);
@@ -246,7 +248,7 @@ float3 shadeHit(float3 P, float3 N, float3 V, MaterialData m, float occlusion, f
     {
         float3 L = gRt.sunDir.xyz;
         if (dot(N, L) > 0.0)
-            color += brdfLight(N, V, L, diffuse, f0, a2, gRt.sunColor.rgb * lightVisible(offset, L, 1000.0, probe));
+            color += brdfLight(N, V, L, diffuse, f0, a2, gRt.sunColor.rgb * lightVisible(offset, L, 1000.0));
     }
     uint  lights = min(gRt.counts.x, MAX_HIT_LIGHTS);
     uint  rays = 0u;
@@ -283,7 +285,7 @@ float3 shadeHit(float3 P, float3 N, float3 V, MaterialData m, float occlusion, f
                 lit *= localShadow(l, P, N, d2 * invDist, NoL, rot);
             else if ((rayAll || l.params.w > 0.5) && rays < maxRays)
             {
-                lit *= lightVisible(offset, L, max(d2 * invDist - 0.05, 0.0), probe);
+                lit *= lightVisible(offset, L, max(d2 * invDist - 0.05, 0.0));
                 rays += 1u;
             }
         }
@@ -1246,7 +1248,9 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
 #if defined(GI_PASS)
 // renderer_gi's probe rays (giCounts.x probes, giCounts.y rays each; a thread a ray, probe-major): ray k of probe i from
 // the probe's place along this frame's turned spherical Fibonacci direction k, against everything that casts a shadow
-// (MASK_GI, opaque casters: glass is skipped as renderer_gi's captures skip it; lights' own emitters and markers don't, so the probes don't count a light twice). A hit is lit where it is
+// (MASK_GI, opaque casters; lights' own emitters and markers don't, so the probes don't count a light twice), through
+// every see-through instance between (MASK_GI_GLASS: what each layer lets through, as glassThrough, multiplies the
+// light, as renderer_gi's raster captures draw them: a multiplicative layer, no light of its own). A hit is lit where it is
 // as reflections' are (emission, the sun's ray, local lights through their maps, rays for at most GI_SHADOW_RAYS lights
 // without one, the probes' own bounced light from last frame), then fogged over its distance; a hit on a back face
 // writes no light and its distance negated (the probe is inside something), unless the surface is two-sided: then it is
@@ -1306,6 +1310,26 @@ void CS_MAIN(SV_GroupID(uint3) gid, SV_GroupThreadID(uint3) tid)
             float3 lit = shadeHit(P, N, -ray.Direction, m, occlusion, float2(cos(phi), sin(phi)), GI_SHADOW_RAYS, true, 1.0);
             result = float4(clampSample(applyHeightFog(lit, ray.Origin, ray.Direction, t)), t);
         }
+    }
+    // Glass between the probe and what its ray met (or the sky): the product of its layers, from a second ray that
+    // only glass answers, up to the hit (any order: a product).
+    if ((gRt.counts.z & FLAG_GLASS) != 0u && result.a > 0.0)
+    {
+        RayDesc glassRay = ray;
+        glassRay.TMax = result.a == GI_MISS ? RT_FAR : result.a;
+        float3 through = float3(1.0, 1.0, 1.0);
+        RayQueryAnyHit(gScene, RAY_TRAVERSAL_FLAG_DEFAULT, RT_RAY_FLAGS, glassRay, MASK_GI_GLASS, layers)
+        RayQueryBeginForEachCandidate(layers)
+        {
+            uint   ci = RayQueryCandidateInstanceID(layers);
+            uint   cp = RayQueryCandidatePrimitiveIndex(layers);
+            float2 cb = RayQueryCandidateBarycentrics(layers);
+            if (!cutAway(ci, cp, cb))
+                through *= glassThrough(ci, cp, cb, ray.Direction);
+            RayQueryProceed(layers);
+        }
+        RayQueryEndForEachCandidate(layers)
+        result.rgb *= through;
     }
     gGiRayOut[index] = result;
     RETURN();

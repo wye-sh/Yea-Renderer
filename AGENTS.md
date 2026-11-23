@@ -148,7 +148,8 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   trace it; dropped 8 frames after their last use. While any are traced, the module logs their refit and rebuild GPU
   time every 10 s (`skinned ray structures`). One
   top-level structure per frame in flight, its instances rewritten with `setInstances` and rebuilt every frame
-  (mask 1 every drawable, 2 shadow casters, 4 shadow casters that aren't glass: GI probe rays and their shadow rays).
+  (mask 1 every drawable, 2 shadow casters, 4 shadow casters that aren't glass: what GI probe rays hit, 8 every glass
+  instance: what they pass through).
   Instances are forced opaque except alpha-tested ones
   (`RenderCaster.masked`, with the frame's material maps): those are non-opaque, and every ray query (reflections,
   their shadow rays, traced shadows, GI probe rays) loops over their candidates, cutting them out by base colour alpha at mip 0 as
@@ -163,8 +164,9 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   hits' and traced shadows') multiply T over the layers they pass. When a glass caster is traced, rt_prepare sets
   `rtShadowTint` (RGBA16F, rtShadows' size and layers: the trace's raw tint with the nearest layer's distance in a,
   then, reused, the filtered tint) and rt_run fills it: accumulated over frames like the visibility over the rays no
-  opaque surface blocked, filtered over the penumbra the layer's distance gives, by plane and normal. GI probe rays skip glass (as renderer_gi's
-  raster captures do). Lit hits (reflections and GI
+  opaque surface blocked, filtered over the penumbra the layer's distance gives, by plane and normal. GI probe rays pass through glass (mask 8, a second ray up to their hit or the sky), their light multiplied by each
+  layer's T, as renderer_gi's raster captures draw see-through surfaces (a multiplicative layer, no light of its own);
+  their hits' shadow rays are tinted as reflections' are. Lit hits (reflections and GI
   probe rays) read the material's maps as the forward pass does (base colour, ORM with its occlusion on the ambient,
   normal, emissive; `hitMaterial` in Trace.comp.fsl), each map's mip from the ray cone (Akenine-Moller 2021: a pixel at
   the surface, spreading by the pixel angle, twice the reflector's bend to its neighbours and the GGX alpha; a probe
