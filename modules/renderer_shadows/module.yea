@@ -42,9 +42,6 @@ setting int shadowed_lights 64 0 64
 # lights want more detail than fits, on cards with 6 GB or more (8192 takes 256 MB).
 setting int local_atlas_resolution 8192 1024 8192
 setting int updates_per_frame 8 1 32
-# Lights' shadows over moving objects: keep each such face's still objects cached (64 MB more) and draw only the moving
-# ones over a copy of them each frame, instead of drawing the whole face again. The same picture either way.
-setting bool cache_still_casters false
 setting int max_tile_resolution 1024 128 2048
 # Light shadows sharp where an object meets what it stands on, softer further away, as from a light
 # with this radius (metres).
