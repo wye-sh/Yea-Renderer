@@ -8,6 +8,8 @@
 
 #include <yea/device.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
 #include <chrono>
 
 #include <Common_3/Graphics/Interfaces/IGraphics.h>
@@ -30,6 +32,7 @@ const uint32_t kMaxSide = 64;            // cells per side at the largest atlas 
 const uint32_t kGroups = 64;             // shadowed lights at most, each with six view slots
 const uint32_t kMaxViews = kSunViews + kGroups * 6;
 const uint32_t kMaxEntries = 1u << 20;   // caster entries per frame
+const uint32_t kListMax = 64;            // a face's caster list (Group::list)
 
 struct Group
 {
@@ -46,6 +49,19 @@ struct Group
     float                 need[6];  // texels each face wants (faceWant), refreshed a few lights a frame
     uint32_t              needOk;   // need[] filled
     uint8_t               cx[6], cy[6];
+    uint8_t               asked[6];      // the size each face was asked for (k may be smaller: the atlas had no room)
+    uint32_t              resizeWait;    // frames a resize has been wanted (sizes change only once it persists)
+    uint64_t              faceDrawn[6];  // the frame after each face was last drawn (a whole redraw, or a moving-caster refresh)
+    // Each face's casters (by instance row) that can be in it: those in its frustum when it was last drawn whole, and every
+    // caster that has moved into it since, so a refresh walks only these (kListMax at most; listCount above it: all).
+    uint32_t              list[6][kListMax];
+    uint32_t              listCount[6];
+    float                 reach; // the farthest its faces reach from the light (their far corners)
+    // Each face's dirty rectangle (6.6.5): ndc x0, y0, x1, y1 of where casters that moved since it was drawn were then and
+    // are now, while dirtyOn; and a world sphere holding all of them (radius 1e30: the whole face, anywhere).
+    uint8_t               dirtyOn[6];
+    float                 dirty[6][4];
+    float                 dirtySphere[6][4];
 };
 
 Renderer*      gRenderer;
@@ -91,6 +107,38 @@ uint64_t              gSunSig[kSunViews];
 uint32_t gNeedCursor; // the next light whose faces' needs are refreshed
 uint32_t gPending[kGroups];
 uint32_t gPendingCount;
+// Faces of lights not redrawn whole this frame whose view holds a caster that moved since the face was drawn: drawn again
+// at the view they have, so a spinning object's own shadow follows its pose every frame instead of the few frames a whole
+// redraw takes to come round (6.6.5). Group * 6 + face; every such face that can show, each frame (none held back).
+const uint32_t kMaxRefresh = kGroups * 6, kResizeFrames = 30;
+uint32_t gRefresh[kMaxRefresh];
+float    gRefreshRect[kMaxRefresh][4]; // the part of each that is drawn again: its dirty rectangle (ndc)
+uint32_t gRefreshCount;
+// Every caster's sphere last frame, by instance row (gPrevFrame: that frame; 0 none), for the dirty rectangles: where a
+// moving caster was. Grown, never shrunk; gMovedNow lists the casters that moved since.
+struct PrevCaster
+{
+    float    sphere[4];
+    uint64_t frame;
+    uint32_t caster; // its index in that frame's casters
+};
+PrevCaster* gPrev;
+uint32_t*   gMovedNow;
+uint32_t    gPrevCap, gPrevCount, gMovedCap;
+uint64_t    gPrevFrame;
+// drawCasters culls to these instead of the view's own planes while gSub (a refresh's dirty rectangle).
+bool      gSub;
+mx::Plane gSubPlanes[6];
+// drawCasters walks only these casters (indices in the frame's, ascending) while gOnly: a refresh's face list.
+bool     gOnly;
+uint32_t gOnlyIdx[kListMax], gOnlyCount;
+// The counters logged with the faces (logAtlas): since its last line.
+struct ShadowStats
+{
+    uint32_t frames, resized, placed, short_, redrawn, refreshed, listed, walked;
+    uint32_t lagSum, lagCount, lagMax; // frames a face holding a moving caster went without a draw, at its draw
+    double   area;                     // the share of their squares those refreshes drew again, summed
+} gStats;
 uint32_t gStreamUsed;
 
 // --- Glass in the shadow maps (frame v26 tintDepth, tintColor, shadowTints) --------------------------------------------
@@ -244,6 +292,8 @@ bool groupAlloc(Group& g, uint32_t faces, const uint32_t* k)
         g.cx[f] = (uint8_t)x;
         g.cy[f] = (uint8_t)y;
         g.k[f] = (uint8_t)c;
+        g.asked[f] = (uint8_t)k[f];
+        gStats.short_ += c < k[f] ? 1 : 0;
     }
     g.nfaces = faces;
     return true;
@@ -481,12 +531,12 @@ void logAtlas()
         }
     glass[RENDER_MAX_TINT_LAYERS + 1] = gTintRefused;
     double now = secondsNow();
-    if ((!memcmp(sizes, gLogSizes, sizeof sizes) && !memcmp(glass, gLogGlass, sizeof glass)) || now < gLogTime + 20.0)
+    gStats.frames++;
+    if (now < gLogTime + 20.0 || (!used && !views))
         return;
     memcpy(gLogSizes, sizes, sizeof sizes);
     memcpy(gLogGlass, glass, sizeof glass);
-    gLogTime = now;
-    char line[400];
+    char line[640];
     int  n = snprintf(line, sizeof line, "renderer_shadows: light faces at 128/256/512/1024/2048: %u/%u/%u/%u/%u; local atlas %u%% full (%u), %u%% wanted",
                       sizes[0], sizes[1], sizes[2], sizes[3], sizes[4], gSide ? used * 100 / (gSide * gSide) : 0, gSide * kCell,
                       gSide ? gWanted * 100 / (gSide * gSide) : 0);
@@ -497,8 +547,19 @@ void logAtlas()
             n += snprintf(line + n, sizeof line - n, "%s%u", i > 1 ? "/" : " ", glass[i]);
         n += snprintf(line + n, sizeof line - n, ", tint maps %u%% full (%u)", cells * 100 / (kTintCells * kTintCells), gTintSize);
         if (gTintRefused)
-            snprintf(line + n, sizeof line - n, ", %u views without (no room)", gTintRefused);
+            n += snprintf(line + n, sizeof line - n, ", %u views without (no room)", gTintRefused);
     }
+    // Per second since the last line: faces resized and newly placed, faces given a smaller square than asked, lights
+    // redrawn whole, faces refreshed for moving casters, and how many frames old the map of a face over a moving caster was, each frame (average/max; 1 is drawn every frame); the
+    // casters each refresh walked from its face's list, and refreshes that walked every caster (a list too long).
+    const double secs = gLogTime > 0 ? now - gLogTime : 20.0;
+    const ShadowStats& t = gStats;
+    snprintf(line + n, sizeof line - n, "; per s: %.1f resized, %.1f placed, %.1f short, %.0f lights redrawn, %.0f moving-caster faces (%.1f casters walked each, %.1f walked all), their age %.1f/%u frames, %.0f%% of their area drawn",
+             t.resized / secs, t.placed / secs, t.short_ / secs, t.redrawn / secs, t.refreshed / secs,
+             t.refreshed > t.walked ? (double)t.listed / (t.refreshed - t.walked) : 0.0, t.walked / secs, t.lagCount ? (double)t.lagSum / t.lagCount : 0.0, t.lagMax,
+             t.refreshed ? t.area * 100.0 / t.refreshed : 0.0);
+    gStats = ShadowStats{};
+    gLogTime = now;
     yea::log(line);
 }
 
@@ -671,6 +732,7 @@ void buildLocalViews(Group& g, const RenderLight& l)
     v3    p = V(l.pos[0], l.pos[1], l.pos[2]);
     float nearZ = clampf(l.range * 0.005f, 0.01f, 0.2f);
     g.faces = l.type == 1 ? 6 : 1;
+    g.reach = 0;
     for (uint32_t f = 0; f < g.faces; ++f)
     {
         RenderGpuShadowView& v = g.views[f];
@@ -697,6 +759,7 @@ void buildLocalViews(Group& g, const RenderLight& l)
         v.rect[0] = (float)(g.cx[f] * kCell) / atlas;
         v.rect[1] = (float)(g.cy[f] * kCell) / atlas;
         v.rect[2] = v.rect[3] = tileRes / atlas;
+        g.reach = maxf(g.reach, l.range * sqrtf(1 + 2 * tanHalf * tanHalf));
         v.info[0] = 2 * tanHalf / tileRes;
         v.info[1] = p.x; // where it was drawn from: the shader picks a point light's face by it
         v.info[2] = p.y;
@@ -724,92 +787,86 @@ uint32_t shadowVersion(const RenderCaster& c, bool sun, const RenderGpuShadowVie
 // Draws the casters inside a view's frustum, one instanced draw per run of the same mesh version. The casters come
 // sorted by the version the screen draws; each such run is drawn once per version it takes here, simplest last.
 // masked: only the alpha-tested casters (gMaskedPipe bound, with the attributes), else only the others (gPipe).
+// While gOnly, only the casters gOnlyIdx lists (a refresh's face list, ascending, so the runs stay whole).
+// The stream is bound once, each draw reading its entries from its first instance on (an instance-rate attribute: both
+// APIs add the first instance to it, unlike SV_InstanceID).
 void drawCasters(Cmd* cmd, const RenderFrame* F, uint32_t view, const RenderGpuShadowView& v, uint32_t* stream, Buffer* streamBuf,
                  bool masked)
 {
-    mx::Plane planes[6];
+    // A refresh culls to its rectangle's planes and the face's own: a large sphere near the light can pass the first alone
+    // while wholly outside the face (side planes meet at the light), and would draw nothing.
+    mx::Plane planes[12];
     clipPlanes(v.row, planes);
-    const bool sun = view < kSunViews;
-    auto draw = [&](uint32_t mesh, uint32_t first, uint32_t count) {
-        if (!count)
-            return;
-        const renderer::Mesh& m = renderer::Meshes[mesh];
-        if (masked)
-        {
-            Buffer*  bufs[3] = { F->positions, F->attributes, streamBuf };
-            uint32_t strides[3] = { RENDER_POSITION_STRIDE, RENDER_ATTRIBUTE_STRIDE, 4 };
-            uint64_t offsets[3] = { 0, 0, (uint64_t)first * 4 };
-            cmdBindVertexBuffer(cmd, 3, bufs, strides, offsets);
-        }
-        else
-        {
-            Buffer*  bufs[2] = { F->positions, streamBuf };
-            uint32_t strides[2] = { RENDER_POSITION_STRIDE, 4 };
-            uint64_t offsets[2] = { 0, (uint64_t)first * 4 };
-            cmdBindVertexBuffer(cmd, 2, bufs, strides, offsets);
-        }
-        cmdDrawIndexedInstanced(cmd, m.indexCount, m.firstIndex, count, m.firstVertex, 0);
-    };
+    const uint32_t planeCount = gSub ? 12 : 6;
+    if (gSub)
+        memcpy(planes + 6, gSubPlanes, sizeof gSubPlanes);
+    const bool     sun = view < kSunViews;
+    const uint32_t count = gOnly ? gOnlyCount : F->casterCount;
+    auto           at = [&](uint32_t k) -> const RenderCaster& { return F->casters[gOnly ? gOnlyIdx[k] : k]; };
+    if (masked)
+    {
+        Buffer*  bufs[3] = { F->positions, F->attributes, streamBuf };
+        uint32_t strides[3] = { RENDER_POSITION_STRIDE, RENDER_ATTRIBUTE_STRIDE, 4 };
+        uint64_t offsets[3] = { 0, 0, 0 };
+        cmdBindVertexBuffer(cmd, 3, bufs, strides, offsets);
+    }
+    else
+    {
+        Buffer*  bufs[2] = { F->positions, streamBuf };
+        uint32_t strides[2] = { RENDER_POSITION_STRIDE, 4 };
+        uint64_t offsets[2] = { 0, 0 };
+        cmdBindVertexBuffer(cmd, 2, bufs, strides, offsets);
+    }
     // Without the masked pipeline (its shaders refused), alpha-tested casters draw whole with the others. Skinned casters
     // (dynamic) draw after the runs, each on its own.
     auto mine = [&](const RenderCaster& c) { return gMaskedNow ? (c.masked != 0) == masked : !masked; };
-    auto ours = [&](const RenderCaster& c) { return !c.dynamic && mine(c); };
-    for (uint32_t i = 0; i < F->casterCount && gStreamUsed < kMaxEntries;)
+    auto inside = [&](const RenderCaster& c) { return sphereInside(planes, planeCount, V(c.sphere[0], c.sphere[1], c.sphere[2]), c.sphere[3]); };
+    // Each caster of a run culled once: the version it takes here, or none (kNone: not this pass's, or outside).
+    const uint32_t kNone = 0xFFFFFFFFu;
+    uint32_t       version[256];
+    for (uint32_t i = 0; i < count && gStreamUsed < kMaxEntries;)
     {
-        // The run of casters the screen draws with one version (the core sorts them by it).
-        uint32_t end = i + 1;
-        while (end < F->casterCount && F->casters[end].mesh == F->casters[i].mesh)
+        // The run of casters the screen draws with one version (the core sorts them by it), at most 256 at a time.
+        const uint32_t mesh = at(i).mesh;
+        uint32_t       end = i + 1;
+        while (end < count && end - i < 256 && at(end).mesh == mesh)
             ++end;
+        for (uint32_t k = i; k < end; ++k)
+        {
+            const RenderCaster& c = at(k);
+            version[k - i] = !c.dynamic && mine(c) && inside(c) ? shadowVersion(c, sun, v) : kNone;
+        }
         // Each version this run takes, finest first: a pass finds the finest not drawn yet, then draws the casters taking it.
         // Versions follow their finer ones in the Mesh table, so "not drawn yet" is a row past the last drawn.
-        uint32_t floor = F->casters[i].mesh;
+        uint32_t floor = mesh;
         for (;;)
         {
-            uint32_t pick = 0xFFFFFFFFu;
+            uint32_t pick = kNone;
             for (uint32_t k = i; k < end; ++k)
-            {
-                const RenderCaster& c = F->casters[k];
-                uint32_t m = shadowVersion(c, sun, v);
-                if (ours(c) && m >= floor && m < pick && sphereInside(planes, 6, V(c.sphere[0], c.sphere[1], c.sphere[2]), c.sphere[3]))
-                    pick = m;
-            }
-            if (pick == 0xFFFFFFFFu)
+                if (version[k - i] >= floor && version[k - i] < pick)
+                    pick = version[k - i];
+            if (pick == kNone)
                 break;
-            uint32_t first = gStreamUsed;
+            const uint32_t first = gStreamUsed;
             for (uint32_t k = i; k < end && gStreamUsed < kMaxEntries; ++k)
-            {
-                const RenderCaster& c = F->casters[k];
-                if (ours(c) && shadowVersion(c, sun, v) == pick && sphereInside(planes, 6, V(c.sphere[0], c.sphere[1], c.sphere[2]), c.sphere[3]))
-                    stream[gStreamUsed++] = c.instance | (view << RENDER_VIEW_SHIFT);
-            }
-            draw(pick, first, gStreamUsed - first);
+                if (version[k - i] == pick)
+                    stream[gStreamUsed++] = at(k).instance | (view << RENDER_VIEW_SHIFT);
+            const renderer::Mesh& m = renderer::Meshes[pick];
+            if (gStreamUsed > first)
+                cmdDrawIndexedInstanced(cmd, m.indexCount, m.firstIndex, gStreamUsed - first, m.firstVertex, first);
             floor = pick + 1;
         }
         i = end;
     }
     // Skinned casters: only the version the core posed exists, at its own vertex offset.
-    for (uint32_t k = 0; k < F->casterCount && gStreamUsed < kMaxEntries; ++k)
+    for (uint32_t k = 0; k < count && gStreamUsed < kMaxEntries; ++k)
     {
-        const RenderCaster& c = F->casters[k];
-        if (!c.dynamic || !mine(c) || !sphereInside(planes, 6, V(c.sphere[0], c.sphere[1], c.sphere[2]), c.sphere[3]))
+        const RenderCaster& c = at(k);
+        if (!c.dynamic || !mine(c) || !inside(c))
             continue;
         const uint32_t first = gStreamUsed;
         stream[gStreamUsed++] = c.instance | (view << RENDER_VIEW_SHIFT);
-        if (masked)
-        {
-            Buffer*  bufs[3] = { F->positions, F->attributes, streamBuf };
-            uint32_t strides[3] = { RENDER_POSITION_STRIDE, RENDER_ATTRIBUTE_STRIDE, 4 };
-            uint64_t offsets[3] = { 0, 0, (uint64_t)first * 4 };
-            cmdBindVertexBuffer(cmd, 3, bufs, strides, offsets);
-        }
-        else
-        {
-            Buffer*  bufs[2] = { F->positions, streamBuf };
-            uint32_t strides[2] = { RENDER_POSITION_STRIDE, 4 };
-            uint64_t offsets[2] = { 0, (uint64_t)first * 4 };
-            cmdBindVertexBuffer(cmd, 2, bufs, strides, offsets);
-        }
-        cmdDrawIndexedInstanced(cmd, c.indexCount, c.firstIndex, 1, (uint32_t)c.vertexOffset, 0);
+        cmdDrawIndexedInstanced(cmd, c.indexCount, c.firstIndex, 1, (uint32_t)c.vertexOffset, first);
     }
 }
 // --- Glass tint (frame v26) ------------------------------------------------------------------------------------------
@@ -1657,6 +1714,11 @@ void unload()
         removePipeline(gRenderer, gMaskedPipe);
     if (gMaskedShader)
         removeShader(gRenderer, gMaskedShader);
+    free(gPrev);
+    free(gMovedNow);
+    gPrev = nullptr, gMovedNow = nullptr;
+    gPrevCap = gMovedCap = 0;
+    gPrevFrame = 0;
     freeTarget(gSunAtlas);
     freeTarget(gLocalAtlas);
     freeTintPasses();
@@ -1700,12 +1762,56 @@ bool coreMatches()
     return false;
 }
 
+// The part of view v's square a sphere covers, as an ndc rectangle (x0, y0, x1, y1) added to r (or set when !on): its exact
+// bounds (Mara and McGuire 2013, "2D Polyhedral Bounds of a Clipped, Perspective-Projected 3D Sphere"), each axis from the
+// sphere's tangents in view space; all of the square when it reaches behind the light.
+void rectAdd(const RenderGpuShadowView& v, v3 c, float rad, float r[4], bool on)
+{
+    float       x0 = -1, y0 = -1, x1 = 1, y1 = 1;
+    const float z = v.row[3][0] * c.x + v.row[3][1] * c.y + v.row[3][2] * c.z + v.row[3][3];
+    if (z > rad * 1.001f + 1e-4f)
+    {
+        auto axis = [&](const float* row, float* lo, float* hi) {
+            const float s = sqrtf(row[0] * row[0] + row[1] * row[1] + row[2] * row[2]); // 1 / tan(half angle)
+            const float a = (row[0] * c.x + row[1] * c.y + row[2] * c.z + row[3]) / s;
+            const float t = sqrtf(a * a + z * z - rad * rad);
+            *lo = s * (a * t - z * rad) / (z * t + a * rad);
+            *hi = s * (a * t + z * rad) / (z * t - a * rad);
+        };
+        axis(v.row[0], &x0, &x1);
+        axis(v.row[1], &y0, &y1);
+    }
+    x0 = maxf(x0, -1.0f), y0 = maxf(y0, -1.0f), x1 = minf(x1, 1.0f), y1 = minf(y1, 1.0f);
+    if (!on)
+        r[0] = x0, r[1] = y0, r[2] = x1, r[3] = y1;
+    else
+        r[0] = minf(r[0], x0), r[1] = minf(r[1], y0), r[2] = maxf(r[2], x1), r[3] = maxf(r[3], y1);
+}
+
+// Grows sphere s (or sets it when !on) to hold sphere (c, r).
+void sphereAdd(float s[4], v3 c, float r, bool on)
+{
+    v3    a = V(s[0], s[1], s[2]);
+    float d = length(c - a);
+    if (on && d + r <= s[3])
+        return;
+    if (!on || d + s[3] <= r)
+    {
+        s[0] = c.x, s[1] = c.y, s[2] = c.z, s[3] = r;
+        return;
+    }
+    float nr = (d + r + s[3]) * 0.5f;
+    v3    nc = a + (c - a) * ((nr - s[3]) / d);
+    s[0] = nc.x, s[1] = nc.y, s[2] = nc.z, s[3] = nr;
+}
+
 bool shadows_prepare(uint64_t address)
 {
     if (!coreMatches())
         return false;
     RenderFrame* F = (RenderFrame*)(uintptr_t)address;
     gLightShadowsOn = false;
+    gRefreshCount = 0;
     if (!gReady || !F || F->version != RENDER_FRAME_VERSION)
         return false;
     // The lights' real sizes for renderer_rt's traced penumbrae: always, whatever the maps' own filtering (pcss,
@@ -2101,6 +2207,18 @@ bool shadows_prepare(uint64_t address)
             target[pj][pf] = tk / 2;
         }
     }
+    // A held face resizes only once the new size has been wanted kResizeFrames frames running (as has a face that got a
+    // smaller square than it asked for, to try again): the squeeze above can trade sizes between faces from one frame to
+    // the next as needs refresh, and each resize moves the light's squares and spends a redraw.
+    for (uint32_t j = 0; j < pickedCount && !gFrozen; ++j)
+    {
+        Group&   g = gGroups[groupOf[j]];
+        uint32_t faces = F->lights[picked[j]].type == 1 ? 6 : 1;
+        bool     settled = g.nfaces == faces;
+        for (uint32_t f = 0; f < faces && settled; ++f)
+            settled = g.asked[f] == target[j][f] && g.k[f] == g.asked[f];
+        g.resizeWait = g.valid && !settled ? g.resizeWait + 1 : 0;
+    }
     uint32_t moved = 0;
     for (uint32_t pass = 0; pass < 2 && !gFrozen; ++pass)
         for (uint32_t j = 0; j < pickedCount && moved < budget; ++j)
@@ -2108,22 +2226,20 @@ bool shadows_prepare(uint64_t address)
             // Lights without a shadow first, then those changing size.
             Group&   g = gGroups[groupOf[j]];
             uint32_t faces = F->lights[picked[j]].type == 1 ? 6 : 1;
-            bool     same = g.nfaces == faces;
-            for (uint32_t f = 0; f < faces && same; ++f)
-                same = g.k[f] == target[j][f];
-            if ((pass == 0) != (g.valid == 0) || same)
+            if ((pass == 0) != (g.valid == 0) || (pass == 0 ? g.nfaces == faces : g.resizeWait < kResizeFrames))
                 continue;
             if (pass == 1)
                 groupFree(g); // its squares can be part of the new ones
             g.valid = 0;
+            g.resizeWait = 0;
             if (groupAlloc(g, faces, target[j]))
+            {
                 moved++;
+                (pass == 0 ? gStats.placed : gStats.resized) += faces;
+            }
         }
     logAtlas();
 
-    uint64_t latestMove = 0;
-    for (uint32_t i = 0; i < F->casterCount; ++i)
-        latestMove = F->casters[i].moved > latestMove ? F->casters[i].moved : latestMove;
     uint32_t dirty[kGroups], dirtyCount = 0;
     for (uint32_t j = 0; j < pickedCount; ++j)
     {
@@ -2132,17 +2248,8 @@ bool shadows_prepare(uint64_t address)
         g.seen = F->frameNumber;
         float key[10];
         lightKey(l, key);
+        // Moved casters don't make a light stale (6.6.5): the faces they are in are refreshed below, each on its own.
         bool stale = !g.valid || memcmp(key, g.key, sizeof key) != 0 || F->casterRemoved >= g.rendered;
-        if (!stale && latestMove >= g.rendered)
-        {
-            v3 p = V(l.pos[0], l.pos[1], l.pos[2]);
-            for (uint32_t i = 0; i < F->casterCount && !stale; ++i)
-            {
-                const RenderCaster& c = F->casters[i];
-                if (c.moved >= g.rendered && length(V(c.sphere[0], c.sphere[1], c.sphere[2]) - p) < l.range + c.sphere[3])
-                    stale = true;
-            }
-        }
         if (stale && !gFrozen && g.nfaces)
             dirty[dirtyCount++] = j;
     }
@@ -2166,7 +2273,191 @@ bool shadows_prepare(uint64_t address)
         lightKey(l, g.key);
         g.valid = 1;
         g.rendered = F->frameNumber + 1;
+        for (uint32_t f = 0; f < 6; ++f)
+            g.faceDrawn[f] = g.rendered;
+        for (uint32_t f = 0; f < g.faces; ++f)
+        {
+            // Its list: the casters in the face's frustum as it is drawn now.
+            mx::Plane planes[6];
+            clipPlanes(g.views[f].row, planes);
+            uint32_t n = 0;
+            for (uint32_t i = 0; i < F->casterCount && n <= kListMax; ++i)
+            {
+                const RenderCaster& c = F->casters[i];
+                if (!sphereInside(planes, 6, V(c.sphere[0], c.sphere[1], c.sphere[2]), c.sphere[3]))
+                    continue;
+                if (n < kListMax)
+                    g.list[f][n] = c.instance;
+                n++;
+            }
+            g.listCount[f] = n;
+        }
         gPending[gPendingCount++] = (uint32_t)groupOf[j];
+    }
+    gStats.redrawn += gPendingCount;
+
+    // Dirty rectangles (6.6.5): each caster that moved since last frame adds where it was and where it is to the faces either
+    // reaches, so a refresh clears and draws again only that part of a face, exactly as a whole redraw would leave it (as
+    // virtual shadow maps invalidate the pages under an object's last and present bounds). A whole redraw empties a face's.
+    // Rows that may have changed hands (instances added or removed, or a frame without this) make every face dirty whole.
+    bool whole[kGroups] = {};
+    for (uint32_t k = 0; k < gPendingCount; ++k)
+        whole[gPending[k]] = true;
+    {
+        const bool all = !gPrevFrame || gPrevFrame + 1 != F->frameNumber || F->instanceCount != gPrevCount ||
+                         F->casterRemoved > gPrevFrame;
+        if (F->instanceCount > gPrevCap || F->casterCount > gMovedCap)
+        {
+            gPrevCap = F->instanceCount > gPrevCap ? F->instanceCount + F->instanceCount / 2 + 64 : gPrevCap;
+            gMovedCap = F->casterCount > gMovedCap ? F->casterCount + F->casterCount / 2 + 64 : gMovedCap;
+            PrevCaster* prev = (PrevCaster*)realloc(gPrev, (size_t)gPrevCap * sizeof *gPrev);
+            uint32_t*   moved = (uint32_t*)realloc(gMovedNow, (size_t)gMovedCap * sizeof *gMovedNow);
+            if (prev)
+                gPrev = prev;
+            if (moved)
+                gMovedNow = moved;
+            if (!prev || !moved)
+                gPrevCap = gMovedCap = 0;
+        }
+        uint32_t movedCount = 0;
+        for (uint32_t i = 0; i < F->casterCount && gMovedCap; ++i)
+            if (F->casters[i].moved > gPrevFrame)
+                gMovedNow[movedCount++] = i;
+        for (uint32_t gi = 0; gi < kGroups; ++gi)
+        {
+            Group& g = gGroups[gi];
+            if (whole[gi] || !g.valid)
+            {
+                memset(g.dirtyOn, 0, sizeof g.dirtyOn);
+                continue;
+            }
+            if (all || !gMovedCap)
+            {
+                // Rows may have changed hands: every face dirty whole, its list unknown (walk every caster) till redrawn.
+                for (uint32_t f = 0; f < g.faces; ++f)
+                {
+                    g.dirty[f][0] = g.dirty[f][1] = -1, g.dirty[f][2] = g.dirty[f][3] = 1;
+                    g.dirtySphere[f][3] = 1e30f;
+                    g.dirtyOn[f] = 1;
+                    g.listCount[f] = kListMax + 1;
+                }
+                continue;
+            }
+            // Only the moved casters within the light's reach (its faces' far corners) are tested against its faces.
+            const v3    light = V(g.key[0], g.key[1], g.key[2]);
+            const float range = g.reach;
+            for (uint32_t m = 0; m < movedCount; ++m)
+            {
+                const RenderCaster& c = F->casters[gMovedNow[m]];
+                const PrevCaster&   p = gPrev[c.instance];
+                const v3            at = V(c.sphere[0], c.sphere[1], c.sphere[2]);
+                const v3            was = V(p.sphere[0], p.sphere[1], p.sphere[2]);
+                const bool          nowNear = length(at - light) < range + c.sphere[3];
+                const bool          wasNear = p.frame == gPrevFrame && length(was - light) < range + p.sphere[3];
+                if (!nowNear && !wasNear)
+                    continue;
+                for (uint32_t f = 0; f < g.faces; ++f)
+                {
+                    mx::Plane planes[6];
+                    clipPlanes(g.views[f].row, planes);
+                    if (nowNear && sphereInside(planes, 6, at, c.sphere[3]))
+                    {
+                        rectAdd(g.views[f], at, c.sphere[3], g.dirty[f], g.dirtyOn[f]);
+                        sphereAdd(g.dirtySphere[f], at, c.sphere[3], g.dirtyOn[f]);
+                        g.dirtyOn[f] = 1;
+                        // Into the face's list, once.
+                        uint32_t& n = g.listCount[f];
+                        bool      listed = n > kListMax;
+                        for (uint32_t i = 0; i < n && !listed; ++i)
+                            listed = g.list[f][i] == c.instance;
+                        if (!listed)
+                        {
+                            if (n < kListMax)
+                                g.list[f][n] = c.instance;
+                            n++;
+                        }
+                    }
+                    if (wasNear && sphereInside(planes, 6, was, p.sphere[3]))
+                    {
+                        rectAdd(g.views[f], was, p.sphere[3], g.dirty[f], g.dirtyOn[f]);
+                        sphereAdd(g.dirtySphere[f], was, p.sphere[3], g.dirtyOn[f]);
+                        g.dirtyOn[f] = 1;
+                    }
+                }
+            }
+        }
+        for (uint32_t i = 0; i < F->casterCount && gPrevCap; ++i)
+        {
+            const RenderCaster& c = F->casters[i];
+            if (c.instance < gPrevCap)
+            {
+                memcpy(gPrev[c.instance].sphere, c.sphere, sizeof c.sphere);
+                gPrev[c.instance].frame = F->frameNumber;
+                gPrev[c.instance].caster = i;
+            }
+        }
+        gPrevFrame = F->frameNumber;
+        gPrevCount = F->instanceCount;
+    }
+
+    // Faces with a dirty rectangle, of lights not redrawn whole this frame: that part of them again, at the view they have
+    // (the light's drawn position, so the cube faces still agree).
+    gRefreshCount = 0;
+    if (!gFrozen)
+    {
+        // Only where it can show: a dirty face counts while its sphere, or the shadow it throws along the light out to the
+        // light's range (a capsule from it to its far end, widening as the light's rays spread), reaches the camera's view.
+        // One that can't stays as drawn, still dirty, and is refreshed once it can.
+        mx::Plane view[6];
+        {
+            float vp[4][4], proj[4][4] = { { F->p00, 0, 0, 0 }, { 0, F->p11, 0, 0 }, { 0, 0, 0, F->nearZ }, { 0, 0, 1, 0 } };
+            float cam[4][4] = { { F->view[0][0], F->view[0][1], F->view[0][2], F->view[0][3] },
+                                { F->view[1][0], F->view[1][1], F->view[1][2], F->view[1][3] },
+                                { F->view[2][0], F->view[2][1], F->view[2][2], F->view[2][3] },
+                                { 0, 0, 0, 1 } };
+            mul(proj, cam, vp);
+            clipPlanes(vp, view);
+            view[4] = view[5]; // reversed-Z: the sixth is the near plane, the fifth degenerate
+        }
+        auto shows = [&](const float* s, v3 light, float range) {
+            if (s[3] >= 1e29f)
+                return true;
+            v3    a = V(s[0], s[1], s[2]);
+            float r = s[3], dist = length(a - light);
+            float reach = maxf(range - dist, 0.0f);
+            v3    b = dist > 1e-4f ? a + (a - light) * (reach / dist) : a;
+            float rb = r * (dist + reach) / maxf(dist - r, 0.05f); // the widest the rays past it spread
+            for (uint32_t i = 0; i < 6; ++i)
+                if (dot(view[i].n, a) + view[i].d < -r && dot(view[i].n, b) + view[i].d < -rb)
+                    return false;
+            return true;
+        };
+        uint32_t cand[kGroups * 6], candCount = 0;
+        for (uint32_t j = 0; j < pickedCount; ++j)
+        {
+            const uint32_t gi = (uint32_t)groupOf[j];
+            const Group&   g = gGroups[gi];
+            if (whole[gi] || !g.valid || !g.nfaces)
+                continue;
+            const float range = F->lights[picked[j]].range;
+            for (uint32_t f = 0; f < g.faces; ++f)
+                if (g.dirtyOn[f] && g.dirty[f][0] < g.dirty[f][2] && g.dirty[f][1] < g.dirty[f][3] &&
+                    shows(g.dirtySphere[f], V(g.views[f].info[1], g.views[f].info[2], g.views[f].info[3]), range))
+                    cand[candCount++] = gi * 6 + f;
+        }
+        for (uint32_t c = 0; c < candCount; ++c)
+        {
+            Group&         g = gGroups[cand[c] / 6];
+            const uint32_t f = cand[c] % 6;
+            const uint32_t lag = (uint32_t)(F->frameNumber + 1 - g.faceDrawn[f]);
+            gStats.lagSum += lag, gStats.lagCount++, gStats.lagMax = lag > gStats.lagMax ? lag : gStats.lagMax;
+            memcpy(gRefreshRect[gRefreshCount], g.dirty[f], sizeof g.dirty[f]);
+            gStats.area += (g.dirty[f][2] - g.dirty[f][0]) * (g.dirty[f][3] - g.dirty[f][1]) * 0.25;
+            gRefresh[gRefreshCount++] = cand[c];
+            g.dirtyOn[f] = 0;
+            g.faceDrawn[f] = F->frameNumber + 1;
+        }
+        gStats.refreshed += gRefreshCount;
     }
     for (uint32_t j = 0; j < pickedCount; ++j)
         if (gGroups[groupOf[j]].valid)
@@ -2295,7 +2586,67 @@ void shadows_render(uint64_t address)
         cmdEndDebugMarker(cmd);
     }
 
-    if (gPendingCount || gLocalFresh)
+    // One face's square, cleared and its casters drawn.
+    // rect: only that part of it (a refresh's dirty rectangle, ndc), widened by two texels, its casters culled to it, and
+    // only those in its list walked (they are every caster that can be in the face).
+    auto drawFace = [&](uint32_t idx, const float* rect) {
+        const uint32_t f = idx % 6;
+        const Group&   g = gGroups[idx / 6];
+        float          tile = (float)(g.k[f] * kCell);
+        float          x = (float)(g.cx[f] * kCell), y = (float)(g.cy[f] * kCell);
+        float          x0 = x, y0 = y, x1 = x + tile, y1 = y + tile;
+        if (rect)
+        {
+            // ndc y up is the square's top row (Lighting.h.fsl's viewToAtlas).
+            x0 = maxf(x, floorf(x + (rect[0] * 0.5f + 0.5f) * tile) - 2), x1 = minf(x + tile, ceilf(x + (rect[2] * 0.5f + 0.5f) * tile) + 2);
+            y0 = maxf(y, floorf(y + (0.5f - rect[3] * 0.5f) * tile) - 2), y1 = minf(y + tile, ceilf(y + (0.5f - rect[1] * 0.5f) * tile) + 2);
+            if (x1 <= x0 || y1 <= y0)
+                return;
+            const float nx0 = (x0 - x) / tile * 2 - 1, nx1 = (x1 - x) / tile * 2 - 1;
+            const float ny0 = 1 - (y1 - y) / tile * 2, ny1 = 1 - (y0 - y) / tile * 2;
+            const float cx = (nx0 + nx1) * 0.5f, hx = (nx1 - nx0) * 0.5f, cy = (ny0 + ny1) * 0.5f, hy = (ny1 - ny0) * 0.5f;
+            float       sub[4][4];
+            memcpy(sub, g.views[f].row, sizeof sub);
+            for (uint32_t i = 0; i < 4; ++i)
+                sub[0][i] = (sub[0][i] - cx * sub[3][i]) / hx, sub[1][i] = (sub[1][i] - cy * sub[3][i]) / hy;
+            clipPlanes(sub, gSubPlanes);
+            gSub = true;
+            if (g.listCount[f] <= kListMax)
+            {
+                // The list's casters by their index this frame, ascending (as the casters come), those gone left out.
+                gOnly = true;
+                gOnlyCount = 0;
+                for (uint32_t i = 0; i < g.listCount[f]; ++i)
+                {
+                    const uint32_t inst = g.list[f][i];
+                    if (inst >= gPrevCap || gPrev[inst].frame != F->frameNumber)
+                        continue;
+                    uint32_t c = gPrev[inst].caster, k = gOnlyCount++;
+                    for (; k > 0 && gOnlyIdx[k - 1] > c; --k)
+                        gOnlyIdx[k] = gOnlyIdx[k - 1];
+                    gOnlyIdx[k] = c;
+                }
+                gStats.listed += gOnlyCount;
+            }
+            else
+                gStats.walked++;
+        }
+        cmdSetViewport(cmd, x, y, tile, tile, 0, 1);
+        cmdSetScissor(cmd, (uint32_t)x0, (uint32_t)y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0));
+        cmdBindPipeline(cmd, gClearPipe);
+        cmdBindDescriptorSet(cmd, fi, gSet);
+        cmdDraw(cmd, 3, 0);
+        if (geometry)
+        {
+            cmdBindPipeline(cmd, gPipe);
+            cmdBindDescriptorSet(cmd, fi, gSet);
+            cmdBindIndexBuffer(cmd, F->indices, INDEX_TYPE_UINT32, 0);
+            drawView(kSunViews + idx, g.views[f]);
+        }
+        gSub = gOnly = false;
+    };
+
+    if (gPendingCount || gRefreshCount || gLocalFresh)
     {
         cmdBeginDebugMarker(cmd, 1.0f, 0.6f, 0.4f, "Renderer local shadows");
         RenderTargetBarrier b = { gLocalAtlas, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_DEPTH_WRITE };
@@ -2306,27 +2657,10 @@ void shadows_render(uint64_t address)
         bind.mDepthStencil.mStoreAction = STORE_ACTION_STORE;
         cmdBindRenderTargets(cmd, &bind);
         for (uint32_t k = 0; k < gPendingCount; ++k)
-        {
-            const Group& g = gGroups[gPending[k]];
-            for (uint32_t f = 0; f < g.faces; ++f)
-            {
-                uint32_t idx = gPending[k] * 6 + f;
-                float    tile = (float)(g.k[f] * kCell);
-                float    x = (float)(g.cx[f] * kCell), y = (float)(g.cy[f] * kCell);
-                cmdSetViewport(cmd, x, y, tile, tile, 0, 1);
-                cmdSetScissor(cmd, (uint32_t)x, (uint32_t)y, (uint32_t)tile, (uint32_t)tile);
-                cmdBindPipeline(cmd, gClearPipe);
-                cmdBindDescriptorSet(cmd, fi, gSet);
-                cmdDraw(cmd, 3, 0);
-                if (geometry)
-                {
-                    cmdBindPipeline(cmd, gPipe);
-                    cmdBindDescriptorSet(cmd, fi, gSet);
-                    cmdBindIndexBuffer(cmd, F->indices, INDEX_TYPE_UINT32, 0);
-                    drawView(kSunViews + idx, g.views[f]);
-                }
-            }
-        }
+            for (uint32_t f = 0; f < gGroups[gPending[k]].faces; ++f)
+                drawFace(gPending[k] * 6 + f, nullptr);
+        for (uint32_t k = 0; k < gRefreshCount; ++k)
+            drawFace(gRefresh[k], gRefreshRect[k]);
         cmdBindRenderTargets(cmd, nullptr);
         b = { gLocalAtlas, RESOURCE_STATE_DEPTH_WRITE, RESOURCE_STATE_SHADER_RESOURCE };
         cmdResourceBarrier(cmd, 0, nullptr, 0, nullptr, 1, &b);
