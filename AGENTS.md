@@ -533,9 +533,15 @@ for screen reflections (a quarter of it at half resolution).
   renderer_rt's 1x1 `addResource` D32 stand-in, bound while renderer_shadows was reloading, most likely crashed
   Direct3D 12 in 2.2.1.
 - A probe sees the objects inside its box too, so a shiny object reflects itself where it is near the probe.
-- Scene pipelines come in fours per pass (opaque or cut-out, one- or two-sided) and are made on first use: the prepass
-  and sky ones in `load()`, cut-out ones once a material is alpha-tested, each forward variant when first drawn. Making
-  them all in `load()` took past Yea's 2 s hang limit on the orb's software GPU (about 400 ms a forward pipeline).
+- Scene pipelines come in fours per pass (opaque or cut-out, one- or two-sided). Never all in `load()`: that took past
+  Yea's 2 s hang limit on the orb's software GPU (about 400 ms a forward pipeline). The frame that (re)makes them makes
+  the opaque prepass, lean forward and sky ones; from the next frame warming makes every other variant (cut-outs and the
+  lean shader first, then the full shader and F1's view modes; not those in a release), 2 ms a frame and one at least,
+  so no variant compiles on a frame that draws: until warmed, cut-outs wait (both passes, so depth and colour agree) and
+  the full shader gives way to the lean one. A pipeline cache in Yea's data folder (`renderer_pipelines_d3d12.bin` or
+  `_vulkan.bin`; a Direct3D 12 library from another driver starts empty) is saved when warming ends and in `unload()`.
+  It logs "scene pipelines warmed in X ms over N frames (at most Y ms a frame); cut-outs held back K frames", and any
+  pipeline still made on a drawing frame.
 
 ## Example view (`example/renderer_example`)
 

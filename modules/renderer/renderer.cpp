@@ -177,6 +177,7 @@ const double    kWarmMs = 2.0;
 bool            gWarmLeft;                       // variants still to warm
 uint32_t        gPipesMade, gWarmFrames;           // scene pipelines made since load; frames that warmed
 double          gWarmMs, gWarmWorstMs;           // their time in all, and the most in one frame
+uint32_t        gHeldFrames;                     // frames that held cut-outs back, their pipelines still warming
 PipelineCache*  gPipeCache;
 bool            gPipeCacheDirty;
 char            gPipeCachePath[1024];
@@ -396,8 +397,9 @@ void destroyScenePipelines()
 }
 
 // Makes the scene pipelines still missing among those asked for: the prepass's and the sky's always, the alpha-tested
-// ones ([2] and [3]) once a material is, and of the forward pass only the variants in `forward` (kForward*), when a frame
-// first draws with them. The forward shaders are large, so a scene compiles only what it draws with.
+// ones ([2] and [3]) with `masked`, and of the forward pass the variants in `forward` (kForward*). A frame that draws
+// asks only for opaque ones it lacks (the first frame); warming asks for the rest, a few a frame. Making them all in
+// load() took past Yea's 2 s limit on a software GPU (about 400 ms a forward pipeline).
 const uint32_t kForwardLean = 1, kForwardFull = 2, kForwardDepth = 4;
 double clockMs()
 {
@@ -409,6 +411,9 @@ double clockMs()
 // starts empty (The Forge would assert). Over 64 MB (pipelines of many shader versions gathered), it starts again.
 #if defined(_WIN32)
 const char* const kPipeCacheFile = "renderer_pipelines_d3d12.bin";
+// d3d12.h's IIDs (its own are in dxguid, which modules don't link).
+const IID kIidDevice1 = { 0x77acce80, 0x638e, 0x4e65, { 0x88, 0x95, 0xc1, 0xf2, 0x33, 0x86, 0x86, 0x3e } };
+const IID kIidPipelineLibrary = { 0xc64226a8, 0x9201, 0x46af, { 0xb4, 0xcc, 0x53, 0xfb, 0x9f, 0xf7, 0x41, 0x4f } };
 #else
 const char* const kPipeCacheFile = "renderer_pipelines_vulkan.bin";
 #endif
@@ -438,8 +443,8 @@ void pipeCacheOpen()
     {
         ID3D12Device1*         device = nullptr;
         ID3D12PipelineLibrary* library = nullptr;
-        if (FAILED(gRenderer->mDx.pDevice->QueryInterface(__uuidof(ID3D12Device1), (void**)&device)) ||
-            FAILED(device->CreatePipelineLibrary(data, (SIZE_T)size, __uuidof(ID3D12PipelineLibrary), (void**)&library)))
+        if (FAILED(gRenderer->mDx.pDevice->QueryInterface(kIidDevice1, (void**)&device)) ||
+            FAILED(device->CreatePipelineLibrary(data, (SIZE_T)size, kIidPipelineLibrary, (void**)&library)))
             size = 0;
         if (library)
             library->Release();
@@ -505,7 +510,6 @@ bool createScenePipelines(uint32_t samples, bool motion, bool masked, uint32_t f
         ++made;
         ++gPipesMade;
     };
-    masked = masked || gPipeMasked;
     const uint32_t sEnd = masked ? 4 : 2;
     auto missing = [&](Pipeline* const* p) {
         for (uint32_t s = 0; s < sEnd; ++s)
@@ -617,8 +621,8 @@ bool createScenePipelines(uint32_t samples, bool motion, bool masked, uint32_t f
     g.pDepthState = &depthTest;
     raster.mCullMode = CULL_MODE_NONE;
 
-    if (!left)
-        gPipeMasked = masked;
+    if (!left && masked)
+        gPipeMasked = true;
     // The sky: a full-screen triangle at depth 0 (reversed-Z far), only where nothing was drawn.
     g.pVertexLayout = nullptr;
     g.pShaderProgram = motion ? gSkyMotionShader : gSkyShader;
@@ -646,9 +650,10 @@ void warmScenePipelines(uint32_t samples, bool motion)
 #if !defined(YEA_GAME_RELEASE)
     forward |= kForwardDepth; // F1's view modes
 #endif
-    const bool masked = gPipeMasked;
-    gWarmLeft = createScenePipelines(samples, motion, true, forward, t0 + kWarmMs);
-    gPipeMasked = masked || !gWarmLeft;
+    // What any scene draws with first (the prepass and the lean forward shader, cut-outs included), then the rest.
+    gWarmLeft = createScenePipelines(samples, motion, true, kForwardLean, t0 + kWarmMs);
+    if (!gWarmLeft)
+        gWarmLeft = clockMs() >= t0 + kWarmMs || createScenePipelines(samples, motion, true, forward, t0 + kWarmMs);
     const double ms = clockMs() - t0;
     gWarmMs += ms;
     gWarmWorstMs = ms > gWarmWorstMs ? ms : gWarmWorstMs;
@@ -656,8 +661,8 @@ void warmScenePipelines(uint32_t samples, bool motion)
     if (gWarmLeft)
         return;
     char line[200];
-    snprintf(line, sizeof line, "renderer: scene pipelines warmed in %.0f ms over %u frames (at most %.1f ms a frame)%s", gWarmMs,
-             gWarmFrames, gWarmWorstMs, gPipeCache ? "" : "; no pipeline cache");
+    snprintf(line, sizeof line, "renderer: scene pipelines warmed in %.0f ms over %u frames (at most %.1f ms a frame)%s; cut-outs held back %u frames",
+             gWarmMs, gWarmFrames, gWarmWorstMs, gPipeCache ? "" : "; no pipeline cache", gHeldFrames);
     yea::log(line);
     pipeCacheSave();
 }
@@ -946,7 +951,7 @@ void bindGeometry(Cmd* cmd, Buffer* stream, uint32_t first)
 
 // Single-sided instances with pipes[0] (back faces culled), then double-sided ones with pipes[1], then alpha-tested ones
 // with pipes[2] and [3].
-void drawVisible(Cmd* cmd, uint32_t fi, Pipeline* const pipes[4])
+void drawVisible(Cmd* cmd, uint32_t fi, Pipeline* const pipes[4], uint32_t sides)
 {
     uint32_t meshCount = Meshes.size() < 1024 ? Meshes.size() : 1024;
     for (uint32_t s = 0; s < 4; ++s)
@@ -955,7 +960,7 @@ void drawVisible(Cmd* cmd, uint32_t fi, Pipeline* const pipes[4])
         for (uint32_t m = 0; m < meshCount; ++m)
         {
             uint32_t key = m * 4 + s;
-            if (!gMeshCount[key] || !pipes[s]) // alpha-tested ones wait for their pipelines (made before this frame draws)
+            if (!gMeshCount[key] || !pipes[s] || !((sides >> s) & 1)) // cut-outs wait for their pipelines (warmed, never made here)
                 continue;
             if (!bound)
             {
@@ -1596,28 +1601,23 @@ void draw(uint32_t pass, const YeaFrame* yf)
         }
         gTargetsFailed = false;
     }
-    // Alpha-tested pipelines once some material is (and kept while the others are).
+    // Cut-out pipelines: made with the others when settings remake them while some material is alpha-tested (a frame
+    // that rebuilds anyway); otherwise warming makes them, never the frame that draws.
     bool masked = gPipeMasked;
     for (uint32_t i = 0; i < MaterialMaps.size() && i < Materials.size() && !masked; ++i)
         masked = Materials[i].alive && MaterialMaps[i].cutoff > 0;
     if (samples == gPipeSamples && taa == gPipeMotion && gWarmLeft)
         warmScenePipelines(samples, taa);
-    const uint32_t pipesBefore = gPipesMade;
-    const double   pipesT0 = clockMs();
     if (samples != gPipeSamples || taa != gPipeMotion)
     {
         waitQueueIdle(gQueue);
         destroyScenePipelines();
-        createScenePipelines(samples, taa, masked, 0);
+        createScenePipelines(samples, taa, masked, kForwardLean); // what the first frame with a scene draws with
         gFrameFormat = TinyImageFormat_UNDEFINED;
         gWarmLeft = true; // from the next frame
         gWarmFrames = 0;
         gWarmMs = gWarmWorstMs = 0;
-    }
-    else if (masked && !gPipeMasked)
-    {
-        createScenePipelines(samples, taa, true, 0);
-        pipesMadeOnDraw(pipesBefore, pipesT0);
+        gHeldFrames = 0;
     }
     if (target->mFormat != gFrameFormat || (uint32_t)target->mSampleCount != gFrameSamples)
     {
@@ -2492,6 +2492,34 @@ void draw(uint32_t pass, const YeaFrame* yf)
     }
 
     bool geometry = gPosBuf && gIndexBuf && count > 0;
+    // The scene pipelines this frame draws with. The opaque ones are made here only on the first frame (or after settings
+    // remade them); a variant warming hasn't reached yet never compiles on a frame that draws: the full forward shader
+    // gives way to the lean one, and cut-outs wait (both for a frame or a few after load, before warming gets there).
+    RenderTarget* second = rtRun ? gSurface : vrs && gGloss && gDepthGlossPipe[0] && gDepthGlossPipe[1] ? gGloss : nullptr;
+    bool full = (gf->counts[2] & (kFlagHeatmap | kFlagCascades | kFlagAoDebug | kFlagContactDebug | kFlagSsrDebug | kFlagRtDebug)) || (shadows && F.lightSize > 0);
+    uint32_t forward = viewMode ? kForwardDepth : full ? kForwardFull : kForwardLean;
+    if (forward == kForwardFull && (!gForwardFullPipe[0] || !gForwardFullPipe[1]) && gForwardPipe[0] && gForwardPipe[1])
+        forward = kForwardLean;
+    uint32_t sides = 3; // opaque, one- and two-sided
+    Pipeline* const* prePipes = rtRun ? gDepthSurfacePipe : second ? gDepthGlossPipe : gDepthPipe;
+    Pipeline* const* forwardPipes = forward == kForwardDepth ? gForwardDepthPipe : forward == kForwardFull ? gForwardFullPipe : gForwardPipe;
+    if (geometry)
+    {
+        const uint32_t before = gPipesMade;
+        const double   t0 = clockMs();
+        createScenePipelines(samples, taa, false, forward); // first use only
+        pipesMadeOnDraw(before, t0);
+        bool held = false;
+        for (uint32_t s = 2; s < 4; ++s)
+        {
+            if (forwardPipes[s] && (viewMode || prePipes[s]))
+                sides |= 1u << s;
+            else
+                for (uint32_t m = 0; m < meshCount && !held; ++m)
+                    held = gMeshCount[m * 4 + s] > 0;
+        }
+        gHeldFrames += held ? 1 : 0;
+    }
     if (gDepthState != RESOURCE_STATE_DEPTH_WRITE)
         barrierRt(cmd, gDepth, gDepthState, RESOURCE_STATE_DEPTH_WRITE);
     BindRenderTargetsDesc bind = {};
@@ -2505,7 +2533,6 @@ void draw(uint32_t pass, const YeaFrame* yf)
     // With renderer_vrs, also each pixel's reflection roughness, so glossy surfaces keep full rate.
     // With renderer_rt, each pixel's reflection roughness and normal instead (renderer_vrs reads its roughness too), and the
     // motion vectors, final for rt_run (the forward pass writes the same again, as its own shading rate has them).
-    RenderTarget* second = rtRun ? gSurface : vrs && gGloss && gDepthGlossPipe[0] && gDepthGlossPipe[1] ? gGloss : nullptr;
     if (second)
     {
         barrierRt(cmd, second, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_RENDER_TARGET);
@@ -2523,7 +2550,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     cmdSetScissor(cmd, 0, 0, w, h);
     if (geometry)
     {
-        drawVisible(cmd, fi, rtRun ? gDepthSurfacePipe : second ? gDepthGlossPipe : gDepthPipe);
+        drawVisible(cmd, fi, prePipes, sides);
     }
     cmdBindRenderTargets(cmd, nullptr);
     if (second)
@@ -2594,12 +2621,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
     cmdSetScissor(cmd, 0, 0, w, h);
     if (geometry)
     {
-        bool full = (gf->counts[2] & (kFlagHeatmap | kFlagCascades | kFlagAoDebug | kFlagContactDebug | kFlagSsrDebug | kFlagRtDebug)) || (shadows && F.lightSize > 0);
-        const uint32_t before = gPipesMade;
-        const double   t0 = clockMs();
-        createScenePipelines(samples, taa, gPipeMasked, viewMode ? kForwardDepth : full ? kForwardFull : kForwardLean); // first use only
-        pipesMadeOnDraw(before, t0);
-        drawVisible(cmd, fi, viewMode ? gForwardDepthPipe : full ? gForwardFullPipe : gForwardPipe);
+        drawVisible(cmd, fi, forwardPipes, sides);
     }
     if (!viewMode)
     {
