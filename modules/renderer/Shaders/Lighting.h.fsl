@@ -50,6 +50,16 @@ float3 aerialPerspective(float3 color, float3 P, float2 uv)
     return color * lerp(1.0, a.a, f) + a.rgb * f;
 }
 
+// Volumetric fog (renderer_fog, FLAG_FOG) between the camera and view depth viewZ at screen uv: renderer_fog's froxels
+// hold the light scattered in and the transmittance to each slice's far side, slices finer near the camera.
+float3 applyFog(float3 color, float viewZ, float2 uv)
+{
+    float  p = log2(max(viewZ, 0.0) * gFrame.fog.x + 1.0) * gFrame.fog.y;
+    float4 f = SampleLvlTex3D(gFogVolume, gSamplerBilinearClamp, float3(uv * gFrame.fog2.xy, (max(p - 1.0, 0.0) + 0.5) * gFrame.fog.z), 0.0);
+    float  k = saturate(p); // within the first slice: towards none
+    return color * lerp(1.0, f.a, k) + f.rgb * k;
+}
+
 float3 skyRadiance(float3 d)
 {
     if ((gFrame.counts.z & FLAG_SKY) != 0u)

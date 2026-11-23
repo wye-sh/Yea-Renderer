@@ -181,6 +181,8 @@ import renderer_upscale void upscale_run(u64 frame)
 import renderer_post u64 post_prepare(u64 frame) = 0
 import renderer_sky bool sky_prepare(u64 frame) = false
 import renderer_sky void sky_run(u64 frame)
+import renderer_fog bool fog_prepare(u64 frame) = false
+import renderer_fog void fog_run(u64 frame)
 import renderer_post void post_run(u64 frame)
 
 category Exposure

@@ -440,6 +440,8 @@ float4 PS_MAIN(VSOutput In)
 
     if ((gFrame.counts.z & FLAG_SKY) != 0u && gFrame.atmosphere.w > 0.0)
         color = aerialPerspective(color, In.WorldPos, In.Position.xy * gFrame.screen.zw);
+    if ((gFrame.counts.z & FLAG_FOG) != 0u)
+        color = applyFog(color, viewZ, In.Position.xy * gFrame.screen.zw);
 
 #ifdef FULL
     if ((gFrame.counts.z & FLAG_CASCADES) != 0u)

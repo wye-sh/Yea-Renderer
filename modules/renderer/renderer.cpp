@@ -61,6 +61,8 @@ struct GpuFrame
     float    rt[4];   // x max roughness of ray-traced reflections
     float    atmosphere[4];  // renderer_sky: km, ground radius, top, the camera from the centre; aerial strength
     float    atmosphere2[4]; // aerial volume depth (km), the sky image's mips
+    float    fog[4];  // renderer_fog: frame.h fogParams
+    float    fog2[4]; // xy frame.h fogUv
     float    taps[32][4]; // xy: the shadow filters' Vogel disk, unturned
 };
 struct GpuMaterial
@@ -86,7 +88,7 @@ struct ExposureData
 const uint32_t kFlagCulled = 1, kFlagHeatmap = 2, kFlagCascades = 4, kFlagShadows = 8, kFlagAo = 16, kFlagAoDebug = 32, kFlagContact = 64,
                kFlagContactDebug = 128, kFlagUnlit = 256, kFlagSsr = 512, kFlagSsrDebug = 1024,
                kFlagReceiverPlane = 2048, kFlagRt = 4096, kFlagRtDebug = 8192, kFlagRtShadows = 16384,
-               kFlagRtSun = 32768, kFlagArea = 65536, kFlagSky = 131072;
+               kFlagRtSun = 32768, kFlagArea = 65536, kFlagSky = 131072, kFlagFog = 262144;
 const uint32_t kMaxFrames = 4;
 const uint32_t kMaxUnculledLights = 256;
 const uint32_t kHistogramBins = 128;
@@ -767,8 +769,8 @@ void barrierBuf(Cmd* cmd, Buffer* buf, ResourceState from, ResourceState to)
 // (that frame's fence has passed by then, so nothing waits), averaged and logged every 10 s.
 namespace
 {
-enum Timing : uint32_t { kTimeSky, kTimeShadows, kTimeProbes, kTimePrepass, kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeVrs, kTimeRt, kTimeForward, kTimeExposure, kTimeTaa, kTimeUpscale, kTimePost, kTimeTonemap, kTimeComposite, kTimeTotal, kTimings };
-const char* const kTimingNames[kTimings] = { "sky", "shadows", "probes", "prepass", "culling", "ao", "contact", "ssr", "vrs", "rt", "forward+sky", "exposure", "taa", "upscale", "post", "tonemap", "composite", "total" };
+enum Timing : uint32_t { kTimeSky, kTimeShadows, kTimeProbes, kTimePrepass, kTimeCulling, kTimeAo, kTimeContact, kTimeSsr, kTimeVrs, kTimeRt, kTimeFog, kTimeForward, kTimeExposure, kTimeTaa, kTimeUpscale, kTimePost, kTimeTonemap, kTimeComposite, kTimeTotal, kTimings };
+const char* const kTimingNames[kTimings] = { "sky", "shadows", "probes", "prepass", "culling", "ao", "contact", "ssr", "vrs", "rt", "fog", "forward+sky", "exposure", "taa", "upscale", "post", "tonemap", "composite", "total" };
 QueryPool*        gTimePool[kMaxFrames];
 uint32_t          gTimeUsed[kMaxFrames]; // bits: what that frame recorded
 double            gTimeTicks;            // per second
@@ -1705,6 +1707,8 @@ void draw(uint32_t pass, const YeaFrame* yf)
     const bool rtShadows = rtRun && rtPicked && F.rtShadows;
     bool ssr = !rt && taa && !viewMode && renderer_ssr::ssr_prepare((uint64_t)(uintptr_t)&F) && F.ssrOn && F.ssrDepth && F.previous;
     bool vrs = taa && !viewMode && renderer_vrs::vrs_prepare((uint64_t)(uintptr_t)&F) && F.rateImage && F.rateCopy;
+    // Volumetric fog (renderer_fog): it reads the lights, their bins and shadow views, and the sky, all set by now.
+    const bool fog = !viewMode && renderer_fog::fog_prepare((uint64_t)(uintptr_t)&F) && F.fogVolume;
 
     // GPU lights in sorted order, with the shadow views renderer_shadows picked; then, for reflections
     // (renderer_rt), the lights outside the view, without shadows.
@@ -1838,7 +1842,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
                     (contact && F.contactDebug ? kFlagContactDebug : 0) |
                     ((viewMode & YEA_VIEW_WIREFRAME) ? kFlagUnlit : 0) | (ssr ? kFlagSsr : 0) | (ssr && F.ssrDebug ? kFlagSsrDebug : 0) |
                     (shadows && F.receiverPlane ? kFlagReceiverPlane : 0) | (rt ? kFlagRt : 0) | (rt && F.rtDebug ? kFlagRtDebug : 0) |
-                    (rtShadows ? kFlagRtShadows : 0) | (rtShadows && F.rtSunShadows ? kFlagRtSun : 0) | (anyShape ? kFlagArea : 0) | (sky ? kFlagSky : 0);
+                    (rtShadows ? kFlagRtShadows : 0) | (rtShadows && F.rtSunShadows ? kFlagRtSun : 0) | (anyShape ? kFlagArea : 0) | (sky ? kFlagSky : 0) | (fog ? kFlagFog : 0);
     if (ssr)
     {
         gf->ssr[0] = F.ssrMaxRoughness;
@@ -1856,6 +1860,12 @@ void draw(uint32_t pass, const YeaFrame* yf)
         memcpy(gf->atmosphere, F.skyRadii, sizeof F.skyRadii);
         gf->atmosphere2[0] = F.skyAerialDepth;
         gf->atmosphere2[1] = (float)F.skyEnvMips;
+    }
+    if (fog)
+    {
+        memcpy(gf->fog, F.fogParams, sizeof F.fogParams);
+        gf->fog2[0] = F.fogUv[0];
+        gf->fog2[1] = F.fogUv[1];
     }
     if (probes)
     {
@@ -2000,7 +2010,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
         Buffer*  masks = culled ? F.tileMasks : gDummyU32;
         Buffer*  bins = culled ? F.zbins : gDummyU32;
         Buffer*  views = shadows ? F.shadowViews : gDummyViews;
-        DescriptorData p[25] = {};
+        DescriptorData p[26] = {};
         Texture*       ssrDepth = ssr ? F.ssrDepth : gDummyDepth->pTexture;
         Texture*       previous = ssr ? F.previous->pTexture : gDummyColor->pTexture;
         Texture*       probeTex = probes ? F.probes->pTexture : gDummyArray->pTexture;
@@ -2063,7 +2073,10 @@ void draw(uint32_t pass, const YeaFrame* yf)
         p[23].ppBuffers = &skySh;
         p[24].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gSkyAerial);
         p[24].ppTextures = &skyAerial;
-        updateDescriptorSet(gRenderer, fi, gSceneFrame, 25, p);
+        Texture* fogVolume = fog ? F.fogVolume : gDummyVolume;
+        p[25].mIndex = SRT_RES_IDX(SceneSrt, PerFrame, gFogVolume);
+        p[25].ppTextures = &fogVolume;
+        updateDescriptorSet(gRenderer, fi, gSceneFrame, 26, p);
 
         DescriptorData c[7] = {};
         c[0].mIndex = SRT_RES_IDX(CompositeSrt, PerFrame, gComposite);
@@ -2149,6 +2162,13 @@ void draw(uint32_t pass, const YeaFrame* yf)
             timeBegin(cmd, fi, kTimeProbes);
         renderer_probes::probes_render((uint64_t)(uintptr_t)&F);
         timeEnd(cmd, fi, kTimeProbes);
+    }
+    if (fog)
+    {
+        if (timed)
+            timeBegin(cmd, fi, kTimeFog);
+        renderer_fog::fog_run((uint64_t)(uintptr_t)&F);
+        timeEnd(cmd, fi, kTimeFog);
     }
 
     bool geometry = gPosBuf && gIndexBuf && count > 0;

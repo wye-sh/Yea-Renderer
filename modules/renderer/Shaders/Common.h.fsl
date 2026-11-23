@@ -39,6 +39,8 @@ STRUCT(FrameData)
     DATA(float4, rt, None);                  // x max roughness of ray-traced reflections (renderer_rt)
     DATA(float4, atmosphere, None);          // physical sky (FLAG_SKY): km, x ground radius, y top, z the camera from the centre; w aerial strength
     DATA(float4, atmosphere2, None);         // x aerial perspective volume depth (km), y gSkyEnv's mips
+    DATA(float4, fog, None);                 // volumetric fog (FLAG_FOG): frame.h fogParams
+    DATA(float4, fog2, None);                // xy frame.h fogUv
     DATA(float4, taps[32], None);            // xy: the shadow filters' Vogel disk of counts.w taps, unturned
 };
 
@@ -68,6 +70,7 @@ STRUCT(ProbeData)
 #define FLAG_RT_SHADOWS 16384u // renderer_rt traces shadows into gRtShadows: lights with params.w >= 2, and the sun with FLAG_RT_SUN
 #define FLAG_RT_SUN   32768u
 #define FLAG_SKY      131072u // renderer_sky: the sky, its reflections and ambient from gSkyView, gSkyEnv and gSkySh; gSkyAerial
+#define FLAG_FOG      262144u // renderer_fog: gFogVolume
 #define FLAG_AREA     65536u // gLightShapes is filled: some light has a shape or its own size (area lights take LTC terms)
 #define RT_MISS       60000.0
 

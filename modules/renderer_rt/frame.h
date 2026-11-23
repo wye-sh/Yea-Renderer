@@ -1,5 +1,5 @@
 // The frame contract between the renderer modules: renderer (the core) fills a RenderFrame each
-// frame and passes its address (as u64) to the other renderer modules (culling, shadows, taa, ao, contact, probes, ssr, vrs, rt, upscale). The same
+// frame and passes its address (as u64) to the other renderer modules (culling, shadows, taa, ao, contact, probes, ssr, vrs, rt, upscale, sky, fog, post). The same
 // file sits in each of them; keep the copies identical and raise RENDER_FRAME_VERSION on any change.
 #pragma once
 #include <stdint.h>
@@ -10,7 +10,7 @@ struct Buffer;
 struct RenderTarget;
 struct Texture;
 
-#define RENDER_FRAME_VERSION 17u
+#define RENDER_FRAME_VERSION 18u
 #define RENDER_RT_MAX_TRACED 8u
 #define RENDER_MAX_CASCADES  4u
 #define RENDER_VIEW_SHIFT    20u // shadow instance stream entry: instance | view << 20
@@ -299,5 +299,12 @@ struct RenderFrame
                            // camera to slice depth skyAerialDepth (km) x ((slice + 1) / 32)^2
     float    skyAerialDepth;
     float    skyRadii[4];  // km: x ground, y top of the atmosphere, z the camera from the planet's centre; w aerial strength
+
+    // Volumetric fog (renderer_fog, frame v18). fog_prepare runs after vrs_prepare, with the lights, culling, shadows and
+    // sky set; fog_run records after probes_render (the shadow maps and the sky's images ready), before the depth prepass.
+    Texture* fogVolume;    // RGBA16F froxels over the render view, SHADER_RESOURCE after fog_run: rgb the light scattered in
+                           // and a the transmittance, from the camera to the far side of each slice; nullptr: no fog
+    float    fogParams[4]; // view depth z lies at slice p = log2(z * x + 1) * y (slice k's far side at p = k + 1); z 1 / slices
+    float    fogUv[2];     // render uv times these: the volume's xy (it may reach past the view's right and bottom edges)
 };
 #define RENDER_RT_MISS 60000.0f

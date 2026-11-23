@@ -1,0 +1,16 @@
+#include "Common_3/Graphics/FSL/defaults.h"
+
+#rootsig default.rootsig
+#end
+
+#rootsig compute.rootsig
+#end
+
+#comp renderer_fog_light.comp
+#define LIGHT
+#include "Fog.comp.fsl"
+#end
+
+#comp renderer_fog_integrate.comp
+#include "Fog.comp.fsl"
+#end

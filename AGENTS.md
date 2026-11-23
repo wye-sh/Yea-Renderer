@@ -157,6 +157,24 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   sky-view LUT, skyIrradiance from the SH, environment()'s sky from the reflection image, aerial perspective on every
   lit pixel (aerial_perspective scales the distance). Probes' captures take their ambient from the SH; renderer_rt's
   misses the reflection image and its hits' ambient the SH.
+- `renderer_fog`: volumetric fog in froxels (Wronski 2014; Hillaire 2015, Frostbite), off by default (`fog`; off or with
+  nothing in the air it costs nothing). Exponential height fog (density at and below base_height, thinning by
+  height_falloff) plus up to 16 local volumes (`Volume` table: boxes or ellipsoids, each with its own density, albedo and
+  soft edge; exports below). `fog_prepare` (core, after vrs_prepare: the lights, their z-bins, shadow views and sky are
+  set) sizes the froxels from the render size (quality: High 8 px columns x 128 slices, Medium 8 x 64, Low 16 x 64; slices
+  finer near the camera, edge(s) = 2 m x (2^(s log2(range / 2 + 1) / slices) - 1), out to `range`). `fog_run` (after
+  probes_render, before the depth prepass; timed "fog"): LIGHT (`Fog.comp.fsl`, 4x4x4 groups) per froxel at a point
+  jittered inside it each frame (R2 across, golden ratio along) the medium and the light it scatters to the camera: the
+  sun as it arrives through one filtered compare in its cascade (none while renderer_rt traces the sun: no cascades
+  then), the sky's mean radiance (the SH's first band, else the gradient's exact average) times the core's ambient, and
+  the local lights in the core's z-bin at that depth (windowed inverse square, spot cone, rects and discs one-sided, area
+  lights no nearer than their size) with one compare in their shadow map; a Henyey-Greenstein phase (anisotropy). It
+  blends 0.9 of last frame's froxel at the same world point (reprojected with last frame's camera; off with temporal,
+  or after a resize, a skipped frame or a quality change). INTEGRATE (8x8, one thread a column) runs Frostbite's
+  energy-conserving step front to back into `fogVolume`: light scattered in and transmittance to each slice's far side.
+  The core applies it (FLAG_FOG, `applyFog` in Lighting.h.fsl) after aerial perspective on every lit pixel and on the
+  sky (its last slice) at render size, before TAA or the upscaler, so it works with each. Not under F1's view modes.
+  Not yet in probe captures or ray-traced reflections. Every GPU object is freed in `unload()`.
 - `renderer_post`: post-processing on the resolved (TAA or upscaled) scene-linear HDR image at display size, before
   the core's tonemapper, so it works the same with every upscaler (NVIDIA's DLSS guide and UE5 place it there).
   `post_prepare` (after the core's composite constants, before its descriptors) returns the image the tonemap pass and
@@ -237,7 +255,7 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   the out target, and leaves everything in SHADER_RESOURCE; the panel shows it with `yea::canvasImage`. The core's
   preview pipelines and buffers are made in its own `load()` (`preview_core.h`); a failure turns only the preview off.
 - The core calls the others through optional imports with a `RenderFrame*` (as `u64`): `frame.h`, copied
-  identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes`, `renderer_ssr`, `renderer_vrs`, `renderer_rt`, `renderer_upscale`, `renderer_post` and `renderer_sky` (`mathx.h` into the
+  identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes`, `renderer_ssr`, `renderer_vrs`, `renderer_rt`, `renderer_upscale`, `renderer_post`, `renderer_sky` and `renderer_fog` (`mathx.h` into the
   first three). Change all copies together and raise `RENDER_FRAME_VERSION`. Geometry (frame v16): two vertex streams, `positions`
   (float3, `RENDER_POSITION_STRIDE`) and `attributes` (`RENDER_ATTRIBUTE_STRIDE`: octahedral normal and tangent snorm16x2,
   uv0, rgba8 colour; frame.h says how to decode), and u32 `indices`. They are GPU-only, made with half again as much room
@@ -333,11 +351,15 @@ show_rates (green half rate, blue 2x2, magenta coarser). `renderer_rt`: enabled,
 reflected_shadows (Scene, Rays, Off), history_frames, brightest, max_distance, show_hits (green: hit seen on screen, blue: lit at the hit, grey: sky),
 probe_rays (temporary: 0 off; traces 1 sun ray plus k-1 local-light rays per pixel and discards them, to measure ray-traced
 shadows' cost on the user's GPU; remove once measured).
+`renderer_fog`: fog, density, height_falloff, base_height, albedo, anisotropy, quality (Low, Medium, High), range,
+temporal. Its exports: `fog_volume_add(shape, center, half_size)` (0 box, 1 ellipsoid; density 0.1, white, softness
+0.25), `fog_volume_place`, `fog_volume_medium(v, density, albedo, softness)`, `fog_volume_remove`, `fog_volume_clear`.
 `renderer_models` (per MODEL line, in the Model Viewer only): scale, up_axis (Auto, Y, Z: Z up in the file turned to Y up),
 lod_quality, cast_shadows, double_sided.
 Players of a released game tune (`player` lines): upscaler, quality_mode, dlss_model, exposure_ev (brightness), lod_error,
 TAA's sharpen, shadows' sun_resolution, shadow_distance, pcss and light_shadows, and enabled for AO, contact shadows, SSR,
-ray-traced reflections and VRS, with half_resolution for AO, SSR and ray-traced reflections, and probes' resolution.
+ray-traced reflections and VRS, with half_resolution for AO, SSR and ray-traced reflections, probes' resolution, and
+fog with its quality.
 Debug views and show_ knobs never. renderer_rt's `enabled` needs `raytracing` and renderer_vrs' `shadingrate` (hidden and
 false without them); each still returns from `load()` before touching its service when that is nullptr, as `load()` runs
 either way.
@@ -362,7 +384,7 @@ library keeps its licence file beside its source, since the component's reposito
 ## Reset
 
 All scene data is in `renderer`'s tables and state: Reset empties the scene; the feature's link module
-builds it again. renderer_models' placements go with it: a game places its models again whenever `mdl::placed(h)` is
+builds it again. renderer_fog's volumes are in its table: Reset removes them too. renderer_models' placements go with it: a game places its models again whenever `mdl::placed(h)` is
 false. GPU objects and shadow caches are rebuilt on load.
 
 ## Cost
@@ -378,7 +400,10 @@ exposure dispatches, with ray-traced reflections (instead of the SSR depth copy 
 rebuild, a trace dispatch (a closest-hit ray per glossy pixel, a quarter of them with half_resolution except
 mirror-like ones; where the hit isn't on screen a shadow map lookup per lit light with a map, a ray for the sun and for mapless casters), with half_resolution a
 full-size reconstruction (nine rays reused per glossy pixel) a full-size resolve (temporal accumulation; tiles with no glossy pixel cost a read or two) and a full-size filter (up to 25 taps per glossy pixel, a write elsewhere), one full-screen TAA resolve (when on; with an upscaler, its dispatch at the display size and a one-thread
-exposure copy instead, every scene pass then at the render size), one full-screen composite. The Model Viewer's preview costs
+exposure copy instead, every scene pass then at the render size), one full-screen composite. With fog on, two
+dispatches: one thread per froxel (240 x 135 x 128 at 1080p on High: 4.1 M, each a cascade compare and its z-bin's lights
+with a compare each) and one per column, plus 3 RGBA16F froxel volumes (about 33 MB at 1080p on High, 17 MB on Medium),
+and one bilinear volume read per pixel in the forward and sky passes. The Model Viewer's preview costs
 nothing unless its panel is open and showing a model: then, per frame, one 1024² shadow map pass and one 4-sample pass of
 that model at twice the canvas size, and a resolve (about 6 MB of targets at a 520 × 320 canvas). No per-frame allocation. GPU memory at the defaults:
 HDR + depth at 4x MSAA, sun atlas 4096² D32 (64 MB), local atlas 4096² (64 MB), a screen-size R32F depth copy
