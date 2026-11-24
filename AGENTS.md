@@ -344,7 +344,8 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
 - `renderer_particles`: GPU particles (on by default, `particles`; nothing runs while no emitter exists and no particle
   can be alive). Up to 64 emitters (`Emitter` table, exports below), a pool of `max_particles` (rounded up to a power
   of two). `particles_prepare` (core, after fog_prepare) counts this frame's emission per emitter on the CPU and bounds
-  the particles alive from a ring of what was made and its longest life; `particles_run` (after fog_run, timed
+  the particles alive from a ring of what was made and its longest life (this frame's emission joins the ring after
+  the pool is made or remade, which empties the ring, so the bound never misses it; 7.5.1); `particles_run` (after fog_run, timed
   \"particles\"; `Sim.comp.fsl`): EMIT (each new particle takes a free slot; it also empties the draw list), SIMULATE
   (age, death into the free list, gravity, drag, divergence-free turbulence; one in view is lit once where it is: the
   sun through one cascade compare, the sky's mean light, the local lights in the core's z-bin at its depth with one
@@ -354,8 +355,8 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   are in view), then SPLIT: one binary search per blended surface's depth cuts the list into runs (`gRunArgs`, indirect
   draws; `gRunStart`, each run's first entry, an instance-rate stream). In the core's see-through pass
   (`particles_draw_begin`, `particles_draw(frame, run)` per run between the surfaces, `particles_draw_end`), each run
-  (BOUNDS: its screen rectangle, every listed particle's quad widened a pixel, over the whole pool, as the list can hold
-  more than the sort's estimate; `particles_run_rects` between draw_begin and draw_end, for the core's chain copies)
+  (BOUNDS: its screen rectangle, every listed particle's quad widened a pixel, over the whole pool, never trusting the
+  CPU's bound; `particles_run_rects` between draw_begin and draw_end, for the core's chain copies)
   draws indirectly: camera-facing round sprites, premultiplied into `hdr` (additive ones write alpha 0), soft against
   the prepass depth (`soft_distance`) and the camera (`near_fade`), behind the froxel fog at their depth, before
   exposure, TAA and the upscaler; their coverage adds into the core's `reactive` (TAA takes up to 0.6 more of the

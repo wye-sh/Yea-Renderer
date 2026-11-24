@@ -711,13 +711,10 @@ bool particles_prepare(uint64_t address)
         longest = e.life_max > longest ? e.life_max : longest;
         blended = blended || !e.additive;
     }
-    if (total)
-    {
-        gRingHead = (gRingHead + 1) % kRing;
-        gRing[gRingHead] = { gNow, longest, total, blended };
-    }
-    uint32_t bound = 0;
-    bool     sort = false;
+    // This frame's emission counts with the records (and joins them below, once the pool is there: a pool made or
+    // remade now forgets the records, but not what this frame emits into it).
+    uint32_t bound = total;
+    bool     sort = total && blended;
     for (uint32_t i = 0; i < kRing; ++i)
         if (gRing[i].count && gNow - gRing[i].time <= (double)gRing[i].life + 0.2)
         {
@@ -729,6 +726,11 @@ bool particles_prepare(uint64_t address)
         return false; // nothing alive, nothing made
     if (!ensurePool(cap))
         return false;
+    if (total)
+    {
+        gRingHead = (gRingHead + 1) % kRing;
+        gRing[gRingHead] = { gNow, longest, total, blended };
+    }
     bound = bound < cap ? bound : cap;
     gSortN = pow2Ceil(bound > 1024 ? bound : 1024);
     gSortN = gSortN < gCap ? gSortN : gCap;
@@ -833,7 +835,7 @@ void particles_run(uint64_t address)
         }
     }
     dispatch(F, kSplit, 1, 0, 0); // the draw's runs
-    // And where on screen each can draw: over the whole pool, as the list can hold more than the sort's estimate (gSortN).
+    // And where on screen each can draw: over the whole pool, so the rectangles never rest on the CPU's bound.
     dispatch(F, kBounds, (gCap + 255) / 256, 0, 0);
     cmdEndDebugMarker(cmd);
 }
