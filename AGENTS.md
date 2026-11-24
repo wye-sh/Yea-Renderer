@@ -714,7 +714,8 @@ sun_disk (degrees), near_plane, gpu_timings (logs each pass's GPU time every 30 
 texture_detail (Full, Half, Quarter: top mips left out; more when GPU memory is short). `renderer_culling`: enabled, max_lights, tile_size (8/16/32), z_bins,
 heatmap. `renderer_shadows`: enabled (the sun's), cascades, shadow_distance, cascade_split, sun_resolution, softness,
 filter_taps, pcss, sun_size, normal_bias, slope_bias, receiver_plane, light_shadows, shadowed_lights, local_atlas_resolution,
-updates_per_frame, max_tile_resolution, contact_hardening, light_size (m), softest_penumbra (texels, 7.6.0), show_cascades, show_atlas (the light shadow atlas, top right),
+updates_per_frame, max_tile_resolution, depth_precision (Bits32, Bits16: both atlases' depth, as UE4's and HDRP's 16-bit option, with one
+16-bit step of constant depth bias; 7.7.0), contact_hardening, light_size (m), softest_penumbra (texels, 7.6.0), show_cascades, show_atlas (the light shadow atlas, top right),
 glass_shadows, glass_resolution (the tint maps' side). `renderer_taa`: enabled, history_weight, clamp_width, sharpen, jitter,
 jitter_phases. `renderer_upscale`: upscaler (TAA, FSR), quality_mode (Native, Quality 67%, Balanced 59%,
 Performance 50%, Ultra_Performance 33%; for FSR only). `renderer_ao`: enabled, half_resolution (GTAO and its blur at half size, upsampled along edges in the forward pass), radius, intensity, falloff, slices, steps, denoise, specular_occlusion,

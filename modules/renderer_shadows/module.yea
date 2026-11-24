@@ -43,6 +43,9 @@ setting int shadowed_lights 64 0 64
 setting int local_atlas_resolution 8192 1024 8192
 setting int updates_per_frame 8 1 32
 setting int max_tile_resolution 1024 128 2048
+# The shadow maps' depth (the lights' atlas and the sun's cascades): Bits32 (float) or Bits16, as Unreal's and HDRP's
+# 16-bit option: half the memory and bandwidth, with one 16-bit step of depth bias (a few mm at a few metres).
+setting choice depth_precision Bits32 Bits32 Bits16
 # Light shadows sharp where an object meets what it stands on, softer further away, as from a light
 # with this radius (metres).
 setting bool contact_hardening true

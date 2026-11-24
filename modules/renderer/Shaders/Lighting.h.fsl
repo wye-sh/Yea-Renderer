@@ -373,6 +373,11 @@ float3 localShadow(LightData l, float3 P, float3 N, float dist, float NoL, float
         view += face;
     }
     ShadowView v = gShadowViews[view];
+    // Whether glass is over the view, read with its other data, before the atlas: most views have none, and their
+    // pixels then never wait on the view's glass after the filter.
+    // (Entry 0 while glass casts no tint: the stand-in buffer holds only four.)
+    bool   tinted = (gFrame.counts.z & FLAG_GLASS_SHADOW) != 0u;
+    bool   glass = tinted && gShadowTints[tinted ? view : 0u].count.x != 0u;
     float  texel = gFrame.shadow2.y;
     float3 Pb = P + N * (gFrame.shadow.w * v.info.x * dist);
     float3 c = viewToAtlas(v, Pb);
@@ -416,7 +421,7 @@ float3 localShadow(LightData l, float3 P, float3 N, float dist, float NoL, float
             count += dot(inFront, float4(1.0, 1.0, 1.0, 1.0));
         }
         if (count == 0.0)
-            return glassTint(view, c.xy, tintDepth(v, P, normalize(l.pos.xyz - P), v.info.x * dist), radius, rot);
+            return glass ? glassTint(view, c.xy, tintDepth(v, P, normalize(l.pos.xyz - P), v.info.x * dist), radius, rot) : float3(1.0, 1.0, 1.0);
         dir = rot;
         for (uint i = 0u; i < 4u; ++i, dir = vogelTurn(dir))
         {
@@ -433,7 +438,7 @@ float3 localShadow(LightData l, float3 P, float3 N, float dist, float NoL, float
     }
     float wide = radius / texel;
     float lit = wide > 8.0 ? localPcfWide(c, g, radius, bounds, gFrame.counts.w, rot, wide) : localPcf(c, g, radius, bounds, gFrame.counts.w, rot);
-    return lit > 0.0 ? lit * glassTint(view, c.xy, tintDepth(v, P, normalize(l.pos.xyz - P), v.info.x * dist), radius, rot) : float3(0.0, 0.0, 0.0);
+    return lit > 0.0 ? (glass ? lit * glassTint(view, c.xy, tintDepth(v, P, normalize(l.pos.xyz - P), v.info.x * dist), radius, rot) : float3(lit, lit, lit)) : float3(0.0, 0.0, 0.0);
 }
 
 // --- Area lights: linearly transformed cosines --------------------------------------------------

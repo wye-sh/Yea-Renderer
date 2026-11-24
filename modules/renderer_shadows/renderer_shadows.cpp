@@ -79,7 +79,9 @@ Pipeline*      gMaskedPipe;
 uint32_t       gTexBound[kMaxFrames]; // the frame's textureVersion each set holds (0: none yet)
 bool           gMaskedNow;            // this frame draws alpha-tested casters on gMaskedPipe (the maps are bound)
 float          gPipeSlope = -1;
-// A new slope's pipelines (gPipe's, gMaskedPipe's, gClearPipe's) while they compile on Yea's threads: the old ones
+// The depth format the pipelines draw (depth_precision), and the one the atlases were made in: they follow the pipelines.
+TinyImageFormat gPipeFormat = TinyImageFormat_UNDEFINED, gNextFormat = TinyImageFormat_UNDEFINED, gAtlasFormat = TinyImageFormat_UNDEFINED;
+// A new slope's (or depth format's) pipelines (gPipe's, gMaskedPipe's, gClearPipe's) while they compile on Yea's threads: the old ones
 // draw till all three are in (none on the first frames: no shadows yet). A failed compile queues all three again,
 // kSlopeTries times at most.
 const YeaPipelines* gPipes;
@@ -326,13 +328,18 @@ void freeTarget(RenderTarget*& t)
     t = nullptr;
 }
 
-RenderTarget* makeAtlas(uint32_t size, const char* name)
+TinyImageFormat atlasFormat()
+{
+    return settings.depth_precision == DepthPrecision::Bits16 ? TinyImageFormat_D16_UNORM : TinyImageFormat_D32_SFLOAT;
+}
+
+RenderTarget* makeAtlas(uint32_t size, const char* name, TinyImageFormat format)
 {
     RenderTargetDesc d = {};
     d.mWidth = d.mHeight = size;
     d.mDepth = d.mArraySize = d.mMipLevels = 1;
     d.mSampleCount = SAMPLE_COUNT_1;
-    d.mFormat = TinyImageFormat_D32_SFLOAT;
+    d.mFormat = format;
     d.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
     d.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
     d.mClearValue = {};
@@ -345,7 +352,7 @@ RenderTarget* makeAtlas(uint32_t size, const char* name)
 
 // A slope's pipelines into out (the casters', the alpha-tested casters', the clear's): each queued on Yea's compile
 // threads into jobs (when it has them), else made now.
-void makePipelines(float slope, Pipeline* out[3], uint64_t jobs[3])
+void makePipelines(float slope, TinyImageFormat format, Pipeline* out[3], uint64_t jobs[3])
 {
     auto make = [&](PipelineDesc& d, uint32_t i) {
         if (!gPipes || !(jobs[i] = gPipes->add(&d)))
@@ -369,6 +376,8 @@ void makePipelines(float slope, Pipeline* out[3], uint64_t jobs[3])
     RasterizerStateDesc raster = {};
     raster.mCullMode = CULL_MODE_NONE;
     raster.mSlopeScaledDepthBias = slope;
+    // 16-bit: one step of constant bias, so a depth rounded to its nearest step never shadows its own surface.
+    raster.mDepthBias = format == TinyImageFormat_D16_UNORM ? 1 : 0;
 #if !defined(_WIN32)
     raster.mDepthBias = 1; // Vulkan's backend turns depth bias on only with a constant term; 1 is one ulp of float depth
 #endif
@@ -385,7 +394,7 @@ void makePipelines(float slope, Pipeline* out[3], uint64_t jobs[3])
     g.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
     g.mRenderTargetCount = 0;
     g.mSampleCount = SAMPLE_COUNT_1;
-    g.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+    g.mDepthStencilFormat = format;
     g.pRasterizerState = &raster;
     g.pDepthState = &depth;
     g.pVertexLayout = &l;
@@ -450,16 +459,19 @@ void dropNext()
     gNextFailed = false;
 }
 
-// Each frame: a new slope's pipelines queued (made here without Yea's compile threads), and swapped in once all three
-// are made; true then (the maps redraw with it). Never waits for a compile.
+// Each frame: a new slope's (or depth format's) pipelines queued (made here without Yea's compile threads), and swapped
+// in once all three are made; true then (the maps redraw with it, in atlases remade in the new format). Never waits for a
+// compile.
 bool slopePipelines(float slope)
 {
-    if (slope != gPipeSlope && slope != gNextSlope)
+    const TinyImageFormat format = atlasFormat();
+    if ((slope != gPipeSlope || format != gPipeFormat) && (slope != gNextSlope || format != gNextFormat))
     {
         dropNext();
         gNextSlope = slope;
+        gNextFormat = format;
         gNextTries = 1;
-        makePipelines(slope, gNext, gNextJob);
+        makePipelines(slope, format, gNext, gNextJob);
     }
     if (gNextSlope < 0 || gNextTries > kSlopeTries) // none queued, or given up on this slope
         return false;
@@ -488,7 +500,7 @@ bool slopePipelines(float slope)
         yea::log(line);
         dropNext();
         if (++gNextTries <= kSlopeTries)
-            makePipelines(gNextSlope, gNext, gNextJob);
+            makePipelines(gNextSlope, gNextFormat, gNext, gNextJob);
         return false;
     }
     if (gPipe || gClearPipe || gMaskedPipe)
@@ -502,6 +514,7 @@ bool slopePipelines(float slope)
     gPipe = gNext[0], gMaskedPipe = gNext[1], gClearPipe = gNext[2];
     gNext[0] = gNext[1] = gNext[2] = nullptr;
     gPipeSlope = gNextSlope;
+    gPipeFormat = gNextFormat;
     gNextSlope = -1;
     return true;
 }
@@ -1969,21 +1982,24 @@ bool shadows_prepare(uint64_t address)
     else
         gOverSince = -1;
     uint32_t localSize = gLocalAuto;
-    if (sunSize != gSunSize || localSize != gLocalSize)
+    // In the format the pipelines draw (none till they are made): a new depth_precision remakes both once its pipelines are in.
+    const bool reformat = gPipe && gPipeFormat != gAtlasFormat;
+    if (gPipe && (sunSize != gSunSize || localSize != gLocalSize || reformat))
     {
         waitQueueIdle(gQueue);
-        if (sunSize != gSunSize)
+        gAtlasFormat = gPipeFormat;
+        if (sunSize != gSunSize || reformat)
         {
             freeTarget(gSunAtlas);
-            gSunAtlas = makeAtlas(sunSize, "renderer_sun_atlas");
+            gSunAtlas = makeAtlas(sunSize, "renderer_sun_atlas", gAtlasFormat);
             gSunSize = sunSize;
             gCascades = 0; // nothing in it yet
             gSunValid = 0;
         }
-        if (localSize != gLocalSize)
+        if (localSize != gLocalSize || reformat)
         {
             freeTarget(gLocalAtlas);
-            gLocalAtlas = makeAtlas(localSize, "renderer_local_atlas");
+            gLocalAtlas = makeAtlas(localSize, "renderer_local_atlas", gAtlasFormat);
             gLocalFresh = true;
             gLocalSize = localSize;
             memset(gGroups, 0, sizeof gGroups);
