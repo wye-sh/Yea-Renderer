@@ -805,6 +805,7 @@ void skinnedBlas(RenderFrame* F, uint32_t drawables, uint32_t casters)
     {
         QueryDesc q = { 1 };
         cmdEndQuery(cmd, gSkinPool[fi], &q);
+        cmdResolveQuery(cmd, gSkinPool[fi], 0, 2); // read back next time this slot comes round (skinnedTimes)
         gSkinUsed[fi] = 1;
     }
 }
