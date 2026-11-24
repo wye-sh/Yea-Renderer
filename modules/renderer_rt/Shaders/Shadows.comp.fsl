@@ -248,15 +248,31 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
 // trails a third of what 32 frames everywhere left, for a little more shimmer at sharp edges, which TAA takes).
 #define HISTORY_PER_PX 2.0
 #define HISTORY_MIN    8.0
+// This frame's rays round the group's 8 x 8 pixels, 2 more each way (the 5 x 5 each pixel takes, edges clamped as
+// before), read once into shared memory: x lit (1) or blocked (0), yzw the glass colour when lit and tinted.
+#define TILE 12
+GroupShared(float4, gsRays[TILE * TILE]);
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(8, 8, 1)
-void CS_MAIN(SV_DispatchThreadID(uint3) id)
+void CS_MAIN(SV_GroupID(uint3) gid, SV_GroupThreadID(uint3) tid, SV_GroupIndex(uint) gi)
 {
     INIT_MAIN;
-    uint  s = id.z;
+    uint  s = gid.z;
     uint4 slot = gSd.slots[s];
     int2  size = screenSize();
-    int2  p = int2(id.xy);
+    int2  p = int2(gid.xy) * 8 + int2(tid.xy);
+    bool  tinted = gSd.misc.w != 0u;
+    const int2 base = int2(gid.xy) * 8 - int2(2, 2);
+    for (uint i = gi; i < uint(TILE * TILE); i += 64u)
+    {
+        int3   q = int3(clamp(base + int2(int(i % uint(TILE)), int(i / uint(TILE))), int2(0, 0), size - int2(1, 1)), int(s));
+        float  v = LoadTex3D(gRaw, NO_SAMPLER, q, 0).x > 0.0 ? 0.0 : 1.0;
+        float3 c = float3(0.0, 0.0, 0.0);
+        if (tinted && v > 0.0)
+            c = LoadTex3D(gTintRaw, NO_SAMPLER, q, 0).rgb;
+        gsRays[i] = float4(v, c);
+    }
+    GroupMemoryBarrier();
     if (p.x >= size.x || p.y >= size.y)
         RETURN();
     float d = LoadTex2D(gDepth, NO_SAMPLER, p, 0).r;
@@ -266,7 +282,6 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
     float2 raw;
     raw.y = LoadTex3D(gRaw, NO_SAMPLER, int3(p, int(s)), 0).x;
     raw.x = raw.y > 0.0 ? 0.0 : 1.0;
-    bool tinted = gSd.misc.w != 0u;
     if (d <= 0.0)
     {
         Write3D(gHistoryOut, int3(p, int(s)), float2(1.0, 0.0));
@@ -284,14 +299,14 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
     {
         for (int x = -2; x <= 2; ++x)
         {
-            int3  q = int3(clamp(p + int2(x, y), int2(0, 0), size - int2(1, 1)), int(s));
-            float v = LoadTex3D(gRaw, NO_SAMPLER, q, 0).x > 0.0 ? 0.0 : 1.0;
+            float4 e = gsRays[(int(tid.y) + y + 2) * TILE + int(tid.x) + x + 2];
+            float  v = e.x;
             m1 += v;
             m2 += v * v;
             n += 1.0;
             if (tinted && v > 0.0)
             {
-                float3 c = LoadTex3D(gTintRaw, NO_SAMPLER, q, 0).rgb;
+                float3 c = e.yzw;
                 t1 += c;
                 t2 += c * c;
                 tn += 1.0;

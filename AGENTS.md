@@ -816,8 +816,8 @@ exposure dispatches, with ray-traced reflections (instead of the SSR depth copy 
 rebuild, a trace dispatch (a closest-hit ray per glossy pixel, a quarter of them with half_resolution except
 mirror-like ones; where the hit isn't on screen a shadow map lookup per lit light with a map, a ray for the sun and for mapless casters), with half_resolution a
 full-size reconstruction (nine rays reused per glossy pixel) a full-size resolve (temporal accumulation; tiles with no glossy pixel cost a read or two) and a full-size filter (up to 25 taps per glossy pixel, a write elsewhere), with ray-traced shadows (the top-level rebuild
-too, if reflections are off) three full-size dispatches per traced shadow (one any-hit ray a pixel, a 25-read temporal
-pass, a filter of up to 25 taps in penumbrae only), and screen-size arrays of 1 + traced_lights layers (at least 2): the
+too, if reflections are off) three full-size dispatches per traced shadow (one any-hit ray a pixel, a temporal pass
+whose 5 x 5 rays a pixel come from a 12 x 12 tile read once into shared memory (7.6.1, the same sums bit for bit), a filter of up to 25 taps in penumbrae only), and screen-size arrays of 1 + traced_lights layers (at least 2): the
 rays and then the output in one R16F (one ray is all or nothing, so its blocker distance alone holds it), and two
 histories of RG16F visibility and blocker distance plus R16F samples: 14 bytes a pixel a layer, plus 8 for two R32F
 depths, about 270 MB at 2560x1356 with the default 4 (4.5.2; 410 MB before, bit for bit the same image), remade when
