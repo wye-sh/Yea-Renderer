@@ -53,6 +53,7 @@ struct RtData
     uint32_t refract[4];                 // the refraction pass's rectangle: first pixel, past the last
     float    refractTemporal[4];         // 1 when last frame's refraction is its history, frames of history, where
                                          // gRtInstances' last-frame rows start (rt_run)
+    float    shadow2[4];                 // x contact-hardening's widest penumbra (texels)
 };
 
 // Shaders/ShadowData.h.fsl
@@ -1380,6 +1381,7 @@ bool rt_prepare(uint64_t address)
     d.shadow[1] = F->normalBias;
     d.shadow[2] = F->localTexel;
     d.shadow[3] = F->localLightSize;
+    d.shadow2[0] = F->localPenumbraMax > 0 ? F->localPenumbraMax : 24.0f;
     d.probe[0] = settings.probe_rays < 0 ? 0 : (uint32_t)settings.probe_rays;
     for (uint32_t i = 0; i < d.shadowMode[0]; ++i)
     {

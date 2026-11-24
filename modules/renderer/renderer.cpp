@@ -84,6 +84,7 @@ struct GpuFrame
     uint32_t decals[4];      // x decals in gDecals (FLAG_DECALS)
     float    refraction[4];  // x the scene colour chain's levels (FLAG_REFRACTION)
     float    taps[32][4]; // xy: the shadow filters' Vogel disk, unturned
+    float    shadow3[4];  // x contact-hardening's widest penumbra (texels)
 };
 // A material's texture maps (Shaders/Common.h.fsl MaterialMapData).
 struct GpuMaterialMap
@@ -374,6 +375,7 @@ struct BlendEntry
     uint32_t refract;  // 1 thin, 2 solid (a ball: its far side isn't drawn, the near side refracts through all of it)
     int32_t  rect[4];  // its screen rectangle (render pixels, x0, y0, x1, y1), refracting ones only
     int32_t  reach[4]; // what its refraction can read of the chain (render pixels; whole: anywhere), refracting ones
+    int32_t  limit[4]; // what refraction_limit lets it read (whole: no limit), refracting ones
 };
 BlendEntry* gBlendList;
 uint32_t    gBlendCount, gBlendStream;
@@ -2027,8 +2029,25 @@ void drawSeeThrough(Cmd* cmd, uint32_t fi, uint32_t count, bool refract, Buffer*
     // With renderer_rt's traced refraction (kFlagRtRefract) a surface reads the chain where its traced ray lands, and the
     // ray bends again through any refracting glass behind it (Trace.comp.fsl followRay): it can land anywhere.
     const bool traced = (gFrameCpu.counts[2] & kFlagRtRefract) != 0;
+    // What surface e can read: its reach (the whole screen with traced refraction) within its limit.
+    auto reachOf = [&](const BlendEntry& e, int32_t q[4]) {
+        const int32_t* a = traced ? whole : e.reach;
+        for (int k = 0; k < 2; ++k)
+            q[k] = a[k] > e.limit[k] ? a[k] : e.limit[k], q[k + 2] = a[k + 2] < e.limit[k + 2] ? a[k + 2] : e.limit[k + 2];
+    };
+    // The first copy covers what any refracting surface can read: outside it nothing reads the chain this frame.
+    int32_t first[4] = { w, h, 0, 0 };
+    for (uint32_t j = 0; refract && j < count; ++j)
+        if (gBlendList[j].refract)
+        {
+            int32_t q[4];
+            reachOf(gBlendList[j], q);
+            if (q[2] > q[0] && q[3] > q[1])
+                grow(first, q);
+        }
     auto chainFor = [&](const BlendEntry& e) {
-        const int32_t* q = traced ? whole : e.reach;
+        int32_t q[4];
+        reachOf(e, q);
         const bool     meets = dirty[0] < q[2] && q[0] < dirty[2] && dirty[1] < q[3] && q[1] < dirty[3] &&
                            dirty[2] > dirty[0] && dirty[3] > dirty[1];
         if (copies && (!meets || copies >= kChainCopies))
@@ -2038,7 +2057,7 @@ void drawSeeThrough(Cmd* cmd, uint32_t fi, uint32_t count, bool refract, Buffer*
         if (copies && runFirst >= 0 && runRects)
             chainUpdate(cmd, fi, copies, drawn, runRects, (uint32_t)runFirst, (uint32_t)(runLast - runFirst + 1));
         else
-            chainUpdate(cmd, fi, copies, copies ? dirty : whole);
+            chainUpdate(cmd, fi, copies, copies ? dirty : first);
         copies++;
         dirty[0] = drawn[0] = w, dirty[1] = drawn[1] = h, dirty[2] = dirty[3] = drawn[2] = drawn[3] = 0;
         runFirst = runLast = -1;
@@ -3299,7 +3318,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
             {
                 BlendEntry& e = gBlendList[blendCount++];
                 float       vz = view[2][0] * sc.x + view[2][1] * sc.y + view[2][2] * sc.z + view[2][3];
-                e = { vz, count, lod, twoSided ? 1u : 0u, 0u, { 0, 0, (int32_t)w, (int32_t)h }, { 0, 0, (int32_t)w, (int32_t)h } };
+                e = { vz, count, lod, twoSided ? 1u : 0u, 0u, { 0, 0, (int32_t)w, (int32_t)h }, { 0, 0, (int32_t)w, (int32_t)h }, { 0, 0, (int32_t)w, (int32_t)h } };
                 float refr[8];
                 // Its shape whatever the knob: a solid is one layer (its near side) with refraction off too, so how many
                 // times glass tints doesn't change with the knob (and matches the shadow maps' tint and renderer_rt).
@@ -3330,11 +3349,13 @@ void draw(uint32_t pass, const YeaFrame* yf)
                 // between where it leaves and the fragment's own pixel, inside the sphere widened by that; a read at the
                 // chain's level L (at most its last) takes level-0 pixels within 4.5 x 2^L of the landing. A solid's
                 // ray leaves it in any direction: anywhere.
+                const uint32_t levels = gChainMips ? gChainMips : kChainLevels;
+                const float    footprint = (float)(5u << (levels - 1)) + 4.0f;
                 if (e.refract == 1)
-                {
-                    const uint32_t levels = gChainMips ? gChainMips : kChainLevels;
-                    box(info.sphere[3] + refr[1] / 0.2f, (float)(5u << (levels - 1)) + 4.0f, e.reach);
-                }
+                    box(info.sphere[3] + refr[1] / 0.2f, footprint, e.reach);
+                // refraction_limit: every landing (raster or traced, any shape) within that many pixels of the fragment's.
+                if (e.refract && settings.refraction_limit > 0)
+                    box(info.sphere[3], settings.refraction_limit * 0.01f * (float)h + footprint, e.limit);
             }
             count++;
             continue;
@@ -3865,6 +3886,8 @@ void draw(uint32_t pass, const YeaFrame* yf)
                     (refractVisible ? kFlagRefraction : 0) | (rtShadows && F.rtShadowTint ? kFlagRtTint : 0) |
                     (glassShadows ? kFlagGlassShadow : 0) | (rtRefract ? kFlagRtRefract : 0);
     gf->refraction[0] = (float)gChainMips;
+    gf->refraction[1] = settings.refraction_limit > 0 ? settings.refraction_limit * 0.01f * (float)h : 0.0f;
+    gf->shadow3[0] = F.localPenumbraMax > 0 ? F.localPenumbraMax : 24.0f;
     if (ssr)
     {
         gf->ssr[0] = F.ssrMaxRoughness;

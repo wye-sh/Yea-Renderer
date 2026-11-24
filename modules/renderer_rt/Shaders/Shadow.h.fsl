@@ -107,7 +107,7 @@ float localShadow(LightData l, float3 P, float3 N, float dist, float NoL, float2
         float dB = b / min(blockers / count - a, -1e-7);
         float tile = v.rect.z / texel;
         float pen = size * max(dR - dB, 0.0) / (max(dB, 1e-4) * dR * v.info.x);
-        radius = clamp(pen, 1.0, min(24.0, tile * 0.08)) * texel + radius * 0.25;
+        radius = clamp(pen, 1.0, min(gRt.shadow2.x, tile * 0.08)) * texel + radius * 0.25;
     }
     return localPcf(c, g, radius, bounds, gRt.shadowMode.x, rot);
 }

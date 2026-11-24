@@ -388,11 +388,11 @@ float3 localShadow(LightData l, float3 P, float3 N, float dist, float NoL, float
         float b = v.row2.w - a * v.row3.w;
         float dR = dot(v.row3, float4(Pb, 1.0));
         float nearZ = -b / a;
-        // The penumbra's widest: at most 24 texels (localPcfWide's spiral keeps them dense, so a wide one is no noisier)
+        // The penumbra's widest: at most softest_penumbra texels (24; localPcfWide's spiral keeps them dense, so a wide one is no noisier)
         // and a share of the tile that grows with the light, 8% to 25% (renderer_shadows widens a soft light's face
         // margin to match, so every tap stays in the face's own texels).
         float tile = v.rect.z / texel;
-        float widest = min(24.0, tile * clamp(size * 0.5, 0.08, 0.25));
+        float widest = min(gFrame.shadow3.x, tile * clamp(size * 0.5, 0.08, 0.25));
         float search = clamp(size * (dR - nearZ) / (dR * nearZ * v.info.x), 1.0, 12.0) * texel;
         // The search disk's rim first: its last four taps, each a gather of the 2 x 2 texels there, compared with
         // the receiver. When none is a blocker the pixel is lit (the same test as four filtered compares, at the

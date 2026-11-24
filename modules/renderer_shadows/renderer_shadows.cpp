@@ -89,7 +89,7 @@ Pipeline*           gNext[3];
 bool                gNextFailed;
 uint32_t            gNextTries;
 const uint32_t      kSlopeTries = 3;
-float          gGuardKey = -1; // what the point lights' face margins were drawn for
+float          gGuardKey[2] = { -1, -1 }; // what the point lights' face margins were drawn for
 DescriptorSet* gSet;
 Buffer *       gViewBuf[kMaxFrames], *gStreamBuf[kMaxFrames];
 RenderTarget * gSunAtlas, *gLocalAtlas;
@@ -822,12 +822,12 @@ void buildLocalViews(Group& g, const RenderLight& l)
         {
             // Past 90 degrees by the widest filter the shader may use at the face's edge (where it switches faces),
             // so every tap lands in this face's own drawn texels: the PCF disk (softness, a quarter of it under
-            // contact-hardening, whose penumbra reaches min(24, the light's share of the tile) texels and whose blocker search
+            // contact-hardening, whose penumbra reaches min(softest_penumbra, the light's share of the tile) texels and whose blocker search
             // 12), plus 2 for the bilinear compare and the 2 x 2 gathers. A narrower margin clamps the taps to the
             // tile's border texels, which draws a false shadow line along each face edge: a square around the
             // light's foot that moves with it.
             float share = penumbraShare(l);
-            float guard = share > 0 ? maxf(minf(24.0f, share * tileRes) + 0.25f * settings.softness, 12.0f) + 2.0f : settings.softness + 2.0f;
+            float guard = share > 0 ? maxf(minf(settings.softest_penumbra, share * tileRes) + 0.25f * settings.softness, 12.0f) + 2.0f : settings.softness + 2.0f;
             tanHalf = tileRes / maxf(tileRes - 2.0f * guard, tileRes * 0.5f);
             perspective(v, p, kFaces[f], tanHalf, nearZ, l.range);
         }
@@ -1993,12 +1993,12 @@ bool shadows_prepare(uint64_t address)
     }
     gSunRes = res;
     // The point lights' faces are drawn wider for wider filters (buildLocalViews): redraw them when those change.
-    float guardKey = settings.softness + (settings.contact_hardening ? 1000.0f : 0.0f);
-    if (guardKey != gGuardKey)
+    float guardKey[2] = { settings.softness + (settings.contact_hardening ? 1000.0f : 0.0f), settings.softest_penumbra };
+    if (memcmp(guardKey, gGuardKey, sizeof guardKey) != 0)
     {
         for (Group& g : gGroups)
             g.valid = 0;
-        gGuardKey = guardKey;
+        memcpy(gGuardKey, guardKey, sizeof guardKey);
     }
     if (!gSunAtlas || !gLocalAtlas || !gPipe)
         return false;
@@ -2573,6 +2573,7 @@ bool shadows_prepare(uint64_t address)
     F->localTexel = 1.0f / (float)gLocalSize;
     F->localLightSize = settings.contact_hardening ? (settings.light_size > 0 ? settings.light_size : -1.0f) : 0.0f;
     F->receiverPlane = settings.receiver_plane;
+    F->localPenumbraMax = settings.softest_penumbra;
     return true;
 }
 

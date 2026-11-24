@@ -111,7 +111,7 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   shaded in loops), so the normal offset can stay small. Point and spot lights harden at contact (PCSS: 4 gathers on
   the search disk's rim first, 16 depths that decide fully lit or umbra; only penumbrae gather 4 more, the 32
   depths averaged raw and turned into the blockers' distance with one divide, giving a penumbra from each light's own
-  size, else `light_size`, at most 24 texels and 8–25% of the tile with the light's size; past 8 texels a golden-angle
+  size, else `light_size`, at most softest_penumbra (renderer_shadows, 24) texels and 8–25% of the tile with the light's size; past 8 texels a golden-angle
   spiral of up to 48 taps keeps it smooth. Soft lights' tiles are sized by screen footprint like every other's;
   keep divides out of the rim, which every pixel runs). With TAA, cascade transitions
   pick one cascade per pixel (dithered) and the filters' noise turns each frame.
@@ -652,7 +652,9 @@ surface's luminance is that over its area). Colours linear RGB.
   much of the surface is there, its reflection stays whole; 0 opaque). With instance_shadow on (the default), a blended
   surface tints the light that passes it, in ray-traced shadows and (4.15.0) in the shadow maps alike.
   `material_refraction(m, ior, thickness, shape, tint)`: how it bends (thin pane 0, solid ball or block 1), blurs (by its
-  roughness: frosted glass) and tints what is behind it. Knob `refraction` (Performance) turns the bending and blur off.
+  roughness: frosted glass) and tints what is behind it. Knob `refraction` (Performance) turns the bending and blur off; `refraction_limit` (7.6.0, % of the screen's height, 0 none)
+  stops every landing (raster and traced) that far from its pixel, and the chain's first copy covers only the refracting
+  surfaces' reaches within it (the union of reaches, exact, even without a limit).
   renderer_models calls `material_blend(m, 1)` for glTF BLEND materials, their alpha in the factors.
 - Decals: `decal_add(pos, quat, half)` (a box; it paints along its -z, its z out of the surface), `decal_place`,
   `decal_look(d, albedo+opacity, roughness, metallic, emissive, nits, weights)` (weights: colour and glow, roughness,
@@ -712,7 +714,7 @@ sun_disk (degrees), near_plane, gpu_timings (logs each pass's GPU time every 30 
 texture_detail (Full, Half, Quarter: top mips left out; more when GPU memory is short). `renderer_culling`: enabled, max_lights, tile_size (8/16/32), z_bins,
 heatmap. `renderer_shadows`: enabled (the sun's), cascades, shadow_distance, cascade_split, sun_resolution, softness,
 filter_taps, pcss, sun_size, normal_bias, slope_bias, receiver_plane, light_shadows, shadowed_lights, local_atlas_resolution,
-updates_per_frame, max_tile_resolution, contact_hardening, light_size (m), show_cascades, show_atlas (the light shadow atlas, top right),
+updates_per_frame, max_tile_resolution, contact_hardening, light_size (m), softest_penumbra (texels, 7.6.0), show_cascades, show_atlas (the light shadow atlas, top right),
 glass_shadows, glass_resolution (the tint maps' side). `renderer_taa`: enabled, history_weight, clamp_width, sharpen, jitter,
 jitter_phases. `renderer_upscale`: upscaler (TAA, FSR), quality_mode (Native, Quality 67%, Balanced 59%,
 Performance 50%, Ultra_Performance 33%; for FSR only). `renderer_ao`: enabled, half_resolution (GTAO and its blur at half size, upsampled along edges in the forward pass), radius, intensity, falloff, slices, steps, denoise, specular_occlusion,

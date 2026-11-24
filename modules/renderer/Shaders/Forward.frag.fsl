@@ -154,6 +154,14 @@ float behind(float2 s, float rayZ)
 #endif
 
 #ifdef TRANSLUCENT
+// Where refraction may read the scene colour chain: within refraction_limit (gFrame.refraction.y render pixels; 0: no
+// limit) of the pixel each way, so the see-through pass copies only that much round each refracting surface.
+float2 landingLimit(float2 q, float2 pixel)
+{
+    float r = gFrame.refraction.y;
+    return r > 0.0 ? pixel + clamp(q - pixel, float2(-r, -r), float2(r, r)) : q;
+}
+
 // The scene's view depth at pixel q (reversed-Z, infinite far): the see-through pass's depth, or with MSAA its resolve.
 float sceneZ(float2 q)
 {
@@ -195,9 +203,9 @@ float3 refractedScene(float3 P, float3 N, float3 V, float4 refr, float a2, float
     float  zE = dot(gFrame.view[2], float4(E, 1.0));
     float  dz = max(dot(gFrame.view[2].xyz, D), 0.1);
     float  zBehind = sceneZ(pixel);
-    float2 q = pixelOf(clipOf(E + D * (max(zBehind - zE, 0.0) / dz)));
+    float2 q = landingLimit(pixelOf(clipOf(E + D * (max(zBehind - zE, 0.0) / dz))), pixel);
     float  zq = sceneZ(q);
-    q = pixelOf(clipOf(E + D * (max(zq - zE, 0.0) / dz)));
+    q = landingLimit(pixelOf(clipOf(E + D * (max(zq - zE, 0.0) / dz))), pixel);
     zq = sceneZ(q);
     if (zq < zP)
     {
@@ -721,7 +729,7 @@ float4 PS_MAIN(VSOutput In)
             if (r.a > 0.0 && abs(r.a - viewZ) < max(0.005 * viewZ, 2.0 * viewZWidth))
             {
                 float4 l = LoadTex2D(gRtRefractLanding, NO_SAMPLER, px, 0);
-                behind = l.w > 0.5 ? SampleLvlTex2D(gSceneColor, gSamplerTrilinearClamp, (In.Position.xy + l.xy) * gFrame.screen.zw,
+                behind = l.w > 0.5 ? SampleLvlTex2D(gSceneColor, gSamplerTrilinearClamp, landingLimit(In.Position.xy + l.xy, In.Position.xy) * gFrame.screen.zw,
                                                     clamp(l.z, 0.0, gFrame.refraction.x - 1.0)).rgb
                                    : r.rgb;
                 traced = true;

@@ -10,7 +10,7 @@ struct Buffer;
 struct RenderTarget;
 struct Texture;
 
-#define RENDER_FRAME_VERSION 28u
+#define RENDER_FRAME_VERSION 29u
 #define RENDER_RT_MAX_TRACED 8u
 #define RENDER_MAX_CASCADES  4u
 #define RENDER_MAX_TEXTURES  1024u // texture maps the shaders' array holds (the core's Texture table)
@@ -198,6 +198,7 @@ struct RenderFrame
     float         localLightSize; // point and spot lights' radius (m) for contact-hardening, 0: plain PCF; negative: contact-
                                   // hardening on with no default radius (lights with their own size use it)
     uint32_t      receiverPlane;  // tilt each PCF tap's depth compare with the receiver's plane
+    float         localPenumbraMax; // contact-hardening's widest penumbra (texels; renderer_shadows' softest_penumbra, frame v29)
 
     // TAA (renderer_taa). taa_prepare runs right after upscale_prepare, with only the fields above the camera set: it sets
     // jitter, taaOn, sharpen and resolved, and the core then renders at one sample with motion vectors.

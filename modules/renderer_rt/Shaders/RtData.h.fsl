@@ -45,4 +45,5 @@ STRUCT(RtData)
     DATA(uint4, refract, None);       // the refraction pass's rectangle: xy its first pixel, zw past its last
     DATA(float4, refractTemporal, None); // x 1 when last frame's refraction is its history, y frames of history, z where
                                          // gRtInstances' last-frame rows of each top-level instance start (3 a glass one)
+    DATA(float4, shadow2, None);         // x contact-hardening's widest penumbra (texels; renderer_shadows softest_penumbra)
 };

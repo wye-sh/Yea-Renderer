@@ -398,6 +398,9 @@ setting bool decals true
 # Glass bends and blurs what is behind it (material_refraction, rough see-through surfaces); off: seen straight through,
 # unblurred (saves a copy of the scene and its blurred levels while glass is in view).
 setting bool refraction true
+# How far glass may bend what is seen through it, as a share of the screen's height (percent; 0: no limit). With a limit
+# the scene copy refraction reads covers only that much round each pane, which is cheaper; bends past it stop at it.
+setting float refraction_limit 0 0 inf
 # How far a mesh's outline may be off on screen (display pixels) before a simpler version of it is drawn; 0 always
 # draws the finest. Built-in shapes only: meshes made vertex by vertex have one version.
 setting float lod_error 0.5 0 inf

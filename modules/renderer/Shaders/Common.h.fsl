@@ -46,8 +46,10 @@ STRUCT(FrameData)
     DATA(float4, textures, None);            // x texture mip bias (log2 of render over display width; 0 at native)
     DATA(float4, gi[4], None);               // dynamic diffuse GI (FLAG_GI): frame.h giGrid
     DATA(uint4, decals, None);               // x decals in gDecals (FLAG_DECALS)
-    DATA(float4, refraction, None);          // x gSceneColor's levels (FLAG_REFRACTION)
+    DATA(float4, refraction, None);          // x gSceneColor's levels (FLAG_REFRACTION), y how far a landing may be
+                                             // from its pixel (render pixels; 0: anywhere; refraction_limit)
     DATA(float4, taps[32], None);            // xy: the shadow filters' Vogel disk of counts.w taps, unturned
+    DATA(float4, shadow3, None);             // x contact-hardening's widest penumbra (texels; softest_penumbra)
 };
 
 // A reflection probe (renderer_probes), smallest box first.

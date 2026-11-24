@@ -47,6 +47,9 @@ setting int max_tile_resolution 1024 128 2048
 # with this radius (metres).
 setting bool contact_hardening true
 setting float light_size 0.06 0 inf
+# The softest a light's shadow gets under contact-hardening: its penumbra's widest, in shadow-map texels (24: as before
+# 7.6.0). Lower is cheaper where shadows are softest and makes the softest edges sharper.
+setting float softest_penumbra 24 1 inf
 setting bool show_atlas false
 category Glass
 # Glass that casts shadows (instance_shadow on a see-through instance) colours the shadow maps' light by what it lets
