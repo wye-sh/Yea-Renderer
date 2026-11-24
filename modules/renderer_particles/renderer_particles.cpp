@@ -5,6 +5,7 @@
 // core's see-through pass (frame.h blendRuns): the sorted list split on the GPU at each blended surface's depth, each run
 // drawn indirectly just before its surface. Nothing runs while no emitter exists and no particle is alive.
 #include "yea_renderer_particles.h"
+#include "knobs.h"
 #include "frame.h"
 #include <yea/pipelines.h>
 
@@ -300,6 +301,7 @@ void makeDrawPipe(TinyImageFormat format, bool queue);
 
 int load(int reloaded)
 {
+    knobs::check(true);
     const YeaHost* host = yea::host();
     gRenderer = (Renderer*)host->renderer;
     gQueue = (Queue*)host->queue;
@@ -487,6 +489,8 @@ void unload()
 
 void update(uint32_t phase, float dt)
 {
+    if (phase == YEA_PHASE_LATE)
+        knobs::check(false);
     if (phase == YEA_PHASE_SIMULATE)
         gPendingDt += dt;
 }

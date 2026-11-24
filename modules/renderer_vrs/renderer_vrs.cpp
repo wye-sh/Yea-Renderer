@@ -2,6 +2,7 @@
 // shading rate per tile into Yea's rate image (yea::shadingRate()); the core binds the forward pass with
 // it. On a GPU without variable-rate shading there is no rate image and this module does nothing.
 #include "yea_renderer_vrs.h"
+#include "knobs.h"
 #include "frame.h"
 #include <yea/shadingrate.h>
 
@@ -100,6 +101,7 @@ void barrier(Cmd* cmd, Texture* t, ResourceState from, ResourceState to)
 
 int load(int reloaded)
 {
+    knobs::check(true);
     const YeaHost* host = yea::host();
     gRenderer = (Renderer*)host->renderer;
     gQueue = (Queue*)host->queue;
@@ -179,7 +181,11 @@ void unload()
         removeShader(gRenderer, gShader);
 }
 
-void update(uint32_t phase, float dt) {}
+void update(uint32_t phase, float dt)
+{
+    if (phase == YEA_PHASE_LATE)
+        knobs::check(false);
+}
 void draw(uint32_t pass, const YeaFrame* frame) {}
 
 // Frame versions (6.1.0): this module's frame layout, for the core; and whether the core's is the same (an older or newer

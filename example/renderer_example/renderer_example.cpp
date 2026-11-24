@@ -4,6 +4,7 @@
 // camera (hold the mouse button to look, the move keys to fly). Each light type can be switched off, which removes its
 // lights. Reset: the scene is rebuilt with the lights and camera where they start.
 #include "yea_renderer_example.h"
+#include "knobs.h"
 #include "../../modules/renderer_models/ModelLink.h"
 
 #include <math.h>
@@ -818,6 +819,7 @@ bool picture(bool on)
 
 int load(int reloaded)
 {
+    knobs::check(true);
     gState = nullptr;
     gFreshVersion = true;
     gLooking = false;
@@ -829,6 +831,8 @@ void unload() { yea::captureMouse(false); }
 
 void update(uint32_t phase, float dt)
 {
+    if (phase == YEA_PHASE_LATE)
+        knobs::check(false);
     if (phase != YEA_PHASE_SIMULATE)
         return;
     State* s = state();

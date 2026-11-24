@@ -4,6 +4,7 @@
 // YEA_PASS_WORLD, with the frame's target bound, it composites that image (tone mapped) onto it, so the
 // host's own world quads draw over it.
 #include "yea_renderer.h"
+#include "knobs.h"
 #include <yea/shadingrate.h>
 #include <yea/raytracing.h>
 #include <yea/pipelines.h>
@@ -2419,6 +2420,7 @@ Texture* loadTonyLut()
 
 int load(int reloaded)
 {
+    knobs::check(true);
     const YeaHost* host = yea::host();
     bindState(); // first: the exports use these blocks even if the GPU side fails below
     gShadingRate = yea::shadingRate();
@@ -2867,7 +2869,11 @@ void unload()
     gPipeCache = nullptr;
 }
 
-void update(uint32_t phase, float dt) {}
+void update(uint32_t phase, float dt)
+{
+    if (phase == YEA_PHASE_LATE)
+        knobs::check(false);
+}
 
 uint64_t gRenderedFrame; // host frame whose scene YEA_PASS_RENDER made, for YEA_PASS_WORLD's composite
 uint32_t gRenderedFi;

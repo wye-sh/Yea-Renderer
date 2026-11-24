@@ -3,6 +3,7 @@
 // one bitmask of lights per screen tile, tested against the tile's depth range from the prepass. The core's decals are
 // binned the same way, into their own masks and bins (any order: each bin keeps its first and last decal).
 #include "yea_renderer_culling.h"
+#include "knobs.h"
 #include "frame.h"
 
 #include <Common_3/Graphics/Interfaces/IGraphics.h>
@@ -77,6 +78,7 @@ uint32_t snapTile(int32_t t) { return t >= 32 ? 32 : t >= 16 ? 16 : 8; }
 
 int load(int reloaded)
 {
+    knobs::check(true);
     const YeaHost* host = yea::host();
     gRenderer = (Renderer*)host->renderer;
     gQueue = (Queue*)host->queue;
@@ -149,7 +151,11 @@ void unload()
         removeDescriptorSet(gRenderer, gSet);
 }
 
-void update(uint32_t phase, float dt) {}
+void update(uint32_t phase, float dt)
+{
+    if (phase == YEA_PHASE_LATE)
+        knobs::check(false);
+}
 void draw(uint32_t pass, const YeaFrame* frame) {}
 
 // Frame versions (6.1.0): this module's frame layout, for the core; and whether the core's is the same (an older or newer

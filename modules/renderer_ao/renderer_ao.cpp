@@ -3,6 +3,7 @@
 // forward pass reads for its ambient light (diffuse with multi-bounce, specular with specular occlusion); at half
 // size the forward pass upsamples it along edges itself (F->aoScale 2), so no full-size pass is needed.
 #include "yea_renderer_ao.h"
+#include "knobs.h"
 #include "frame.h"
 
 #include <Common_3/Graphics/Interfaces/IGraphics.h>
@@ -117,6 +118,7 @@ Pipeline* computePipeline(Shader* s, const char* name)
 
 int load(int reloaded)
 {
+    knobs::check(true);
     const YeaHost* host = yea::host();
     gRenderer = (Renderer*)host->renderer;
     gQueue = (Queue*)host->queue;
@@ -176,7 +178,11 @@ void unload()
     }
 }
 
-void update(uint32_t phase, float dt) {}
+void update(uint32_t phase, float dt)
+{
+    if (phase == YEA_PHASE_LATE)
+        knobs::check(false);
+}
 void draw(uint32_t pass, const YeaFrame* frame) {}
 
 // Frame versions (6.1.0): this module's frame layout, for the core; and whether the core's is the same (an older or newer

@@ -5,6 +5,7 @@
 // ambient as 9 spherical harmonics. The sun's light reaching the camera is worked out here on the CPU with the same
 // model, so the core hands every module the sun as it arrives (red at sunset, gone below the horizon).
 #include "yea_renderer_sky.h"
+#include "knobs.h"
 #include "frame.h"
 
 #include <Common_3/Graphics/Interfaces/IGraphics.h>
@@ -220,6 +221,7 @@ void freeAll()
 
 int load(int reloaded)
 {
+    knobs::check(true);
     const YeaHost* host = yea::host();
     gRenderer = (Renderer*)host->renderer;
     gQueue = (Queue*)host->queue;
@@ -353,7 +355,11 @@ void unload()
     gReady = gOn = false;
 }
 
-void update(uint32_t phase, float dt) {}
+void update(uint32_t phase, float dt)
+{
+    if (phase == YEA_PHASE_LATE)
+        knobs::check(false);
+}
 void draw(uint32_t pass, const YeaFrame* frame) {}
 
 // Frame versions (6.1.0): this module's frame layout, for the core; and whether the core's is the same (an older or newer

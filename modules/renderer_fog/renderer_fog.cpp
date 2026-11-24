@@ -4,6 +4,7 @@
 // shadow maps, jittered each frame and blended with last frame's froxels (reprojected), then integrated front to back.
 // The core reads the result in its forward and sky passes at render size, before TAA or the upscaler.
 #include "yea_renderer_fog.h"
+#include "knobs.h"
 #include "frame.h"
 
 #include <Common_3/Graphics/Interfaces/IGraphics.h>
@@ -193,6 +194,7 @@ Texture* makeNoGi(const char* name)
 
 int load(int reloaded)
 {
+    knobs::check(true);
     const YeaHost* host = yea::host();
     gRenderer = (Renderer*)host->renderer;
     gQueue = (Queue*)host->queue;
@@ -309,7 +311,11 @@ void unload()
     gReady = gOn = false;
 }
 
-void update(uint32_t phase, float dt) {}
+void update(uint32_t phase, float dt)
+{
+    if (phase == YEA_PHASE_LATE)
+        knobs::check(false);
+}
 void draw(uint32_t pass, const YeaFrame* frame) {}
 
 // --- Volumes -------------------------------------------------------------------------------------------------------

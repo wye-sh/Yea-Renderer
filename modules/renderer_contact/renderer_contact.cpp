@@ -2,6 +2,7 @@
 // BendSss.h.fsl; third_party/bend_sss, Apache-2.0) from the depth prepass towards the sun, into a full-size R32F
 // visibility texture the forward pass multiplies the sun's shadow by.
 #include "yea_renderer_contact.h"
+#include "knobs.h"
 #include "frame.h"
 #include "third_party/bend_sss/bend_sss_cpu.h"
 
@@ -84,6 +85,7 @@ void barrier(Cmd* cmd, Texture* t, ResourceState from, ResourceState to)
 
 int load(int reloaded)
 {
+    knobs::check(true);
     const YeaHost* host = yea::host();
     gRenderer = (Renderer*)host->renderer;
     gQueue = (Queue*)host->queue;
@@ -142,7 +144,11 @@ void unload()
     }
 }
 
-void update(uint32_t phase, float dt) {}
+void update(uint32_t phase, float dt)
+{
+    if (phase == YEA_PHASE_LATE)
+        knobs::check(false);
+}
 void draw(uint32_t pass, const YeaFrame* frame) {}
 
 // Frame versions (6.1.0): this module's frame layout, for the core; and whether the core's is the same (an older or newer

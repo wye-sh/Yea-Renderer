@@ -567,6 +567,7 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   ambient and reflections, a floor showing only shadow and contact darkening), resolves its 4 samples tonemapped into
   the out target, and leaves everything in SHADER_RESOURCE; the panel shows it with `yea::canvasImage`. The core's
   preview pipelines and buffers are made in its own `load()` (`preview_core.h`); a failure turns only the preview off.
+- `knobs.h`, copied identically into every renderer module and `renderer_example`: each logs one line of its knobs that differ from their module.yea defaults (`<module> knobs off their defaults: name=value ...`) at load, then after a change once the values hold still 2 s, at most every 10 s. `yea reports --module <m>` shows what a user's Yea runs with, without reading F1 (7.4.1).
 - The core calls the others through optional imports with a `RenderFrame*` (as `u64`): `frame.h`, copied
   identically into `renderer`, `renderer_culling`, `renderer_shadows`, `renderer_taa`, `renderer_ao`, `renderer_contact`, `renderer_probes`, `renderer_ssr`, `renderer_vrs`, `renderer_rt`, `renderer_upscale`, `renderer_post`, `renderer_sky`, `renderer_fog`, `renderer_particles` and `renderer_gi` (`mathx.h` into the
   first three). Change all copies together and raise `RENDER_FRAME_VERSION`. Mixed versions (6.1.0; Yea 148 swapped

@@ -3,6 +3,7 @@
 // motion vectors; taa_resolve blends the frame into the reprojected history (Shaders/Taa.comp.fsl).
 // The two history targets swap every frame; the resolved one is what the core composites.
 #include "yea_renderer_taa.h"
+#include "knobs.h"
 #include "frame.h"
 
 #include <Common_3/Graphics/Interfaces/IGraphics.h>
@@ -88,6 +89,7 @@ void barrier(Cmd* cmd, RenderTarget* rt, ResourceState from, ResourceState to)
 
 int load(int reloaded)
 {
+    knobs::check(true);
     const YeaHost* host = yea::host();
     gRenderer = (Renderer*)host->renderer;
     gQueue = (Queue*)host->queue;
@@ -159,7 +161,11 @@ void unload()
         removeShader(gRenderer, gShader);
 }
 
-void update(uint32_t phase, float dt) {}
+void update(uint32_t phase, float dt)
+{
+    if (phase == YEA_PHASE_LATE)
+        knobs::check(false);
+}
 void draw(uint32_t pass, const YeaFrame* frame) {}
 
 // Frame versions (6.1.0): this module's frame layout, for the core; and whether the core's is the same (an older or newer

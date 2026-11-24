@@ -8,6 +8,7 @@
 // as renderer_rt lights its hits, read back as the same rays, so everything after is the same. The core reads the
 // probes for diffuse ambient; fog, particles and reflection hits read them too (Shaders/GiSample.h.fsl).
 #include "yea_renderer_gi.h"
+#include "knobs.h"
 #include <yea/raytracing.h>
 #include "frame.h"
 
@@ -963,6 +964,7 @@ void recordCapture(const RenderFrame* F, uint32_t count)
 
 int load(int reloaded)
 {
+    knobs::check(true);
     const YeaHost* host = yea::host();
     gRenderer = (Renderer*)host->renderer;
     gQueue = (Queue*)host->queue;
@@ -1030,7 +1032,11 @@ void unload()
     gReady = gOn = false;
 }
 
-void update(uint32_t phase, float dt) {}
+void update(uint32_t phase, float dt)
+{
+    if (phase == YEA_PHASE_LATE)
+        knobs::check(false);
+}
 void draw(uint32_t pass, const YeaFrame* frame) {}
 
 void gi_volume(yea_float3 center, yea_float3 size)

@@ -3,6 +3,7 @@
 // pixel's reflection against that copy and takes its colour from last frame's anti-aliased image
 // (renderer_taa's `previous`), blended over the reflection probes (renderer's Shaders/Forward.frag.fsl).
 #include "yea_renderer_ssr.h"
+#include "knobs.h"
 #include "frame.h"
 
 #include <Common_3/Graphics/Interfaces/IGraphics.h>
@@ -77,6 +78,7 @@ void barrier(Cmd* cmd, Texture* t, ResourceState from, ResourceState to)
 
 int load(int reloaded)
 {
+    knobs::check(true);
     const YeaHost* host = yea::host();
     gRenderer = (Renderer*)host->renderer;
     gQueue = (Queue*)host->queue;
@@ -128,7 +130,11 @@ void unload()
         removeShader(gRenderer, gShader);
 }
 
-void update(uint32_t phase, float dt) {}
+void update(uint32_t phase, float dt)
+{
+    if (phase == YEA_PHASE_LATE)
+        knobs::check(false);
+}
 void draw(uint32_t pass, const YeaFrame* frame) {}
 
 // Frame versions (6.1.0): this module's frame layout, for the core; and whether the core's is the same (an older or newer

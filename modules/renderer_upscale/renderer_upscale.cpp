@@ -7,6 +7,7 @@
 // FSR (Windows, Direct3D 12): AMD's FSR SDK 2.4, through its signed loader and upscaler DLLs (Assets/), loaded only
 // while FSR is picked and let go when it isn't. AMD's API headers are in third_party/ffx (MIT).
 #include "yea_renderer_upscale.h"
+#include "knobs.h"
 #include "frame.h"
 
 #include <Common_3/Graphics/Interfaces/IGraphics.h>
@@ -640,6 +641,7 @@ Active gActive, gLastActive;
 
 int load(int reloaded)
 {
+    knobs::check(true);
     const YeaHost* host = yea::host();
     gRenderer = (Renderer*)host->renderer;
     gQueue = (Queue*)host->queue;
@@ -727,6 +729,8 @@ void unload()
 
 void update(uint32_t phase, float dt)
 {
+    if (phase == YEA_PHASE_LATE)
+        knobs::check(false);
     for (uint32_t i = 0; i < gSayCount; ++i)
         yea::host()->log(gSayLevel[i], gSay[i]);
     gSayCount = 0;

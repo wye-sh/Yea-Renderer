@@ -3,6 +3,7 @@
 // of them as the renderer's instances, and the Model Viewer's preview (drawn by the core's preview_draw into this
 // module's own targets).
 #include "yea_renderer_models.h"
+#include "knobs.h"
 #include "models.h"
 #include "retarget.h"
 #include "blend.h"
@@ -2818,6 +2819,7 @@ uint64_t api(uint32_t version) { return version == mdl::kApi ? (uint64_t)(uintpt
 
 int load(int reloaded)
 {
+    knobs::check(true);
     const YeaHost* host = yea::host();
     gRenderer = (Renderer*)host->renderer;
     gQueue = (Queue*)host->queue;
@@ -2900,6 +2902,8 @@ void unload()
 
 void update(uint32_t phase, float dt)
 {
+    if (phase == YEA_PHASE_LATE)
+        knobs::check(false);
     if (phase != YEA_PHASE_LATE) // after the game's modules have placed and moved their models this frame
     {
         if (phase == YEA_PHASE_SIMULATE && gPreview.turntable)

@@ -5,6 +5,7 @@
 // through uncovered texels. Materials with reflections off skip them.
 // Dirty probes are captured first; `updates_per_frame` more are re-captured in turn so moving things show.
 #include "yea_renderer_probes.h"
+#include "knobs.h"
 #include "frame.h"
 
 #include <Common_3/Graphics/Interfaces/IGraphics.h>
@@ -407,6 +408,7 @@ uint32_t probe_count()
 // --- Module -----------------------------------------------------------------------------------------
 int load(int reloaded)
 {
+    knobs::check(true);
     const YeaHost* host = yea::host();
     gRenderer = (Renderer*)host->renderer;
     gQueue = (Queue*)host->queue;
@@ -483,7 +485,11 @@ void unload()
             removeShader(gRenderer, s);
 }
 
-void update(uint32_t phase, float dt) {}
+void update(uint32_t phase, float dt)
+{
+    if (phase == YEA_PHASE_LATE)
+        knobs::check(false);
+}
 void draw(uint32_t pass, const YeaFrame* frame) {}
 
 // Frame versions (6.1.0): this module's frame layout, for the core; and whether the core's is the same (an older or newer

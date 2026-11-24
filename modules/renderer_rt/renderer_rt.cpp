@@ -8,6 +8,7 @@
 // alternating), then the filter, which averages each glossy pixel's accumulated reflection over its gloss footprint
 // into the texture the core's forward pass reads (the trace's own, free by then).
 #include "yea_renderer_rt.h"
+#include "knobs.h"
 #include <yea/raytracing.h>
 #include <yea/pipelines.h>
 #include "frame.h"
@@ -895,6 +896,7 @@ void mulRows(const float a[4][4], const float b[4][4], float out[4][4])
 
 int load(int reloaded)
 {
+    knobs::check(true);
     const YeaHost* host = yea::host();
     gRenderer = (Renderer*)host->renderer;
     gQueue = (Queue*)host->queue;
@@ -1184,6 +1186,8 @@ void unload()
 
 void update(uint32_t phase, float dt)
 {
+    if (phase == YEA_PHASE_LATE)
+        knobs::check(false);
     if (phase == YEA_PHASE_LATE && gRenderer && gRay)
         retryPipelines();
 }

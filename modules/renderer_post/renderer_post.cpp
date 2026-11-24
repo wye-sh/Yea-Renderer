@@ -3,6 +3,7 @@
 // colour grading through a 32^3 LUT in ACEScct (white balance, contrast, lift / gamma / gain, saturation). With every
 // effect neutral, post_prepare returns 0 and nothing runs.
 #include "yea_renderer_post.h"
+#include "knobs.h"
 #include "frame.h"
 
 #include <Common_3/Graphics/Interfaces/IGraphics.h>
@@ -352,6 +353,7 @@ void dispatch(RenderFrame* F, Pass pass, const PostData& d, Texture* src, Textur
 
 int load(int reloaded)
 {
+    knobs::check(true);
     const YeaHost* host = yea::host();
     gRenderer = (Renderer*)host->renderer;
     gQueue = (Queue*)host->queue;
@@ -426,6 +428,8 @@ void unload()
 
 void update(uint32_t phase, float dt)
 {
+    if (phase == YEA_PHASE_LATE)
+        knobs::check(false);
     if (dt > 0)
         gDt = dt; // autofocus eases by the frame's length
 }

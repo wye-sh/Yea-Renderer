@@ -3,6 +3,7 @@
 // redrawn only when its view or a caster over it changed. Spot and point lights: one cached atlas of tiles; a light's tiles are
 // redrawn only when it or a caster near it moved, a few lights per frame.
 #include "yea_renderer_shadows.h"
+#include "knobs.h"
 #include "frame.h"
 #include "mathx.h"
 
@@ -1726,6 +1727,7 @@ void freeTintPasses()
 
 int load(int reloaded)
 {
+    knobs::check(true);
     const YeaHost* host = yea::host();
     gRenderer = (Renderer*)host->renderer;
     gQueue = (Queue*)host->queue;
@@ -1825,6 +1827,8 @@ void unload()
 // take (one queued under the core's call, as prepare is, isn't).
 void update(uint32_t phase, float dt)
 {
+    if (phase == YEA_PHASE_LATE)
+        knobs::check(false);
     if (gReady && slopePipelines(settings.slope_bias))
     {
         for (Group& g : gGroups)
