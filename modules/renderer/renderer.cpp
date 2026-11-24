@@ -2006,7 +2006,7 @@ void segSwitch(Cmd* cmd, uint32_t fi, uint32_t part);
 // `before(j)` draws what goes just behind surface j (a particle run) and says which run it drew (-1: none). Refraction:
 // the scene colour chain copied before the first glass that bends what is behind it, and again over what was drawn since
 // (the dirty rectangle: surfaces' screen rectangles, the whole screen for a particle run) before glass whose reach (what
-// its refraction can read, BlendEntry) meets it. Where the runs drawn since have screen
+// its refraction can read, BlendEntry; the whole screen with traced refraction) meets it. Where the runs drawn since have screen
 // rectangles (`runRects`, renderer_particles'), that copy covers only the surfaces drawn since and those rectangles,
 // worked out on the GPU: the same copies, each over every pixel that changed since the one before.
 template <typename Rebind, typename Before>
@@ -2024,8 +2024,11 @@ void drawSeeThrough(Cmd* cmd, uint32_t fi, uint32_t count, bool refract, Buffer*
         d[2] = r[2] > d[2] ? r[2] : d[2];
         d[3] = r[3] > d[3] ? r[3] : d[3];
     };
+    // With renderer_rt's traced refraction (kFlagRtRefract) a surface reads the chain where its traced ray lands, and the
+    // ray bends again through any refracting glass behind it (Trace.comp.fsl followRay): it can land anywhere.
+    const bool traced = (gFrameCpu.counts[2] & kFlagRtRefract) != 0;
     auto chainFor = [&](const BlendEntry& e) {
-        const int32_t* q = e.reach;
+        const int32_t* q = traced ? whole : e.reach;
         const bool     meets = dirty[0] < q[2] && q[0] < dirty[2] && dirty[1] < q[3] && q[1] < dirty[3] &&
                            dirty[2] > dirty[0] && dirty[3] > dirty[1];
         if (copies && (!meets || copies >= kChainCopies))
