@@ -2196,6 +2196,78 @@ void freeLightCount()
         freeBuffer(gCountRead[i]);
 }
 
+// SCRATCH-DUMP (local measurement only, never committed): YEA_DUMP=<frame>:<file> writes the HDR scene (after the
+// see-through pass) at the first host frame >= <frame> that is a multiple of 64, as w, h, row pitch, then the rows.
+#if defined(_WIN32)
+ID3D12Resource*                    gDumpBuf;
+uint64_t                           gDumpFrame;
+int                                gDumpState;
+D3D12_PLACED_SUBRESOURCE_FOOTPRINT gDumpFp;
+void scratchDump(Cmd* cmd)
+{
+    // YEA_DUMP=<frame>[,<frame>...]:<path> writes <path>.<frame>.raw for each (exact host frames, ascending).
+    static const char* env = getenv("YEA_DUMP");
+    static const char* next = env;
+    if (!env)
+        return;
+    const uint64_t frame = yea::host()->frame();
+    if (gDumpState == 1)
+    {
+        if (frame < gDumpFrame + 8)
+            return;
+        void* p = nullptr;
+        gDumpBuf->Map(0, nullptr, &p);
+        char path[512];
+        snprintf(path, sizeof path, "%s.%llu.raw", strchr(env, ':') + 1, (unsigned long long)gDumpFrame);
+        FILE* f = fopen(path, "wb");
+        if (f && p)
+        {
+            uint32_t hdr[3] = { gDumpFp.Footprint.Width, gDumpFp.Footprint.Height, gDumpFp.Footprint.RowPitch };
+            fwrite(hdr, 4, 3, f);
+            fwrite(p, 1, (size_t)gDumpFp.Footprint.RowPitch * gDumpFp.Footprint.Height, f);
+        }
+        if (f)
+            fclose(f);
+        gDumpBuf->Unmap(0, nullptr);
+        gDumpBuf->Release();
+        gDumpBuf = nullptr;
+        gDumpState = 0;
+    }
+    if (!next || *next == ':' || !*next)
+        return;
+    if (frame != strtoull(next, nullptr, 10))
+        return;
+    next = strchr(next, ',') ? strchr(next, ',') + 1 : nullptr;
+    ID3D12Device*       dev = gRenderer->mDx.pDevice;
+    ID3D12Resource*     res = gHdr->pTexture->mDx.pResource;
+    D3D12_RESOURCE_DESC rd;
+    res->GetDesc(&rd);
+    UINT64              total = 0;
+    dev->GetCopyableFootprints(&rd, 0, 1, 0, &gDumpFp, nullptr, nullptr, &total);
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bd = {};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = total;
+    bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&gDumpBuf))))
+        return;
+    barrierRt(cmd, gHdr, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+    dst.pResource = gDumpBuf;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint = gDumpFp;
+    src.pResource = res;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    cmd->mDx.pCmdList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    barrierRt(cmd, gHdr, RESOURCE_STATE_COPY_SOURCE, RESOURCE_STATE_SHADER_RESOURCE);
+    gDumpFrame = frame;
+    gDumpState = 1;
+}
+#endif
+
 void timeFrame(Cmd* cmd, uint32_t fi, bool on, const char* scene)
 {
     if (gCountPending[fi])
@@ -2264,7 +2336,8 @@ void timeFrame(Cmd* cmd, uint32_t fi, bool on, const char* scene)
         gTimeLiveRan = gTimeLiveFrames = 0;
         gTimeLiveAt = at;
     }
-    if (at - gTimeLogged >= 30.0 && gTimeCount[kTimeTotal]) // 30 s in 6.1.0: Yea takes 10 lines a minute
+    static const double every = getenv("YEA_TIMING_SECONDS") ? atof(getenv("YEA_TIMING_SECONDS")) : 30.0; // SCRATCH-DUMP
+    if (at - gTimeLogged >= every && gTimeCount[kTimeTotal]) // 30 s in 6.1.0: Yea takes 10 lines a minute
     {
         char line[1024];
         int  n = snprintf(line, sizeof line, "gpu ms avg/max over %u frames:", gTimeCount[kTimeTotal]);
@@ -2279,6 +2352,9 @@ void timeFrame(Cmd* cmd, uint32_t fi, bool on, const char* scene)
                      gCountSum[1] / gCountSum[0], gCountSum[2] / gCountSum[0], gCountSum[3] / gCountSum[0], gCountSum[4] / gCountSum[0],
                      gCountSum[5] / gCountSum[0], gCountSum[6] / gCountSum[0]);
         memset(gCountSum, 0, sizeof gCountSum);
+        if (const char* tf = getenv("YEA_TIMING_FILE")) // SCRATCH-DUMP
+            if (FILE* f = fopen(tf, "a"))
+                fprintf(f, "%s\n", line), fclose(f);
         yea::log(line);
         memset(gTimeSum, 0, sizeof gTimeSum);
         memset(gTimeMax, 0, sizeof gTimeMax);
@@ -4479,6 +4555,9 @@ void draw(uint32_t pass, const YeaFrame* yf)
         F.transparency = blendDraw ? gTransparency->pTexture : nullptr;
         timeEnd(cmd, fi, kTimeBlend);
     }
+#if defined(_WIN32)
+    scratchDump(cmd); // SCRATCH-DUMP
+#endif
 
     // Auto exposure: histogram, then the adapted exposure. Held still in a view mode or a debug view,
     // so it never meters (and chases) the debug image, and is where it was when it ends.

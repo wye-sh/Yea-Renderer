@@ -684,9 +684,30 @@ void syncLights(State* s)
     }
 }
 
+// Benchmark View shows the lights and shapes at one moment of their motion, the same on every run and every machine, so
+// GPU timings compare between versions and with the user's reports: kBenchmarkTime seconds in. At 0 the moving lights sit at
+// their golden-angle spread, and the frame's cost is the median of eight moments over two minutes of motion (15.0-17.6 ms on
+// an RTX 2080 at 2560 x 1356, 15.2 here). Logged once each time it turns on.
+const float kBenchmarkTime = 0.0f;
+bool        gBenchmarkLogged;
+
+float benchmarkTime()
+{
+    float t = kBenchmarkTime;
+    if (!gBenchmarkLogged)
+    {
+        char line[160];
+        snprintf(line, sizeof line, "renderer_example: Benchmark View holds the scene at %.1f s of its motion (scene %u, light speed %g)", t,
+                 (uint32_t)sceneIndex(), settings.light_speed);
+        yea::log(line);
+        gBenchmarkLogged = true;
+    }
+    return t;
+}
+
 void animate(State* s)
 {
-    float t = s->t;
+    float t = settings.benchmark_view ? benchmarkTime() : s->t;
     float el = settings.sun_elevation * kPi / 180, az = settings.sun_azimuth * kPi / 180;
     if (s->sun != kNone)
     {
@@ -860,7 +881,8 @@ void update(uint32_t phase, float dt)
     if (renderer_probes::probe_count() == 0)
         addProbes(); // renderer_probes came up after the scene was built: its import was a stub then
     if (!settings.benchmark_view)
-        s->t += dt; // Benchmark View holds the lights and shapes still, so timings repeat
+        gBenchmarkLogged = false; // logged again the next time it turns on
+    s->t += dt; // runs on under Benchmark View, which shows kBenchmarkTime instead (animate), so turning it off resumes
     placeModels();
     syncLights(s);
     syncEmitter(particles->dust, settings.dust && has(kHasDust), makeDust);

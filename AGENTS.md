@@ -975,7 +975,7 @@ asks the host for the mouse each frame (`yea::captureMouse(true)`: hidden, kept 
 The host lets go when the button is up (it is no longer asked), F1 opens, focus is lost, or on a view switch
 or Reset. Reset: lights, camera, dust and steam
 back to the start (the particle pool starts empty). `benchmark_view` holds the camera at its start view (field of view 55), or at the gold or
-mirror sphere's close-up (`benchmark_camera`, field of view 40), without moving the user's own, and holds the lights and shapes still, so GPU Timings compare between versions; the project's
+mirror sphere's close-up (`benchmark_camera`, field of view 40), without moving the user's own, and shows the lights and shapes at one fixed moment of their motion (`kBenchmarkTime`, 0 s: the median frame of their motion; logged when it turns on; turning it off resumes them where they would be), so GPU Timings compare between versions and machines; the project's
 `modules/test_renderer_bench` (a test on the user's machine) drives it. Exports `picture` (a fixed angle).
 `scene` (7.3.0, category Scene): Full (all of the above), or a small scene for one part of the renderer: Shadows (sun,
 4 moving lights, shapes, spinners), Area Lights (the area lights alone, no sun, with shapes and sphere rows), Global

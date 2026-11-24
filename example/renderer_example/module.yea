@@ -84,7 +84,7 @@ category Scene
 # lights, global illumination, reflections, glass, fog and particles, post and upscaling, models and animation), each
 # from its own start view. The knobs below still switch their parts off in every scene.
 setting choice scene Full Full Shadows Area_Lights Global_Illumination Reflections Glass Fog_and_Particles Post_and_Upscaling Models
-# The camera held at its scene's start view (field of view 55) and the lights and shapes held still, so GPU timings
+# The camera held at its scene's start view (field of view 55) and the lights and shapes at one fixed moment, so GPU timings
 # compare between versions.
 setting bool benchmark_view false
 # Where Benchmark View holds the camera: the start view (field of view 55), or a close-up of the gold or the
