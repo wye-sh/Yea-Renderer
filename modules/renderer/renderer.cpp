@@ -373,6 +373,7 @@ struct BlendEntry
     uint32_t instance, mesh, twoSided;
     uint32_t refract;  // 1 thin, 2 solid (a ball: its far side isn't drawn, the near side refracts through all of it)
     int32_t  rect[4];  // its screen rectangle (render pixels, x0, y0, x1, y1), refracting ones only
+    int32_t  reach[4]; // what its refraction can read of the chain (render pixels; whole: anywhere), refracting ones
 };
 BlendEntry* gBlendList;
 uint32_t    gBlendCount, gBlendStream;
@@ -2004,8 +2005,8 @@ void segSwitch(Cmd* cmd, uint32_t fi, uint32_t part);
 // See-through surfaces 0 to count of the sorted list, back to front, into the bound pass (`rebind` binds it again).
 // `before(j)` draws what goes just behind surface j (a particle run) and says which run it drew (-1: none). Refraction:
 // the scene colour chain copied before the first glass that bends what is behind it, and again over what was drawn since
-// (the dirty rectangle: surfaces' screen rectangles, the whole screen for a particle run) before glass whose rectangle,
-// widened by its own size each way for the rays it bends sideways, meets it. Where the runs drawn since have screen
+// (the dirty rectangle: surfaces' screen rectangles, the whole screen for a particle run) before glass whose reach (what
+// its refraction can read, BlendEntry) meets it. Where the runs drawn since have screen
 // rectangles (`runRects`, renderer_particles'), that copy covers only the surfaces drawn since and those rectangles,
 // worked out on the GPU: the same copies, each over every pixel that changed since the one before.
 template <typename Rebind, typename Before>
@@ -2024,9 +2025,9 @@ void drawSeeThrough(Cmd* cmd, uint32_t fi, uint32_t count, bool refract, Buffer*
         d[3] = r[3] > d[3] ? r[3] : d[3];
     };
     auto chainFor = [&](const BlendEntry& e) {
-        const int32_t ew = e.rect[2] - e.rect[0], eh = e.rect[3] - e.rect[1];
-        const bool    meets = dirty[0] < e.rect[2] + ew && e.rect[0] - ew < dirty[2] && dirty[1] < e.rect[3] + eh &&
-                           e.rect[1] - eh < dirty[3];
+        const int32_t* q = e.reach;
+        const bool     meets = dirty[0] < q[2] && q[0] < dirty[2] && dirty[1] < q[3] && q[1] < dirty[3] &&
+                           dirty[2] > dirty[0] && dirty[3] > dirty[1];
         if (copies && (!meets || copies >= kChainCopies))
             return;
         cmdBindRenderTargets(cmd, nullptr);
@@ -3295,7 +3296,7 @@ void draw(uint32_t pass, const YeaFrame* yf)
             {
                 BlendEntry& e = gBlendList[blendCount++];
                 float       vz = view[2][0] * sc.x + view[2][1] * sc.y + view[2][2] * sc.z + view[2][3];
-                e = { vz, count, lod, twoSided ? 1u : 0u, 0u, { 0, 0, (int32_t)w, (int32_t)h } };
+                e = { vz, count, lod, twoSided ? 1u : 0u, 0u, { 0, 0, (int32_t)w, (int32_t)h }, { 0, 0, (int32_t)w, (int32_t)h } };
                 float refr[8];
                 // Its shape whatever the knob: a solid is one layer (its near side) with refraction off too, so how many
                 // times glass tints doesn't change with the knob (and matches the shadow maps' tint and renderer_rt).
@@ -3307,17 +3308,29 @@ void draw(uint32_t pass, const YeaFrame* yf)
                 // Its screen rectangle (the refraction chain is copied again only where a later surface reads what an
                 // earlier one changed): the box around its sphere in view space, projected, whole when it reaches the
                 // near plane.
-                float r = info.sphere[3], zn = vz - r, zf = vz + r;
-                if (zn > nearZ)
-                {
-                    float vx = view[0][0] * sc.x + view[0][1] * sc.y + view[0][2] * sc.z + view[0][3];
-                    float vy = view[1][0] * sc.x + view[1][1] * sc.y + view[1][2] * sc.z + view[1][3];
+                const float vx = view[0][0] * sc.x + view[0][1] * sc.y + view[0][2] * sc.z + view[0][3];
+                const float vy = view[1][0] * sc.x + view[1][1] * sc.y + view[1][2] * sc.z + view[1][3];
+                auto box = [&](float r, float pad, int32_t out[4]) {
+                    float zn = vz - r, zf = vz + r;
+                    if (zn <= nearZ)
+                        return;
                     float x0 = minf((vx - r) / zn, (vx - r) / zf) * p00, x1 = maxf((vx + r) / zn, (vx + r) / zf) * p00;
                     float y0 = minf((vy - r) / zn, (vy - r) / zf) * p11, y1 = maxf((vy + r) / zn, (vy + r) / zf) * p11;
-                    e.rect[0] = (int32_t)maxf(floorf((x0 * 0.5f + 0.5f) * (float)w) - 2.0f, 0.0f);
-                    e.rect[1] = (int32_t)maxf(floorf((0.5f - y1 * 0.5f) * (float)h) - 2.0f, 0.0f);
-                    e.rect[2] = (int32_t)minf(ceilf((x1 * 0.5f + 0.5f) * (float)w) + 2.0f, (float)w);
-                    e.rect[3] = (int32_t)minf(ceilf((0.5f - y0 * 0.5f) * (float)h) + 2.0f, (float)h);
+                    out[0] = (int32_t)maxf(floorf((x0 * 0.5f + 0.5f) * (float)w) - pad, 0.0f);
+                    out[1] = (int32_t)maxf(floorf((0.5f - y1 * 0.5f) * (float)h) - pad, 0.0f);
+                    out[2] = (int32_t)minf(ceilf((x1 * 0.5f + 0.5f) * (float)w) + pad, (float)w);
+                    out[3] = (int32_t)minf(ceilf((0.5f - y0 * 0.5f) * (float)h) + pad, (float)h);
+                };
+                box(info.sphere[3], 2.0f, e.rect);
+                // What its refraction can read (Forward.frag refractedScene): a thin pane's ray leaves it within
+                // thickness / 0.2 of the fragment and goes on parallel to the view ray through the fragment, so it lands
+                // between where it leaves and the fragment's own pixel, inside the sphere widened by that; a read at the
+                // chain's level L (at most its last) takes level-0 pixels within 4.5 x 2^L of the landing. A solid's
+                // ray leaves it in any direction: anywhere.
+                if (e.refract == 1)
+                {
+                    const uint32_t levels = gChainMips ? gChainMips : kChainLevels;
+                    box(info.sphere[3] + refr[1] / 0.2f, (float)(5u << (levels - 1)) + 4.0f, e.reach);
                 }
             }
             count++;

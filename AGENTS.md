@@ -45,7 +45,9 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   levels to ~8 px; `gSceneColor`), Chain.comp.fsl: level 0 a copy of hdr, then Jimenez 2014's 13-tap downsample, the
   first Karis-weighted (no fireflies). Copied over the whole screen before the first refracting surface, then again over
   the dirty rectangle (blended surfaces' screen rectangles since the last copy, the whole screen for a particle run)
-  before one whose rectangle, widened by its size each way, meets it: at most kChainCopies (6) a frame, so glass sees
+  before one whose reach meets it (7.5.2; BlendEntry.reach: a thin pane's sphere widened by thickness / 0.2, where its
+  bent ray can land, plus the last chain level's read footprint; a solid's the whole screen, as its ray can leave in any
+  direction), so a skipped copy never leaves stale colour where glass reads: at most kChainCopies (6) a frame, so glass sees
   glass and steam behind it. After particle runs (7.5.0) that copy covers only the surfaces drawn since and the runs'
   screen rectangles (renderer_particles' `particles_run_rects`): ChainRect.comp.fsl works out each level's rectangle and
   dispatch on the GPU (one thread) and the levels dispatch indirectly, so the copies are the same, each over every pixel
