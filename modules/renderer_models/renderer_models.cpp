@@ -2904,7 +2904,6 @@ void update(uint32_t phase, float dt)
 {
     if (phase == YEA_PHASE_LATE)
         knobs::check(false);
-    if (getenv("YEA_FIXED_DT")) dt = 1.0f / 60.0f; // SCRATCH-DUMP
     if (phase != YEA_PHASE_LATE) // after the game's modules have placed and moved their models this frame
     {
         if (phase == YEA_PHASE_SIMULATE && gPreview.turntable)

@@ -360,6 +360,7 @@ import renderer_particles void particles_run(u64 frame)
 import renderer_particles bool particles_draw_begin(u64 frame) = false
 import renderer_particles void particles_draw(u64 frame, u32 run)
 import renderer_particles void particles_draw_end(u64 frame)
+import renderer_particles u64 particles_run_rects() = 0
 import renderer_post void post_run(u64 frame)
 import renderer_gi bool gi_prepare(u64 frame) = false
 import renderer_gi void gi_run(u64 frame)
@@ -367,7 +368,7 @@ import renderer_gi void gi_run(u64 frame)
 category Exposure
 setting float exposure_ev 0
 player exposure_ev
-setting bool auto_exposure false
+setting bool auto_exposure true
 setting float manual_ev100 9
 setting float adapt_speed 1.5 0 inf
 # How much auto exposure brightens scenes darker than a sunset (dusk, night, dim interiors): 1 all the way, as bright as

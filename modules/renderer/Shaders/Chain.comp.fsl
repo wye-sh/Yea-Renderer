@@ -7,6 +7,7 @@ STRUCT(ChainData)
 {
     DATA(uint4, rect, None);  // xy the first texel written, zw one past the last
     DATA(uint4, mode, None);  // x 1: level 0 (a copy of gHdrIn), yz the level read's size, w 1: Karis-weighted
+    DATA(uint4, gpu, None);   // x 1: the rectangle is gRects[y] instead (written on the GPU, ChainRect.comp.fsl)
 };
 #ifdef CHAIN_MS
 #include "ChainMs.srt.h"
@@ -43,8 +44,9 @@ NUM_THREADS(8, 8, 1)
 void CS_MAIN(SV_DispatchThreadID(uint3) id)
 {
     INIT_MAIN;
-    uint2 p = gChain.rect.xy + id.xy;
-    if (p.x >= gChain.rect.z || p.y >= gChain.rect.w)
+    uint4 rect = gChain.gpu.x != 0u ? gRects[gChain.gpu.y] : gChain.rect;
+    uint2 p = rect.xy + id.xy;
+    if (p.x >= rect.z || p.y >= rect.w)
         RETURN();
     if (gChain.mode.x != 0u)
     {

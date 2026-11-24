@@ -27,5 +27,6 @@ BEGIN_SRT(PartSrt)
         DECL_RWBUFFER(PerFrame, RWBuffer(uint), gCounters)  // [0] free slots, [1] particles to draw
         DECL_RWBUFFER(PerFrame, RWBuffer(uint), gRunArgs)   // SPLIT: per draw run its indirect draw (vertices, 1, 0, 0)
         DECL_RWBUFFER(PerFrame, RWBuffer(uint), gRunStart)  // and its first list entry
+        DECL_RWBUFFER(PerFrame, RWBuffer(uint), gRunRect)   // and its screen rectangle (render pixels: x0, y0, x1, y1; BOUNDS)
     END_SRT_SET(PerFrame)
 END_SRT(PartSrt)

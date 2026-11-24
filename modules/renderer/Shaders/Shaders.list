@@ -195,6 +195,10 @@
 #include "Chain.comp.fsl"
 #end
 
+#comp renderer_chain_rect.comp
+#include "ChainRect.comp.fsl"
+#end
+
 #comp renderer_chain_ms_2.comp
 #define CHAIN_MS
 #define SAMPLE_COUNT 2

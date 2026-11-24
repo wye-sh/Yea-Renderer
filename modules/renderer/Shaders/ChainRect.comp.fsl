@@ -1,0 +1,51 @@
+// After particle runs (whose pixels only the GPU knows, renderer_particles' run rectangles): the rectangle a copy of the
+// scene colour chain covers (renderer.cpp drawSeeThrough), one thread. The CPU still decides whether a copy is made, as
+// if the runs had changed the whole screen; this only narrows it to what changed since the last copy: the surfaces drawn
+// since (cpu) and the runs drawn since. Writes each level's rectangle and its dispatch (0 groups: nothing to do there),
+// as chainUpdate computes them on the CPU.
+STRUCT(ChainRectData)
+{
+    DATA(int4, cpu, None);   // the surfaces drawn since the last copy, render pixels x0, y0, x1, y1 (x1 <= x0: none)
+    DATA(uint4, runs, None); // x the first run drawn since, y how many
+    DATA(uint4, info, None); // x width, y height, z the chain's levels, w the copy's first level's index
+};
+#include "ChainRect.srt.h"
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(1, 1, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) id)
+{
+    INIT_MAIN;
+    int4 q = gRect.cpu;
+    bool any = q.z > q.x && q.w > q.y;
+    for (uint k = 0u; k < gRect.runs.y; ++k)
+    {
+        uint r = (gRect.runs.x + k) * 4u;
+        uint4 b = uint4(gRunRects[r], gRunRects[r + 1u], gRunRects[r + 2u], gRunRects[r + 3u]);
+        if (b.z <= b.x || b.w <= b.y) // a run that draws nothing on screen
+            continue;
+        int4 c = int4(b);
+        q = any ? int4(min(q.x, c.x), min(q.y, c.y), max(q.z, c.z), max(q.w, c.w)) : c;
+        any = true;
+    }
+    for (uint l = 0u; l < gRect.info.z; ++l)
+    {
+        if (l > 0u)
+        {
+            // Texel p of this level reads texels 2p - 2 .. 2p + 3 of the one above.
+            q.x = max(q.x - 3, 0) / 2;
+            q.y = max(q.y - 3, 0) / 2;
+            q.z = (q.z + 1) / 2 + 1;
+            q.w = (q.w + 1) / 2 + 1;
+        }
+        q.z = min(q.z, int(gRect.info.x >> l));
+        q.w = min(q.w, int(gRect.info.y >> l));
+        any = any && q.z > q.x && q.w > q.y;
+        uint at = gRect.info.w + l;
+        gRectsOut[at] = any ? uint4(q) : uint4(0u, 0u, 0u, 0u);
+        gArgsOut[at * 3u] = any ? uint(q.z - q.x + 7) / 8u : 0u;
+        gArgsOut[at * 3u + 1u] = any ? uint(q.w - q.y + 7) / 8u : 0u;
+        gArgsOut[at * 3u + 2u] = 1u;
+    }
+    RETURN();
+}

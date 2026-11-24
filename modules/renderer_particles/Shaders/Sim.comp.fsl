@@ -9,6 +9,8 @@
 //   group in shared memory, the strides past it a pass each.
 // SPLIT: the sorted list cut into the draw's runs at the blended surfaces' depths (frame.h blendRuns), a binary search
 //   each: run k the entries deeper than depth k and not deeper than depth k - 1, the last run the rest.
+// BOUNDS: each run's screen rectangle, the pixels its quads can cover (the core's scene colour chain copies only those
+//   after a run, renderer.cpp drawSeeThrough): every listed particle's quad as Draw.vert.fsl places it, widened a pixel.
 #include "ParticleData.h.fsl"
 #include "Particles.srt.h"
 #define GI_IRRADIANCE gGiIrradiance
@@ -404,6 +406,83 @@ void CS_MAIN(SV_DispatchThreadID(uint3) id)
     gRunArgs[k * 4u + 2u] = 0u;
     gRunArgs[k * 4u + 3u] = 0u;
     gRunStart[k] = first;
+    gRunRect[k * 4u + 0u] = 0xFFFFFFFFu; // none yet (BOUNDS)
+    gRunRect[k * 4u + 1u] = 0xFFFFFFFFu;
+    gRunRect[k * 4u + 2u] = 0u;
+    gRunRect[k * 4u + 3u] = 0u;
+    RETURN();
+}
+#endif
+
+#if defined(BOUNDS)
+#define RUNS 65u // frame.h RENDER_MAX_BLEND_RUNS + 1
+GroupShared(uint, gsRect[RUNS * 4u]);
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(256, 1, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) id, SV_GroupIndex(uint) gi)
+{
+    INIT_MAIN;
+    for (uint i = gi; i < RUNS * 4u; i += 256u)
+        gsRect[i] = (i % 4u) < 2u ? 0xFFFFFFFFu : 0u;
+    GroupMemoryBarrier();
+    uint q = id.x;
+    uint runs = gFrame.runs.x;
+    if (q < gCounters[1])
+    {
+        // Its run: the last whose first entry is at or before it (an empty run starts where the next one does).
+        uint lo = 0u, hi = runs + 1u;
+        while (hi - lo > 1u)
+        {
+            uint mid = (lo + hi) / 2u;
+            if (gRunStart[mid] <= q)
+                lo = mid;
+            else
+                hi = mid;
+        }
+        uint     slot = gList[q].y;
+        Particle p = gParticles[slot];
+        Emitter  e = gEmitters[p.info.x];
+        float    t = saturate(p.pos.w / max(p.vel.w, 1e-6));
+        float    size = lerp(e.size.x, e.size.y, t);
+        float4   w = float4(p.pos.xyz, 1.0);
+        float3   v = float3(dot(gFrame.view[0], w), dot(gFrame.view[1], w), dot(gFrame.view[2], w));
+        // A quad wholly nearer than the near plane is clipped away (its corners share v.z).
+        if (v.z >= gFrame.camPos.w * 0.999)
+        {
+            // The turned square lies within the one twice its half-diagonal across.
+            float  r = size * 1.4143;
+            float  x0 = 1e30, y0 = 1e30, x1 = -1e30, y1 = -1e30;
+            for (uint c = 0u; c < 4u; ++c)
+            {
+                float2 o = float2((c & 1u) != 0u ? r : -r, (c & 2u) != 0u ? r : -r);
+                float2 xy = v.xy + o;
+                float2 ndc = float2(xy.x * gFrame.proj.x + gFrame.proj.z * v.z, xy.y * gFrame.proj.y + gFrame.proj.w * v.z) / v.z;
+                float2 px = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * gFrame.screen.xy;
+                x0 = min(x0, px.x), x1 = max(x1, px.x), y0 = min(y0, px.y), y1 = max(y1, px.y);
+            }
+            int2 a = int2(clamp(floor(float2(x0, y0)) - 1.0, float2(0.0, 0.0), gFrame.screen.xy));
+            int2 b = int2(clamp(ceil(float2(x1, y1)) + 1.0, float2(0.0, 0.0), gFrame.screen.xy));
+            if (b.x > a.x && b.y > a.y)
+            {
+                AtomicMin(gsRect[lo * 4u + 0u], uint(a.x));
+                AtomicMin(gsRect[lo * 4u + 1u], uint(a.y));
+                AtomicMax(gsRect[lo * 4u + 2u], uint(b.x));
+                AtomicMax(gsRect[lo * 4u + 3u], uint(b.y));
+            }
+        }
+    }
+    GroupMemoryBarrier();
+    for (uint i = gi; i < (runs + 1u) * 4u; i += 256u)
+    {
+        uint r = i / 4u;
+        if (gsRect[r * 4u + 2u] == 0u)
+            continue;
+        if ((i % 4u) < 2u)
+            AtomicMin(gRunRect[i], gsRect[i]);
+        else
+            AtomicMax(gRunRect[i], gsRect[i]);
+    }
     RETURN();
 }
 #endif

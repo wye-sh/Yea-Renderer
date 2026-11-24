@@ -42,10 +42,11 @@ struct GpuParticle
 };
 
 const uint32_t kMaxFrames = 4, kSlots = 40, kMaxEmitters = 64, kRing = 8192;
-enum Pass { kInit, kEmit, kSimulate, kPad, kSortLocal, kSortGlobal, kSplit, kPasses };
+enum Pass { kInit, kEmit, kSimulate, kPad, kSortLocal, kSortGlobal, kSplit, kBounds, kPasses };
 const char* const kShaderNames[kPasses] = { "renderer_particles_init.comp", "renderer_particles_emit.comp", "renderer_particles_simulate.comp",
                                             "renderer_particles_pad.comp", "renderer_particles_sort_local.comp",
-                                            "renderer_particles_sort_global.comp", "renderer_particles_split.comp" };
+                                            "renderer_particles_sort_global.comp", "renderer_particles_split.comp",
+                                            "renderer_particles_bounds.comp" };
 const uint32_t kRuns = RENDER_MAX_BLEND_RUNS + 1;
 
 Renderer*      gRenderer;
@@ -81,6 +82,8 @@ uint32_t       gCap;
 // first list entry, read as an instance-rate vertex stream at the run's offset (never SV_InstanceID).
 // UNORDERED_ACCESS between frames.
 Buffer*        gRunArgs, *gRunStart;
+// And each run's screen rectangle (BOUNDS: x0, y0, x1, y1 render pixels, x1 0: none), for particles_run_rects.
+Buffer*        gRunRect;
 uint32_t       gRunCount; // this frame's: blendRuns + 1
 bool           gReady, gInit;
 
@@ -219,7 +222,7 @@ void dispatch(const RenderFrame* F, Pass pass, uint32_t groups, uint32_t k, uint
     uint32_t step[4] = { k, j, 0, 0 };
     memcpy(gStepCb[index]->pCpuMappedAddress, step, sizeof step);
     Buffer*        emitters = gEmitterBuf[F->frameIndex], *spawn = gSpawnBuf[F->frameIndex];
-    DescriptorData p[21] = {};
+    DescriptorData p[22] = {};
     p[0].mIndex = SRT_RES_IDX(PartSrt, PerFrame, gFrame);
     p[0].ppBuffers = &gFrameCb[F->frameIndex];
     p[1].mIndex = SRT_RES_IDX(PartSrt, PerFrame, gStep);
@@ -262,7 +265,9 @@ void dispatch(const RenderFrame* F, Pass pass, uint32_t groups, uint32_t k, uint
     p[19].ppBuffers = &gRunArgs;
     p[20].mIndex = SRT_RES_IDX(PartSrt, PerFrame, gRunStart);
     p[20].ppBuffers = &gRunStart;
-    updateDescriptorSet(gRenderer, index, gSet, 21, p);
+    p[21].mIndex = SRT_RES_IDX(PartSrt, PerFrame, gRunRect);
+    p[21].ppBuffers = &gRunRect;
+    updateDescriptorSet(gRenderer, index, gSet, 22, p);
     Cmd* cmd = F->cmd;
     cmdBindPipeline(cmd, gPipe[pass]);
     cmdBindDescriptorSet(cmd, 0, gPersistent);
@@ -386,6 +391,8 @@ int load(int reloaded)
                           RESOURCE_STATE_UNORDERED_ACCESS, "renderer_particles_run_args");
     gRunStart = makeBuffer(kRuns * 4, 4, DESCRIPTOR_TYPE_RW_BUFFER | DESCRIPTOR_TYPE_VERTEX_BUFFER, RESOURCE_MEMORY_USAGE_GPU_ONLY,
                            RESOURCE_STATE_UNORDERED_ACCESS, "renderer_particles_run_start");
+    gRunRect = makeBuffer(kRuns * 16, 4, DESCRIPTOR_TYPE_RW_BUFFER | DESCRIPTOR_TYPE_BUFFER, RESOURCE_MEMORY_USAGE_GPU_ONLY,
+                          RESOURCE_STATE_UNORDERED_ACCESS, "renderer_particles_run_rect");
     DescriptorSetDesc persistent = SRT_SET_DESC(PartSrt, Persistent, 1, 0);
     addDescriptorSet(gRenderer, &persistent, &gPersistent);
     DescriptorSetDesc perFrame = SRT_SET_DESC(PartSrt, PerFrame, gFrames * kSlots, 0);
@@ -394,7 +401,7 @@ int load(int reloaded)
     addDescriptorSet(gRenderer, &drawDesc, &gDrawSet);
     waitForAllResourceLoads();
     bool ok = gNoGi && gShadowCmp && gDummyAtlas && gDummyAtlas->pTexture && gDummyFog && gDummyViews && gDummyBins && gDummySh && gDummyLights &&
-              gDummyShapes && gPersistent && gSet && gDrawSet && gRunArgs && gRunStart;
+              gDummyShapes && gPersistent && gSet && gDrawSet && gRunArgs && gRunStart && gRunRect;
     for (uint32_t i = 0; i < gFrames; ++i)
         ok = ok && gFrameCb[i] && gEmitterBuf[i] && gSpawnBuf[i] && gFrameCb[i]->pCpuMappedAddress && gEmitterBuf[i]->pCpuMappedAddress &&
              gSpawnBuf[i]->pCpuMappedAddress;
@@ -440,7 +447,7 @@ void unload()
     for (uint32_t i = 0; i < kMaxFrames * kSlots; ++i)
         if (gStepCb[i])
             removeResource(gStepCb[i]), gStepCb[i] = nullptr;
-    Buffer** bufs[] = { &gDummyViews, &gDummyBins, &gDummySh, &gDummyLights, &gDummyShapes, &gRunArgs, &gRunStart };
+    Buffer** bufs[] = { &gDummyViews, &gDummyBins, &gDummySh, &gDummyLights, &gDummyShapes, &gRunArgs, &gRunStart, &gRunRect };
     for (Buffer** b : bufs)
     {
         if (*b)
@@ -491,7 +498,6 @@ void update(uint32_t phase, float dt)
 {
     if (phase == YEA_PHASE_LATE)
         knobs::check(false);
-    if (getenv("YEA_FIXED_DT")) dt = 1.0f / 60.0f; // SCRATCH-DUMP
     if (phase == YEA_PHASE_SIMULATE)
         gPendingDt += dt;
 }
@@ -827,6 +833,8 @@ void particles_run(uint64_t address)
         }
     }
     dispatch(F, kSplit, 1, 0, 0); // the draw's runs
+    // And where on screen each can draw: over the whole pool, as the list can hold more than the sort's estimate (gSortN).
+    dispatch(F, kBounds, (gCap + 255) / 256, 0, 0);
     cmdEndDebugMarker(cmd);
 }
 
@@ -928,10 +936,12 @@ bool ensureDrawPipe(TinyImageFormat format)
 void runBarrier(Cmd* cmd, bool toDraw)
 {
     const ResourceState uav = RESOURCE_STATE_UNORDERED_ACCESS;
-    BufferBarrier b[2] = { { gRunArgs, toDraw ? uav : RESOURCE_STATE_INDIRECT_ARGUMENT, toDraw ? RESOURCE_STATE_INDIRECT_ARGUMENT : uav },
+    const ResourceState sr = RESOURCE_STATE_SHADER_RESOURCE;
+    BufferBarrier b[3] = { { gRunArgs, toDraw ? uav : RESOURCE_STATE_INDIRECT_ARGUMENT, toDraw ? RESOURCE_STATE_INDIRECT_ARGUMENT : uav },
                            { gRunStart, toDraw ? uav : RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
-                             toDraw ? RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER : uav } };
-    cmdResourceBarrier(cmd, 2, b, 0, nullptr, 0, nullptr);
+                             toDraw ? RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER : uav },
+                           { gRunRect, toDraw ? uav : sr, toDraw ? sr : uav } };
+    cmdResourceBarrier(cmd, 3, b, 0, nullptr, 0, nullptr);
 }
 } // namespace
 
@@ -990,6 +1000,13 @@ void particles_draw(uint64_t address, uint32_t run)
     uint64_t offset = (uint64_t)run * 4;
     cmdBindVertexBuffer(cmd, 1, &gRunStart, &stride, &offset);
     cmdExecuteIndirect(cmd, INDIRECT_DRAW, 1, gRunArgs, (uint64_t)run * 16, nullptr, 0);
+}
+
+// Each run's screen rectangle this frame (a Buffer*: uint4 a run, x0, y0, x1, y1 in render pixels, x1 0 when it draws
+// nothing), SHADER_RESOURCE from particles_draw_begin to particles_draw_end; 0 when no run draws.
+uint64_t particles_run_rects()
+{
+    return gDrawn ? (uint64_t)(uintptr_t)gRunRect : 0;
 }
 
 // After the core unbinds its pass.

@@ -46,7 +46,10 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   first Karis-weighted (no fireflies). Copied over the whole screen before the first refracting surface, then again over
   the dirty rectangle (blended surfaces' screen rectangles since the last copy, the whole screen for a particle run)
   before one whose rectangle, widened by its size each way, meets it: at most kChainCopies (6) a frame, so glass sees
-  glass and steam behind it. A refracting surface's multiply writes 0 and its add puts T times the chain at the bent
+  glass and steam behind it. After particle runs (7.5.0) that copy covers only the surfaces drawn since and the runs'
+  screen rectangles (renderer_particles' `particles_run_rects`): ChainRect.comp.fsl works out each level's rectangle and
+  dispatch on the GPU (one thread) and the levels dispatch indirectly, so the copies are the same, each over every pixel
+  that changed since the last: the same picture. Without the rectangles, the whole screen as before. A refracting surface's multiply writes 0 and its add puts T times the chain at the bent
   ray's landing (Forward.frag `refractedScene`: thin a slab, solid a ball refracted in and out, landing found in two
   steps on gSceneDepth, a landing in front of the glass taking the straight view; mip from roughness x distance behind),
   fog kept exact. A solid one draws its near side only; a thin double-sided one its far side, a recopy, its near side.
@@ -351,6 +354,8 @@ and composites it in `YEA_PASS_WORLD` with a `YEA_PIPELINE_PICTURE` pipeline, un
   are in view), then SPLIT: one binary search per blended surface's depth cuts the list into runs (`gRunArgs`, indirect
   draws; `gRunStart`, each run's first entry, an instance-rate stream). In the core's see-through pass
   (`particles_draw_begin`, `particles_draw(frame, run)` per run between the surfaces, `particles_draw_end`), each run
+  (BOUNDS: its screen rectangle, every listed particle's quad widened a pixel, over the whole pool, as the list can hold
+  more than the sort's estimate; `particles_run_rects` between draw_begin and draw_end, for the core's chain copies)
   draws indirectly: camera-facing round sprites, premultiplied into `hdr` (additive ones write alpha 0), soft against
   the prepass depth (`soft_distance`) and the camera (`near_fade`), behind the froxel fog at their depth, before
   exposure, TAA and the upscaler; their coverage adds into the core's `reactive` (TAA takes up to 0.6 more of the

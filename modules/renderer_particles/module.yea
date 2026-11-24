@@ -73,6 +73,9 @@ export void particles_run(u64 frame)
 export bool particles_draw_begin(u64 frame)
 export void particles_draw(u64 frame, u32 run)
 export void particles_draw_end(u64 frame)
+# Between particles_draw_begin and particles_draw_end: each run's screen rectangle (a Buffer*, uint4 a run: x0, y0, x1,
+# y1 render pixels, x1 0 when it draws nothing), SHADER_RESOURCE; 0 when nothing draws. The core's chain copies only that.
+export u64 particles_run_rects()
 
 category Particles
 # Dust, steam, smoke and sparks from the game's emitters.

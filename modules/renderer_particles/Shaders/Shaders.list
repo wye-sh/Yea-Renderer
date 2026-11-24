@@ -41,6 +41,11 @@
 #include "Sim.comp.fsl"
 #end
 
+#comp renderer_particles_bounds.comp
+#define BOUNDS
+#include "Sim.comp.fsl"
+#end
+
 #vert renderer_particles.vert
 #include "Draw.vert.fsl"
 #end

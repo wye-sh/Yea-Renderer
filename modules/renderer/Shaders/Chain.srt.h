@@ -8,5 +8,6 @@ BEGIN_SRT(ChainSrt)
         DECL_TEXTURE(PerFrame, Tex2D(float4), gHdrIn)      // level 0's source: the HDR target
         DECL_RWTEXTURE(PerFrame, RWTex2D(half4), gPrev)    // the level read (the chain at the level above)
         DECL_RWTEXTURE(PerFrame, RWTex2D(half4), gDst)     // the level written
+        DECL_BUFFER(PerFrame, Buffer(uint4), gRects)       // the rectangles ChainRect.comp.fsl wrote (gChain.gpu)
     END_SRT_SET(PerFrame)
 END_SRT(ChainSrt)
